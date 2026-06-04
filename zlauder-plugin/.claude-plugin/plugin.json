@@ -1,0 +1,16 @@
+{
+  "name": "zlauder",
+  "description": "PII mask/unmask proxy control plane for Claude Code",
+  "version": "0.1.0",
+  "author": {
+    "name": "FailSpy"
+  },
+  "homepage": "https://github.com/FailSpy/zlauder",
+  "keywords": [
+    "privacy",
+    "pii",
+    "proxy",
+    "masking",
+    "redaction"
+  ]
+}
