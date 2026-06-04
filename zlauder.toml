@@ -1,0 +1,47 @@
+# zlauder runtime configuration.
+# Passed to the proxy via `--config` (the SessionStart hook does this).
+
+[proxy]
+port = 8787
+bind = "127.0.0.1"
+upstream_base_url = "https://api.anthropic.com"
+
+[engine]
+# Detection sensitivity preset is informational; the explicit fields below win.
+profile = "balanced"
+# Presidio confidence floor (0.0–1.0). Lower = more aggressive.
+score_threshold = 0.5
+language = "en"
+# Default reversible operator. Alternatives below under [engine.entity_operators].
+default_operator = { kind = "token" }
+# Which entity categories to mask. "personal" (PERSON/LOCATION/ORG) needs an NLP
+# model and is off by default.
+enabled_categories = ["secrets", "financial", "identity", "contact"]
+# If true, a detection error refuses the request instead of forwarding plaintext.
+fail_closed = false
+
+# Per-entity-type operator overrides (optional).
+[engine.entity_operators]
+CREDIT_CARD = { kind = "mask", char = "*", from_end = 4 }   # ************1111
+# PASSWORD  = { kind = "redact" }                            # irreversible
+
+# Values that must never be tokenized. `patterns` are regexes.
+[engine.allow_list]
+exact = ["Anthropic", "Claude", "127.0.0.1"]
+exact_ci = ["localhost"]
+patterns = ['^\d{4}$']
+
+# Custom rules. priority: lower = higher precedence. is_regex=false ⇒ literal.
+# literal_token=true emits the fixed `token` verbatim (still reversible).
+# [[engine.custom_replacements]]
+# pattern = "ACME-INTERNAL-CODENAME"
+# entity_type = "CODENAME"
+# is_regex = false
+# literal_token = true
+# token = "[CODENAME_acme]"
+
+# [[engine.custom_replacements]]
+# pattern = '\bEMP-\d{6}\b'
+# entity_type = "EMPLOYEE_ID"
+# is_regex = true
+# priority = 10

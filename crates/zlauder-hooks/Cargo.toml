@@ -1,0 +1,20 @@
+[package]
+name = "zlauder-hooks"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Claude Code control-plane hook handler for zlauder: SessionStart proxy launch, status line, reveal/audit."
+
+[[bin]]
+name = "zlauder-hooks"
+path = "src/main.rs"
+
+[dependencies]
+clap       = { workspace = true }
+serde      = { workspace = true }
+serde_json = { workspace = true }
+anyhow     = { workspace = true }
+rand       = { workspace = true }
+reqwest    = { version = "0.12", default-features = false, features = ["blocking"] }

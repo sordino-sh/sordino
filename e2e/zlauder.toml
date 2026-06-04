@@ -1,0 +1,17 @@
+# e2e test config: proxy on 18820, upstream is the local fake Anthropic on 18821.
+[proxy]
+port = 18820
+bind = "127.0.0.1"
+upstream_base_url = "http://127.0.0.1:18821"
+
+[engine]
+profile = "balanced"
+score_threshold = 0.5
+language = "en"
+default_operator = { kind = "token" }
+enabled_categories = ["secrets", "financial", "identity", "contact"]
+fail_closed = false
+
+[engine.allow_list]
+exact = ["Anthropic", "Claude"]
+exact_ci = ["localhost"]

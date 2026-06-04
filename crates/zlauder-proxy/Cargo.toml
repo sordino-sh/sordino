@@ -1,0 +1,39 @@
+[package]
+name = "zlauder-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Local reverse proxy: masks PII in Anthropic Messages API requests and unmasks streamed/non-streamed responses on the wire."
+
+[[bin]]
+name = "zlauder-proxy"
+path = "src/main.rs"
+
+[dependencies]
+zlauder-engine = { path = "../zlauder-engine", version = "0.1.0" }
+
+anthropic-wire = { workspace = true }
+sse-core       = { workspace = true }
+
+axum       = { workspace = true }
+tower-http = { workspace = true }
+tokio      = { workspace = true }
+reqwest    = { workspace = true }
+http       = { workspace = true }
+bytes      = { workspace = true }
+futures    = { workspace = true }
+
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+toml       = { workspace = true }
+clap       = { workspace = true }
+anyhow     = { workspace = true }
+tracing    = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }

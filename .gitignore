@@ -1,0 +1,5 @@
+/target
+# e2e runtime artifacts (proxy/fake logs, captured bodies, session state)
+e2e/state/
+e2e/state-*/
+*.log

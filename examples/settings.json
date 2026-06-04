@@ -1,0 +1,27 @@
+{
+  "//": "Example Claude Code settings for zlauder. Copy the relevant pieces into",
+  "//env": "your project's .claude/settings.json (or ~/.claude/settings.json).",
+  "//warn": "ANTHROPIC_BASE_URL points Claude Code at the local proxy — only enable",
+  "//warn2": "this once `zlauder-proxy`/`zlauder-hooks` are on PATH and a proxy will run.",
+
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:8787"
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "zlauder-hooks session-start --config ${CLAUDE_PROJECT_DIR}/zlauder.toml"
+          }
+        ]
+      }
+    ]
+  },
+  "statusLine": {
+    "type": "command",
+    "command": "zlauder-hooks statusline"
+  }
+}
