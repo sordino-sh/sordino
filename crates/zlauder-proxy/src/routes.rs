@@ -10,7 +10,7 @@ use axum::routing::{get, post};
 use http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
 use zlauder_engine::UnmaskManifest;
 
-use crate::{headers, sse, state::AppState, walk};
+use crate::{admin, headers, sse, state::AppState, walk};
 
 const MAX_BODY: usize = 64 * 1024 * 1024;
 
@@ -18,6 +18,14 @@ pub fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/zlauder/reveal/{token}", get(reveal))
+        // `/privacy` control plane (all key-gated; per-project proxy).
+        .route(
+            "/zlauder/config",
+            get(admin::get_config).put(admin::put_config),
+        )
+        .route("/zlauder/enable", post(admin::enable))
+        .route("/zlauder/disable", post(admin::disable))
+        .route("/zlauder/reload", post(admin::reload))
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
         .fallback(passthrough)
@@ -26,12 +34,12 @@ pub fn router(state: AppState) -> Router {
 
 /// Audit reveal: `GET /zlauder/reveal/{token}` with header `x-zlauder-key`.
 /// Local operator affordance only; not reachable by the upstream model.
-async fn reveal(State(st): State<AppState>, hdrs: HeaderMap, Path(token): Path<String>) -> Response {
-    let provided = hdrs
-        .get("x-zlauder-key")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-    if provided != st.admin_key.as_str() {
+async fn reveal(
+    State(st): State<AppState>,
+    hdrs: HeaderMap,
+    Path(token): Path<String>,
+) -> Response {
+    if !st.authed(&hdrs) {
         return err(StatusCode::FORBIDDEN, "missing or invalid x-zlauder-key");
     }
     match st.engine.reveal(&token) {
@@ -74,7 +82,12 @@ async fn messages(State(st): State<AppState>, req: Request) -> Response {
     } else {
         let bytes = match resp.bytes().await {
             Ok(b) => b,
-            Err(e) => return err(StatusCode::BAD_GATEWAY, &format!("upstream body error: {e}")),
+            Err(e) => {
+                return err(
+                    StatusCode::BAD_GATEWAY,
+                    &format!("upstream body error: {e}"),
+                );
+            }
         };
         let out = walk::unmask_response(st.engine.as_ref(), &manifest, &bytes)
             .unwrap_or_else(|_| bytes.to_vec());
@@ -106,7 +119,10 @@ async fn count_tokens(State(st): State<AppState>, req: Request) -> Response {
             headers::downstream_response_headers(&h, false),
             Body::from(bytes.to_vec()),
         ),
-        Err(e) => err(StatusCode::BAD_GATEWAY, &format!("upstream body error: {e}")),
+        Err(e) => err(
+            StatusCode::BAD_GATEWAY,
+            &format!("upstream body error: {e}"),
+        ),
     }
 }
 
@@ -156,9 +172,11 @@ fn mask_body(st: &AppState, body: &[u8]) -> Result<(Vec<u8>, UnmaskManifest), Re
             StatusCode::BAD_REQUEST,
             &format!("unparseable request body, refusing to forward: {e}"),
         )),
+        // The engine refused to mask (fail_closed detection error, or an encryption
+        // failure). Either way we do NOT forward — refusing is the safe outcome.
         Err(walk::MaskError::Engine(e)) => Err(err(
             StatusCode::INTERNAL_SERVER_ERROR,
-            &format!("masking refused (fail_closed): {e}"),
+            &format!("masking error, request refused: {e}"),
         )),
     }
 }

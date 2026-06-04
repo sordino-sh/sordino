@@ -109,9 +109,8 @@ pub fn run_detection(
     }
 
     // Pass 2: presidio analyzer.
-    let results = analyzer.analyze(
-        AnalyzeRequest::new(text, &cfg.language).score_threshold(cfg.score_threshold),
-    );
+    let results = analyzer
+        .analyze(AnalyzeRequest::new(text, &cfg.language).score_threshold(cfg.score_threshold));
     for r in results {
         let entity_type = r.entity_type.to_string();
         if !cfg.entity_enabled(&entity_type) {
@@ -168,9 +167,7 @@ fn resolve_overlaps(mut dets: Vec<Detection>) -> Vec<Detection> {
 
     let mut kept: Vec<Detection> = Vec::new();
     for d in dets {
-        let overlaps = kept
-            .iter()
-            .any(|k| d.start < k.end && k.start < d.end);
+        let overlaps = kept.iter().any(|k| d.start < k.end && k.start < d.end);
         if !overlaps {
             kept.push(d);
         }

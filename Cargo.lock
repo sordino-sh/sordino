@@ -2793,6 +2793,9 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "toml_edit",
+ "zlauder-engine",
+ "zlauder-state",
 ]
 
 [[package]]
@@ -2817,6 +2820,17 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "zlauder-engine",
+ "zlauder-state",
+]
+
+[[package]]
+name = "zlauder-state"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -167,7 +167,9 @@ impl SseUnmasker {
             std::mem::take(c)
         };
         let (safe, held) = split_safe(&buf);
-        let emitted = engine.unmask(safe, manifest).unwrap_or_else(|_| safe.to_string());
+        let emitted = engine
+            .unmask(safe, manifest)
+            .unwrap_or_else(|_| safe.to_string());
         self.carry.insert(index, held.to_string());
         if emitted.is_empty() {
             Vec::new()

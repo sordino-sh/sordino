@@ -119,7 +119,9 @@ impl MaskWalker<'_> {
             ApiContentBlock::ToolUse { input, .. } => self.value(input, Surface::ToolUseInput)?,
             ApiContentBlock::ToolResult { content, .. } => self.tool_result(content)?,
             ApiContentBlock::Image { source } => self.image(source, Surface::UserMessage)?,
-            ApiContentBlock::Document { source, .. } => self.document(source, Surface::UserMessage)?,
+            ApiContentBlock::Document { source, .. } => {
+                self.document(source, Surface::UserMessage)?
+            }
             ApiContentBlock::Compaction { content, .. } => {
                 self.str(content, Surface::AssistantText)?
             }
@@ -341,7 +343,10 @@ mod tests {
         // R2 — unknown top-level key survives, and the unknown nested `extra`
         // map is still walked (its PII is masked).
         assert_eq!(v["x_future_flag"], serde_json::json!(true));
-        assert!(!s.contains("carol@example.com"), "unknown-field PII leaked: {s}");
+        assert!(
+            !s.contains("carol@example.com"),
+            "unknown-field PII leaked: {s}"
+        );
 
         // Arrow 1 — user text masked.
         assert!(!s.contains("alice@example.com"), "user email leaked");
@@ -372,8 +377,14 @@ mod tests {
         });
         let (masked, manifest) = mask_request(&e, body.to_string().as_bytes()).unwrap();
         let s = String::from_utf8(masked).unwrap();
-        assert!(!s.contains("sue@example.com"), "string-content PII leaked: {s}");
-        assert!(!s.contains("rob@example.com"), "array-content PII leaked: {s}");
+        assert!(
+            !s.contains("sue@example.com"),
+            "string-content PII leaked: {s}"
+        );
+        assert!(
+            !s.contains("rob@example.com"),
+            "array-content PII leaked: {s}"
+        );
         assert!(s.contains("[EMAIL_ADDRESS_"));
         assert_eq!(manifest.len(), 2);
     }

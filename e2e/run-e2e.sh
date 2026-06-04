@@ -31,6 +31,18 @@ PROX=$!
 sleep 1.2
 log "proxy_healthz=$(curl -sS -m 3 http://127.0.0.1:18820/healthz)"
 
+# 2b) /privacy control plane: the same endpoints the slash command drives.
+#     KEY is the proxy's session key (admin_key) from the state file it wrote.
+KEY=$(grep -oE '"admin_key": "[0-9a-f]+"' state/proxy-18820.json | grep -oE '[0-9a-f]{64}')
+log "config_show=$("$BIN/zlauder-hooks" config show --port 18820 2>&1 | head -1)"
+# Unauthenticated disable must be refused (the prompt-injection defense).
+log "unauth_disable_code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18820/zlauder/disable)"
+# Authenticated off → on round-trip via the CLI.
+"$BIN/zlauder-hooks" config off --port 18820 >/dev/null 2>&1
+log "after_off_enabled=$(curl -sS -H "x-zlauder-key: $KEY" http://127.0.0.1:18820/zlauder/config | grep -oE '\"enabled\":(true|false)' | head -1)"
+"$BIN/zlauder-hooks" config on --port 18820 >/dev/null 2>&1
+log "after_on_enabled=$(curl -sS -H "x-zlauder-key: $KEY" http://127.0.0.1:18820/zlauder/config | grep -oE '\"enabled\":(true|false)' | head -1)"
+
 # 3) REAL claude, spawned here; routing comes entirely from .claude/settings.json
 timeout 110 claude -p "My personal email is zoe.quine@example.com and my home server is 10.55.66.77 . Acknowledge in one short sentence." \
   > state/claude-out.txt 2> state/claude-err.txt
@@ -45,3 +57,5 @@ echo "  email: $(grep -c 'zoe.quine@example.com' "$CAP")  ip: $(grep -c '10.55.6
 echo "  tokens forwarded:"; grep -oE '\[[A-Z_]+_[0-9a-f]{12}\]' "$CAP" | sed -E 's/_[0-9a-f]{12}\]/]/' | sort | uniq -c
 echo "==== ingress: canary restored to claude ===="
 grep -oE 'zoe\.quine@example\.com|10\.55\.66\.77' state/claude-out.txt | sort | uniq -c
+echo "==== /privacy control plane (want: unauth=403, off=false, on=true) ===="
+grep -E 'unauth_disable_code|after_off_enabled|after_on_enabled' "$OUT"

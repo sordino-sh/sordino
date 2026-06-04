@@ -98,7 +98,13 @@ impl Category {
             // false positives while keeping real URLs (scheme / www. / path).
             // DOMAIN stays OFF: its recognizer is still aggressive on filenames;
             // re-enable per-deployment via `entity_operators` if wanted.
-            Category::Contact => &["EMAIL_ADDRESS", "PHONE_NUMBER", "IP_ADDRESS", "URL", "MAC_ADDRESS"],
+            Category::Contact => &[
+                "EMAIL_ADDRESS",
+                "PHONE_NUMBER",
+                "IP_ADDRESS",
+                "URL",
+                "MAC_ADDRESS",
+            ],
             Category::Personal => &["PERSON", "LOCATION", "ORGANIZATION"],
         }
     }
@@ -202,6 +208,12 @@ pub struct CustomReplacement {
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EngineConfig {
+    /// Master switch. When `false` the engine is a transparent passthrough on the
+    /// mask (request) path — no detection, no tokens. Unmasking (response path)
+    /// still runs, so tokens already in the transcript keep decoding. Toggled live
+    /// via the proxy's control endpoint or persisted per scope.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
     #[serde(default)]
     pub profile: Profile,
     #[serde(default = "default_threshold")]
@@ -242,6 +254,7 @@ fn default_categories() -> HashSet<Category> {
 impl Default for EngineConfig {
     fn default() -> Self {
         Self {
+            enabled: true,
             profile: Profile::Balanced,
             score_threshold: 0.5,
             enabled_categories: Profile::Balanced.default_categories(),

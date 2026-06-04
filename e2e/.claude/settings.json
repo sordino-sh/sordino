@@ -1,6 +1,7 @@
 {
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:18820",
+    "ZLAUDER_PORT": "18820",
     "ZLAUDER_STATE_DIR": "/home/failspy/Projects/zlauder/e2e/state"
   },
   "hooks": {
@@ -10,7 +11,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/failspy/Projects/zlauder/target/debug/zlauder-hooks session-start --port 18820 --proxy-bin /home/failspy/Projects/zlauder/target/debug/zlauder-proxy --config /home/failspy/Projects/zlauder/e2e/zlauder.toml"
+            "command": "/home/failspy/Projects/zlauder/target/debug/zlauder-hooks session-start --proxy-bin /home/failspy/Projects/zlauder/target/debug/zlauder-proxy --config /home/failspy/Projects/zlauder/e2e/zlauder.toml"
           }
         ]
       }
@@ -18,6 +19,6 @@
   },
   "statusLine": {
     "type": "command",
-    "command": "/home/failspy/Projects/zlauder/target/debug/zlauder-hooks statusline --port 18820"
+    "command": "/home/failspy/Projects/zlauder/target/debug/zlauder-hooks statusline"
   }
 }

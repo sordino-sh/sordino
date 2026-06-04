@@ -92,11 +92,7 @@ impl SessionStore {
 
     /// Mint-or-reuse a deterministic token for `(entity_type, plaintext)`.
     /// Determinism means the token itself is the dedup key.
-    pub fn intern(
-        &mut self,
-        entity_type: &str,
-        plaintext: &str,
-    ) -> Result<String, EngineError> {
+    pub fn intern(&mut self, entity_type: &str, plaintext: &str) -> Result<String, EngineError> {
         let token = make_token(entity_type, plaintext, &self.salt);
         self.insert_if_absent(token.clone(), plaintext)?;
         Ok(token)

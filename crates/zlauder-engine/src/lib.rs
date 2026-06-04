@@ -20,18 +20,27 @@ pub use manifest::{ManifestEntry, MaskOutcome, UnmaskManifest};
 pub use surface::{Direction, Surface};
 pub use token::{MAX_TOKEN_LEN, TOKEN_HASH_HEX_LEN, make_token, token_regex};
 
-use std::sync::Mutex;
+use std::sync::{Mutex, RwLock};
 
 use detect::{CompiledCustom, compile_customs, run_detection};
 use store::SessionStore;
 use token::hash_value;
 
-/// The masking engine. Cheap to share behind an `Arc`; interior mutability via a
-/// `Mutex` on the session store.
-pub struct MaskEngine {
-    analyzer: presidio_analyzer::AnalyzerEngine,
+/// The mutable masking *policy*: the config plus its compiled custom rules. Held
+/// behind an `RwLock` so the proxy can hot-swap it (e.g. a `/privacy` toggle)
+/// without dropping the session store — token determinism (and the prompt-cache
+/// prefix) therefore survives a config change.
+struct Policy {
     config: EngineConfig,
     customs: Vec<CompiledCustom>,
+}
+
+/// The masking engine. Cheap to share behind an `Arc`; interior mutability via an
+/// `RwLock` on the hot-swappable policy and a `Mutex` on the session store. The
+/// analyzer is fixed at construction (a `language` change needs a rebuild).
+pub struct MaskEngine {
+    analyzer: presidio_analyzer::AnalyzerEngine,
+    policy: RwLock<Policy>,
     store: Mutex<SessionStore>,
 }
 
@@ -42,8 +51,7 @@ impl MaskEngine {
         let customs = compile_customs(&config.custom_replacements)?;
         Ok(Self {
             analyzer,
-            config,
-            customs,
+            policy: RwLock::new(Policy { config, customs }),
             store: Mutex::new(SessionStore::new()),
         })
     }
@@ -59,14 +67,48 @@ impl MaskEngine {
         let customs = compile_customs(&config.custom_replacements)?;
         Ok(Self {
             analyzer,
-            config,
-            customs,
+            policy: RwLock::new(Policy { config, customs }),
             store: Mutex::new(SessionStore::with_key_and_salt(key, salt)),
         })
     }
 
-    pub fn config(&self) -> &EngineConfig {
-        &self.config
+    /// A clone of the current effective config (snapshot; not a live view).
+    pub fn config_snapshot(&self) -> EngineConfig {
+        self.policy
+            .read()
+            .expect("policy rwlock poisoned")
+            .config
+            .clone()
+    }
+
+    /// Whether masking is currently on (the config `enabled` master switch).
+    pub fn is_enabled(&self) -> bool {
+        self.policy
+            .read()
+            .expect("policy rwlock poisoned")
+            .config
+            .enabled
+    }
+
+    /// Flip the master switch live (cheap; doesn't recompile custom rules).
+    pub fn set_enabled(&self, enabled: bool) {
+        self.policy
+            .write()
+            .expect("policy rwlock poisoned")
+            .config
+            .enabled = enabled;
+    }
+
+    /// Hot-swap the whole policy. Recompiles custom rules; the session store
+    /// (key/salt/minted tokens) is untouched, so already-minted tokens keep
+    /// resolving and determinism is preserved across the swap. A change to
+    /// `config.language` does NOT rebuild the analyzer — that needs a restart.
+    pub fn set_config(&self, config: EngineConfig) -> Result<(), EngineError> {
+        let customs = compile_customs(&config.custom_replacements)?;
+        let mut policy = self.policy.write().expect("policy rwlock poisoned");
+        policy.config = config;
+        policy.customs = customs;
+        Ok(())
     }
 
     /// Number of distinct tokens minted so far this session.
@@ -82,17 +124,26 @@ impl MaskEngine {
     /// plaintext) and unmasks every inbound field. Determinism makes the
     /// round-trip reproduce the original token form exactly.
     pub fn mask(&self, text: &str, surface: Surface) -> Result<MaskOutcome, EngineError> {
-        if !self.config.surface_enabled(surface) {
+        let policy = self.policy.read().expect("policy rwlock poisoned");
+        // Master switch off, or this surface disabled by policy → transparent
+        // passthrough on the mask path (unmask still runs on the response side).
+        if !policy.config.enabled || !policy.config.surface_enabled(surface) {
             return Ok(MaskOutcome {
                 masked_text: text.to_string(),
                 manifest: UnmaskManifest::new(),
             });
         }
 
-        let dets = match run_detection(&self.analyzer, &self.config, &self.customs, text, surface) {
+        let dets = match run_detection(
+            &self.analyzer,
+            &policy.config,
+            &policy.customs,
+            text,
+            surface,
+        ) {
             Ok(d) => d,
             Err(e) => {
-                if self.config.fail_closed {
+                if policy.config.fail_closed {
                     return Err(e);
                 }
                 tracing::warn!("detection failed, passing text through unmasked: {e}");
@@ -177,7 +228,10 @@ impl MaskEngine {
 
     /// Reveal a single token to its plaintext (audit). `None` if unknown.
     pub fn reveal(&self, token: &str) -> Option<String> {
-        self.store.lock().expect("store mutex poisoned").reveal(token)
+        self.store
+            .lock()
+            .expect("store mutex poisoned")
+            .reveal(token)
     }
 
     /// Export the session key + salt so a sibling process can decrypt for audit.
@@ -232,10 +286,21 @@ mod tests {
     #[test]
     fn determinism_same_engine() {
         let e = engine();
-        let a = e.mask("write to carol@example.com", Surface::UserMessage).unwrap();
-        let b = e.mask("write to carol@example.com", Surface::ToolResult).unwrap();
-        assert!(a.masked_text.contains("[EMAIL_ADDRESS_"), "got: {}", a.masked_text);
-        assert_eq!(a.masked_text, b.masked_text, "same plaintext => identical token");
+        let a = e
+            .mask("write to carol@example.com", Surface::UserMessage)
+            .unwrap();
+        let b = e
+            .mask("write to carol@example.com", Surface::ToolResult)
+            .unwrap();
+        assert!(
+            a.masked_text.contains("[EMAIL_ADDRESS_"),
+            "got: {}",
+            a.masked_text
+        );
+        assert_eq!(
+            a.masked_text, b.masked_text,
+            "same plaintext => identical token"
+        );
     }
 
     #[test]
@@ -246,11 +311,17 @@ mod tests {
         let e2 = MaskEngine::with_session(EngineConfig::default(), key, salt).unwrap();
         let t1 = e1.mask("alice@example.com", Surface::UserMessage).unwrap();
         let t2 = e2.mask("alice@example.com", Surface::UserMessage).unwrap();
-        assert_eq!(t1.masked_text, t2.masked_text, "same (key,salt) => same token");
+        assert_eq!(
+            t1.masked_text, t2.masked_text,
+            "same (key,salt) => same token"
+        );
 
         let e3 = MaskEngine::with_session(EngineConfig::default(), key, [1u8; 16]).unwrap();
         let t3 = e3.mask("alice@example.com", Surface::UserMessage).unwrap();
-        assert_ne!(t1.masked_text, t3.masked_text, "different salt => different token");
+        assert_ne!(
+            t1.masked_text, t3.masked_text,
+            "different salt => different token"
+        );
     }
 
     // T3 — reveal.
@@ -267,17 +338,26 @@ mod tests {
     #[test]
     fn operators() {
         let mut cfg = EngineConfig::default();
-        cfg.entity_operators
-            .insert("CREDIT_CARD".into(), Operator::Mask { char: '*', from_end: 4 });
+        cfg.entity_operators.insert(
+            "CREDIT_CARD".into(),
+            Operator::Mask {
+                char: '*',
+                from_end: 4,
+            },
+        );
         cfg.entity_operators
             .insert("EMAIL_ADDRESS".into(), Operator::Redact);
         let e = MaskEngine::new(cfg).unwrap();
 
-        let out = e.mask("card 4111111111111111 here", Surface::UserMessage).unwrap();
+        let out = e
+            .mask("card 4111111111111111 here", Surface::UserMessage)
+            .unwrap();
         assert!(out.masked_text.contains("************1111"));
         assert!(out.manifest.is_empty(), "Mask produces no reversible entry");
 
-        let out2 = e.mask("mail bob@example.com", Surface::UserMessage).unwrap();
+        let out2 = e
+            .mask("mail bob@example.com", Surface::UserMessage)
+            .unwrap();
         assert!(out2.masked_text.contains("[REDACTED]"));
         assert!(!out2.masked_text.contains("bob@example.com"));
         // Unmasking redacted text is a no-op.
@@ -308,7 +388,10 @@ mod tests {
                 Surface::UserMessage,
             )
             .unwrap();
-        assert!(out.masked_text.contains("admin@example.com"), "allow-listed not masked");
+        assert!(
+            out.masked_text.contains("admin@example.com"),
+            "allow-listed not masked"
+        );
         assert!(out.masked_text.contains("[CODENAME_acme]"));
         let back = e.unmask(&out.masked_text, &out.manifest).unwrap();
         assert_eq!(back, "ping admin@example.com about ACME-CODENAME");
@@ -319,11 +402,18 @@ mod tests {
     #[test]
     fn strict_url_skips_filenames_keeps_real_urls() {
         let e = engine();
-        let text =
-            "edit CLAUDE.md and opts.la then open https://corp.example.com/secret and mail bob@example.com";
+        let text = "edit CLAUDE.md and opts.la then open https://corp.example.com/secret and mail bob@example.com";
         let out = e.mask(text, Surface::UserMessage).unwrap();
-        assert!(out.masked_text.contains("CLAUDE.md"), "filename masked: {}", out.masked_text);
-        assert!(out.masked_text.contains("opts.la"), "code ident masked: {}", out.masked_text);
+        assert!(
+            out.masked_text.contains("CLAUDE.md"),
+            "filename masked: {}",
+            out.masked_text
+        );
+        assert!(
+            out.masked_text.contains("opts.la"),
+            "code ident masked: {}",
+            out.masked_text
+        );
         assert!(
             !out.masked_text.contains("https://corp.example.com/secret"),
             "real URL not masked: {}",
@@ -332,6 +422,79 @@ mod tests {
         assert!(!out.masked_text.contains("bob@example.com"));
         assert!(out.masked_text.contains("[URL_"));
         assert!(out.masked_text.contains("[EMAIL_ADDRESS_"));
+    }
+
+    // Master switch off ⇒ mask path is a transparent passthrough, but already
+    // minted tokens still unmask on the response path.
+    #[test]
+    fn disabled_passes_through_but_still_unmasks() {
+        let e = engine();
+        // Mint a token while enabled.
+        let on = e
+            .mask("ping alice@example.com", Surface::UserMessage)
+            .unwrap();
+        let token = on.manifest.entries[0].token_handle.clone();
+
+        // Now disable: a fresh outbound field is NOT masked.
+        e.set_enabled(false);
+        assert!(!e.is_enabled());
+        let off = e
+            .mask("ping bob@example.com", Surface::UserMessage)
+            .unwrap();
+        assert_eq!(
+            off.masked_text, "ping bob@example.com",
+            "should pass through verbatim"
+        );
+        assert!(off.manifest.is_empty());
+
+        // ...yet the earlier token still decodes (unmask is not gated).
+        let restored = e
+            .unmask(&format!("reply to {token}"), &on.manifest)
+            .unwrap();
+        assert_eq!(restored, "reply to alice@example.com");
+
+        // Re-enable and masking resumes, deterministically (same token as before).
+        e.set_enabled(true);
+        let again = e
+            .mask("ping alice@example.com", Surface::UserMessage)
+            .unwrap();
+        assert_eq!(
+            again.masked_text, on.masked_text,
+            "determinism survives the toggle"
+        );
+    }
+
+    // Live policy swap takes effect immediately and keeps the store (determinism).
+    #[test]
+    fn set_config_swaps_policy_live() {
+        let e = engine();
+        let before = e
+            .mask("card 4111111111111111", Surface::UserMessage)
+            .unwrap();
+        assert!(
+            before.masked_text.contains("[CREDIT_CARD_"),
+            "default tokenizes CC"
+        );
+
+        // Swap to a config that masks CC with stars instead of a token.
+        let mut cfg = e.config_snapshot();
+        cfg.entity_operators.insert(
+            "CREDIT_CARD".into(),
+            Operator::Mask {
+                char: '*',
+                from_end: 4,
+            },
+        );
+        e.set_config(cfg).unwrap();
+
+        let after = e
+            .mask("card 4111111111111111", Surface::UserMessage)
+            .unwrap();
+        assert!(
+            after.masked_text.contains("************1111"),
+            "got: {}",
+            after.masked_text
+        );
     }
 
     // Any surface label can be masked (no direction gate); unmask round-trips.

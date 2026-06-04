@@ -1,5 +1,10 @@
 //! zlauder-proxy — local reverse proxy that masks PII in Claude Code's
 //! Anthropic Messages API traffic and unmasks responses on the wire.
+//!
+//! One proxy per project (the SessionStart hook launches it on a project-derived
+//! port). The proxy is the authoritative writer of its state file: after it binds
+//! the port it records its real key/salt/pid, so the `zlauder-hooks` CLI always
+//! reaches a key that matches the live proxy — even if two sessions race to start.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,12 +23,15 @@ struct Args {
     /// Bind address (overrides config; default 127.0.0.1).
     #[arg(long, env = "ZLAUDER_BIND")]
     bind: Option<String>,
-    /// Path to zlauder.toml.
+    /// Path to zlauder.toml (the project-scope config layer).
     #[arg(long, env = "ZLAUDER_CONFIG")]
     config: Option<PathBuf>,
     /// Upstream base URL (overrides config; default https://api.anthropic.com).
     #[arg(long, env = "ZLAUDER_UPSTREAM")]
     upstream: Option<String>,
+    /// Absolute project root this proxy serves (for the state record / config GET).
+    #[arg(long, env = "ZLAUDER_PROJECT_ROOT")]
+    project_root: Option<PathBuf>,
 }
 
 #[tokio::main]
@@ -40,9 +48,12 @@ async fn main() -> anyhow::Result<()> {
     let port = args.port.unwrap_or(cfg.port);
     let bind = args.bind.unwrap_or(cfg.bind);
     let upstream = args.upstream.unwrap_or(cfg.upstream_base_url);
+    let project_root = resolve_project_root(args.project_root);
 
     let engine = build_engine(cfg.engine)?;
-    let admin_key = hex_encode(&engine.session_handle().0);
+    let (key, salt) = engine.session_handle();
+    let admin_key = hex_encode(&key);
+    let salt_hex = hex_encode(&salt);
     let http = reqwest::Client::builder()
         .build()
         .context("building HTTP client")?;
@@ -51,7 +62,10 @@ async fn main() -> anyhow::Result<()> {
         engine: Arc::new(engine),
         http,
         upstream_base: Arc::new(upstream.clone()),
-        admin_key: Arc::new(admin_key),
+        admin_key: Arc::new(admin_key.clone()),
+        layers: Arc::new(cfg.layers),
+        project_root: Arc::new(project_root.clone()),
+        port,
     };
 
     let app = routes::router(state);
@@ -59,6 +73,22 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .with_context(|| format!("binding {addr}"))?;
+
+    // We bound the port → we are the live proxy for it. Record authoritative
+    // state BEFORE serving so the CLI never reads a key that doesn't match us.
+    // (A racing rival that failed to bind exits above and never writes.)
+    let base_url = format!("http://127.0.0.1:{port}");
+    if let Err(e) = zlauder_state::write_state(&zlauder_state::ProxyState {
+        port,
+        admin_key,
+        salt: salt_hex,
+        base_url,
+        pid: std::process::id(),
+        project_root,
+    }) {
+        tracing::warn!("could not write state file (reveal/config CLI may not find the key): {e}");
+    }
+
     tracing::info!("zlauder-proxy listening on http://{addr} -> {upstream}");
 
     axum::serve(listener, app)
@@ -66,6 +96,19 @@ async fn main() -> anyhow::Result<()> {
         .await
         .context("server error")?;
     Ok(())
+}
+
+/// Canonical absolute project root: `--project-root`/env, else `CLAUDE_PROJECT_DIR`,
+/// else the current working directory.
+fn resolve_project_root(explicit: Option<PathBuf>) -> String {
+    let raw = explicit
+        .or_else(|| std::env::var_os("CLAUDE_PROJECT_DIR").map(PathBuf::from))
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."));
+    std::fs::canonicalize(&raw)
+        .unwrap_or(raw)
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Build the engine, reusing the SessionStart-issued key+salt from the
@@ -94,7 +137,12 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 fn decode_hex_array<const N: usize>(s: &str) -> anyhow::Result<[u8; N]> {
     let s = s.trim();
-    anyhow::ensure!(s.len() == N * 2, "expected {} hex chars, got {}", N * 2, s.len());
+    anyhow::ensure!(
+        s.len() == N * 2,
+        "expected {} hex chars, got {}",
+        N * 2,
+        s.len()
+    );
     let mut out = [0u8; N];
     for (i, byte) in out.iter_mut().enumerate() {
         *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)

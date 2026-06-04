@@ -7,6 +7,8 @@ bind = "127.0.0.1"
 upstream_base_url = "https://api.anthropic.com"
 
 [engine]
+# Master on/off switch. `/privacy off` (or `zlauder-hooks config off`) flips this.
+enabled = true
 # Detection sensitivity preset is informational; the explicit fields below win.
 profile = "balanced"
 # Presidio confidence floor (0.0–1.0). Lower = more aggressive.

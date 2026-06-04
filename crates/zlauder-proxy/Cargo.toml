@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 zlauder-engine = { path = "../zlauder-engine", version = "0.1.0" }
+zlauder-state  = { path = "../zlauder-state",  version = "0.1.0" }
 
 anthropic-wire = { workspace = true }
 sse-core       = { workspace = true }

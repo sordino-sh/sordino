@@ -36,6 +36,10 @@ is 10.55.66.77 …"*:
   `zoe.quine@example.com` and `10.55.66.77` again.
 - **Routing** comes entirely from `.claude/settings.json` — Claude Code talks to
   the proxy, not directly to Anthropic.
+- **`/privacy` control plane.** The harness also drives the same key-gated config
+  endpoints the `/privacy` slash command uses: an *unauthenticated* `disable` is
+  refused (`403`), and an authenticated `off`→`on` round-trip flips the live
+  `enabled` flag. See the "control plane" block in the output.
 
 ### Notes
 

@@ -16,9 +16,15 @@ zlauder is a **hybrid**: a reverse proxy is the data plane, and thin Claude Code
 hooks are the control plane.
 
 ```
-Claude Code  ──ANTHROPIC_BASE_URL=http://127.0.0.1:8787──►  zlauder-proxy  ──TLS──►  api.anthropic.com
-   (sees plaintext)                                          (masks/unmasks)        (sees only tokens)
+Claude Code  ──ANTHROPIC_BASE_URL=http://127.0.0.1:<project-port>──►  zlauder-proxy  ──TLS──►  api.anthropic.com
+   (sees plaintext)                                                   (masks/unmasks)        (sees only tokens)
 ```
+
+**One proxy per project.** Each project gets its own proxy on a port derived from
+its path, so its key, token store, and config are fully isolated — concurrent
+`claude` sessions in *different* projects never interfere or correlate, while two
+windows in the *same* project share one proxy. `zlauder-hooks init` assigns the
+port and writes it into the project's `.claude/settings.json`.
 
 This is **not** a TLS-intercepting MITM — Claude Code natively supports
 `ANTHROPIC_BASE_URL`, so you simply point it at the local proxy, which
@@ -53,9 +59,10 @@ are kept tokenized end-to-end (never unmasked), so signatures stay valid.
 
 | crate | role |
 |---|---|
-| `zlauder-engine` | masking engine: detection (presidio) + deterministic tokens + AES-GCM reversible store + config (profiles/categories/operators/allow-list/custom rules). Runtime-free. |
-| `zlauder-proxy` | axum reverse proxy: request mask walk, per-call manifest, upstream relay, JSON + streaming-SSE unmask. |
-| `zlauder-hooks` | Claude Code control plane: `session-start` (launch proxy), `statusline`, `reveal`. |
+| `zlauder-engine` | masking engine: detection (presidio) + deterministic tokens + AES-GCM reversible store + hot-swappable config (profiles/categories/operators/allow-list/custom rules). Runtime-free. |
+| `zlauder-proxy` | axum reverse proxy: request mask walk, per-call manifest, upstream relay, JSON + streaming-SSE unmask, and a key-gated `/privacy` control plane (live enable/disable/profile/reload). |
+| `zlauder-hooks` | Claude Code control plane: `init` (per-project setup), `session-start` (launch proxy), `statusline`, `config` (the `/privacy` command), `reveal`. |
+| `zlauder-state` | shared on-disk session state (port/key/salt/pid) + project→port derivation; the single source of truth both binaries read. |
 
 ## Build
 
@@ -70,14 +77,21 @@ Requires Rust ≥ 1.91 (the `anthropic-wire` dependency is edition 2024).
 
 1. Put `zlauder-proxy` and `zlauder-hooks` on your `PATH`
    (e.g. `cp target/release/zlauder-{proxy,hooks} ~/.local/bin/`).
-2. Drop a [`zlauder.toml`](./zlauder.toml) in your project (or point the hook at
-   one with `--config`).
-3. Merge [`examples/settings.json`](./examples/settings.json) into your project's
-   `.claude/settings.json`. This sets `ANTHROPIC_BASE_URL`, runs the
-   `SessionStart` hook (which launches the proxy on first use), and adds a status
-   line.
+2. From your project, run the one-time setup:
 
-The proxy can also be run standalone:
+   ```sh
+   cd ~/code/my-project
+   zlauder-hooks init
+   ```
+
+   This picks a free per-project port, then writes:
+   - `.claude/settings.json` — `ANTHROPIC_BASE_URL` + `ZLAUDER_PORT`, the
+     `SessionStart` hook (launches the proxy on first use), and a status line;
+   - `.claude/commands/privacy.md` — the `/privacy` slash command;
+   - `zlauder.toml` — a starter config (only if absent).
+3. Start `claude` from that directory. The proxy launches automatically.
+
+The proxy can also be run standalone (no per-project derivation):
 
 ```sh
 zlauder-proxy --port 8787 --config zlauder.toml
@@ -86,8 +100,43 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude   # any client honoring the base
 
 ## Configuration
 
+### The `/privacy` command
+
+Inside a `claude` session, change masking settings live with the slash command
+(or `zlauder-hooks config …` from a shell). It affects **only this project's**
+proxy.
+
+```
+/privacy                          # show current state (on/off, profile, categories)
+/privacy off                      # transparent passthrough (this session, live)
+/privacy on
+/privacy profile strict           # threshold + categories + default operator preset
+/privacy category contact off     # toggle one category
+/privacy threshold 0.3
+```
+
+Each change takes a `--scope` (default `session`):
+
+| scope | persists to | applies |
+|---|---|---|
+| `session` | nothing (live only) | this project's running proxy; lost on restart |
+| `project` | `./zlauder.toml` (committed) | now (reload) + every future session |
+| `local` | `./zlauder.local.toml` (gitignored) | now + future sessions, just for you |
+| `user` | `~/.config/zlauder/config.toml` | now + every project you own |
+
+At startup the proxy merges these layers (user < project < local). Because each
+project has its own proxy, a live change here is isolated — it never affects a
+`claude` running in another project.
+
+> The control endpoints are gated by the session key (`x-zlauder-key`, from the
+> `0600` state file), so a blind tool-driven `curl …/zlauder/disable` (e.g. via
+> prompt injection) can't silently turn masking off.
+
+### `zlauder.toml`
+
 See [`zlauder.toml`](./zlauder.toml). Highlights:
 
+- `enabled` — master switch (`/privacy on`/`off`).
 - `profile` / `score_threshold` / `enabled_categories` — what to detect.
 - `default_operator` and per-type `entity_operators`: `token` (reversible),
   `redact`, `mask` (keep last N), `hash`, `keep`.
@@ -126,12 +175,16 @@ so it isn't a trivial deanonymization oracle for a tool-driven `curl`.
   per-session salt), so masked content is byte-stable across turns and
   Anthropic's prompt-cache prefix is preserved. Verified: two identical requests
   produce byte-identical masked output. The salt is reused across proxy restarts
-  on a port, so cross-turn consistency survives a crash.
-- **Multi-session:** verified concurrency-safe — simultaneous sessions don't
-  corrupt each other or cross-contaminate responses. But with the single fixed
-  port they share one proxy + one store/salt, so identical plaintext maps to the
-  same token across sessions (correlation). Fine for single-user local use; true
-  per-session isolation would need per-session ports.
+  on a port, so cross-turn consistency survives a crash. A live `/privacy` config
+  change keeps the store (and salt), so determinism survives reconfiguration too.
+- **Multi-session / multi-project:** each project runs its **own** proxy on a
+  project-derived port — separate key, salt, store, and config. Concurrent
+  sessions in different projects can't corrupt each other, cross-contaminate
+  responses, or correlate tokens (a value masked in project A is a *different*
+  token in project B, and isn't resolvable by B's store). Two windows in the same
+  project correctly share one proxy. The bound proxy is the sole writer of its
+  state file (after it binds), so even two sessions racing to launch the same
+  project's proxy can't desync the key the `reveal`/`config` CLI reads.
 - **Subscription (OAuth) auth:** verified working through the proxy against the
   real `api.anthropic.com` (the `Authorization` header is forwarded verbatim).
 
