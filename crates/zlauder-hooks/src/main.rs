@@ -203,7 +203,45 @@ fn session_start(port: Option<u16>, config: Option<PathBuf>, proxy_bin: String) 
         p.exists().then_some(p)
     });
 
-    if !proxy_healthy(port) {
+    // A healthy proxy already on our port is normally reused as-is. But the proxy is
+    // long-lived (one per project, kept alive across sessions), so a plugin/proxy
+    // update does NOT take effect until the old process is recycled. Decide whether
+    // to (re)launch: nothing healthy here, or a healthy-but-STALE build of ours.
+    let mut needs_launch = !proxy_healthy(port);
+    if !needs_launch {
+        match read_state(port).ok() {
+            // Another project's proxy holds our port — never touch it; warn.
+            Some(st) if !st.project_root.is_empty() && st.project_root != root => {
+                eprintln!(
+                    "zlauder: WARNING — port {port} is serving a different project ({}). \
+                     Your traffic would be masked under that project. Run `/zlauder:disable` \
+                     then `/zlauder:enable` in this project to get a fresh, isolated port.",
+                    st.project_root
+                );
+            }
+            // Ours (or unowned): recycle it if its reported build differs from ours.
+            // Guard on known ids so we never churn when either side can't report one
+            // (an "unknown" build, or a pre-build-id proxy whose /healthz says "ok"
+            // — that "ok" != our SHA, so an older proxy is correctly recycled too).
+            st => {
+                let ours = zlauder_state::BUILD_ID;
+                if ours != "unknown"
+                    && let Some(running) = proxy_build_id(port)
+                    && running != "unknown"
+                    && running != ours
+                {
+                    eprintln!(
+                        "zlauder: proxy on :{port} is build '{running}', current is '{ours}' \
+                         — restarting to apply the update."
+                    );
+                    stop_proxy(port, st.as_ref().map(|s| s.pid).unwrap_or(0));
+                    needs_launch = true;
+                }
+            }
+        }
+    }
+
+    if needs_launch {
         // Reuse this port's SALT (and only the salt) iff the existing record is
         // OURS, so a crashed-and-relaunched proxy keeps minting the SAME tokens
         // (prompt-cache prefix stable). We must NOT inherit another project's salt
@@ -252,21 +290,6 @@ fn session_start(port: Option<u16>, config: Option<PathBuf>, proxy_bin: String) 
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-    } else if let Ok(st) = read_state(port)
-        && !st.project_root.is_empty()
-        && st.project_root != root
-    {
-        // A healthy proxy is already on our port but belongs to a DIFFERENT project
-        // — a port collision (e.g. a hand-copied settings.json; the first-launch
-        // `reserve_port` prevents this in the normal flow). Reusing it would mask our
-        // traffic under that project's salt/store. Warn loudly; the static
-        // ANTHROPIC_BASE_URL still points here, so the fix is to re-derive a port.
-        eprintln!(
-            "zlauder: WARNING — port {port} is serving a different project ({}). \
-             Your traffic would be masked under that project. Run `/zlauder:disable` \
-             then `/zlauder:enable` in this project to get a fresh, isolated port.",
-            st.project_root
-        );
     }
 
     // SessionStart hook output. The static `env` written by `/zlauder:enable` into
@@ -955,6 +978,53 @@ fn proxy_healthy(port: u16) -> bool {
         .send()
         .map(|r| r.status().is_success())
         .unwrap_or(false)
+}
+
+/// The build id the proxy on `port` reports (its `/healthz` body), if reachable.
+/// A pre-build-id proxy returns `"ok"`; an unreachable/erroring proxy returns None.
+fn proxy_build_id(port: u16) -> Option<String> {
+    blocking_client()
+        .get(format!("http://127.0.0.1:{port}/healthz"))
+        .send()
+        .ok()
+        .filter(|r| r.status().is_success())
+        .and_then(|r| r.text().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Stop the proxy on `port` so a fresh build can take its place. SIGINT to `pid`
+/// (the proxy shuts down gracefully on ctrl_c), wait for the listener to drop, then
+/// escalate to SIGKILL. The state file — and thus the token salt — is left intact,
+/// so the relaunched proxy reuses the same salt and tokens stay prompt-cache stable.
+fn stop_proxy(port: u16, pid: u32) {
+    let signal = |sig: &str| {
+        if pid != 0 {
+            let _ = std::process::Command::new("kill")
+                .arg(sig)
+                .arg(pid.to_string())
+                .status();
+        }
+    };
+    signal("-INT");
+    for _ in 0..60 {
+        // ~3s graceful
+        if !proxy_healthy(port) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    signal("-KILL");
+    for _ in 0..40 {
+        // ~2s backstop
+        if !proxy_healthy(port) {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    eprintln!(
+        "zlauder: WARNING — proxy on :{port} (pid {pid}) did not exit; the new one may fail to bind."
+    );
 }
 
 fn hex(bytes: &[u8]) -> String {

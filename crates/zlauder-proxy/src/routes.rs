@@ -16,7 +16,9 @@ const MAX_BODY: usize = 64 * 1024 * 1024;
 
 pub fn router(state: AppState) -> Router {
     Router::new()
-        .route("/healthz", get(|| async { "ok" }))
+        // Body is this proxy's build id — the SessionStart hook reads it to detect a
+        // stale long-lived proxy (older build) and restart it. Health = HTTP 200.
+        .route("/healthz", get(|| async { zlauder_state::BUILD_ID }))
         .route("/zlauder/reveal/{token}", get(reveal))
         // `/privacy` control plane (all key-gated; per-project proxy).
         .route(

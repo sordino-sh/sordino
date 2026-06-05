@@ -37,6 +37,16 @@ pub const PORT_BASE: u16 = 18000;
 /// Number of ports in the derivation window (`PORT_BASE..PORT_BASE+PORT_SPAN`).
 pub const PORT_SPAN: u16 = 2000;
 
+/// Per-build identity baked in by `build.rs` (git short SHA, `-dirty` if the tree
+/// had uncommitted changes, or `"unknown"` without git). Both binaries embed it;
+/// the proxy reports it on `/healthz` and the SessionStart hook compares it against
+/// its own to detect — and recycle — a long-lived proxy left over from an older
+/// build (e.g. after a plugin update).
+pub const BUILD_ID: &str = match option_env!("ZLAUDER_BUILD") {
+    Some(s) => s,
+    None => "unknown",
+};
+
 /// On-disk record describing one running (or last-known) per-project proxy.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProxyState {
