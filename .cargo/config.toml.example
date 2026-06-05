@@ -1,0 +1,16 @@
+# Local co-development override for zlauder.
+#
+# Copy this to `.cargo/config.toml` (gitignored) to build the workspace against
+# local checkouts of the git dependencies instead of fetching them from GitHub:
+#
+#     cp .cargo/config.toml.example .cargo/config.toml
+#
+# Each `paths` entry overrides any matching crate (by package name) in the
+# dependency graph with the local source at that path. No manifest edits, no
+# network. Remove `.cargo/config.toml` to go back to the pinned git deps.
+paths = [
+    "../jcc/presidio-rs/presidio-core",
+    "../jcc/presidio-rs/presidio-analyzer",
+    "../jcc/llm-wires/anthropic-wire",
+    "../jcc/llm-wires/sse-core",
+]

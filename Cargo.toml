@@ -15,13 +15,19 @@ license = "MIT"
 authors = ["failspy <failspy@exonull.com>"]
 
 [workspace.dependencies]
-# local path deps: presidio-rs (detection)
-presidio-core     = { path = "../jcc/presidio-rs/presidio-core",     version = "0.1.0" }
-presidio-analyzer = { path = "../jcc/presidio-rs/presidio-analyzer", version = "0.1.0" }
+# External crates, each published as its own GitHub repo (crates.io planned).
+# Git deps so the workspace builds from a clean checkout (CI, contributors);
+# Cargo.lock pins the exact commit for reproducible release builds. To swap to
+# crates.io later, drop `git`/`branch` and keep `version`.
+#
+# For local co-development against ../jcc checkouts, add a gitignored
+# .cargo/config.toml `paths` override (see .cargo/config.toml.example) — cargo
+# then uses your local trees with no network and no manifest edits.
+presidio-core     = { git = "https://github.com/FailSpy/presidio-rs.git", branch = "main", version = "0.1.0" }
+presidio-analyzer = { git = "https://github.com/FailSpy/presidio-rs.git", branch = "main", version = "0.1.0" }
 
-# local path deps: llm-wires (Anthropic wire types + SSE)
-anthropic-wire = { path = "../jcc/llm-wires/anthropic-wire", version = "0.1.0" }
-sse-core       = { path = "../jcc/llm-wires/sse-core",       version = "0.1.0" }
+anthropic-wire = { git = "https://github.com/FailSpy/llm-wires.git", branch = "main", version = "0.1.0" }
+sse-core       = { git = "https://github.com/FailSpy/llm-wires.git", branch = "main", version = "0.1.0" }
 
 # masking engine
 blake3   = "1.5"

@@ -9,3 +9,6 @@ zlauder.local.toml
 
 # pair/agent worktrees (harness artifacts; symlinks point outside the repo)
 .claude/worktrees/
+
+# local co-development override (path deps); keep the .example tracked
+.cargo/config.toml
