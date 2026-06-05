@@ -229,6 +229,99 @@ impl AllowList {
     }
 }
 
+/// Display-time decoration for *unmasked assistant text* (Arrow 2 only). When a
+/// token is restored to plaintext on its way to the terminal, the plaintext is
+/// wrapped with `prefix`/`suffix` so the operator can SEE, at a glance, exactly
+/// which spans of the assistant's reply were un-masked. This is purely a local
+/// rendering aid:
+///
+/// - It is applied ONLY to `Surface::AssistantText` (the model's prose), never to
+///   tool inputs, tool results, citations, or compaction — wrapping those could
+///   corrupt a value the model is writing into a file or passing to a tool.
+/// - On the next turn the wrapped reply is re-sent as assistant history; the mask
+///   path strips the marker literals *before* detection (see `MaskEngine::mask`),
+///   so upstream receives the bare token — byte-identical to a no-marker
+///   round-trip, with zero added noise and a stable prompt-cache prefix.
+///
+/// The default `prefix`/`suffix` are ANSI escapes (a colored background + reset).
+/// ANSI is out-of-band — the model cannot accidentally emit or override it the way
+/// it can with markdown (`**bold**`) — at the cost of only rendering if the
+/// surrounding harness passes raw escapes through (Claude Code renders model text
+/// as markdown, so this is best confirmed empirically). Any prefix/suffix pair
+/// works; pick markers that do NOT occur in ordinary prose, since the strip removes
+/// the exact literals from re-sent assistant history (the default escapes never
+/// collide; printable markers like a backtick would over-strip code spans).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct RevealMarker {
+    /// Master switch for the decoration. Off by default (no behavior change).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Inserted immediately before each un-masked value.
+    #[serde(default = "default_marker_prefix")]
+    pub prefix: String,
+    /// Inserted immediately after each un-masked value.
+    #[serde(default = "default_marker_suffix")]
+    pub suffix: String,
+}
+
+/// `ESC[97;44m` — bright-white foreground on a blue background.
+fn default_marker_prefix() -> String {
+    "\u{1b}[97;44m".to_string()
+}
+/// `ESC[0m` — reset all attributes.
+fn default_marker_suffix() -> String {
+    "\u{1b}[0m".to_string()
+}
+
+impl Default for RevealMarker {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            prefix: default_marker_prefix(),
+            suffix: default_marker_suffix(),
+        }
+    }
+}
+
+impl RevealMarker {
+    /// On (and has at least one non-empty delimiter to add/strip).
+    pub fn is_active(&self) -> bool {
+        self.enabled && (!self.prefix.is_empty() || !self.suffix.is_empty())
+    }
+
+    /// Wrap one un-masked value for display: `prefix || value || suffix`.
+    pub fn wrap(&self, value: &str) -> String {
+        let mut s = String::with_capacity(self.prefix.len() + value.len() + self.suffix.len());
+        s.push_str(&self.prefix);
+        s.push_str(value);
+        s.push_str(&self.suffix);
+        s
+    }
+
+    /// Could `text` contain either delimiter? Cheap guard so the common
+    /// (marker-free) leaf skips the allocation in [`Self::strip`].
+    pub fn contained_in(&self, text: &str) -> bool {
+        (!self.prefix.is_empty() && text.contains(&self.prefix))
+            || (!self.suffix.is_empty() && text.contains(&self.suffix))
+    }
+
+    /// Remove every exact `prefix`/`suffix` literal — used on the mask path to peel
+    /// a prior turn's display decoration off re-sent assistant history *before*
+    /// detection runs, so detection sees the original value (no marker char fused to
+    /// the PII) and upstream gets the bare token.
+    pub fn strip(&self, text: &str) -> String {
+        let mut out = if self.prefix.is_empty() {
+            text.to_string()
+        } else {
+            text.replace(&self.prefix, "")
+        };
+        if !self.suffix.is_empty() && self.suffix != self.prefix {
+            out = out.replace(&self.suffix, "");
+        }
+        out
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CustomReplacement {
     pub pattern: String,
@@ -337,6 +430,12 @@ pub struct EngineConfig {
     #[serde(default)]
     pub ml: MlConfig,
 
+    /// Display-time decoration for un-masked assistant text (see [`RevealMarker`]).
+    /// Off by default; a display/apply-time concern, so it is NOT part of
+    /// `detection_fingerprint` (changing it does not invalidate the detection cache).
+    #[serde(default)]
+    pub reveal_marker: RevealMarker,
+
     // --- Detection cache (Component 1) ------------------------------------
     /// Max entries in the in-memory detection cache (LRU). `0` disables + clears
     /// it live. Default ~50k leaves; an empty detection list (the ~95% clean-leaf
@@ -402,6 +501,7 @@ impl Default for EngineConfig {
             allow_list: AllowList::with_common_words(),
             custom_replacements: Vec::new(),
             ml: MlConfig::default(),
+            reveal_marker: RevealMarker::default(),
             detection_cache_cap: default_cache_cap(),
             detection_cache_persist: false,
             detection_cache_path: None,
@@ -461,8 +561,10 @@ impl EngineConfig {
     /// `default_operator` (resolved at apply time), the `enabled` master switch and
     /// `disabled_surfaces` (their effect is the un-cached early-return passthrough),
     /// `fail_closed` (error policy, not detection), `profile` (only a seed for the
-    /// derived fields), `ml` (covered by the separate `ml_fp`), and the cache /
-    /// Component-3 scaffolding fields.
+    /// derived fields), `ml` (covered by the separate `ml_fp`), `reveal_marker`
+    /// (a display/apply-time decoration; the marker strip happens before this
+    /// fingerprint is consulted, so the cache key already reflects its effect), and
+    /// the cache / Component-3 scaffolding fields.
     ///
     /// All maps/sets are serialized in a canonical (sorted) order so semantically
     /// identical configs hash identically (audit #6). `custom_replacements` is hashed

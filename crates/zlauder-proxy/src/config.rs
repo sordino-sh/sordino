@@ -200,6 +200,9 @@ mod tests {
         ));
         // Categories parsed (snake_case).
         assert!(cfg.engine.enabled_categories.contains(&Category::Secrets));
+        // Reveal marker seeded on with the ANSI escape (basic-string \u001b).
+        assert!(cfg.engine.reveal_marker.enabled);
+        assert!(cfg.engine.reveal_marker.prefix.starts_with('\u{1b}'));
         // Allow-list compiled: common-word default + the `^\d{4}$` pattern.
         assert!(cfg.engine.allow_list.is_allowed("Anthropic"));
         assert!(cfg.engine.allow_list.is_allowed("1234"));
@@ -237,6 +240,31 @@ mod tests {
         assert_eq!(cfg.engine.ml.min_score, Some(0.7));
         // A config without `[engine.ml]` still defaults cleanly (off).
         assert!(!EngineConfig::default().ml.enabled);
+
+        unsafe { std::env::remove_var("ZLAUDER_USER_CONFIG") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_engine_reveal_marker_section() {
+        let dir = std::env::temp_dir().join(format!("zlauder-marker-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let project = dir.join("zlauder.toml");
+        // TOML basic strings carry the ANSI ESC byte via a \u001b escape.
+        std::fs::write(
+            &project,
+            "[engine.reveal_marker]\nenabled = true\nprefix = \"\\u001b[97;44m\"\nsuffix = \"\\u001b[0m\"\n",
+        )
+        .unwrap();
+        // SAFETY: single-threaded unit test.
+        unsafe { std::env::set_var("ZLAUDER_USER_CONFIG", "/nonexistent/zlauder/config.toml") };
+
+        let cfg = load(Some(&project)).expect("reveal_marker section load");
+        assert!(cfg.engine.reveal_marker.enabled);
+        assert_eq!(cfg.engine.reveal_marker.prefix, "\u{1b}[97;44m");
+        assert_eq!(cfg.engine.reveal_marker.suffix, "\u{1b}[0m");
+        // A config without the section defaults cleanly (off).
+        assert!(!zlauder_engine::EngineConfig::default().reveal_marker.enabled);
 
         unsafe { std::env::remove_var("ZLAUDER_USER_CONFIG") };
         let _ = std::fs::remove_dir_all(&dir);

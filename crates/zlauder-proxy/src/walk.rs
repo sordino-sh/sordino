@@ -298,7 +298,11 @@ pub fn unmask_response(
 
 fn unmask_block(engine: &MaskEngine, manifest: &UnmaskManifest, block: &mut ApiContentBlock) {
     match block {
-        ApiContentBlock::Text { text, .. } => unmask_str(engine, manifest, text),
+        // Assistant prose → display: the ONLY place the reveal marker decorates, so
+        // the operator can see which spans were un-masked.
+        ApiContentBlock::Text { text, .. } => unmask_str_assistant(engine, manifest, text),
+        // Tool input is consumed verbatim by a tool (could be written to a file): no
+        // decoration, ever. Same for compaction (machine context that is re-sent).
         ApiContentBlock::ToolUse { input, .. } => unmask_value(engine, manifest, input),
         ApiContentBlock::Compaction { content, .. } => unmask_str(engine, manifest, content),
         // Opaque: leave thinking/redacted tokenized so signatures stay valid.
@@ -306,9 +310,17 @@ fn unmask_block(engine: &MaskEngine, manifest: &UnmaskManifest, block: &mut ApiC
     }
 }
 
-/// Unmask a single string in place (used by the response walkers).
+/// Unmask a single string in place (used by the response walkers). No decoration —
+/// for fields whose bytes must stay exact (compaction).
 pub fn unmask_str(engine: &MaskEngine, manifest: &UnmaskManifest, text: &mut String) {
     if let Ok(out) = engine.unmask(text, manifest) {
+        *text = out;
+    }
+}
+
+/// Unmask assistant prose in place, applying the reveal marker (when configured).
+fn unmask_str_assistant(engine: &MaskEngine, manifest: &UnmaskManifest, text: &mut String) {
+    if let Ok(out) = engine.unmask_assistant(text, manifest) {
         *text = out;
     }
 }
@@ -343,10 +355,62 @@ fn unmask_map(engine: &MaskEngine, manifest: &UnmaskManifest, m: &mut Map<String
 #[cfg(test)]
 mod tests {
     use super::*;
-    use zlauder_engine::EngineConfig;
+    use zlauder_engine::{EngineConfig, RevealMarker};
 
     fn engine() -> MaskEngine {
         MaskEngine::new(EngineConfig::default()).unwrap()
+    }
+
+    fn engine_marked() -> MaskEngine {
+        let mut cfg = EngineConfig::default();
+        cfg.reveal_marker = RevealMarker {
+            enabled: true,
+            prefix: "«".into(),
+            suffix: "»".into(),
+        };
+        MaskEngine::new(cfg).unwrap()
+    }
+
+    // The reveal marker decorates the assistant `text` block but MUST leave a
+    // `tool_use` input untouched (it may be written verbatim into a file/tool).
+    #[test]
+    fn reveal_marker_decorates_text_block_not_tool_input() {
+        let e = engine_marked();
+        // Mint a token for an email via a request mask.
+        let (_m, manifest) = mask_request(
+            &e,
+            serde_json::json!({
+                "model": "m", "max_tokens": 10,
+                "messages": [{"role":"user","content":[{"type":"text","text":"to bob@example.com"}]}]
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        let token = manifest.entries[0].token_handle.clone();
+
+        let resp = serde_json::json!({
+            "content": [
+                {"type":"text","text": format!("I'll write to {token} now")},
+                {"type":"tool_use","id":"t1","name":"write_file",
+                 "input": {"path":"/etc/cfg","contents": format!("addr={token}")}}
+            ],
+            "model": "m"
+        });
+        let out = unmask_response(&e, &manifest, resp.to_string().as_bytes()).unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+
+        // Assistant prose: decorated.
+        assert_eq!(
+            v["content"][0]["text"].as_str().unwrap(),
+            "I'll write to «bob@example.com» now"
+        );
+        // Tool input: un-masked but NOT decorated — the file would otherwise get the
+        // marker bytes baked in.
+        assert_eq!(
+            v["content"][1]["input"]["contents"].as_str().unwrap(),
+            "addr=bob@example.com"
+        );
     }
 
     #[test]

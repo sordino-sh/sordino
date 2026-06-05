@@ -159,6 +159,8 @@ See [`zlauder.toml`](./zlauder.toml). Highlights:
 - `custom_replacements` — your own literal or regex rules (e.g. project
   codenames, employee IDs).
 - `[engine.ml]` — the optional ML recognizer (below).
+- `[engine.reveal_marker]` — highlight un-masked values in the assistant's
+  replies (below).
 
 ### Optional: `openai/privacy-filter` on CPU
 
@@ -189,6 +191,36 @@ but **off by default** and runs only after you download the model:
 
 > Note: because the Candle stack is always compiled in, the build is heavier and
 > the binaries are larger than a regex-only build — a deliberate trade-off.
+
+### Optional: highlight un-masked values (`[engine.reveal_marker]`)
+
+Normally an un-masked value is restored silently into the assistant's reply, so
+you can't tell which spans came back from a token. Turn on `reveal_marker` to wrap
+each restored value with a configurable `prefix`/`suffix` for display:
+
+```toml
+[engine.reveal_marker]
+enabled = true
+prefix = "$"   # or any string — the repo default is an ANSI colour escape
+suffix = "$"   #   (see zlauder.toml; written with the TOML \uXXXX escape)
+```
+
+- **Assistant prose only.** The decoration is applied **only** to `Surface::AssistantText`
+  (Arrow 2). Tool inputs, tool results, citations, and compaction are un-masked
+  byte-for-byte — so a value the model writes into a file or passes to a tool is
+  never altered.
+- **Zero upstream noise.** Claude Code stores the (decorated) reply in the transcript
+  and re-sends it as assistant history next turn. The mask path strips the exact
+  marker literals **before** detection, so upstream receives the bare token —
+  byte-identical to a no-marker round-trip, with a stable prompt-cache prefix. The
+  marker is purely a local display aid; it never reaches the model.
+- **ANSI vs. printable.** The default `prefix`/`suffix` are ANSI escapes — out-of-band,
+  so the model can't emit or override them (unlike `**bold**`). Whether they render
+  as color depends on the harness (Claude Code renders model text as markdown, so
+  confirm empirically); if you see literal escape junk, switch to a printable pair
+  like `prefix = suffix = "$"`. Pick markers that don't occur in ordinary prose —
+  the strip removes the **exact** literal from re-sent history (the ANSI escapes
+  never collide; a backtick or `*` would over-strip code/emphasis).
 
 ## Audit / reveal
 

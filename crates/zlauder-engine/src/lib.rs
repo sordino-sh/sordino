@@ -19,7 +19,7 @@ mod token;
 
 pub use config::{
     AllowList, Category, CustomReplacement, EngineConfig, ExposureRedactionScope, MlConfig,
-    Operator, Profile, SaltScope,
+    Operator, Profile, RevealMarker, SaltScope,
 };
 pub use error::EngineError;
 pub use manifest::{ManifestEntry, MaskOutcome, MaskStats, UnmaskManifest};
@@ -422,6 +422,26 @@ impl MaskEngine {
             return Ok(MaskOutcome::passthrough(text, MaskStats::disabled()));
         }
 
+        // Peel a prior turn's reveal-marker decoration off re-sent assistant history
+        // BEFORE anything else (detection, hashing, splicing). Claude Code stores the
+        // un-masked (and, with the marker on, wrapped) reply in the transcript and
+        // re-sends it as `AssistantText`; stripping the exact marker literals here
+        // makes detection see the original value (no marker byte fused to the PII) and
+        // makes the re-minted token byte-identical to a no-marker round-trip — so the
+        // decoration adds zero noise upstream and keeps the prompt-cache prefix stable.
+        // Cheap-guarded so a marker-free leaf never allocates; keyed on the cleaned
+        // text below, so a marker change can't serve a stale entry.
+        let stripped;
+        let text: &str = if surface == Surface::AssistantText
+            && policy.config.reveal_marker.is_active()
+            && policy.config.reveal_marker.contained_in(text)
+        {
+            stripped = policy.config.reveal_marker.strip(text);
+            &stripped
+        } else {
+            text
+        };
+
         // Snapshot the ML recognizer + its fingerprint together (atomic across an ML
         // transition). `None` while loading/disabled ⇒ regex-only key space.
         let (ml, ml_fp) = self.ml_snapshot_with_fp();
@@ -556,6 +576,34 @@ impl MaskEngine {
     /// tokens minted in earlier turns). Never re-masks; unknown tokens are left
     /// verbatim.
     pub fn unmask(&self, text: &str, manifest: &UnmaskManifest) -> Result<String, EngineError> {
+        self.unmask_inner(text, manifest, None)
+    }
+
+    /// Unmask assistant prose (Arrow 2 → display) and, when the live config's
+    /// [`RevealMarker`] is active, wrap each value we actually un-masked with the
+    /// marker so the operator can see which spans were restored. ONLY for
+    /// `Surface::AssistantText` — tool inputs / results / citations / compaction
+    /// must use [`Self::unmask`] so their bytes stay exact. A value left verbatim
+    /// (unknown token) is never wrapped.
+    pub fn unmask_assistant(
+        &self,
+        text: &str,
+        manifest: &UnmaskManifest,
+    ) -> Result<String, EngineError> {
+        let policy = Arc::clone(&self.policy.read().expect("policy rwlock poisoned"));
+        let marker = &policy.config.reveal_marker;
+        self.unmask_inner(text, manifest, marker.is_active().then_some(marker))
+    }
+
+    /// Shared unmask body. With `marker = Some`, each successfully-resolved value is
+    /// wrapped for display; unknown tokens pass through untouched (so nothing fake is
+    /// ever decorated).
+    fn unmask_inner(
+        &self,
+        text: &str,
+        manifest: &UnmaskManifest,
+        marker: Option<&RevealMarker>,
+    ) -> Result<String, EngineError> {
         let store = self.store.lock().expect("store mutex poisoned");
         let re = token_regex();
         let mut out = String::with_capacity(text.len());
@@ -563,12 +611,16 @@ impl MaskEngine {
         for m in re.find_iter(text) {
             out.push_str(&text[last..m.start()]);
             let tok = m.as_str();
-            if let Some(p) = manifest.lookup(tok) {
-                out.push_str(p);
-            } else if let Some(p) = store.reveal(tok) {
-                out.push_str(&p);
-            } else {
-                out.push_str(tok);
+            // Resolve to plaintext (manifest first, then the cross-turn store); only a
+            // genuine resolution is wrapped — an unknown token stays verbatim.
+            let plain = manifest
+                .lookup(tok)
+                .map(str::to_string)
+                .or_else(|| store.reveal(tok));
+            match (plain, marker) {
+                (Some(p), Some(mk)) => out.push_str(&mk.wrap(&p)),
+                (Some(p), None) => out.push_str(&p),
+                (None, _) => out.push_str(tok),
             }
             last = m.end();
         }
@@ -578,7 +630,11 @@ impl MaskEngine {
         // Custom literal tokens that don't match the standard token grammar.
         for e in &manifest.entries {
             if !re.is_match(&e.token_handle) {
-                out = out.replace(&e.token_handle, &e.canonical_form);
+                let replacement = match marker {
+                    Some(mk) => mk.wrap(&e.canonical_form),
+                    None => e.canonical_form.clone(),
+                };
+                out = out.replace(&e.token_handle, &replacement);
             }
         }
         Ok(out)
@@ -1118,6 +1174,123 @@ mod tests {
                 "{expected} missing from its category"
             );
         }
+    }
+
+    // ----- Reveal marker (display-time decoration of un-masked assistant text) ---
+
+    fn engine_with_marker(prefix: &str, suffix: &str) -> MaskEngine {
+        let mut cfg = EngineConfig::default();
+        cfg.reveal_marker = RevealMarker {
+            enabled: true,
+            prefix: prefix.to_string(),
+            suffix: suffix.to_string(),
+        };
+        MaskEngine::new(cfg).unwrap()
+    }
+
+    // `unmask_assistant` wraps every value it RESOLVES; plain `unmask` never does.
+    #[test]
+    fn reveal_marker_wraps_assistant_unmask_only() {
+        let e = engine_with_marker("<", ">");
+        let m = e.mask("mail bob@example.com", Surface::UserMessage).unwrap();
+        let tok = m.manifest.entries[0].token_handle.clone();
+        let line = format!("write to {tok} now");
+
+        let decorated = e.unmask_assistant(&line, &m.manifest).unwrap();
+        assert_eq!(decorated, "write to <bob@example.com> now");
+
+        // Plain unmask (tool input / compaction path) is undecorated.
+        let plain = e.unmask(&line, &m.manifest).unwrap();
+        assert_eq!(plain, "write to bob@example.com now");
+    }
+
+    // An UNKNOWN token (not in the manifest or store) is left verbatim — never
+    // wrapped, so we never decorate a value we didn't actually reveal.
+    #[test]
+    fn reveal_marker_leaves_unknown_token_verbatim() {
+        let e = engine_with_marker("<", ">");
+        let m = UnmaskManifest::new();
+        let line = "ghost [EMAIL_ADDRESS_deadbeef0000] here";
+        assert_eq!(e.unmask_assistant(line, &m).unwrap(), line);
+    }
+
+    // Disabled marker ⇒ `unmask_assistant` == `unmask` (no behavior change; this is
+    // why every pre-existing default-config test stays green).
+    #[test]
+    fn reveal_marker_disabled_is_plain_unmask() {
+        let e = engine(); // default: marker off
+        let m = e.mask("mail bob@example.com", Surface::UserMessage).unwrap();
+        let tok = m.manifest.entries[0].token_handle.clone();
+        let line = format!("to {tok}");
+        assert_eq!(
+            e.unmask_assistant(&line, &m.manifest).unwrap(),
+            e.unmask(&line, &m.manifest).unwrap()
+        );
+    }
+
+    // THE transparency invariant: a wrapped reply re-sent as assistant history masks
+    // to BYTE-IDENTICAL bytes as masking the bare token — the decoration adds zero
+    // noise upstream. Proven with an ANSI marker whose prefix ends in a word char
+    // (`m`), the worst case for naive token-adjacent stripping.
+    #[test]
+    fn reveal_marker_strips_on_resend_byte_identical() {
+        let e = engine_with_marker("\u{1b}[97;44m", "\u{1b}[0m");
+
+        // Turn 1: a value is minted, then revealed+wrapped for display.
+        let t1 = e
+            .mask("contact alice@example.com", Surface::UserMessage)
+            .unwrap();
+        let tok = t1.manifest.entries[0].token_handle.clone();
+        let reply_tokenized = format!("I'll email {tok} today");
+        let shown = e.unmask_assistant(&reply_tokenized, &t1.manifest).unwrap();
+        assert!(shown.contains("\u{1b}[97;44malice@example.com\u{1b}[0m"));
+
+        // Turn 2: Claude Code re-sends that shown reply as assistant history.
+        let resent = e.mask(&shown, Surface::AssistantText).unwrap();
+        // Baseline: what the bare token would have masked to with no marker at all.
+        let baseline = e.mask(&reply_tokenized, Surface::AssistantText).unwrap();
+        assert_eq!(
+            resent.masked_text, baseline.masked_text,
+            "re-sent assistant history must be byte-identical to the un-decorated token: {:?}",
+            resent.masked_text
+        );
+        // And concretely: the email is a clean token, no stray ANSI bytes survive.
+        assert!(resent.masked_text.contains(&tok));
+        assert!(!resent.masked_text.contains('\u{1b}'));
+        assert!(!resent.masked_text.contains("alice@example.com"));
+    }
+
+    // The reveal marker is display/apply-time: a live change must NOT move the
+    // detection fingerprint (the cache must survive toggling the decoration).
+    #[test]
+    fn reveal_marker_not_in_detection_fingerprint() {
+        let base = EngineConfig::default().detection_fingerprint();
+        let mut cfg = EngineConfig::default();
+        cfg.reveal_marker = RevealMarker {
+            enabled: true,
+            prefix: "<<".into(),
+            suffix: ">>".into(),
+        };
+        assert_eq!(
+            base,
+            cfg.detection_fingerprint(),
+            "reveal_marker must not affect the detection fingerprint"
+        );
+    }
+
+    // The strip is assistant-surface-only and token-faithful: it must NOT mangle a
+    // user message that legitimately contains the marker bytes around non-PII.
+    #[test]
+    fn reveal_marker_strip_is_assistant_surface_only() {
+        let e = engine_with_marker("$", "$");
+        // A user types literal `$`; that surface is never stripped, so the `$` survive
+        // (the strip is AssistantText-only — we only peel decoration WE added).
+        let user = e.mask("the price is $5 to $10", Surface::UserMessage).unwrap();
+        assert!(
+            user.masked_text.contains("$5") && user.masked_text.contains("$10"),
+            "user-surface `$` must not be stripped: {:?}",
+            user.masked_text
+        );
     }
 
     // Any surface label can be masked (no direction gate); unmask round-trips.

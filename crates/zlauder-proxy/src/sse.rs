@@ -68,6 +68,14 @@ fn split_safe(buf: &str) -> (&str, &str) {
 // Per-stream transform
 // ---------------------------------------------------------------------------
 
+/// Whether an unmasked delta is decorated with the reveal marker. Only assistant
+/// prose (`text_delta`) is `Reveal`; tool-input/compaction deltas are `Plain`.
+#[derive(Clone, Copy)]
+enum Wrap {
+    Reveal,
+    Plain,
+}
+
 /// Stateful per-response unmasker. One per streamed response.
 #[derive(Default)]
 pub struct SseUnmasker {
@@ -121,20 +129,23 @@ impl SseUnmasker {
         manifest: &UnmaskManifest,
     ) -> Vec<StreamEvent> {
         match delta {
+            // Assistant prose → display: the only delta the reveal marker decorates.
             ContentBlockDelta::TextDelta { text } => {
-                self.buffered(index, text, engine, manifest, |t| {
+                self.buffered(index, text, Wrap::Reveal, engine, manifest, |t| {
                     ContentBlockDelta::TextDelta { text: t }
                 })
             }
+            // Machine context that is re-sent upstream: never decorate.
             ContentBlockDelta::CompactionDelta { content } => {
-                self.buffered(index, content, engine, manifest, |t| {
+                self.buffered(index, content, Wrap::Plain, engine, manifest, |t| {
                     ContentBlockDelta::CompactionDelta { content: t }
                 })
             }
             ContentBlockDelta::InputJsonDelta { partial_json } => {
                 // Token chars are all JSON-safe (never escaped), so a token can
                 // only be split by a chunk boundary, not a JSON-escape boundary.
-                self.buffered(index, partial_json, engine, manifest, |t| {
+                // Tool input is consumed verbatim by a tool → never decorate.
+                self.buffered(index, partial_json, Wrap::Plain, engine, manifest, |t| {
                     ContentBlockDelta::InputJsonDelta { partial_json: t }
                 })
             }
@@ -157,6 +168,7 @@ impl SseUnmasker {
         &mut self,
         index: u32,
         incoming: String,
+        wrap: Wrap,
         engine: &MaskEngine,
         manifest: &UnmaskManifest,
         make: impl Fn(String) -> ContentBlockDelta,
@@ -167,9 +179,14 @@ impl SseUnmasker {
             std::mem::take(c)
         };
         let (safe, held) = split_safe(&buf);
-        let emitted = engine
-            .unmask(safe, manifest)
-            .unwrap_or_else(|_| safe.to_string());
+        // Only the `safe` prefix is unmasked here; `held` is at most one INCOMPLETE
+        // token tail (never a resolvable token), so the reveal marker only ever needs
+        // to apply on this path — the stop/drain flushes below stay plain.
+        let emitted = match wrap {
+            Wrap::Reveal => engine.unmask_assistant(safe, manifest),
+            Wrap::Plain => engine.unmask(safe, manifest),
+        }
+        .unwrap_or_else(|_| safe.to_string());
         self.carry.insert(index, held.to_string());
         if emitted.is_empty() {
             Vec::new()
@@ -370,6 +387,58 @@ mod tests {
                 &m.manifest,
             )));
             assert_eq!(got, expected, "mismatch at split index {split}");
+        }
+    }
+
+    // The reveal marker wraps a streamed assistant value even when the token is
+    // split across delta boundaries (it is unmasked once whole, in the safe prefix).
+    #[test]
+    fn sse_text_delta_wraps_revealed_value_across_split() {
+        let mut cfg = EngineConfig::default();
+        cfg.reveal_marker = zlauder_engine::RevealMarker {
+            enabled: true,
+            prefix: "<".into(),
+            suffix: ">".into(),
+        };
+        let e = MaskEngine::new(cfg).unwrap();
+        let m = e.mask("person@example.com", Surface::UserMessage).unwrap();
+        let token = m.manifest.entries[0].token_handle.clone();
+        let full = format!("contact {token} now");
+
+        for split in 0..=full.len() {
+            if !full.is_char_boundary(split) {
+                continue;
+            }
+            let (a, b) = full.split_at(split);
+            let mut x = SseUnmasker::new();
+            x.process(
+                StreamEvent::ContentBlockStart {
+                    index: 0,
+                    content_block: ApiContentBlock::Text {
+                        text: String::new(),
+                        cache_control: None,
+                    },
+                },
+                &e,
+                &m.manifest,
+            );
+            let mut got = String::new();
+            for piece in [a, b] {
+                got.push_str(&collect_text(x.process(
+                    text_delta(0, piece.to_string()),
+                    &e,
+                    &m.manifest,
+                )));
+            }
+            got.push_str(&collect_text(x.process(
+                StreamEvent::ContentBlockStop { index: 0 },
+                &e,
+                &m.manifest,
+            )));
+            assert_eq!(
+                got, "contact <person@example.com> now",
+                "mismatch at split index {split}"
+            );
         }
     }
 

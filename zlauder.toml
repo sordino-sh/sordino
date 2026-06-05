@@ -34,6 +34,21 @@ model = "openai/privacy-filter"
 # min_score  = 0.5
 # prefer_gpu = false
 
+# Display-time highlighting of UN-MASKED values in the assistant's replies, so you
+# can see at a glance which spans were restored from a token. Applies ONLY to the
+# assistant's prose (never tool inputs/results), and the marker is stripped back off
+# before the reply is re-sent upstream — so it adds zero noise to API requests and
+# never changes what the model sees. The default prefix/suffix are ANSI escapes
+# (bright-white fg on a blue bg, then reset): out-of-band, so the model can't emit or
+# override them. If your terminal/harness shows literal escape junk instead of color,
+# swap to printable markers — e.g. prefix = suffix = "$" — bearing in mind the strip
+# removes the EXACT literal from re-sent history, so pick markers that don't occur in
+# ordinary prose (avoid backticks/asterisks). `\u001b` is the TOML escape for ESC.
+[engine.reveal_marker]
+enabled = true
+prefix = "\u001b[97;44m"   # ESC[97;44m → bright-white fg on blue bg
+suffix = "\u001b[0m"       # ESC[0m     → reset
+
 # Per-entity-type operator overrides (optional).
 [engine.entity_operators]
 CREDIT_CARD = { kind = "mask", char = "*", from_end = 4 }   # ************1111
