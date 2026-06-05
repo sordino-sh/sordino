@@ -49,8 +49,14 @@ jobs:
         include:
           - { target: x86_64-unknown-linux-gnu,  runner: ubuntu-22.04 }
           - { target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm }
-          - { target: x86_64-apple-darwin,        runner: macos-13 }
-          - { target: aarch64-apple-darwin,       runner: macos-14 }
+          # Both macOS targets build on Apple Silicon: macos-15 (current GA image,
+          # what `macos-latest` points to, supported into Fall 2027). x86_64 is
+          # cross-compiled (`cargo build --target x86_64-apple-darwin`). We avoid
+          # macos-14 (deprecation begins 2026-07-06) and macos-13 (retired
+          # 2025-12-04). For a *native* Intel build instead of cross, the
+          # `macos-15-intel` label exists until ~Aug 2027.
+          - { target: x86_64-apple-darwin,        runner: macos-15 }
+          - { target: aarch64-apple-darwin,       runner: macos-15 }
     steps:
       - uses: actions/checkout@v4
         with:
