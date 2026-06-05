@@ -2,7 +2,9 @@
 # Passed to the proxy via `--config` (the SessionStart hook does this).
 
 [proxy]
-port = 8787
+# No static `port` here: the SessionStart hook derives a per-project port
+# (18000..20000) and launches the proxy with an explicit --port, so a fixed value
+# would be dead, misleading config. Set $ZLAUDER_PORT to pin one.
 bind = "127.0.0.1"
 upstream_base_url = "https://api.anthropic.com"
 

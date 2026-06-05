@@ -16,8 +16,10 @@ if [[ ! -f "$settings" ]]; then
   exit 0
 fi
 
-if ! jq -e '.env.ANTHROPIC_BASE_URL' "$settings" >/dev/null 2>&1; then
-  echo "zlauder already disabled: ANTHROPIC_BASE_URL not set in $settings"
+# Trigger on EITHER key so disable is a true inverse even in asymmetric state
+# (e.g. ZLAUDER_PORT left behind by a partial edit) — not just when both are set.
+if ! jq -e '(.env? // {}) | (has("ANTHROPIC_BASE_URL") or has("ZLAUDER_PORT"))' "$settings" >/dev/null 2>&1; then
+  echo "zlauder already disabled: no ANTHROPIC_BASE_URL/ZLAUDER_PORT in $settings"
   exit 0
 fi
 

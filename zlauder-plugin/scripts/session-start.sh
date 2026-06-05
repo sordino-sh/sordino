@@ -15,6 +15,10 @@
 # proxy is up but traffic is not actually pointed at it.
 set -euo pipefail
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=_resolve-bins.sh
+. "$SCRIPT_DIR/_resolve-bins.sh"
+
 # Do NOT default the port. zlauder-hooks/zlauder-proxy derive a per-project port
 # via derive_port(project_root) (range 18000..20000) whenever neither --port nor
 # $ZLAUDER_PORT is set. Forcing a fixed port would collapse every project onto one
@@ -25,7 +29,6 @@ if [ -n "${ZLAUDER_PORT:-}" ]; then
   PORT_ARGS=(--port "$ZLAUDER_PORT")
 fi
 PLUGIN_ROOT="${CLAUDE_PLUGIN_ROOT:-}"
-DATA_DIR="${CLAUDE_PLUGIN_DATA:-}"
 
 warn() { printf '%s\n' "$*" >&2; }
 
@@ -37,76 +40,6 @@ config_path() {
   elif [ -n "$PLUGIN_ROOT" ] && [ -f "$PLUGIN_ROOT/zlauder.toml" ]; then
     printf '%s\n' "$PLUGIN_ROOT/zlauder.toml"
   fi
-}
-
-# True if both binaries are invocable from the given dir (or PATH if dir empty).
-has_both() {
-  local dir="$1"
-  if [ -n "$dir" ]; then
-    [ -x "$dir/zlauder-proxy" ] && [ -x "$dir/zlauder-hooks" ]
-  else
-    command -v zlauder-proxy >/dev/null 2>&1 && command -v zlauder-hooks >/dev/null 2>&1
-  fi
-}
-
-# Resolve a dir holding both binaries (empty string => already on PATH), per the
-# locked precedence: PATH -> plugin bin/ -> data bin/ -> build into data bin/.
-# Prints the dir (or nothing for PATH) on stdout via the BIN_DIR global.
-BIN_DIR=""
-resolve_bins() {
-  # 1) already on PATH -> nothing to add.
-  if has_both ""; then
-    BIN_DIR=""
-    return 0
-  fi
-  # 2) prebuilt, shipped with the plugin.
-  if [ -n "$PLUGIN_ROOT" ] && has_both "$PLUGIN_ROOT/bin"; then
-    BIN_DIR="$PLUGIN_ROOT/bin"
-    return 0
-  fi
-  # 3) cached from a previous build.
-  if [ -n "$DATA_DIR" ] && has_both "$DATA_DIR/bin"; then
-    BIN_DIR="$DATA_DIR/bin"
-    return 0
-  fi
-  # 4) build from the cargo workspace into the data bin dir.
-  build_bins
-}
-
-build_bins() {
-  local workspace="${ZLAUDER_WORKSPACE:-}"
-  if [ -z "$workspace" ] && [ -n "$PLUGIN_ROOT" ]; then
-    workspace="$PLUGIN_ROOT/.."
-  fi
-  if [ -z "$workspace" ] || [ ! -f "$workspace/Cargo.toml" ]; then
-    warn "zlauder: cannot resolve binaries — not on PATH, no prebuilt bin/, and no cargo workspace at \"${workspace:-<unset>}\"."
-    warn "zlauder: set \$ZLAUDER_WORKSPACE to the zlauder checkout, or ship prebuilt binaries in ${PLUGIN_ROOT:-<plugin>}/bin/."
-    return 1
-  fi
-  if ! command -v cargo >/dev/null 2>&1; then
-    warn "zlauder: cargo not found; cannot build zlauder-proxy/zlauder-hooks. Install Rust or ship prebuilt binaries in ${PLUGIN_ROOT:-<plugin>}/bin/."
-    return 1
-  fi
-  if [ -z "$DATA_DIR" ]; then
-    warn "zlauder: CLAUDE_PLUGIN_DATA is unset; cannot cache a build."
-    return 1
-  fi
-
-  warn "zlauder: building proxy/hooks from $workspace (first run; cached afterward)…"
-  # cargo's own output goes to stderr to keep stdout clean for the hook JSON.
-  if ! ( cd "$workspace" && cargo build --release --bin zlauder-proxy --bin zlauder-hooks ) >&2; then
-    warn "zlauder: cargo build failed."
-    return 1
-  fi
-
-  local rel="$workspace/target/release"
-  if [ ! -x "$rel/zlauder-proxy" ] || [ ! -x "$rel/zlauder-hooks" ]; then
-    warn "zlauder: build reported success but binaries are missing under $rel."
-    return 1
-  fi
-  mkdir -p "$DATA_DIR/bin"
-  install -m 0755 "$rel/zlauder-proxy" "$rel/zlauder-hooks" "$DATA_DIR/bin/"
-  BIN_DIR="$DATA_DIR/bin"
 }
 
 # Warn when the proxy is up but ANTHROPIC_BASE_URL does not route through it.
@@ -126,14 +59,12 @@ route_guard() {
   warn "⚠ zlauder proxy is up but ANTHROPIC_BASE_URL is not set to ${want} — traffic is NOT masked. Run /zlauder:enable then restart Claude Code."
 }
 
-if ! resolve_bins; then
+# Resolve (and, on first run, build) the binaries; this also prepends their dir
+# to PATH so the bare `zlauder-hooks` calls below and session-start's default
+# --proxy-bin "zlauder-proxy" both resolve.
+if ! zlauder_resolve_bins; then
   warn "zlauder: proxy not started this session."
   exit 1
-fi
-
-if [ -n "$BIN_DIR" ]; then
-  PATH="$BIN_DIR:$PATH"
-  export PATH
 fi
 
 CFG="$(config_path)"

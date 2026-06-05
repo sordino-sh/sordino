@@ -15,22 +15,27 @@ fi
 # the project root (range 18000..20000), NOT the static 8787 config default. The
 # authoritative source is zlauder-hooks: `session-start` ensures the proxy is up and
 # emits the resolved port in its hook JSON's env block. We parse that, never guess.
-HOOKS=zlauder-hooks
-command -v zlauder-hooks >/dev/null 2>&1 || HOOKS="${CLAUDE_PLUGIN_DATA:-}/bin/zlauder-hooks"
+#
+# Share the SessionStart resolver so the binaries are found the SAME way (PATH ->
+# plugin bin/ -> data bin/ -> build) and their dir is exported onto PATH — otherwise
+# a session-start that needs to spawn the proxy can't find a non-PATH `zlauder-proxy`.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=_resolve-bins.sh
+. "$SCRIPT_DIR/_resolve-bins.sh"
 
 port=""
 if [ -n "${ZLAUDER_PORT:-}" ]; then
   # User pinned an explicit port; honor it.
   port="$ZLAUDER_PORT"
-elif [ -x "$HOOKS" ] || command -v "$HOOKS" >/dev/null 2>&1; then
+elif zlauder_resolve_bins; then
   # Ask zlauder-hooks for the real (derived) port. session-start launches the proxy
   # if needed and prints the hook JSON with env.ZLAUDER_PORT = the resolved port.
-  hook_json="$("$HOOKS" session-start 2>/dev/null < /dev/null || true)"
+  hook_json="$(zlauder-hooks session-start 2>/dev/null < /dev/null || true)"
   port="$(printf '%s' "$hook_json" | jq -r '.env.ZLAUDER_PORT // empty' 2>/dev/null || true)"
 fi
 
 if [ -z "$port" ]; then
-  echo "error: could not resolve the zlauder proxy port. Ensure zlauder-hooks is on PATH (or built into \$CLAUDE_PLUGIN_DATA/bin), or set \$ZLAUDER_PORT explicitly, then re-run /zlauder:enable." >&2
+  echo "error: could not resolve the zlauder proxy port. Ensure the zlauder binaries are available (on PATH, shipped in the plugin's bin/, or buildable from the cargo workspace), or set \$ZLAUDER_PORT explicitly, then re-run /zlauder:enable." >&2
   exit 1
 fi
 
