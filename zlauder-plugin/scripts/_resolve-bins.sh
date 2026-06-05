@@ -28,6 +28,21 @@
 
 zlauder__warn() { printf '%s\n' "$*" >&2; }
 
+# Repair CLAUDE_PLUGIN_ROOT when it isn't in the environment. Claude Code exports
+# it to SessionStart *hook* processes, but a slash-command `!bash` block only
+# substitutes ${CLAUDE_PLUGIN_ROOT} into the command STRING — it does NOT export the
+# var to that subprocess. A sourced script reading the env var would then see it
+# empty, so the resolver can't find bin/<triple> and the workspace probe is blank
+# (observed: `/zlauder:enable` -> "no prebuilt binary ... no cargo workspace at ''").
+# Derive it from THIS file's path (<plugin_root>/scripts/_resolve-bins.sh) and export
+# it, so every consumer in the sourcing script (binary resolution AND e.g. enable.sh's
+# zlauder.toml seeding) sees a consistent value. No-op under a hook, where it's set.
+if [ -z "${CLAUDE_PLUGIN_ROOT:-}" ]; then
+  _zl_pr="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd || true)"
+  [ -n "$_zl_pr" ] && export CLAUDE_PLUGIN_ROOT="$_zl_pr"
+  unset _zl_pr
+fi
+
 # This host's Rust target triple, or "" if unsupported (-> falls through to a
 # source build). Must match the bin/<triple> dirs CI publishes on plugin-dist and
 # the zlauder-<triple>.tar.gz release assets (see .github/workflows/release.yml).
