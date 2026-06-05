@@ -72,6 +72,32 @@ impl MaskEngine {
         })
     }
 
+    /// Build reusing only a `salt` (token determinism across a proxy restart) with
+    /// a FRESH random encryption key. The proxy uses this so the on-disk state file
+    /// never holds the AES key — the control token (see [`Self::control_token`]) is
+    /// what gates the control plane, decoupling control access from decryption.
+    pub fn with_salt(config: EngineConfig, salt: [u8; 16]) -> Result<Self, EngineError> {
+        let analyzer = presidio_analyzer::default_analyzer(&config.language);
+        let customs = compile_customs(&config.custom_replacements)?;
+        Ok(Self {
+            analyzer,
+            policy: RwLock::new(Policy { config, customs }),
+            store: Mutex::new(SessionStore::with_salt(salt)),
+        })
+    }
+
+    /// A control token derived from — but not revealing — the session key, used as
+    /// the `x-zlauder-key` for the control/reveal plane. It is `blake3` of the key
+    /// under a distinct domain, so leaking it (e.g. via the state file) grants
+    /// control-plane access but NOT offline decryption of the transcript.
+    pub fn control_token(&self) -> String {
+        let store = self.store.lock().expect("store mutex poisoned");
+        let mut h = blake3::Hasher::new();
+        h.update(b"zlauder-control-token-v1");
+        h.update(store.key());
+        h.finalize().to_hex().to_string()
+    }
+
     /// A clone of the current effective config (snapshot; not a live view).
     pub fn config_snapshot(&self) -> EngineConfig {
         self.policy
@@ -158,7 +184,13 @@ impl MaskEngine {
         let mut out = text.to_string();
         // Splice back-to-front so original byte offsets stay valid.
         for d in dets.iter().rev() {
-            let slice = &text[d.start..d.end];
+            // Detector offsets are char-aligned in practice (regex over `&str`), but
+            // if one ever isn't, `&text[start..end]` would panic and poison the store
+            // mutex — wedging the proxy while /healthz still says "ok". Snap OUTWARD
+            // to char boundaries instead: we still mask the span (fail SAFE — never
+            // panic, and never leave it as plaintext, which skipping the span would).
+            let (start, end) = snap_to_char_boundary(text, d.start, d.end);
+            let slice = &text[start..end];
             let replacement = match d.operator {
                 Operator::Keep => continue,
                 Operator::Redact => "[REDACTED]".to_string(),
@@ -184,7 +216,7 @@ impl MaskEngine {
                     token
                 }
             };
-            out.replace_range(d.start..d.end, &replacement);
+            out.replace_range(start..end, &replacement);
         }
 
         Ok(MaskOutcome {
@@ -239,6 +271,21 @@ impl MaskEngine {
         let store = self.store.lock().expect("store mutex poisoned");
         (*store.key(), *store.salt())
     }
+}
+
+/// Widen `[start, end)` outward to the nearest UTF-8 char boundaries (and clamp to
+/// `text.len()`), so slicing/splicing can never panic on a stray non-boundary
+/// detector offset. A no-op for the normal (already-aligned) case.
+fn snap_to_char_boundary(text: &str, start: usize, end: usize) -> (usize, usize) {
+    let mut start = start.min(text.len());
+    let mut end = end.min(text.len()).max(start);
+    while start > 0 && !text.is_char_boundary(start) {
+        start -= 1;
+    }
+    while end < text.len() && !text.is_char_boundary(end) {
+        end += 1;
+    }
+    (start, end)
 }
 
 /// `Mask` operator: keep the last `from_end` chars, replace the rest with `ch`.
@@ -422,6 +469,59 @@ mod tests {
         assert!(!out.masked_text.contains("bob@example.com"));
         assert!(out.masked_text.contains("[URL_"));
         assert!(out.masked_text.contains("[EMAIL_ADDRESS_"));
+    }
+
+    // The control token is derived from the key (stable for a key) but is NOT the
+    // key itself, so the state file it lands in carries no decryption material.
+    #[test]
+    fn control_token_is_decoupled_from_key() {
+        let key = [7u8; 32];
+        let salt = [9u8; 16];
+        let e = MaskEngine::with_session(EngineConfig::default(), key, salt).unwrap();
+        let tok = e.control_token();
+        assert_eq!(tok.len(), 64, "blake3 → 64 hex");
+        let key_hex: String = key.iter().map(|b| format!("{b:02x}")).collect();
+        assert_ne!(tok, key_hex, "control token must not be the AES key");
+        assert_eq!(tok, e.control_token(), "stable for the same key");
+
+        // `with_salt` mints a fresh random key each time → distinct control tokens,
+        // confirming the key (not just the token) is fresh and unpersisted.
+        let a = MaskEngine::with_salt(EngineConfig::default(), salt).unwrap();
+        let b = MaskEngine::with_salt(EngineConfig::default(), salt).unwrap();
+        assert_ne!(a.control_token(), b.control_token());
+    }
+
+    #[test]
+    fn snap_widens_off_boundary_spans() {
+        let s = "héllo"; // 'é' occupies bytes 1..3
+        assert_eq!(
+            snap_to_char_boundary(s, 2, 2),
+            (1, 3),
+            "mid-char snaps outward"
+        );
+        assert_eq!(
+            snap_to_char_boundary("hello", 1, 3),
+            (1, 3),
+            "aligned is unchanged"
+        );
+        let n = s.len();
+        assert_eq!(
+            snap_to_char_boundary(s, n + 5, n + 9),
+            (n, n),
+            "clamps past end"
+        );
+    }
+
+    // Multibyte text around the match must not panic and must round-trip exactly
+    // (the snap guard is a no-op here since presidio offsets are char-aligned).
+    #[test]
+    fn mask_round_trips_with_multibyte_text() {
+        let e = engine();
+        let original = "café 🎉 mail bob@example.com please";
+        let out = e.mask(original, Surface::UserMessage).unwrap();
+        assert!(!out.masked_text.contains("bob@example.com"));
+        assert!(out.masked_text.contains("café") && out.masked_text.contains('🎉'));
+        assert_eq!(e.unmask(&out.masked_text, &out.manifest).unwrap(), original);
     }
 
     // Master switch off ⇒ mask path is a transparent passthrough, but already

@@ -29,7 +29,7 @@ use rand::RngCore;
 use rand::rngs::OsRng;
 use serde_json::{Value, json};
 use zlauder_engine::{EngineConfig, Profile};
-use zlauder_state::{pick_port, read_state};
+use zlauder_state::{pick_port, read_state, reserve_port};
 
 #[derive(Parser)]
 #[command(name = "zlauder-hooks", version, about)]
@@ -166,7 +166,10 @@ fn init(dir: Option<PathBuf>, force: bool) -> Result<()> {
         dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
     std::fs::create_dir_all(&root_path).ok();
     let root = canonical(&root_path);
-    let port = pick_port(&root);
+    // Atomically reserve the port (writes a durable reservation record) so a second
+    // project that hashes to the same port can SEE this claim before either proxy
+    // runs and probe past it — closing the init-time split-brain (review F1/HIGH).
+    let port = reserve_port(&root)?;
 
     // .claude/settings.json
     let claude_dir = root_path.join(".claude");
@@ -288,20 +291,17 @@ fn session_start(port: Option<u16>, config: Option<PathBuf>, proxy_bin: String) 
     });
 
     if !proxy_healthy(port) {
-        // Reuse this port's previously-issued key+salt if a state file exists, so a
-        // proxy that crashed and is relaunched keeps minting the SAME tokens
-        // (cross-turn consistency + Anthropic's prompt-cache prefix). The PROXY is
-        // the authoritative writer of the state file (after it binds), so we only
-        // read here and pass the bytes via env; we never write a key that might not
-        // match the live proxy.
-        let (key_hex, salt_hex) = match read_state(port) {
-            Ok(st) if st.admin_key.len() == 64 && st.salt.len() == 32 => (st.admin_key, st.salt),
+        // Reuse this port's SALT (and only the salt) iff the existing record is
+        // OURS, so a crashed-and-relaunched proxy keeps minting the SAME tokens
+        // (prompt-cache prefix stable). We must NOT inherit another project's salt
+        // (that would correlate tokens across projects — review F6/C2), nor reuse
+        // any key: the proxy mints a fresh encryption key and writes its own state.
+        let salt_hex = match read_state(port) {
+            Ok(st) if st.project_root == root && st.salt.len() == 32 => st.salt,
             _ => {
-                let mut key = [0u8; 32];
                 let mut salt = [0u8; 16];
-                OsRng.fill_bytes(&mut key);
                 OsRng.fill_bytes(&mut salt);
-                (hex(&key), hex(&salt))
+                hex(&salt)
             }
         };
 
@@ -315,7 +315,6 @@ fn session_start(port: Option<u16>, config: Option<PathBuf>, proxy_bin: String) 
             .arg(port.to_string())
             .arg("--project-root")
             .arg(&root)
-            .env("ZLAUDER_SESSION_KEY", &key_hex)
             .env("ZLAUDER_SESSION_SALT", &salt_hex)
             .env("ZLAUDER_PROJECT_ROOT", &root)
             .stdin(std::process::Stdio::null())
@@ -334,6 +333,21 @@ fn session_start(port: Option<u16>, config: Option<PathBuf>, proxy_bin: String) 
             }
             std::thread::sleep(Duration::from_millis(50));
         }
+    } else if let Ok(st) = read_state(port)
+        && !st.project_root.is_empty()
+        && st.project_root != root
+    {
+        // A healthy proxy is already on our port but belongs to a DIFFERENT project
+        // — a port collision (e.g. a hand-copied settings.json; `init`'s atomic
+        // reservation prevents this in the normal flow). Reusing it would mask our
+        // traffic under that project's salt/store. Warn loudly; the static
+        // ANTHROPIC_BASE_URL still points here, so the fix is to re-init.
+        eprintln!(
+            "zlauder: WARNING — port {port} is serving a different project ({}). \
+             Your traffic would be masked under that project. Run `zlauder-hooks init` \
+             in this directory to get a fresh, isolated port.",
+            st.project_root
+        );
     }
 
     // SessionStart hook output. The static `env` written by `init` into
@@ -365,17 +379,17 @@ fn statusline(port: Option<u16>) -> Result<()> {
         println!("\u{26a0} zlauder off");
         return Ok(());
     }
-    // Try the (key-gated) config endpoint for a richer indicator.
+    // Try the (key-gated) config endpoint for a richer indicator. We only show the
+    // shield (🛡) when we have CONFIRMED masking is on; any unconfirmed state (key
+    // desync / 403 / stale state / unfamiliar shape) degrades to "❔ unverified" —
+    // never a false shield (review finding C5).
     match key_for(port).and_then(|k| admin_get(port, &k)) {
         Ok(snap) => match serde_json::from_value::<Snapshot>(snap) {
             Ok(s) if s.enabled => println!("\u{1f6e1} zlauder :{port} {}", s.config.profile),
             Ok(_) => println!("\u{26a0} zlauder OFF :{port}"),
-            // Healthy, but the snapshot shape is unfamiliar — show "?" rather than
-            // assume a state (never falsely claim masking is on).
-            Err(_) => println!("\u{1f6e1} zlauder :{port} ?"),
+            Err(_) => println!("\u{2754} zlauder :{port} (unverified)"),
         },
-        // Healthy but couldn't read config (no key yet) — basic indicator.
-        Err(_) => println!("\u{1f6e1} zlauder :{port}"),
+        Err(_) => println!("\u{2754} zlauder :{port} (unverified)"),
     }
     Ok(())
 }
@@ -416,7 +430,7 @@ fn apply_enabled(port: u16, root: &str, scope: Scope, on: bool) -> Result<()> {
     edit_scope_file(scope, root, |doc| {
         doc["engine"]["enabled"] = toml_edit::value(on);
     })?;
-    finish_file_scope(port, scope, root)
+    finish_file_scope(port, scope, root, if on { "enable" } else { "disable" })
 }
 
 fn apply_threshold(port: u16, root: &str, scope: Scope, value: f32) -> Result<()> {
@@ -436,7 +450,7 @@ fn apply_threshold(port: u16, root: &str, scope: Scope, value: f32) -> Result<()
     edit_scope_file(scope, root, |doc| {
         doc["engine"]["score_threshold"] = toml_edit::value(f32_to_toml(value));
     })?;
-    finish_file_scope(port, scope, root)
+    finish_file_scope(port, scope, root, "reload")
 }
 
 /// Widen an `f32` to `f64` via its shortest decimal form, so a value like `0.3`
@@ -484,15 +498,16 @@ fn apply_profile(port: u16, root: &str, scope: Scope, profile: Profile) -> Resul
             doc["engine"]["default_operator"] = toml_edit::value(t);
         }
     })?;
-    finish_file_scope(port, scope, root)
+    finish_file_scope(port, scope, root, "reload")
 }
 
 fn apply_category(port: u16, root: &str, scope: Scope, name: &str, on: bool) -> Result<()> {
     let name = name.to_lowercase();
     validate_category(&name)?;
 
-    // Current effective categories (prefer the live proxy; fall back to balanced).
-    let mut cats = current_categories(port);
+    // Base the toggle on the effective set (live proxy, else the config files —
+    // never the balanced default, which would clobber a custom persisted set).
+    let mut cats = effective_categories(port, root);
     if on {
         if !cats.contains(&name) {
             cats.push(name.clone());
@@ -515,14 +530,16 @@ fn apply_category(port: u16, root: &str, scope: Scope, name: &str, on: bool) -> 
     edit_scope_file(scope, root, |doc| {
         doc["engine"]["enabled_categories"] = toml_edit::value(str_array(&cats));
     })?;
-    finish_file_scope(port, scope, root)
+    finish_file_scope(port, scope, root, "reload")
 }
 
-/// After editing a scope file: apply live (if the proxy is up) via `reload`, and
-/// report where it was persisted.
-fn finish_file_scope(port: u16, scope: Scope, root: &str) -> Result<()> {
+/// After editing a scope file: apply it live (if the proxy is up) via `action`, and
+/// report where it was persisted. Most edits use `"reload"` (re-read the files);
+/// the master switch uses `"enable"`/`"disable"` because `reload` deliberately
+/// preserves the live switch (so an unrelated edit can't flip masking — review F3).
+fn finish_file_scope(port: u16, scope: Scope, root: &str, action: &str) -> Result<()> {
     let path = scope_path(scope, root);
-    let applied = match key_for(port).and_then(|k| admin_post(port, &k, "reload")) {
+    let applied = match key_for(port).and_then(|k| admin_post(port, &k, action)) {
         Ok(snap) => {
             print_applied(&snap, port, scope_label(scope))?;
             true
@@ -634,7 +651,7 @@ fn validate_category(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn categories_to_json(cats: &std::collections::HashSet<zlauder_engine::Category>) -> Value {
+fn category_set_to_vec(cats: &std::collections::HashSet<zlauder_engine::Category>) -> Vec<String> {
     let mut v: Vec<String> = cats
         .iter()
         .filter_map(|c| {
@@ -644,12 +661,18 @@ fn categories_to_json(cats: &std::collections::HashSet<zlauder_engine::Category>
         })
         .collect();
     v.sort();
-    json!(v)
+    v
 }
 
-/// Current effective categories: from the live proxy if reachable, else the
-/// balanced default set.
-fn current_categories(port: u16) -> Vec<String> {
+fn categories_to_json(cats: &std::collections::HashSet<zlauder_engine::Category>) -> Value {
+    json!(category_set_to_vec(cats))
+}
+
+/// Effective categories to base a toggle on: the authoritative LIVE proxy if
+/// reachable, else computed from the config FILES (user < project < local) — NOT
+/// the balanced default, which would silently erase a custom persisted set when the
+/// proxy happens to be down (review finding F2/C4).
+fn effective_categories(port: u16, root: &str) -> Vec<String> {
     if let Ok(snap) = live_snapshot(port)
         && let Some(arr) = snap
             .pointer("/config/enabled_categories")
@@ -660,18 +683,42 @@ fn current_categories(port: u16) -> Vec<String> {
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect();
     }
-    let def = EngineConfig::default();
-    let mut v: Vec<String> = def
-        .enabled_categories
-        .iter()
-        .filter_map(|c| {
-            serde_json::to_value(c)
-                .ok()
-                .and_then(|j| j.as_str().map(str::to_string))
-        })
-        .collect();
-    v.sort();
-    v
+    categories_from_files(root)
+}
+
+/// Merge `enabled_categories` across the config files (last layer that sets it
+/// wins). If no layer sets it explicitly, fall back to the **balanced default** —
+/// matching the proxy's actual deserialization, which uses the serde default and
+/// does NOT derive categories from `profile` (that field is informational). Keeping
+/// this identical to the proxy means an offline edit produces the same base the live
+/// proxy would (review re-pass: a profile-derived fallback diverged from the proxy).
+fn categories_from_files(root: &str) -> Vec<String> {
+    let layers = [
+        zlauder_state::user_config_path(),
+        Path::new(root).join("zlauder.toml"),
+        Path::new(root).join("zlauder.local.toml"),
+    ];
+    let mut cats: Option<Vec<String>> = None;
+    for p in layers {
+        let Ok(text) = std::fs::read_to_string(&p) else {
+            continue;
+        };
+        let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+            continue;
+        };
+        if let Some(arr) = doc
+            .get("engine")
+            .and_then(|e| e.get("enabled_categories"))
+            .and_then(|v| v.as_array())
+        {
+            cats = Some(
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .collect(),
+            );
+        }
+    }
+    cats.unwrap_or_else(|| category_set_to_vec(&EngineConfig::default().enabled_categories))
 }
 
 // ---------------------------------------------------------------------------

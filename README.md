@@ -153,16 +153,21 @@ Normally you never see a token (responses are unmasked). To decode one seen in a
 zlauder-hooks reveal '[EMAIL_ADDRESS_a47n1d8s9c0f]'
 ```
 
-The reveal endpoint on the proxy is gated by the session key (`x-zlauder-key`),
-so it isn't a trivial deanonymization oracle for a tool-driven `curl`.
+The reveal (and `/privacy` control) endpoints are gated by a control token
+(`x-zlauder-key`, from the `0600` state file), so they aren't a trivial
+deanonymization/disable oracle for a tool-driven `curl`. The token is *derived*
+from the session key (blake3), not the key itself — the AES key never leaves proxy
+memory, so the state file grants control but not offline decryption.
 
 ## Threat model & limitations
 
 - **Guarantee:** masked PII (per the configured categories) does not reach the
   Anthropic API over the wire. The proxy masks the actual request bytes.
 - **Out of scope:** a model with local shell access is a different threat tier —
-  it can read local files (including the session key file) just like you can.
-  zlauder protects the *egress to the provider*, not against a local jailbreak.
+  it can read local files and run the trusted CLI just like you can. zlauder
+  protects the *egress to the provider*, not against a local jailbreak. (The state
+  file holds a control token + salt, not the AES key, so it isn't an offline
+  decryption oracle — but a shell can still drive the CLI.)
 - **Not masked:** base64 image/document bytes (masking would corrupt them);
   `model` id and `stop_sequences` (tokenizing them breaks the API). Payloads of
   *novel* content-block types ride through via `extra` sinks but aren't scanned.

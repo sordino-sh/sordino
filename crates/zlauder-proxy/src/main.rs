@@ -51,9 +51,12 @@ async fn main() -> anyhow::Result<()> {
     let project_root = resolve_project_root(args.project_root);
 
     let engine = build_engine(cfg.engine)?;
-    let (key, salt) = engine.session_handle();
-    let admin_key = hex_encode(&key);
+    let (_key, salt) = engine.session_handle();
     let salt_hex = hex_encode(&salt);
+    // The `x-zlauder-key` is a control token DERIVED from the AES key (blake3), not
+    // the key itself — so the 0600 state file grants control-plane access but not
+    // offline decryption of the transcript.
+    let admin_key = engine.control_token();
     let http = reqwest::Client::builder()
         .build()
         .context("building HTTP client")?;
@@ -111,18 +114,18 @@ fn resolve_project_root(explicit: Option<PathBuf>) -> String {
         .into_owned()
 }
 
-/// Build the engine, reusing the SessionStart-issued key+salt from the
-/// environment when present (so token minting is stable for the whole session).
+/// Build the engine, reusing the SessionStart-issued *salt* from the environment
+/// when present (so token minting stays stable across a proxy restart). The
+/// encryption key is always fresh — the reversible store is in-memory only, so the
+/// key never needs to persist, and not persisting it keeps decryption material off
+/// disk and out of the process environment.
 fn build_engine(cfg: EngineConfig) -> anyhow::Result<MaskEngine> {
-    let key = std::env::var("ZLAUDER_SESSION_KEY").ok();
-    let salt = std::env::var("ZLAUDER_SESSION_SALT").ok();
-    match (key, salt) {
-        (Some(k), Some(s)) => {
-            let key = decode_hex_array::<32>(&k).context("ZLAUDER_SESSION_KEY (need 64 hex)")?;
+    match std::env::var("ZLAUDER_SESSION_SALT").ok() {
+        Some(s) => {
             let salt = decode_hex_array::<16>(&s).context("ZLAUDER_SESSION_SALT (need 32 hex)")?;
-            MaskEngine::with_session(cfg, key, salt).context("building engine")
+            MaskEngine::with_salt(cfg, salt).context("building engine")
         }
-        _ => MaskEngine::new(cfg).context("building engine"),
+        None => MaskEngine::new(cfg).context("building engine"),
     }
 }
 

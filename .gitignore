@@ -6,3 +6,6 @@ e2e/state-*/
 # per-developer local-scope privacy overrides (`/privacy … --scope local`)
 zlauder.local.toml
 **/zlauder.local.toml
+
+# pair/agent worktrees (harness artifacts; symlinks point outside the repo)
+.claude/worktrees/

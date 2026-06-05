@@ -1,12 +1,14 @@
 //! `/privacy` control plane: key-gated endpoints that read and hot-swap the live
 //! masking policy on *this* (per-project) proxy.
 //!
-//! Every endpoint requires the `x-zlauder-key` header (the session key, from the
-//! 0600 state file) — the same gate as `reveal`. That stops a blind, tool-driven
+//! Every endpoint requires the `x-zlauder-key` header — a control token derived
+//! from (but not revealing) the AES session key, read from the 0600 state file;
+//! the same gate as `reveal`. That stops a blind, tool-driven
 //! `curl 127.0.0.1:PORT/zlauder/disable` (e.g. via prompt injection) from silently
-//! turning masking off. It does NOT defend against a model that already has full
-//! shell access and can read the key file — that's the documented shell-access
-//! threat tier, out of scope.
+//! turning masking off, while keeping the encryption key off disk (reading the
+//! state file grants control, not offline decryption). It does NOT defend against
+//! a model that already has full shell access and can run the trusted CLI — that's
+//! the documented shell-access threat tier, out of scope.
 //!
 //! Because each project has its own proxy, a change here is scoped to this project
 //! only; concurrent sessions in other projects are untouched.
@@ -125,6 +127,15 @@ pub async fn put_config(State(st): State<AppState>, hdrs: HeaderMap, body: Bytes
             );
         }
     };
+    if !(0.0..=1.0).contains(&engine_cfg.score_threshold) {
+        return text(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "score_threshold {} out of range 0.0..=1.0",
+                engine_cfg.score_threshold
+            ),
+        );
+    }
     if let Err(e) = st.engine.set_config(engine_cfg) {
         return text(StatusCode::BAD_REQUEST, &format!("config rejected: {e}"));
     }
@@ -154,7 +165,7 @@ pub async fn reload(State(st): State<AppState>, hdrs: HeaderMap) -> Response {
     if !st.authed(&hdrs) {
         return forbidden();
     }
-    let cfg = match config::reload_engine(&st.layers) {
+    let mut cfg = match config::reload_engine(&st.layers) {
         Ok(c) => c,
         Err(e) => {
             return text(
@@ -163,6 +174,11 @@ pub async fn reload(State(st): State<AppState>, hdrs: HeaderMap) -> Response {
             );
         }
     };
+    // The master switch is "live"-owned: a file reload (e.g. triggered by an
+    // unrelated `profile`/`category` edit) must NOT silently flip masking on/off.
+    // Only the explicit enable/disable endpoints change it; the file's `enabled`
+    // value applies on a cold start (when the proxy reads the files fresh).
+    cfg.enabled = st.engine.is_enabled();
     if let Err(e) = st.engine.set_config(cfg) {
         return text(
             StatusCode::BAD_REQUEST,

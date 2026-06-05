@@ -22,11 +22,12 @@ python3 "$HERE/fake_anthropic.py" 18821 "$CAP" > state/fake.log 2>&1 &
 FAKE=$!
 sleep 1
 
-# 2) the proxy (deterministic session key/salt so tokens are reproducible).
+# 2) the proxy (fixed salt so tokens are reproducible; the encryption key is always
+#    fresh and never persisted — only the salt drives token determinism).
 #    In production the SessionStart hook launches this; here we launch it directly
 #    so the test is deterministic. Claude's own hook reuses it if already healthy.
-ZLAUDER_SESSION_KEY=$(printf '%064x' 1) ZLAUDER_SESSION_SALT=$(printf '%032x' 2) \
-  "$BIN/zlauder-proxy" --port 18820 --config "$HERE/zlauder.toml" > state/proxy.log 2>&1 &
+ZLAUDER_SESSION_SALT=$(printf '%032x' 2) \
+  "$BIN/zlauder-proxy" --port 18820 --project-root "$HERE" --config "$HERE/zlauder.toml" > state/proxy.log 2>&1 &
 PROX=$!
 sleep 1.2
 log "proxy_healthz=$(curl -sS -m 3 http://127.0.0.1:18820/healthz)"

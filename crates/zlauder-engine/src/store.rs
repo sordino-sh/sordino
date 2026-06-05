@@ -57,6 +57,20 @@ impl SessionStore {
         }
     }
 
+    /// Reuse a salt (for token determinism across a proxy restart) but mint a
+    /// FRESH random encryption key. The reversible map is in-memory only, so the
+    /// key never needs to be stable across restarts — and not persisting it means
+    /// the on-disk state file holds no decryption material.
+    pub fn with_salt(salt: [u8; 16]) -> Self {
+        let mut key = [0u8; 32];
+        OsRng.fill_bytes(&mut key);
+        Self {
+            session_key: key,
+            salt,
+            token_map: HashMap::new(),
+        }
+    }
+
     pub fn salt(&self) -> &[u8; 16] {
         &self.salt
     }
