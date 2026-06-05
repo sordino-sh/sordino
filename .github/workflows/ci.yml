@@ -12,6 +12,12 @@ on:
 permissions:
   contents: read
 
+# Harden cargo network I/O against transient "HTTP2 framing layer" resets when
+# pulling from crates.io (force HTTP/1.1, retry more).
+env:
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true

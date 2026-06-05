@@ -193,6 +193,15 @@ pub struct MaskEngine {
     ml_gate: Mutex<()>,
 }
 
+/// Whether the shared apply loop mints reversible tokens into the session store
+/// (the real [`MaskEngine::mask`] path) or only computes their deterministic form
+/// for a side-effect-free [`MaskEngine::preview`] (`/dryrun`). `Preview` carries the
+/// session salt so the token can be derived without ever locking the store to write.
+enum TokenMode {
+    Mint,
+    Preview([u8; 16]),
+}
+
 impl MaskEngine {
     /// Build the analyzer (offline regex recognizers) and a fresh random session.
     pub fn new(config: EngineConfig) -> Result<Self, EngineError> {

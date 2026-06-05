@@ -21,6 +21,13 @@ on:
 permissions:
   contents: write          # create the Release + force-push plugin-dist
 
+# Harden cargo network I/O against transient runner blips — notably the
+# intermittent "HTTP2 framing layer / connection reset by peer" when pulling
+# crates from crates.io. Force HTTP/1.1 and retry more before failing.
+env:
+  CARGO_NET_RETRY: "10"
+  CARGO_HTTP_MULTIPLEXING: "false"
+
 concurrency:
   group: release-${{ github.event.inputs.tag || github.ref_name }}
   cancel-in-progress: false
