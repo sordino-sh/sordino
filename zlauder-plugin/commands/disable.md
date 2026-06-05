@@ -3,7 +3,7 @@ description: Stop routing this project through the zlauder proxy (reverts .claud
 allowed-tools: Bash(bash:*)
 ---
 
-Reverting the zlauder wiring for this project. The script below removes the `env.ANTHROPIC_BASE_URL` and `env.ZLAUDER_PORT` keys that `/zlauder:enable` added to this project's `.claude/settings.json` (and drops the `env` object if it becomes empty). It leaves any `statusLine` and all other settings untouched, and leaves the running proxy alone — it only stops Claude Code from routing through it.
+Reverting the zlauder wiring for this project. The script below removes the `env.ANTHROPIC_BASE_URL` and `env.ZLAUDER_PORT` keys that `/zlauder:enable` added to this project's `.claude/settings.json` (and drops the `env` object if it becomes empty), and removes the zlauder `🛡` status line if `/zlauder:enable` added it (a custom `statusLine` is left untouched). It leaves all other settings — and the seeded `zlauder.toml` — in place, and leaves the running proxy alone: it only stops Claude Code from routing through it.
 
 !`bash "${CLAUDE_PLUGIN_ROOT}/scripts/disable.sh"`
 

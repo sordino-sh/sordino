@@ -33,12 +33,13 @@ to set that variable — routing is **per-project**, not global — and Claude C
    each session; on first run it resolves/builds the binaries and launches the
    proxy on a **per-project port derived in `18000..20000`** from the project
    root (override with `ZLAUDER_PORT`). Routing is **not** active yet.
-2. **Run `/zlauder:enable`.** This patches this project's `.claude/settings.json`,
-   setting `env.ANTHROPIC_BASE_URL=http://127.0.0.1:<derived-port>` (and
-   `env.ZLAUDER_PORT=<derived-port>`).
+2. **Run `/zlauder:enable`.** This is the per-project setup step. It patches this
+   project's `.claude/settings.json` with `env.ANTHROPIC_BASE_URL=http://127.0.0.1:<derived-port>`
+   (and `env.ZLAUDER_PORT`), adds a `🛡` status line, and seeds a starter
+   `zlauder.toml` if the project has none.
 3. **Restart Claude Code.** `env` is read only at startup; without a restart the
    new base URL is not picked up and traffic still bypasses the proxy.
-4. **Run `/zlauder:status`** to confirm the session is actually routed through
+4. **Run `/zlauder:privacy`** to confirm the session is actually routed through
    the proxy and masking is on.
 
 To stop routing: `/zlauder:disable` reverts the `settings.json` change; restart
@@ -56,16 +57,26 @@ Add the marketplace and enable the plugin:
 (Or add this directory as a local marketplace if you are working in-repo.)
 Enabling the plugin only wires up the `SessionStart` hook and the
 `/zlauder:*` commands — it does **not** route traffic. Continue with the
-activation flow above.
+activation flow above. **This plugin is the only supported install interface** —
+there is no separate CLI setup step.
 
 ## Commands
 
+Two layers, deliberately separated: `enable`/`disable` control **routing** (whether
+traffic goes through the proxy at all — a `settings.json` patch that needs a
+restart), while `privacy` controls **masking** (what the running proxy does — live,
+no restart).
+
 | Command | What it does |
 |---|---|
-| `/zlauder:enable` | Patch this project's `.claude/settings.json` to set `ANTHROPIC_BASE_URL` (and `ZLAUDER_PORT`) at the proxy's per-project derived port. **Requires a Claude Code restart to take effect.** |
-| `/zlauder:disable` | Revert that `settings.json` change so traffic goes straight to Anthropic again. Also requires a restart. |
-| `/zlauder:status` | Show whether the proxy is up, whether masking is enabled, the active profile/port, and whether this session is routed through the proxy. |
-| `/zlauder:reveal <token>` | Decode one masked token (e.g. `[EMAIL_ADDRESS_a47n1d8s9c0f]`) to plaintext via the running proxy. Gated by the session key, so it is not a trivial deanonymization oracle for a tool-driven `curl`. |
+| `/zlauder:enable` | Per-project setup: patch this project's `.claude/settings.json` to set `ANTHROPIC_BASE_URL` (and `ZLAUDER_PORT`) at the proxy's per-project derived port, add a status line, and seed a starter `zlauder.toml`. **Requires a Claude Code restart to take effect.** |
+| `/zlauder:disable` | Revert the routing change (and the zlauder status line) so traffic goes straight to Anthropic again. Also requires a restart. |
+| `/zlauder:privacy [args]` | Unified masking control. With no args (or `status`): show proxy health, whether this session is routed, and the masking state (on/off, profile, categories). Also: `on` / `off`, `profile <name>`, `category <name> on\|off`, `threshold <0-1>` (each takes `--scope session\|project\|user\|local`), and `reveal <token>` to decode one masked token (e.g. `[EMAIL_ADDRESS_a47n1d8s9c0f]`) via the key-gated proxy. |
+
+> **Changed in 0.2.0:** `/zlauder:status` and `/zlauder:reveal` were folded into
+> `/zlauder:privacy` (`/zlauder:privacy status` and `/zlauder:privacy reveal <token>`).
+> The standalone `zlauder-hooks init` CLI setup path was removed — the plugin is now
+> the sole install interface.
 
 ## How the binaries are resolved (and built)
 

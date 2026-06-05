@@ -1,13 +1,17 @@
 //! zlauder-hooks — Claude Code control-plane integration for zlauder.
 //!
 //! Subcommands:
-//!   init           One-time per-project setup: pick a project port and write
-//!                  `.claude/settings.json` + `zlauder.toml` + the `/privacy` command.
 //!   session-start  Launch this project's proxy (if not already running) and emit
-//!                  the SessionStart hook JSON that points Claude Code at it.
+//!                  the SessionStart hook JSON that points Claude Code at it. On the
+//!                  first launch it atomically reserves the project's derived port.
 //!   statusline     One-line status indicator (on/off + profile).
-//!   config         View or change privacy settings (the `/privacy` slash command).
+//!   config         View or change privacy settings (backs `/zlauder:privacy`).
 //!   reveal <tok>   Audit: decode a token to its plaintext via the running proxy.
+//!
+//! Per-project setup (writing `ANTHROPIC_BASE_URL` + `ZLAUDER_PORT` and a status
+//! line into `.claude/settings.json`) is done by the Claude Code plugin's
+//! `/zlauder:enable` command, not by this binary — the plugin is the sole install
+//! interface. See `zlauder-plugin/`.
 //!
 //! ## Per-project isolation
 //!
@@ -15,8 +19,8 @@
 //! [`zlauder_state::derive_port`]), so its key, store, and config are isolated.
 //! Two `claude` windows in the same project share the one proxy; different projects
 //! never interfere. The port is baked into each project's `.claude/settings.json`
-//! (as `ANTHROPIC_BASE_URL` + `ZLAUDER_PORT`) by `init`, so the load-bearing path is
-//! the static base URL — not a best-effort dynamic env.
+//! (as `ANTHROPIC_BASE_URL` + `ZLAUDER_PORT`) by `/zlauder:enable`, so the
+//! load-bearing path is the static base URL — not a best-effort dynamic env.
 
 use std::io::Read;
 use std::net::TcpListener;
@@ -34,8 +38,8 @@ use zlauder_state::{pick_port, read_state, reserve_port};
 #[derive(Parser)]
 #[command(name = "zlauder-hooks", version, about)]
 struct Cli {
-    /// Target proxy port. Defaults to `$ZLAUDER_PORT` (set per project by `init`),
-    /// else a port derived from the project path.
+    /// Target proxy port. Defaults to `$ZLAUDER_PORT` (set per project by
+    /// `/zlauder:enable`), else a port derived from the project path.
     #[arg(long, env = "ZLAUDER_PORT", global = true)]
     port: Option<u16>,
     #[command(subcommand)]
@@ -44,15 +48,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// One-time per-project setup (assign a port, write settings + config + command).
-    Init {
-        /// Project directory to set up (default: current directory).
-        #[arg(long)]
-        dir: Option<PathBuf>,
-        /// Overwrite an existing status line / slash command if present.
-        #[arg(long)]
-        force: bool,
-    },
     /// SessionStart hook: ensure this project's proxy is running.
     SessionStart {
         #[arg(long, env = "ZLAUDER_CONFIG")]
@@ -62,7 +57,7 @@ enum Cmd {
     },
     /// Print a one-line status indicator for the Claude Code status line.
     Statusline,
-    /// View or change privacy settings (backs the `/privacy` slash command).
+    /// View or change privacy settings (backs the `/zlauder:privacy` command).
     Config {
         #[command(subcommand)]
         action: Option<ConfigAction>,
@@ -149,127 +144,10 @@ enum OnOff {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.cmd {
-        Cmd::Init { dir, force } => init(dir, force),
         Cmd::SessionStart { config, proxy_bin } => session_start(cli.port, config, proxy_bin),
         Cmd::Statusline => statusline(cli.port),
         Cmd::Config { action } => config_cmd(cli.port, action),
         Cmd::Reveal { token } => reveal(cli.port, token),
-    }
-}
-
-// ---------------------------------------------------------------------------
-// init
-// ---------------------------------------------------------------------------
-
-fn init(dir: Option<PathBuf>, force: bool) -> Result<()> {
-    let root_path =
-        dir.unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    std::fs::create_dir_all(&root_path).ok();
-    let root = canonical(&root_path);
-    // Atomically reserve the port (writes a durable reservation record) so a second
-    // project that hashes to the same port can SEE this claim before either proxy
-    // runs and probe past it — closing the init-time split-brain (review F1/HIGH).
-    let port = reserve_port(&root)?;
-
-    // .claude/settings.json
-    let claude_dir = root_path.join(".claude");
-    std::fs::create_dir_all(&claude_dir).context("creating .claude/")?;
-    install_settings(&claude_dir.join("settings.json"), port, force)?;
-
-    // .claude/commands/privacy.md (the /privacy slash command)
-    let cmd_dir = claude_dir.join("commands");
-    std::fs::create_dir_all(&cmd_dir).context("creating .claude/commands/")?;
-    let cmd_path = cmd_dir.join("privacy.md");
-    if force || !cmd_path.exists() {
-        std::fs::write(&cmd_path, PRIVACY_COMMAND_MD).context("writing privacy command")?;
-    }
-
-    // zlauder.toml (project config) — only if absent (don't clobber a tuned one).
-    let cfg_path = root_path.join("zlauder.toml");
-    if !cfg_path.exists() {
-        std::fs::write(&cfg_path, project_config_template(port)).context("writing zlauder.toml")?;
-    }
-
-    println!("zlauder initialised for this project.");
-    println!("  project : {root}");
-    println!("  port    : {port}  (ANTHROPIC_BASE_URL=http://127.0.0.1:{port})");
-    println!(
-        "  wrote   : .claude/settings.json, .claude/commands/privacy.md{}",
-        if cfg_path.exists() {
-            ", zlauder.toml"
-        } else {
-            ""
-        }
-    );
-    println!();
-    println!("Make sure `zlauder-proxy` and `zlauder-hooks` are on PATH, then start");
-    println!("`claude` from this directory. Use `/privacy` to view or change settings.");
-    Ok(())
-}
-
-fn install_settings(path: &Path, port: u16, force: bool) -> Result<()> {
-    let mut root: serde_json::Map<String, Value> = if path.exists() {
-        let text = std::fs::read_to_string(path)?;
-        serde_json::from_str(&text).unwrap_or_default()
-    } else {
-        serde_json::Map::new()
-    };
-
-    // env: base URL (load-bearing) + ZLAUDER_PORT (so the CLI/statusline target us).
-    let env = root.entry("env").or_insert_with(|| json!({}));
-    if let Some(env) = env.as_object_mut() {
-        env.insert(
-            "ANTHROPIC_BASE_URL".into(),
-            json!(format!("http://127.0.0.1:{port}")),
-        );
-        env.insert("ZLAUDER_PORT".into(), json!(port.to_string()));
-    }
-
-    // hooks.SessionStart: add our launcher if not already present.
-    ensure_session_hook(&mut root);
-
-    // statusLine: set if absent (or forced) — don't clobber a custom one silently.
-    if force || !root.contains_key("statusLine") {
-        root.insert(
-            "statusLine".into(),
-            json!({"type": "command", "command": "zlauder-hooks statusline"}),
-        );
-    }
-
-    let text = serde_json::to_string_pretty(&Value::Object(root))?;
-    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))?;
-    Ok(())
-}
-
-fn ensure_session_hook(root: &mut serde_json::Map<String, Value>) {
-    let hooks = root.entry("hooks").or_insert_with(|| json!({}));
-    let Some(hooks) = hooks.as_object_mut() else {
-        return;
-    };
-    let list = hooks
-        .entry("SessionStart")
-        .or_insert_with(|| Value::Array(vec![]));
-    let Some(arr) = list.as_array_mut() else {
-        return;
-    };
-    let already = arr.iter().any(|entry| {
-        entry
-            .get("hooks")
-            .and_then(Value::as_array)
-            .map(|hs| {
-                hs.iter().any(|h| {
-                    h.get("command")
-                        .and_then(Value::as_str)
-                        .is_some_and(|c| c.contains("zlauder-hooks session-start"))
-                })
-            })
-            .unwrap_or(false)
-    });
-    if !already {
-        arr.push(json!({
-            "matcher": "*",
-            "hooks": [{"type": "command", "command": "zlauder-hooks session-start"}]
-        }));
     }
 }
 
@@ -283,7 +161,18 @@ fn session_start(port: Option<u16>, config: Option<PathBuf>, proxy_bin: String) 
     let _ = std::io::stdin().read_to_string(&mut _stdin);
 
     let root = canonical(&project_root());
-    let port = port.unwrap_or_else(|| pick_port(&root));
+    // Resolve the port. With an explicit --port/$ZLAUDER_PORT (the normal case once
+    // `/zlauder:enable` has baked it into settings.json) we honor it verbatim — the
+    // port is already pinned, so there is nothing left to race. With no explicit
+    // port (the FIRST launch, e.g. during `/zlauder:enable` before the port is
+    // baked) we `reserve_port`, which atomically claims the derived port via an
+    // O_EXCL record so a second project hashing to the same port can't bake it too
+    // (review finding F1/HIGH — formerly owned by `init`). The proxy overwrites this
+    // reservation with its live record on bind.
+    let port = match port {
+        Some(p) => p,
+        None => reserve_port(&root)?,
+    };
     let base_url = format!("http://127.0.0.1:{port}");
     let config = config.or_else(|| {
         let p = Path::new(&root).join("zlauder.toml");
@@ -323,8 +212,14 @@ fn session_start(port: Option<u16>, config: Option<PathBuf>, proxy_bin: String) 
         if let Some(cfg) = &config {
             cmd.arg("--config").arg(cfg);
         }
-        cmd.spawn()
-            .with_context(|| format!("spawning proxy binary '{proxy_bin}'"))?;
+        if let Err(e) = cmd.spawn() {
+            // A hard spawn failure (e.g. proxy binary missing) must not leave the
+            // O_EXCL reservation we may have just written behind to pin this
+            // project's derived port forever. Drop it iff it's still our unbound
+            // reservation; a live proxy's record (pid != 0) is never touched.
+            clear_reservation_if_ours(port, &root);
+            return Err(e).with_context(|| format!("spawning proxy binary '{proxy_bin}'"));
+        }
 
         // Wait for the listener so the first request doesn't race the bind.
         for _ in 0..40 {
@@ -338,19 +233,19 @@ fn session_start(port: Option<u16>, config: Option<PathBuf>, proxy_bin: String) 
         && st.project_root != root
     {
         // A healthy proxy is already on our port but belongs to a DIFFERENT project
-        // — a port collision (e.g. a hand-copied settings.json; `init`'s atomic
-        // reservation prevents this in the normal flow). Reusing it would mask our
+        // — a port collision (e.g. a hand-copied settings.json; the first-launch
+        // `reserve_port` prevents this in the normal flow). Reusing it would mask our
         // traffic under that project's salt/store. Warn loudly; the static
-        // ANTHROPIC_BASE_URL still points here, so the fix is to re-init.
+        // ANTHROPIC_BASE_URL still points here, so the fix is to re-derive a port.
         eprintln!(
             "zlauder: WARNING — port {port} is serving a different project ({}). \
-             Your traffic would be masked under that project. Run `zlauder-hooks init` \
-             in this directory to get a fresh, isolated port.",
+             Your traffic would be masked under that project. Run `/zlauder:disable` \
+             then `/zlauder:enable` in this project to get a fresh, isolated port.",
             st.project_root
         );
     }
 
-    // SessionStart hook output. The static `env` written by `init` into
+    // SessionStart hook output. The static `env` written by `/zlauder:enable` into
     // settings.json is the load-bearing path for ANTHROPIC_BASE_URL; the `env` key
     // here is a best-effort override for harness versions that honor it.
     let out = json!({
@@ -359,7 +254,7 @@ fn session_start(port: Option<u16>, config: Option<PathBuf>, proxy_bin: String) 
             "additionalContext":
                 "zlauder PII masking proxy active for this project. Outbound text is masked \
                  before it reaches the model; responses are unmasked on return. Tokens look \
-                 like [EMAIL_ADDRESS_xxxx]. Configure with the /privacy command."
+                 like [EMAIL_ADDRESS_xxxx]. Configure with the /zlauder:privacy command."
         },
         "env": { "ANTHROPIC_BASE_URL": base_url, "ZLAUDER_PORT": port.to_string() }
     });
@@ -395,7 +290,7 @@ fn statusline(port: Option<u16>) -> Result<()> {
 }
 
 // ---------------------------------------------------------------------------
-// config (/privacy)
+// config (/zlauder:privacy)
 // ---------------------------------------------------------------------------
 
 fn config_cmd(port: Option<u16>, action: Option<ConfigAction>) -> Result<()> {
@@ -899,39 +794,20 @@ fn percent_encode(s: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// templates
+// reservation cleanup
 // ---------------------------------------------------------------------------
 
-const PRIVACY_COMMAND_MD: &str = include_str!("../../../assets/privacy.md");
-
-fn project_config_template(port: u16) -> String {
-    format!(
-        r#"# zlauder runtime configuration for this project.
-# The SessionStart hook launches the proxy with this file as the project layer.
-# `/privacy` (or `zlauder-hooks config`) edits the [engine] table below.
-
-[proxy]
-port = {port}
-bind = "127.0.0.1"
-upstream_base_url = "https://api.anthropic.com"
-
-[engine]
-# Master switch. `/privacy off` flips this.
-enabled = true
-profile = "balanced"
-score_threshold = 0.5
-language = "en"
-default_operator = {{ kind = "token" }}
-enabled_categories = ["secrets", "financial", "identity", "contact"]
-fail_closed = false
-
-[engine.entity_operators]
-CREDIT_CARD = {{ kind = "mask", char = "*", from_end = 4 }}
-
-[engine.allow_list]
-exact = ["Anthropic", "Claude", "127.0.0.1"]
-exact_ci = ["localhost"]
-patterns = ['^\d{{4}}$']
-"#
-    )
+/// Remove the port's state file iff it is still *our* unbound reservation
+/// (`pid == 0`, matching project root). Used to undo a `reserve_port` claim when the
+/// proxy spawn fails, so a transient launch error can't permanently pin a project's
+/// derived port. A live-proxy record (`pid != 0`) or another project's record is
+/// never touched.
+fn clear_reservation_if_ours(port: u16, root: &str) {
+    if let Ok(st) = read_state(port)
+        && st.pid == 0
+        && st.project_root == root
+        && let Ok(path) = zlauder_state::state_path(port)
+    {
+        let _ = std::fs::remove_file(path);
+    }
 }

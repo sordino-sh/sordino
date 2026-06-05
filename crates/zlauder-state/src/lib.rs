@@ -15,10 +15,10 @@
 //! ## Who writes it
 //!
 //! Two writers, by design:
-//! - `init` writes a **reservation** ([`reserve_port`], `pid == 0`, empty key) so a
-//!   project durably owns its port *before* its proxy ever runs — otherwise two
-//!   colliding projects could each bake the same port into their `settings.json`
-//!   and end up sharing one proxy.
+//! - `session-start` writes a **reservation** ([`reserve_port`], `pid == 0`, empty
+//!   key) on a project's first launch, so it durably owns its port *before* its
+//!   proxy has bound — otherwise two colliding projects could each bake the same
+//!   port into their `settings.json` and end up sharing one proxy.
 //! - The **bound proxy** then overwrites with the live record (real control token,
 //!   salt, pid) after it binds, so the file always matches the live proxy even if
 //!   two sessions race to launch (the loser fails to bind and never writes).
@@ -53,7 +53,7 @@ pub struct ProxyState {
     #[serde(default)]
     pub salt: String,
     pub base_url: String,
-    /// PID of the live proxy, or `0` for an `init` reservation (no proxy yet).
+    /// PID of the live proxy, or `0` for a pre-launch reservation (no proxy yet).
     pub pid: u32,
     /// Absolute project root this proxy serves (so a port collision between two
     /// different projects is detectable).
@@ -79,7 +79,7 @@ pub fn user_config_path() -> PathBuf {
 /// Deterministically map a (canonical) project root to a port in the derivation
 /// window. Same path → same port (so repeat sessions and sibling windows share a
 /// proxy); different paths → almost-always different ports. Collisions are rare
-/// and resolved at `init` time by probing upward.
+/// and resolved at first-launch time by probing upward.
 pub fn derive_port(project_root: &str) -> u16 {
     let h = blake3::hash(project_root.as_bytes());
     let b = h.as_bytes();
@@ -151,9 +151,9 @@ fn port_owner(port: u16) -> Option<String> {
 
 /// Resolve the port a project should use: its [`derive_port`] value, probed upward
 /// past any port currently owned by a *different* project (live proxy or standing
-/// reservation). Read-only — used by the `session-start` fallback when no port was
-/// baked into `settings.json`. `init` uses [`reserve_port`] instead, which also
-/// claims the port atomically.
+/// reservation). Read-only — used by the observer commands (`statusline`, `config`,
+/// `reveal`) when no port was baked into `settings.json`. The `session-start`
+/// launcher uses [`reserve_port`] instead, which also claims the port atomically.
 pub fn pick_port(project_root: &str) -> u16 {
     let start = derive_port(project_root);
     for off in 0..PORT_SPAN {
@@ -166,15 +166,17 @@ pub fn pick_port(project_root: &str) -> u16 {
     start
 }
 
-/// Atomically reserve and return the port for `project_root` (used by `init`).
+/// Atomically reserve and return the port for `project_root` (used by
+/// `session-start` on a project's first launch).
 ///
 /// Probes like [`pick_port`], but for a free slot it writes a reservation record
-/// via `O_CREAT|O_EXCL`, so two concurrent `init`s can't claim the same port (one
-/// loses the create race and keeps probing). A port already owned by this project
-/// (reservation or live proxy) is returned as-is — `init` is idempotent. The
-/// reservation makes the port visible to *other* projects' `pick_port`/`reserve_port`
-/// before this project's proxy has ever run, which is what prevents two colliding
-/// projects from baking the same port (review finding F1/HIGH).
+/// via `O_CREAT|O_EXCL`, so two concurrent first-launches can't claim the same port
+/// (one loses the create race and keeps probing). A port already owned by this
+/// project (reservation or live proxy) is returned as-is — re-launching is
+/// idempotent. The reservation makes the port visible to *other* projects'
+/// `pick_port`/`reserve_port` before this project's proxy has bound, which is what
+/// prevents two colliding projects from baking the same port (review finding
+/// F1/HIGH).
 pub fn reserve_port(project_root: &str) -> Result<u16> {
     let start = derive_port(project_root);
     for off in 0..PORT_SPAN {
@@ -186,9 +188,9 @@ pub fn reserve_port(project_root: &str) -> Result<u16> {
                 if try_reserve(p, project_root)? {
                     return Ok(p);
                 }
-                // Lost the create race. Re-check ownership: if a concurrent `init`
+                // Lost the create race. Re-check ownership: if a concurrent launch
                 // for THIS project just claimed it, it's ours — return it (so two
-                // same-project inits converge on ONE port, not p and p+1). If a
+                // same-project launches converge on ONE port, not p and p+1). If a
                 // different project won, keep probing.
                 match port_owner(p) {
                     Some(owner) if owner == project_root => return Ok(p),

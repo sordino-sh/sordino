@@ -23,8 +23,9 @@ Claude Code  ──ANTHROPIC_BASE_URL=http://127.0.0.1:<project-port>──►  
 **One proxy per project.** Each project gets its own proxy on a port derived from
 its path, so its key, token store, and config are fully isolated — concurrent
 `claude` sessions in *different* projects never interfere or correlate, while two
-windows in the *same* project share one proxy. `zlauder-hooks init` assigns the
-port and writes it into the project's `.claude/settings.json`.
+windows in the *same* project share one proxy. The Claude Code plugin's
+`/zlauder:enable` assigns the port and writes it into the project's
+`.claude/settings.json`.
 
 This is **not** a TLS-intercepting MITM — Claude Code natively supports
 `ANTHROPIC_BASE_URL`, so you simply point it at the local proxy, which
@@ -60,8 +61,8 @@ are kept tokenized end-to-end (never unmasked), so signatures stay valid.
 | crate | role |
 |---|---|
 | `zlauder-engine` | masking engine: detection (presidio) + deterministic tokens + AES-GCM reversible store + hot-swappable config (profiles/categories/operators/allow-list/custom rules). Runtime-free. |
-| `zlauder-proxy` | axum reverse proxy: request mask walk, per-call manifest, upstream relay, JSON + streaming-SSE unmask, and a key-gated `/privacy` control plane (live enable/disable/profile/reload). |
-| `zlauder-hooks` | Claude Code control plane: `init` (per-project setup), `session-start` (launch proxy), `statusline`, `config` (the `/privacy` command), `reveal`. |
+| `zlauder-proxy` | axum reverse proxy: request mask walk, per-call manifest, upstream relay, JSON + streaming-SSE unmask, and a key-gated privacy control plane (live enable/disable/profile/reload) that backs `/zlauder:privacy`. |
+| `zlauder-hooks` | Claude Code control plane: `session-start` (launch proxy, reserve port), `statusline`, `config` (backs `/zlauder:privacy`), `reveal`. Per-project setup is done by the plugin's `/zlauder:enable`. |
 | `zlauder-state` | shared on-disk session state (port/key/salt/pid) + project→port derivation; the single source of truth both binaries read. |
 
 ## Build
@@ -75,23 +76,30 @@ Requires Rust ≥ 1.91 (the `anthropic-wire` dependency is edition 2024).
 
 ## Install into Claude Code
 
-1. Put `zlauder-proxy` and `zlauder-hooks` on your `PATH`
-   (e.g. `cp target/release/zlauder-{proxy,hooks} ~/.local/bin/`).
-2. From your project, run the one-time setup:
+zlauder installs as a **Claude Code plugin** — that is the only supported
+interface. Add the marketplace and enable the plugin:
 
-   ```sh
-   cd ~/code/my-project
-   zlauder-hooks init
-   ```
+```
+/plugin marketplace add FailSpy/zlauder
+/plugin install zlauder
+```
 
-   This picks a free per-project port, then writes:
-   - `.claude/settings.json` — `ANTHROPIC_BASE_URL` + `ZLAUDER_PORT`, the
-     `SessionStart` hook (launches the proxy on first use), and a status line;
-   - `.claude/commands/privacy.md` — the `/privacy` slash command;
-   - `zlauder.toml` — a starter config (only if absent).
-3. Start `claude` from that directory. The proxy launches automatically.
+Then, per project:
 
-The proxy can also be run standalone (no per-project derivation):
+1. **`/zlauder:enable`** — picks a free per-project port and writes
+   `.claude/settings.json` (`ANTHROPIC_BASE_URL` + `ZLAUDER_PORT` + a status line)
+   plus a starter `zlauder.toml`. The plugin's `SessionStart` hook resolves the
+   binaries (PATH → shipped `bin/` → cached build → build from this workspace) and
+   launches the proxy automatically.
+2. **Restart Claude Code** — `ANTHROPIC_BASE_URL` is read once at startup.
+3. **`/zlauder:privacy`** — confirm routing + masking.
+
+A plugin cannot set `ANTHROPIC_BASE_URL` itself (only `agent`/`subagentStatusLine`
+are honored from a plugin's settings.json, and there is no install-time hook), so
+the one-time `/zlauder:enable` patch and the restart are required. See
+[`zlauder-plugin/`](./zlauder-plugin/) for the full rationale and command reference.
+
+The proxy can also be run standalone (no Claude Code, no per-project derivation):
 
 ```sh
 zlauder-proxy --port 8787 --config zlauder.toml
@@ -100,19 +108,21 @@ ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude   # any client honoring the base
 
 ## Configuration
 
-### The `/privacy` command
+### The `/zlauder:privacy` command
 
 Inside a `claude` session, change masking settings live with the slash command
 (or `zlauder-hooks config …` from a shell). It affects **only this project's**
-proxy.
+proxy. This is the **masking** layer; `/zlauder:enable` / `/zlauder:disable` are
+the separate **routing** layer.
 
 ```
-/privacy                          # show current state (on/off, profile, categories)
-/privacy off                      # transparent passthrough (this session, live)
-/privacy on
-/privacy profile strict           # threshold + categories + default operator preset
-/privacy category contact off     # toggle one category
-/privacy threshold 0.3
+/zlauder:privacy                        # status: health, routing, on/off, profile, categories
+/zlauder:privacy off                    # transparent passthrough (this session, live)
+/zlauder:privacy on
+/zlauder:privacy profile strict         # threshold + categories + default operator preset
+/zlauder:privacy category contact off   # toggle one category
+/zlauder:privacy threshold 0.3
+/zlauder:privacy reveal '[EMAIL_ADDRESS_a47n1d8s9c0f]'   # decode one token (local audit)
 ```
 
 Each change takes a `--scope` (default `session`):
@@ -136,7 +146,7 @@ project has its own proxy, a live change here is isolated — it never affects a
 
 See [`zlauder.toml`](./zlauder.toml). Highlights:
 
-- `enabled` — master switch (`/privacy on`/`off`).
+- `enabled` — master switch (`/zlauder:privacy on`/`off`).
 - `profile` / `score_threshold` / `enabled_categories` — what to detect.
 - `default_operator` and per-type `entity_operators`: `token` (reversible),
   `redact`, `mask` (keep last N), `hash`, `keep`.
@@ -153,7 +163,7 @@ Normally you never see a token (responses are unmasked). To decode one seen in a
 zlauder-hooks reveal '[EMAIL_ADDRESS_a47n1d8s9c0f]'
 ```
 
-The reveal (and `/privacy` control) endpoints are gated by a control token
+The reveal (and `/zlauder:privacy` control) endpoints are gated by a control token
 (`x-zlauder-key`, from the `0600` state file), so they aren't a trivial
 deanonymization/disable oracle for a tool-driven `curl`. The token is *derived*
 from the session key (blake3), not the key itself — the AES key never leaves proxy
@@ -180,7 +190,7 @@ memory, so the state file grants control but not offline decryption.
   per-session salt), so masked content is byte-stable across turns and
   Anthropic's prompt-cache prefix is preserved. Verified: two identical requests
   produce byte-identical masked output. The salt is reused across proxy restarts
-  on a port, so cross-turn consistency survives a crash. A live `/privacy` config
+  on a port, so cross-turn consistency survives a crash. A live `/zlauder:privacy` config
   change keeps the store (and salt), so determinism survives reconfiguration too.
 - **Multi-session / multi-project:** each project runs its **own** proxy on a
   project-derived port — separate key, salt, store, and config. Concurrent
