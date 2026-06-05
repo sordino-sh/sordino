@@ -20,7 +20,7 @@ Code through the proxy and to show live status. A plugin's shipped
 and `statusLine` are ignored. There is also no install/build lifecycle hook.
 
 So enabling the plugin alone does **not** route your traffic through the proxy.
-The `SessionStart` hook will build/launch the proxy and inject an informational
+The `SessionStart` hook will launch the proxy and inject an informational
 context message, but until `ANTHROPIC_BASE_URL` points at the proxy, requests
 still go straight to `api.anthropic.com`. The `/zlauder:enable` command patches
 this project's `.claude/settings.json` (`${CLAUDE_PROJECT_DIR}/.claude/settings.json`)
@@ -30,9 +30,10 @@ to set that variable — routing is **per-project**, not global — and Claude C
 ## Activation flow (do these in order)
 
 1. **Enable the plugin** (see Install below). The `SessionStart` hook now runs
-   each session; on first run it resolves/builds the binaries and launches the
-   proxy on a **per-project port derived in `18000..20000`** from the project
-   root (override with `ZLAUDER_PORT`). Routing is **not** active yet.
+   each session; on first run it resolves the prebuilt per-platform binary that
+   shipped with the plugin (**no compile, no download**) and launches the proxy
+   on a **per-project port derived in `18000..20000`** from the project root
+   (override with `ZLAUDER_PORT`). Routing is **not** active yet.
 2. **Run `/zlauder:enable`.** This is the per-project setup step. It patches this
    project's `.claude/settings.json` with `env.ANTHROPIC_BASE_URL=http://127.0.0.1:<derived-port>`
    (and `env.ZLAUDER_PORT`), adds a `🛡` status line, and seeds a starter
@@ -79,36 +80,39 @@ no restart).
 > The standalone `zlauder-hooks init` CLI setup path was removed — the plugin is now
 > the sole install interface.
 
-## How the binaries are resolved (and built)
+## How the binaries are resolved
 
-The `SessionStart` hook (`scripts/session-start.sh`) needs `zlauder-proxy` and
-`zlauder-hooks`. There is no plugin postinstall step, so resolution happens
-lazily every session and no-ops once a working binary is found. Precedence:
+`zlauder-proxy` and `zlauder-hooks` ship **prebuilt, per-platform** with the
+plugin. CI (`.github/workflows/release.yml`) builds them for every supported
+target and publishes them on the `plugin-dist` branch under
+`bin/<target-triple>/`; the marketplace entry installs from that branch, so
+`/plugin install zlauder` lands a ready-to-run binary for your OS/arch with **no
+compile and no runtime download**. (See [docs/RELEASING.md](../docs/RELEASING.md).)
 
-1. **On `PATH`** — if `zlauder-proxy` / `zlauder-hooks` are already installed,
-   use them.
-2. **Prebuilt in `${CLAUDE_PLUGIN_ROOT}/bin/`** — binaries shipped with the
-   plugin. **Platform-specific** (OS + architecture); only usable on a matching
-   machine.
-3. **Cached in `${CLAUDE_PLUGIN_DATA}/bin/`** — binaries this hook built on a
-   previous session, persisted in the per-plugin data dir.
-4. **Build from source** — `cd "${CLAUDE_PLUGIN_ROOT}/.."` (or `$ZLAUDER_WORKSPACE`
-   if set) and `cargo build --release`, then copy the two binaries into
-   `${CLAUDE_PLUGIN_DATA}/bin/` for reuse. This requires a Rust toolchain and the
-   cargo workspace to be present at that path (the plugin lives inside the repo
-   workspace, so `${CLAUDE_PLUGIN_ROOT}/..` is the workspace root in-repo).
+The `SessionStart` hook (`scripts/session-start.sh`) resolves them lazily each
+session and no-ops once a working binary is found. Precedence:
 
-If none of these can produce a binary, the hook prints a clear error and exits
-non-zero.
+1. **On `PATH`** — an already-installed `zlauder-proxy` / `zlauder-hooks`.
+2. **`${CLAUDE_PLUGIN_ROOT}/bin/<triple>/`** — the prebuilt binary shipped for
+   *your* platform (the normal marketplace path). `<triple>` is your Rust target
+   triple, e.g. `x86_64-unknown-linux-gnu` or `aarch64-apple-darwin`.
+3. **`${CLAUDE_PLUGIN_ROOT}/bin/`** — a flat, hand-dropped binary.
+4. **`${CLAUDE_PLUGIN_DATA}/bin/`** — a binary this hook built on a prior session.
+5. **`<workspace>/target/release/`** — an in-repo `cargo build --release`.
+6. **Build from source** (in-repo dev only) — `cargo build --release` from
+   `$ZLAUDER_WORKSPACE` or `${CLAUDE_PLUGIN_ROOT}/..`, cached into
+   `${CLAUDE_PLUGIN_DATA}/bin/`. Needs a Rust toolchain and network (it fetches
+   the pinned git deps). Steps 1–5 satisfy a normal install, so this only runs
+   for someone hacking on zlauder itself.
 
-**Cross-platform / distribution caveat:** prebuilt `bin/` binaries only work on
-the platform they were compiled for. If you install the plugin on a different
-OS/architecture and the binaries are not on your `PATH`, the source-build
-fallback runs — which needs Rust and the cargo workspace reachable at
-`${CLAUDE_PLUGIN_ROOT}/..` or `$ZLAUDER_WORKSPACE`. A standalone, out-of-repo
-install with no toolchain and no matching prebuilt binary will not be able to
-start the proxy. Put the binaries on your `PATH`, or set `$ZLAUDER_WORKSPACE` to
-a checkout of the repo, in that case.
+If none can produce a binary, the hook prints a clear error and exits non-zero.
+
+**Supported platforms (shipped binaries):** `x86_64` / `aarch64` Linux
+(glibc ≥ 2.35) and `x86_64` / `aarch64` macOS. On any other platform there is no
+shipped binary, so the hook falls through to the source build (which needs the
+cargo workspace + toolchain). In that case, put the binaries on your `PATH` —
+e.g. grab a tarball from the [GitHub Release](https://github.com/FailSpy/zlauder/releases)
+and drop them in `~/.local/bin` — or set `$ZLAUDER_WORKSPACE` to a checkout.
 
 ## Security and limitations
 

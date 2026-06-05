@@ -12,3 +12,11 @@ zlauder.local.toml
 
 # local co-development override (path deps); keep the .example tracked
 .cargo/config.toml
+
+# release CI staging (assembled into the plugin-dist branch / GitHub Release)
+/out/
+/pkg/
+/stage/
+# prebuilt plugin binaries are shipped on the plugin-dist branch, never on main;
+# a locally-dropped bin/ (for testing the resolver) stays untracked
+zlauder-plugin/bin/

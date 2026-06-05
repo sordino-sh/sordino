@@ -89,8 +89,10 @@ Then, per project:
 1. **`/zlauder:enable`** — picks a free per-project port and writes
    `.claude/settings.json` (`ANTHROPIC_BASE_URL` + `ZLAUDER_PORT` + a status line)
    plus a starter `zlauder.toml`. The plugin's `SessionStart` hook resolves the
-   binaries (PATH → shipped `bin/` → cached build → build from this workspace) and
-   launches the proxy automatically.
+   binaries and launches the proxy automatically. `zlauder-proxy` / `zlauder-hooks`
+   are **shipped prebuilt per-platform** with the plugin (precedence: PATH →
+   shipped `bin/<triple>` → cached/in-repo build), so a marketplace install needs
+   **no compile and no download** — see [docs/RELEASING.md](./docs/RELEASING.md).
 2. **Restart Claude Code** — `ANTHROPIC_BASE_URL` is read once at startup.
 3. **`/zlauder:privacy`** — confirm routing + masking.
 

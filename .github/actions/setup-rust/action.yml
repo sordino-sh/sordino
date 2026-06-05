@@ -1,0 +1,47 @@
+name: Set up Rust build
+description: >-
+  Install the Rust toolchain (optionally a cross target), enable cargo/target
+  caching, and — only while the path-dependency repos are still private —
+  configure git auth so cargo can fetch them. Once presidio-rs / llm-wires are
+  public, leave the deps-token empty and the auth step is skipped entirely.
+
+inputs:
+  target:
+    description: Rust target triple to add (e.g. aarch64-apple-darwin). Empty = host only.
+    required: false
+    default: ""
+  deps-token:
+    description: >-
+      PAT with read access to the private dependency repos
+      (FailSpy/presidio-rs, FailSpy/llm-wires). Leave empty once those repos
+      are public — anonymous HTTPS fetch then works with no token.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: ${{ inputs.target }}
+
+    - name: Cache cargo registry + target
+      uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ inputs.target }}
+
+    - name: Authenticate to private dependency repos (interim)
+      if: inputs.deps-token != ''
+      shell: bash
+      env:
+        DEPS_TOKEN: ${{ inputs.deps-token }}
+      run: |
+        set -euo pipefail
+        # The presidio-rs / llm-wires deps are pinned git deps in Cargo.toml.
+        # While those repos are private, cargo must fetch them with credentials:
+        # rewrite the GitHub HTTPS origin to carry a token and force cargo to use
+        # the git CLI (which honours the rewrite). This whole step is skipped once
+        # deps-token is empty, i.e. after the repos go public.
+        git config --global url."https://x-access-token:${DEPS_TOKEN}@github.com/".insteadOf "https://github.com/"
+        echo "CARGO_NET_GIT_FETCH_WITH_CLI=true" >> "$GITHUB_ENV"

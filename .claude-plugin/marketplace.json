@@ -8,10 +8,14 @@
   "plugins": [
     {
       "name": "zlauder",
-      "source": "./zlauder-plugin",
+      "source": {
+        "source": "github",
+        "repo": "FailSpy/zlauder",
+        "ref": "plugin-dist"
+      },
       "displayName": "ZlauDeR",
       "description": "PII mask/unmask proxy control plane for Claude Code: launches the local masking reverse-proxy, wires routing, and adds /zlauder:enable, :disable, and :privacy.",
-      "version": "0.2.0",
+      "version": "0.3.0",
       "author": {
         "name": "FailSpy",
         "email": "failspy@exonull.com"

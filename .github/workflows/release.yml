@@ -1,0 +1,186 @@
+name: release
+
+# Cuts a ZlauDeR release: builds zlauder-proxy/zlauder-hooks for every supported
+# platform, then ships them two ways —
+#   1. force-pushes the `plugin-dist` branch (the Claude Code plugin + a
+#      bin/<triple>/ dir per platform) so a `/plugin install` lands a ready-to-run
+#      binary with NO compile and NO runtime download; and
+#   2. attaches per-platform tarballs + checksums to a GitHub Release for manual
+#      / on-PATH installs.
+# See docs/RELEASING.md.
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build & publish (e.g. v0.2.0)"
+        required: true
+
+permissions:
+  contents: write          # create the Release + force-push plugin-dist
+
+concurrency:
+  group: release-${{ github.event.inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+      - uses: ./.github/actions/setup-rust
+        with:
+          deps-token: ${{ secrets.DEPS_TOKEN }}
+      - name: Test workspace
+        run: cargo test --workspace --locked
+
+  build:
+    name: build ${{ matrix.target }}
+    needs: test
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-gnu,  runner: ubuntu-22.04 }
+          - { target: aarch64-unknown-linux-gnu, runner: ubuntu-22.04-arm }
+          - { target: x86_64-apple-darwin,        runner: macos-13 }
+          - { target: aarch64-apple-darwin,       runner: macos-14 }
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+      - uses: ./.github/actions/setup-rust
+        with:
+          target: ${{ matrix.target }}
+          deps-token: ${{ secrets.DEPS_TOKEN }}
+      - name: Build release binaries (default features)
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin zlauder-proxy --bin zlauder-hooks
+      - name: Stage artifacts (flat, triple-named)
+        shell: bash
+        run: |
+          set -euo pipefail
+          t='${{ matrix.target }}'
+          rel="target/$t/release"
+          mkdir -p out
+          # loose binaries -> assembled into plugin-dist bin/<triple>/ by `publish`
+          cp "$rel/zlauder-proxy" "out/zlauder-proxy-$t"
+          cp "$rel/zlauder-hooks" "out/zlauder-hooks-$t"
+          # tarball + checksum -> Release assets (mode preserved from the +x source)
+          tar -C "$rel" -czf "out/zlauder-$t.tar.gz" zlauder-proxy zlauder-hooks
+          ( cd out
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "zlauder-$t.tar.gz" > "zlauder-$t.tar.gz.sha256"
+            else
+              shasum -a 256 "zlauder-$t.tar.gz" > "zlauder-$t.tar.gz.sha256"
+            fi )
+      - uses: actions/upload-artifact@v4
+        with:
+          name: out-${{ matrix.target }}
+          path: out
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: publish (plugin-dist + Release)
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+
+      - name: Resolve & verify tag
+        id: v
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag='${{ github.event.inputs.tag || github.ref_name }}'
+          case "$tag" in v*) ;; *) echo "::error::expected a v* tag, got '$tag'"; exit 1 ;; esac
+          ver="$(jq -r .version zlauder-plugin/.claude-plugin/plugin.json)"
+          if [ "$tag" != "v$ver" ]; then
+            echo "::error::tag '$tag' != plugin.json version 'v$ver'. Bump zlauder-plugin/.claude-plugin/plugin.json (and the marketplace entry + Cargo version) to match the tag before releasing." >&2
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "ver=$ver" >> "$GITHUB_OUTPUT"
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dl
+          pattern: out-*
+
+      - name: Flatten artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          # artifact nesting can vary; every file is uniquely (triple-)named, so
+          # collect them all into one flat dir by basename.
+          mkdir -p stage
+          find dl -type f -exec cp -f {} stage/ \;
+          ls -l stage
+
+      - name: Assemble plugin payload (-> pkg/)
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag='${{ steps.v.outputs.tag }}'
+          rm -rf pkg && mkdir pkg
+          # the plugin itself: manifest, commands, hooks, scripts, zlauder.toml, README
+          cp -a zlauder-plugin/. pkg/
+          # per-platform binaries: stage/zlauder-{proxy,hooks}-<triple> -> pkg/bin/<triple>/
+          shopt -s nullglob
+          found=0
+          for proxy in stage/zlauder-proxy-*; do
+            found=1
+            t="$(basename "$proxy")"; t="${t#zlauder-proxy-}"
+            mkdir -p "pkg/bin/$t"
+            cp "stage/zlauder-proxy-$t" "pkg/bin/$t/zlauder-proxy"
+            cp "stage/zlauder-hooks-$t"  "pkg/bin/$t/zlauder-hooks"
+            chmod +x "pkg/bin/$t/zlauder-proxy" "pkg/bin/$t/zlauder-hooks"
+          done
+          [ "$found" = 1 ] || { echo "::error::no staged binaries found"; exit 1; }
+          # stamp the release tag + keep the shipped plugin.json version aligned to it
+          printf '%s\n' "$tag" > pkg/.zlauder-release
+          tmp="$(mktemp)"
+          jq --arg v '${{ steps.v.outputs.ver }}' '.version=$v' pkg/.claude-plugin/plugin.json > "$tmp"
+          mv "$tmp" pkg/.claude-plugin/plugin.json
+          echo "Payload:"; find pkg -type f | sort
+
+      - name: Force-push plugin-dist branch
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag='${{ steps.v.outputs.tag }}'
+          remote="https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          cd pkg
+          git init -q -b plugin-dist
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -q -m "plugin-dist: $tag (${GITHUB_SHA})"
+          # orphan + force-push => plugin-dist is always a single flat commit, so
+          # the binaries never accumulate in the repo's history.
+          git push -f "$remote" plugin-dist
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag='${{ steps.v.outputs.tag }}'
+          assets=(stage/*.tar.gz stage/*.sha256)
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "${assets[@]}" --clobber
+          else
+            gh release create "$tag" "${assets[@]}" --title "$tag" --generate-notes
+          fi

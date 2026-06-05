@@ -1,0 +1,34 @@
+name: ci
+
+# Build + test on every push to main and every PR, so a tag never publishes
+# binaries from a broken tree. Mirrors the release build (default features,
+# --locked) on the cheapest single target.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test:
+    name: build + test
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          # While the dep repos are private, fork PRs have no access to this
+          # secret and cannot build — expected until presidio-rs / llm-wires
+          # are public, after which the credential step is skipped anyway.
+          deps-token: ${{ secrets.DEPS_TOKEN }}
+      - name: Build workspace
+        run: cargo build --workspace --locked
+      - name: Test workspace
+        run: cargo test --workspace --locked
