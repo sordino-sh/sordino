@@ -409,6 +409,12 @@ impl MaskEngine {
     /// plaintext) and unmasks every inbound field. Determinism makes the
     /// round-trip reproduce the original token form exactly.
     pub fn mask(&self, text: &str, surface: Surface) -> Result<MaskOutcome, EngineError> {
+        if surface == Surface::UserMessage {
+            if let Some(outcome) = self.mask_user_bypass(text)? {
+                return Ok(outcome);
+            }
+        }
+
         // Snapshot the policy as a cheap `Arc` clone, then RELEASE the lock before
         // any detection/inference/apply work (audit #2): a slow miss or Ready-rescan
         // must never hold a read lock that could starve a live `set_config` write.
@@ -534,6 +540,38 @@ impl MaskEngine {
             manifest,
             stats,
         })
+    }
+
+    /// One-shot user-message bypass: `>>secret<<` is sent upstream as `secret`
+    /// without detection, token minting, or any future implication. Surrounding text
+    /// is still masked normally.
+    fn mask_user_bypass(&self, text: &str) -> Result<Option<MaskOutcome>, EngineError> {
+        let Some(segments) = user_bypass_segments(text) else {
+            return Ok(None);
+        };
+
+        let mut masked_text = String::with_capacity(text.len());
+        let mut manifest = UnmaskManifest::new();
+        let mut stats = MaskStats::default();
+
+        for segment in segments {
+            match segment {
+                UserBypassSegment::Mask(s) if !s.is_empty() => {
+                    let outcome = self.mask(s, Surface::UserMessage)?;
+                    masked_text.push_str(&outcome.masked_text);
+                    manifest.merge(outcome.manifest);
+                    stats.merge(&outcome.stats);
+                }
+                UserBypassSegment::Mask(_) => {}
+                UserBypassSegment::Bypass(s) => masked_text.push_str(s),
+            }
+        }
+
+        Ok(Some(MaskOutcome {
+            masked_text,
+            manifest,
+            stats,
+        }))
     }
 
     /// Run detection for a cache miss and (on success) populate the cache. A
@@ -685,6 +723,42 @@ fn mask_value(slice: &str, ch: char, from_end: usize) -> String {
     s
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum UserBypassSegment<'a> {
+    Mask(&'a str),
+    Bypass(&'a str),
+}
+
+fn user_bypass_segments(text: &str) -> Option<Vec<UserBypassSegment<'_>>> {
+    const START: &str = ">>";
+    const END: &str = "<<";
+
+    let mut segments = Vec::new();
+    let mut cursor = 0;
+    let mut matched = false;
+
+    while let Some(rel_start) = text[cursor..].find(START) {
+        let start = cursor + rel_start;
+        let inner_start = start + START.len();
+        let Some(rel_end) = text[inner_start..].find(END) else {
+            break;
+        };
+        let end = inner_start + rel_end;
+
+        segments.push(UserBypassSegment::Mask(&text[cursor..start]));
+        segments.push(UserBypassSegment::Bypass(&text[inner_start..end]));
+        cursor = end + END.len();
+        matched = true;
+    }
+
+    if !matched {
+        return None;
+    }
+
+    segments.push(UserBypassSegment::Mask(&text[cursor..]));
+    Some(segments)
+}
+
 // Engine must be shareable across async tasks in the proxy.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
@@ -824,6 +898,56 @@ mod tests {
         assert!(out.masked_text.contains("[CODENAME_acme]"));
         let back = e.unmask(&out.masked_text, &out.manifest).unwrap();
         assert_eq!(back, "ping admin@example.com about ACME-CODENAME");
+    }
+
+    #[test]
+    fn user_message_bypass_removes_markers_and_skips_masking() {
+        let e = engine();
+        let out = e
+            .mask(
+                "send >>bob@example.com<< and cc alice@example.com",
+                Surface::UserMessage,
+            )
+            .unwrap();
+
+        assert!(out.masked_text.contains("bob@example.com"));
+        assert!(!out.masked_text.contains(">>"));
+        assert!(!out.masked_text.contains("<<"));
+        assert!(!out.masked_text.contains("alice@example.com"));
+        assert_eq!(out.manifest.len(), 1);
+        assert_eq!(
+            e.unmask(&out.masked_text, &out.manifest).unwrap(),
+            "send bob@example.com and cc alice@example.com"
+        );
+    }
+
+    #[test]
+    fn user_message_bypass_has_no_future_effect() {
+        let e = engine();
+        let first = e
+            .mask("send >>bob@example.com<<", Surface::UserMessage)
+            .unwrap();
+        assert_eq!(first.masked_text, "send bob@example.com");
+        assert!(first.manifest.is_empty());
+
+        let second = e
+            .mask("send bob@example.com", Surface::UserMessage)
+            .unwrap();
+        assert!(!second.masked_text.contains("bob@example.com"));
+        assert_eq!(second.manifest.len(), 1);
+    }
+
+    #[test]
+    fn bypass_syntax_is_user_message_only() {
+        let e = engine();
+        let out = e
+            .mask("system >>bob@example.com<<", Surface::SystemPrompt)
+            .unwrap();
+
+        assert!(!out.masked_text.contains("bob@example.com"));
+        assert!(out.masked_text.contains(">>"));
+        assert!(out.masked_text.contains("<<"));
+        assert_eq!(out.manifest.len(), 1);
     }
 
     // presidio's strict UrlRecognizer (default) drops scheme-less filenames/code

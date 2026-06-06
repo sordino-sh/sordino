@@ -455,6 +455,27 @@ mod tests {
         assert_eq!(restored, "the admin is reachable at bob@example.com");
     }
 
+    #[test]
+    fn user_bypass_is_plaintext_in_upstream_prompt_only_for_wrapped_span() {
+        let e = engine();
+        let body = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "send >>bob@example.com<< and cc alice@example.com"}
+            ]}]
+        });
+
+        let (masked, manifest) = mask_request(&e, body.to_string().as_bytes()).unwrap();
+        let s = String::from_utf8(masked).unwrap();
+
+        assert!(s.contains("bob@example.com"));
+        assert!(!s.contains(">>"));
+        assert!(!s.contains("<<"));
+        assert!(!s.contains("alice@example.com"));
+        assert_eq!(manifest.len(), 1);
+    }
+
     // Regression: Claude Code sends some messages with bare-string `content`
     // (and role "system" inside messages). This historically broke typed parse
     // and leaked plaintext upstream. Must be masked now.
