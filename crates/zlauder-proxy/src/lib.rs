@@ -5,6 +5,7 @@ pub mod admin;
 pub mod config;
 pub mod headers;
 pub mod ml;
+pub mod monitor;
 pub mod openai_chat;
 pub mod openai_responses;
 pub mod routes;

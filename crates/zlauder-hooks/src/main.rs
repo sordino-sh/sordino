@@ -71,6 +71,8 @@ enum Cmd {
     },
     /// Reveal a masked token's plaintext (local audit).
     Reveal { token: String },
+    /// Print the keyed local web monitor URL for this project's proxy.
+    Monitor,
     /// Redact burned plaintext values from a Claude Code transcript JSONL file.
     Scrub {
         /// Transcript JSONL file to mutate.
@@ -209,6 +211,7 @@ fn main() -> Result<()> {
         Cmd::Statusline => statusline(cli.port),
         Cmd::Config { action } => config_cmd(cli.port, action),
         Cmd::Reveal { token } => reveal(cli.port, token),
+        Cmd::Monitor => monitor_cmd(cli.port),
         Cmd::Scrub {
             transcript,
             values,
@@ -282,9 +285,11 @@ fn scrub_cmd(
 // ---------------------------------------------------------------------------
 
 fn session_start(port: Option<u16>, config: Option<PathBuf>, proxy_bin: String) -> Result<()> {
-    // Drain stdin (the SessionStart hook payload) so the pipe doesn't block.
-    let mut _stdin = String::new();
-    let _ = std::io::stdin().read_to_string(&mut _stdin);
+    // Drain stdin (the SessionStart hook payload) so the pipe doesn't block, and
+    // opportunistically extract a stable conversation key for the monitor.
+    let mut stdin = String::new();
+    let _ = std::io::stdin().read_to_string(&mut stdin);
+    let conversation = conversation_id_from_hook_payload(&stdin);
 
     let root = canonical(&project_root());
     // Resolve the port. With an explicit --port/$ZLAUDER_PORT (the normal case once
@@ -432,6 +437,10 @@ fn session_start(port: Option<u16>, config: Option<PathBuf>, proxy_bin: String) 
     // SessionStart hook output. The static `env` written by `/zlauder:enable` into
     // settings.json is the load-bearing path for ANTHROPIC_BASE_URL; the `env` key
     // here is a best-effort override for harness versions that honor it.
+    let session_base_url = conversation
+        .as_deref()
+        .map(|c| format!("{base_url}/zlauder/session/{c}"))
+        .unwrap_or_else(|| base_url.clone());
     let out = json!({
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
@@ -440,10 +449,66 @@ fn session_start(port: Option<u16>, config: Option<PathBuf>, proxy_bin: String) 
                  before it reaches the model; responses are unmasked on return. Tokens look \
                  like [EMAIL_ADDRESS_xxxx]. Configure with the /zlauder:privacy command."
         },
-        "env": { "ANTHROPIC_BASE_URL": base_url, "ZLAUDER_PORT": port.to_string() }
+        "env": { "ANTHROPIC_BASE_URL": session_base_url, "ZLAUDER_PORT": port.to_string() }
     });
     println!("{out}");
     Ok(())
+}
+
+fn conversation_id_from_hook_payload(stdin: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(stdin).ok()?;
+    for key in [
+        "session_id",
+        "sessionId",
+        "conversation_id",
+        "conversationId",
+        "transcript_path",
+        "transcriptPath",
+    ] {
+        if let Some(raw) = find_string_key(&value, key) {
+            return Some(safe_conversation_id(&raw));
+        }
+    }
+    None
+}
+
+fn find_string_key(value: &Value, key: &str) -> Option<String> {
+    match value {
+        Value::Object(obj) => {
+            if let Some(s) = obj.get(key).and_then(Value::as_str) {
+                return Some(s.to_string());
+            }
+            obj.values().find_map(|v| find_string_key(v, key))
+        }
+        Value::Array(items) => items.iter().find_map(|v| find_string_key(v, key)),
+        _ => None,
+    }
+}
+
+fn safe_conversation_id(raw: &str) -> String {
+    let mut out: String = raw
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
+    out = out.trim_matches('-').to_string();
+    if out.len() > 80 {
+        let mut h = blake3::Hasher::new();
+        h.update(raw.as_bytes());
+        format!("{}-{}", &out[..40], h.finalize().to_hex()[..16].to_string())
+    } else if out.is_empty() {
+        "unknown".to_string()
+    } else {
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -502,9 +567,9 @@ fn statusline(port: Option<u16>) -> Result<()> {
 /// their text is NOT yet filtered through it), a warning if a load failed.
 fn ml_indicator(ml: Option<&MlSnap>) -> &'static str {
     match ml.map(|m| m.status.as_str()) {
-        Some("ready") => " \u{1f9e0}",      // 🧠 filtering
-        Some("loading") => " \u{23f3}ml",   // ⏳ml loading — not filtered yet
-        Some("failed") => " \u{26a0}ml",    // ⚠ml load failed
+        Some("ready") => " \u{1f9e0}",    // 🧠 filtering
+        Some("loading") => " \u{23f3}ml", // ⏳ml loading — not filtered yet
+        Some("failed") => " \u{26a0}ml",  // ⚠ml load failed
         _ => "",
     }
 }
@@ -542,9 +607,8 @@ fn config_cmd(port: Option<u16>, action: Option<ConfigAction>) -> Result<()> {
 fn ml_cmd(port: u16, root: &str, action: MlAction) -> Result<()> {
     match action {
         MlAction::Status => {
-            let snap = live_snapshot(port).context(
-                "could not reach this project's proxy (is a `claude` session running?)",
-            )?;
+            let snap = live_snapshot(port)
+                .context("could not reach this project's proxy (is a `claude` session running?)")?;
             print_ml_line(&parse_snapshot(&snap)?, port);
             Ok(())
         }
@@ -623,9 +687,8 @@ fn print_ml_line(s: &Snapshot, port: u16) {
     println!("  desired : {}", if ml.enabled { "on" } else { "off" });
     let status = match ml.status.as_str() {
         "ready" => "ready — filtering active".to_string(),
-        "loading" => {
-            "loading — NOT filtering through the model yet; wait, or continue regex-only".to_string()
-        }
+        "loading" => "loading — NOT filtering through the model yet; wait, or continue regex-only"
+            .to_string(),
         "failed" => format!(
             "failed{}",
             ml.error
@@ -814,6 +877,18 @@ fn reveal(port: Option<u16>, token: String) -> Result<()> {
             resp.text().unwrap_or_default()
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// monitor
+// ---------------------------------------------------------------------------
+
+fn monitor_cmd(port: Option<u16>) -> Result<()> {
+    let root = canonical(&project_root());
+    let port = port.unwrap_or_else(|| pick_port(&root));
+    let key = key_for(port).context("reading session state (is the proxy running?)")?;
+    println!("http://127.0.0.1:{port}/zlauder/ui?key={key}");
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1291,7 +1366,10 @@ mod route_tests {
         let want = "http://127.0.0.1:18394";
         assert!(base_url_matches("http://127.0.0.1:18394", want));
         assert!(base_url_matches("http://127.0.0.1:18394/", want));
-        assert!(base_url_matches("http://127.0.0.1:18394", "http://127.0.0.1:18394/"));
+        assert!(base_url_matches(
+            "http://127.0.0.1:18394",
+            "http://127.0.0.1:18394/"
+        ));
     }
 
     #[test]

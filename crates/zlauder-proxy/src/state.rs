@@ -4,6 +4,7 @@ use std::sync::Arc;
 use zlauder_engine::MaskEngine;
 
 use crate::config::ConfigLayers;
+use crate::monitor::Monitor;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -21,6 +22,8 @@ pub struct AppState {
     pub project_root: Arc<String>,
     /// The port this proxy is bound to (reported by the config endpoint).
     pub port: u16,
+    /// In-memory local request monitor and optional approval gate.
+    pub monitor: Monitor,
     /// Serializes ML state transitions (`/zlauder/ml/{enable,disable}`, and the ML
     /// reconcile in `put`/`reload`). Without it, two concurrent `model on`/`off`
     /// requests can interleave their config-write and runtime-toggle so a stale

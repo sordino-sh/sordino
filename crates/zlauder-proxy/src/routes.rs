@@ -10,7 +10,7 @@ use axum::routing::{get, post};
 use http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
 use zlauder_engine::UnmaskManifest;
 
-use crate::{admin, headers, openai_chat, openai_responses, sse, state::AppState, walk};
+use crate::{admin, headers, monitor, openai_chat, openai_responses, sse, state::AppState, walk};
 
 const MAX_BODY: usize = 64 * 1024 * 1024;
 
@@ -30,6 +30,32 @@ pub fn router(state: AppState) -> Router {
         .route("/zlauder/reload", post(admin::reload))
         .route("/zlauder/ml/enable", post(admin::ml_enable))
         .route("/zlauder/ml/disable", post(admin::ml_disable))
+        .route("/zlauder/ui", get(monitor::ui))
+        .route("/zlauder/monitor/snapshot", get(monitor::snapshot))
+        .route("/zlauder/monitor/events", get(monitor::events))
+        .route("/zlauder/monitor/mode", post(monitor::set_mode))
+        .route(
+            "/zlauder/monitor/requests/{id}/approve",
+            post(monitor::approve),
+        )
+        .route(
+            "/zlauder/monitor/requests/{id}/reject",
+            post(monitor::reject),
+        )
+        .route("/zlauder/monitor/requests/{id}/tags", post(monitor::tags))
+        .route("/zlauder/monitor/custom-mask", post(monitor::custom_mask))
+        .route(
+            "/zlauder/session/{conversation}/v1/messages",
+            post(messages_session),
+        )
+        .route(
+            "/zlauder/session/{conversation}/v1/chat/completions",
+            post(openai_chat::chat_completions_session),
+        )
+        .route(
+            "/zlauder/session/{conversation}/v1/responses",
+            post(openai_responses::responses_session),
+        )
         .route("/v1/messages", post(messages))
         .route("/v1/messages/count_tokens", post(count_tokens))
         .route("/v1/chat/completions", post(openai_chat::chat_completions))
@@ -56,6 +82,18 @@ async fn reveal(
 
 /// `/v1/messages` — mask request, relay, unmask response (JSON or SSE).
 async fn messages(State(st): State<AppState>, req: Request) -> Response {
+    messages_inner(st, req, None).await
+}
+
+async fn messages_session(
+    State(st): State<AppState>,
+    Path(conversation): Path<String>,
+    req: Request,
+) -> Response {
+    messages_inner(st, req, Some(conversation)).await
+}
+
+async fn messages_inner(st: AppState, req: Request, conversation: Option<String>) -> Response {
     let (parts, body) = req.into_parts();
     let body_bytes = match to_bytes(body, MAX_BODY).await {
         Ok(b) => b,
@@ -66,10 +104,26 @@ async fn messages(State(st): State<AppState>, req: Request) -> Response {
         Ok(x) => x,
         Err(resp) => return resp,
     };
+    let conversation = conversation.or_else(|| monitor::conversation_from_headers(&parts.headers));
+    let ticket = st.monitor.record_llm_request(
+        "/v1/messages",
+        parts.method.as_str(),
+        conversation,
+        &masked,
+        &manifest,
+    );
+    let record_id = ticket.id().to_string();
+    if let Err(resp) = monitor::maybe_approve(&st, ticket).await {
+        return resp;
+    }
 
     let resp = match send_upstream(&st, &parts, masked, "/v1/messages").await {
         Ok(r) => r,
-        Err(resp) => return resp,
+        Err(resp) => {
+            st.monitor
+                .record_upstream_error(&record_id, "upstream request failed");
+            return resp;
+        }
     };
 
     let status = resp.status();
@@ -84,6 +138,7 @@ async fn messages(State(st): State<AppState>, req: Request) -> Response {
 
     if is_sse {
         let body = sse::unmask_sse_body(Box::pin(resp.bytes_stream()), st.engine.clone(), manifest);
+        st.monitor.record_response(&record_id, status, None);
         respond(status, out_headers, body)
     } else {
         let bytes = match resp.bytes().await {
@@ -97,6 +152,7 @@ async fn messages(State(st): State<AppState>, req: Request) -> Response {
         };
         let out = walk::unmask_response(st.engine.as_ref(), &manifest, &bytes)
             .unwrap_or_else(|_| bytes.to_vec());
+        st.monitor.record_response(&record_id, status, Some(&out));
         respond(status, out_headers, Body::from(out))
     }
 }

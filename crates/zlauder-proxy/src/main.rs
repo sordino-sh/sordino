@@ -12,7 +12,7 @@ use std::sync::Arc;
 use anyhow::Context;
 use clap::Parser;
 use zlauder_engine::{EngineConfig, MaskEngine, MlConfig};
-use zlauder_proxy::{config, ml, routes, state::AppState};
+use zlauder_proxy::{config, ml, monitor::Monitor, routes, state::AppState};
 
 #[derive(Parser, Debug)]
 #[command(name = "zlauder-proxy", version, about)]
@@ -85,6 +85,7 @@ async fn main() -> anyhow::Result<()> {
         layers: Arc::new(cfg.layers),
         project_root: Arc::new(project_root.clone()),
         port,
+        monitor: Monitor::new(),
         ml_control: Arc::new(std::sync::Mutex::new(())),
     };
 

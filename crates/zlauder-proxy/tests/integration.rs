@@ -12,7 +12,9 @@ use axum::response::{IntoResponse, Json};
 use axum::routing::post;
 use http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
 use zlauder_engine::{EngineConfig, MaskEngine, token_regex};
-use zlauder_proxy::{config::ConfigLayers, routes::router as proxy_router, state::AppState};
+use zlauder_proxy::{
+    config::ConfigLayers, monitor::Monitor, routes::router as proxy_router, state::AppState,
+};
 
 /// Build an `AppState` for tests (no real config files; reload points at a
 /// nonexistent user layer so it's a deterministic no-op).
@@ -29,6 +31,7 @@ fn mk_state(engine: MaskEngine, upstream_base: String, admin_key: &str) -> AppSt
         }),
         project_root: Arc::new("/tmp/zlauder-test-project".into()),
         port: 0,
+        monitor: Monitor::new(),
         ml_control: Arc::new(std::sync::Mutex::new(())),
     }
 }
@@ -753,4 +756,247 @@ async fn put_config_replaces_live_policy() {
         !body.contains("[EMAIL_ADDRESS_"),
         "should be redacted, not tokenized: {body}"
     );
+}
+
+#[tokio::test]
+async fn monitor_default_observes_without_blocking() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, format!("http://{up_addr}"), "mon");
+    let proxy_addr = spawn(proxy_router(state)).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "m", "max_tokens": 10,
+            "messages": [{"role":"user","content":[{"type":"text","text":"mail monitor@example.com"}]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(cap.bodies.lock().unwrap().len(), 1);
+
+    let snap: serde_json::Value = client
+        .get(format!("http://{proxy_addr}/zlauder/monitor/snapshot"))
+        .header("x-zlauder-key", "mon")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(snap["mode"], "off");
+    assert_eq!(snap["records"][0]["decision"], "completed");
+    assert_eq!(snap["records"][0]["tokens"].as_array().unwrap().len(), 1);
+    assert!(
+        snap["records"][0]["request_preview"]
+            .as_str()
+            .unwrap()
+            .contains("[EMAIL_ADDRESS_")
+    );
+}
+
+#[tokio::test]
+async fn monitor_manual_reject_never_reaches_upstream() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, format!("http://{up_addr}"), "reject-key");
+    let proxy_addr = spawn(proxy_router(state)).await;
+    let client = reqwest::Client::new();
+
+    let mode = client
+        .post(format!("http://{proxy_addr}/zlauder/monitor/mode"))
+        .header("x-zlauder-key", "reject-key")
+        .json(&serde_json::json!({"mode":"manual_all_llm"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mode.status(), 200);
+
+    let c2 = client.clone();
+    let pending = tokio::spawn(async move {
+        c2.post(format!("http://{proxy_addr}/v1/messages"))
+            .json(&serde_json::json!({
+                "model": "m", "max_tokens": 10,
+                "messages": [{"role":"user","content":[{"type":"text","text":"mail reject@example.com"}]}]
+            }))
+            .send()
+            .await
+            .unwrap()
+    });
+
+    let id = wait_for_pending(&client, proxy_addr, "reject-key").await;
+    let rej = client
+        .post(format!(
+            "http://{proxy_addr}/zlauder/monitor/requests/{id}/reject"
+        ))
+        .header("x-zlauder-key", "reject-key")
+        .json(&serde_json::json!({"reason":"test reject"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rej.status(), 200);
+    let resp = pending.await.unwrap();
+    assert_eq!(resp.status(), 403);
+    assert_eq!(cap.bodies.lock().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn monitor_manual_approve_releases_request() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, format!("http://{up_addr}"), "approve-key");
+    let proxy_addr = spawn(proxy_router(state)).await;
+    let client = reqwest::Client::new();
+
+    client
+        .post(format!("http://{proxy_addr}/zlauder/monitor/mode"))
+        .header("x-zlauder-key", "approve-key")
+        .json(&serde_json::json!({"mode":"manual_all_llm"}))
+        .send()
+        .await
+        .unwrap();
+
+    let c2 = client.clone();
+    let pending = tokio::spawn(async move {
+        c2.post(format!("http://{proxy_addr}/v1/messages"))
+            .json(&serde_json::json!({
+                "model": "m", "max_tokens": 10,
+                "messages": [{"role":"user","content":[{"type":"text","text":"mail approve@example.com"}]}]
+            }))
+            .send()
+            .await
+            .unwrap()
+    });
+
+    let id = wait_for_pending(&client, proxy_addr, "approve-key").await;
+    let ok = client
+        .post(format!(
+            "http://{proxy_addr}/zlauder/monitor/requests/{id}/approve"
+        ))
+        .header("x-zlauder-key", "approve-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+    let resp = pending.await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert_eq!(cap.bodies.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn monitor_custom_mask_applies_to_future_requests() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, format!("http://{up_addr}"), "custom-key");
+    let proxy_addr = spawn(proxy_router(state)).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("http://{proxy_addr}/zlauder/monitor/custom-mask"))
+        .header("x-zlauder-key", "custom-key")
+        .json(&serde_json::json!({"pattern":"ACME-ALPHA"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let _ = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "m", "max_tokens": 10,
+            "messages": [{"role":"user","content":[{"type":"text","text":"project ACME-ALPHA ships"}]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let body = cap.body.lock().unwrap().clone();
+    assert!(!body.contains("ACME-ALPHA"), "custom value leaked: {body}");
+    assert!(
+        body.contains("[CUSTOM_KEYWORD_"),
+        "custom token missing: {body}"
+    );
+}
+
+#[tokio::test]
+async fn monitor_session_prefixed_route_groups_by_conversation() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, format!("http://{up_addr}"), "session-key");
+    let proxy_addr = spawn(proxy_router(state)).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!(
+            "http://{proxy_addr}/zlauder/session/convo-123/v1/messages"
+        ))
+        .json(&serde_json::json!({
+            "model": "m", "max_tokens": 10,
+            "messages": [{"role":"user","content":[{"type":"text","text":"mail session@example.com"}]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+
+    let snap: serde_json::Value = client
+        .get(format!("http://{proxy_addr}/zlauder/monitor/snapshot"))
+        .header("x-zlauder-key", "session-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(snap["records"][0]["conversation_id"], "convo-123");
+}
+
+async fn wait_for_pending(client: &reqwest::Client, proxy_addr: SocketAddr, key: &str) -> String {
+    for _ in 0..50 {
+        let snap: serde_json::Value = client
+            .get(format!("http://{proxy_addr}/zlauder/monitor/snapshot"))
+            .header("x-zlauder-key", key)
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if let Some(record) =
+            snap["records"].as_array().unwrap().iter().find(|r| {
+                r.get("decision") == Some(&serde_json::Value::String("pending".to_string()))
+            })
+        {
+            return record["id"].as_str().unwrap().to_string();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    panic!("request never became pending");
 }

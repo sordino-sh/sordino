@@ -12,13 +12,14 @@ name = "zlauder-hooks"
 path = "src/main.rs"
 
 [dependencies]
-zlauder-state  = { path = "../zlauder-state",  version = "0.4.0" }
-zlauder-engine = { path = "../zlauder-engine", version = "0.4.0" }
+zlauder-state  = { path = "../zlauder-state",  version = "0.5.0" }
+zlauder-engine = { path = "../zlauder-engine", version = "0.5.0" }
 
 clap       = { workspace = true }
 serde      = { workspace = true }
 serde_json = { workspace = true }
 anyhow     = { workspace = true }
 rand       = { workspace = true }
+blake3     = { workspace = true }
 toml_edit  = "0.22"
 reqwest    = { version = "0.12", default-features = false, features = ["blocking", "json"] }

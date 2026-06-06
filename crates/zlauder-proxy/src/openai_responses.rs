@@ -21,12 +21,24 @@ use zlauder_engine::{
     EngineError, MAX_TOKEN_LEN, MaskEngine, MaskStats, Surface, UnmaskManifest, token_regex,
 };
 
-use crate::{headers, routes, state::AppState, walk};
+use crate::{headers, monitor, routes, state::AppState, walk};
 
 const MAX_BODY: usize = 64 * 1024 * 1024;
 
 /// `/v1/responses` — mask request, relay, unmask response (JSON or SSE).
 pub async fn responses(State(st): State<AppState>, req: Request) -> Response {
+    responses_inner(st, req, None).await
+}
+
+pub async fn responses_session(
+    State(st): State<AppState>,
+    axum::extract::Path(conversation): axum::extract::Path<String>,
+    req: Request,
+) -> Response {
+    responses_inner(st, req, Some(conversation)).await
+}
+
+async fn responses_inner(st: AppState, req: Request, conversation: Option<String>) -> Response {
     let (parts, body) = req.into_parts();
     let body_bytes = match to_bytes(body, MAX_BODY).await {
         Ok(b) => b,
@@ -37,10 +49,26 @@ pub async fn responses(State(st): State<AppState>, req: Request) -> Response {
         Ok(x) => x,
         Err(resp) => return resp,
     };
+    let conversation = conversation.or_else(|| monitor::conversation_from_headers(&parts.headers));
+    let ticket = st.monitor.record_llm_request(
+        "/v1/responses",
+        parts.method.as_str(),
+        conversation,
+        &masked,
+        &manifest,
+    );
+    let record_id = ticket.id().to_string();
+    if let Err(resp) = monitor::maybe_approve(&st, ticket).await {
+        return resp;
+    }
 
     let resp = match routes::send_upstream(&st, &parts, masked, "/v1/responses").await {
         Ok(r) => r,
-        Err(resp) => return resp,
+        Err(resp) => {
+            st.monitor
+                .record_upstream_error(&record_id, "upstream request failed");
+            return resp;
+        }
     };
 
     let status = resp.status();
@@ -55,6 +83,7 @@ pub async fn responses(State(st): State<AppState>, req: Request) -> Response {
 
     if is_sse {
         let body = unmask_sse_body(Box::pin(resp.bytes_stream()), st.engine.clone(), manifest);
+        st.monitor.record_response(&record_id, status, None);
         routes::respond(status, out_headers, body)
     } else {
         let bytes = match resp.bytes().await {
@@ -68,6 +97,7 @@ pub async fn responses(State(st): State<AppState>, req: Request) -> Response {
         };
         let out = unmask_response(st.engine.as_ref(), &manifest, &bytes)
             .unwrap_or_else(|_| bytes.to_vec());
+        st.monitor.record_response(&record_id, status, Some(&out));
         routes::respond(status, out_headers, Body::from(out))
     }
 }
