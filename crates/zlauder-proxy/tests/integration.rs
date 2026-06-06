@@ -795,12 +795,108 @@ async fn monitor_default_observes_without_blocking() {
     assert_eq!(snap["mode"], "off");
     assert_eq!(snap["records"][0]["decision"], "completed");
     assert_eq!(snap["records"][0]["tokens"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        snap["records"][0]["request_spans"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        snap["records"][0]["response_spans"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
     assert!(
         snap["records"][0]["request_preview"]
             .as_str()
             .unwrap()
             .contains("[EMAIL_ADDRESS_")
     );
+}
+
+#[tokio::test]
+async fn monitor_backpressure_rejects_when_pending_queue_is_full() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, format!("http://{up_addr}"), "bp-key");
+    let proxy_addr = spawn(proxy_router(state)).await;
+    let client = reqwest::Client::new();
+
+    let mode = client
+        .post(format!("http://{proxy_addr}/zlauder/monitor/mode"))
+        .header("x-zlauder-key", "bp-key")
+        .json(&serde_json::json!({
+            "mode": "manual_all_llm",
+            "max_pending_approvals": 1
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(mode.status(), 200);
+
+    let c2 = client.clone();
+    let first = tokio::spawn(async move {
+        c2.post(format!("http://{proxy_addr}/v1/messages"))
+            .json(&serde_json::json!({
+                "model": "m", "max_tokens": 10,
+                "messages": [{"role":"user","content":[{"type":"text","text":"mail first-bp@example.com"}]}]
+            }))
+            .send()
+            .await
+            .unwrap()
+    });
+
+    let id = wait_for_pending(&client, proxy_addr, "bp-key").await;
+
+    let second = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "m", "max_tokens": 10,
+            "messages": [{"role":"user","content":[{"type":"text","text":"mail second-bp@example.com"}]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(second.status(), 403);
+
+    let snap: serde_json::Value = client
+        .get(format!("http://{proxy_addr}/zlauder/monitor/snapshot"))
+        .header("x-zlauder-key", "bp-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(snap["pending_count"], 1);
+    assert_eq!(snap["max_pending_approvals"], 1);
+    assert!(
+        snap["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["decision"] == "backpressure_rejected")
+    );
+
+    let ok = client
+        .post(format!(
+            "http://{proxy_addr}/zlauder/monitor/requests/{id}/approve"
+        ))
+        .header("x-zlauder-key", "bp-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), 200);
+    assert_eq!(first.await.unwrap().status(), 200);
+    assert_eq!(cap.bodies.lock().unwrap().len(), 1);
 }
 
 #[tokio::test]

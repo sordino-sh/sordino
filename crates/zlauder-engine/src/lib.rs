@@ -531,7 +531,7 @@ impl MaskEngine {
                         token_handle: token.clone(),
                         entity_kind: d.entity_type.clone(),
                         arrow_origin: surface,
-                        exposed_at: None,
+                        exposed_at: Some(start..start + token.len()),
                     });
                     token
                 }

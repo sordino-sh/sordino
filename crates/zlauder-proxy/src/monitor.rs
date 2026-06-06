@@ -23,6 +23,7 @@ use crate::state::AppState;
 const MAX_RECORDS: usize = 500;
 const PREVIEW_LIMIT: usize = 128 * 1024;
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
+const DEFAULT_MAX_PENDING_APPROVALS: usize = 32;
 
 #[derive(Clone)]
 pub struct Monitor {
@@ -32,6 +33,7 @@ pub struct Monitor {
 
 struct Inner {
     mode: MonitorMode,
+    max_pending_approvals: usize,
     next_seq: u64,
     records: VecDeque<RequestRecord>,
     waiters: HashMap<String, oneshot::Sender<ApprovalDecision>>,
@@ -49,6 +51,7 @@ impl Monitor {
         Self {
             inner: Arc::new(Mutex::new(Inner {
                 mode: MonitorMode::Off,
+                max_pending_approvals: DEFAULT_MAX_PENDING_APPROVALS,
                 next_seq: 1,
                 records: VecDeque::new(),
                 waiters: HashMap::new(),
@@ -61,14 +64,23 @@ impl Monitor {
         let inner = self.inner.lock().expect("monitor mutex poisoned");
         MonitorSnapshot {
             mode: inner.mode,
+            pending_count: inner.waiters.len(),
+            max_pending_approvals: inner.max_pending_approvals,
             records: inner.records.iter().cloned().collect(),
         }
     }
 
-    pub fn set_mode(&self, mode: MonitorMode) -> MonitorSnapshot {
+    pub fn set_mode(
+        &self,
+        mode: MonitorMode,
+        max_pending_approvals: Option<usize>,
+    ) -> MonitorSnapshot {
         {
             let mut inner = self.inner.lock().expect("monitor mutex poisoned");
             inner.mode = mode;
+            if let Some(max) = max_pending_approvals {
+                inner.max_pending_approvals = max;
+            }
         }
         let snap = self.snapshot();
         self.emit(MonitorEvent::Snapshot(snap.clone()));
@@ -91,41 +103,68 @@ impl Monitor {
             MonitorMode::ManualAllLlm => true,
             MonitorMode::ManualOnDetection => !manifest.is_empty(),
         };
-        let (status, rx) = if should_hold {
+        let now = now_ms();
+        let request_preview = preview(masked_body);
+        let tokens = token_previews(manifest);
+        let request_spans = spans_from_manifest(manifest, &request_preview);
+        let pending_full = should_hold && inner.waiters.len() >= inner.max_pending_approvals;
+        let (status, rx, immediate_reject) = if pending_full {
+            (
+                RequestDecision::BackpressureRejected,
+                None,
+                Some(format!(
+                    "pending approval limit reached ({})",
+                    inner.max_pending_approvals
+                )),
+            )
+        } else if should_hold {
             let (tx, rx) = oneshot::channel();
             inner.waiters.insert(id.clone(), tx);
-            (RequestDecision::Pending, Some(rx))
+            (RequestDecision::Pending, Some(rx), None)
         } else {
-            (RequestDecision::AutoAccepted, None)
+            (RequestDecision::AutoAccepted, None, None)
         };
         let record = RequestRecord {
             id: id.clone(),
             conversation_id: conversation_id.unwrap_or_else(|| "unknown".to_string()),
             endpoint: endpoint.to_string(),
             method: method.to_string(),
-            started_ms: now_ms(),
-            updated_ms: now_ms(),
+            started_ms: now,
+            updated_ms: now,
             decision: status,
-            request_preview: preview(masked_body),
+            request_preview,
+            request_spans,
             response_preview: None,
+            response_spans: Vec::new(),
             response_status: None,
-            tokens: token_previews(manifest),
+            tokens,
             tags: Vec::new(),
-            rejection_reason: None,
+            rejection_reason: immediate_reject.clone(),
         };
         push_record(&mut inner.records, record.clone());
         drop(inner);
         self.emit(MonitorEvent::Record(record.clone()));
-        ReviewTicket { id, rx }
+        ReviewTicket {
+            id,
+            rx,
+            immediate_reject,
+        }
     }
 
     pub fn record_response(&self, id: &str, status: StatusCode, body: Option<&[u8]>) {
         self.update_record(id, |r| {
             r.response_status = Some(status.as_u16());
             r.response_preview = body.map(preview);
+            r.response_spans = r
+                .response_preview
+                .as_deref()
+                .map(|p| spans_from_values(&r.tokens, p))
+                .unwrap_or_default();
             if !matches!(
                 r.decision,
-                RequestDecision::Rejected | RequestDecision::TimedOut
+                RequestDecision::Rejected
+                    | RequestDecision::TimedOut
+                    | RequestDecision::BackpressureRejected
             ) {
                 r.decision = RequestDecision::Completed;
             }
@@ -141,6 +180,9 @@ impl Monitor {
 
     async fn wait_for_approval(&self, ticket: ReviewTicket) -> ApprovalDecision {
         let Some(rx) = ticket.rx else {
+            if let Some(reason) = ticket.immediate_reject {
+                return ApprovalDecision::Reject { reason };
+            }
             return ApprovalDecision::Approve;
         };
         match tokio::time::timeout(APPROVAL_TIMEOUT, rx).await {
@@ -222,6 +264,7 @@ impl Monitor {
 pub struct ReviewTicket {
     id: String,
     rx: Option<oneshot::Receiver<ApprovalDecision>>,
+    immediate_reject: Option<String>,
 }
 
 impl ReviewTicket {
@@ -252,6 +295,7 @@ pub enum RequestDecision {
     Pending,
     Approved,
     Rejected,
+    BackpressureRejected,
     TimedOut,
     UpstreamError,
     Completed,
@@ -267,7 +311,9 @@ pub struct RequestRecord {
     pub updated_ms: u128,
     pub decision: RequestDecision,
     pub request_preview: String,
+    pub request_spans: Vec<PreviewSpan>,
     pub response_preview: Option<String>,
+    pub response_spans: Vec<PreviewSpan>,
     pub response_status: Option<u16>,
     pub tokens: Vec<TokenPreview>,
     pub tags: Vec<String>,
@@ -280,11 +326,24 @@ pub struct TokenPreview {
     pub value: String,
     pub entity_kind: String,
     pub surface: String,
+    pub request_start: Option<usize>,
+    pub request_end: Option<usize>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct PreviewSpan {
+    pub start: usize,
+    pub end: usize,
+    pub token: String,
+    pub entity_kind: String,
+    pub surface: String,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct MonitorSnapshot {
     pub mode: MonitorMode,
+    pub pending_count: usize,
+    pub max_pending_approvals: usize,
     pub records: Vec<RequestRecord>,
 }
 
@@ -298,6 +357,8 @@ enum MonitorEvent {
 #[derive(Deserialize)]
 pub struct ModeRequest {
     mode: MonitorMode,
+    #[serde(default)]
+    max_pending_approvals: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -340,7 +401,7 @@ pub async fn set_mode(
     if !st.authed(&hdrs) {
         return forbidden();
     }
-    json_response(&st.monitor.set_mode(req.mode))
+    json_response(&st.monitor.set_mode(req.mode, req.max_pending_approvals))
 }
 
 pub async fn approve(
@@ -497,8 +558,70 @@ fn token_previews(manifest: &UnmaskManifest) -> Vec<TokenPreview> {
             value: e.canonical_form.clone(),
             entity_kind: e.entity_kind.clone(),
             surface: format!("{:?}", e.arrow_origin),
+            request_start: e.exposed_at.as_ref().map(|r| r.start),
+            request_end: e.exposed_at.as_ref().map(|r| r.end),
         })
         .collect()
+}
+
+fn spans_from_manifest(manifest: &UnmaskManifest, preview: &str) -> Vec<PreviewSpan> {
+    let mut spans: Vec<PreviewSpan> = manifest
+        .entries
+        .iter()
+        .filter_map(|e| {
+            let r = e.exposed_at.as_ref()?;
+            if r.start >= r.end || r.end > preview.len() {
+                return None;
+            }
+            Some(PreviewSpan {
+                start: r.start,
+                end: r.end,
+                token: e.token_handle.clone(),
+                entity_kind: e.entity_kind.clone(),
+                surface: format!("{:?}", e.arrow_origin),
+            })
+        })
+        .collect();
+    spans.sort_by_key(|s| (s.start, s.end));
+    spans
+}
+
+fn spans_from_values(tokens: &[TokenPreview], preview: &str) -> Vec<PreviewSpan> {
+    let mut spans = Vec::new();
+    for t in tokens {
+        if t.value.is_empty() {
+            continue;
+        }
+        let mut search_from = 0;
+        while search_from < preview.len() {
+            let Some(rel) = preview[search_from..].find(&t.value) else {
+                break;
+            };
+            let start = search_from + rel;
+            let end = start + t.value.len();
+            spans.push(PreviewSpan {
+                start,
+                end,
+                token: t.token.clone(),
+                entity_kind: t.entity_kind.clone(),
+                surface: t.surface.clone(),
+            });
+            search_from = end;
+        }
+    }
+    spans.sort_by_key(|s| (s.start, s.end));
+    dedupe_overlapping_spans(spans)
+}
+
+fn dedupe_overlapping_spans(spans: Vec<PreviewSpan>) -> Vec<PreviewSpan> {
+    let mut out: Vec<PreviewSpan> = Vec::new();
+    for span in spans {
+        if out.iter().any(|s| span.start < s.end && s.start < span.end) {
+            continue;
+        }
+        out.push(span);
+    }
+    out
 }
 
 fn preview(body: &[u8]) -> String {
@@ -576,6 +699,8 @@ aside{border-right:1px solid #d0d7de;background:#fff;padding:12px}
 .panel .body{padding:12px}
 pre{white-space:pre-wrap;word-break:break-word;margin:0;font:12px ui-monospace,SFMono-Regular,Menlo,monospace}
 .token{display:inline-block;border:1px solid #d0d7de;border-radius:6px;padding:4px 6px;margin:3px;background:#fff8c5;font-size:12px}
+.mark{background:#fff8c5;border-bottom:2px solid #bf8700;border-radius:3px;padding:0 1px}
+.queue{font-size:12px;color:#57606a}
 .spacer{flex:1}
 .empty{padding:24px;color:#57606a}
 </style>
@@ -589,6 +714,7 @@ pre{white-space:pre-wrap;word-break:break-word;margin:0;font:12px ui-monospace,S
     <option value="manual_on_detection">Approve when tokens detected</option>
   </select>
   <button id="saveMode">Set mode</button>
+  <span class="queue" id="queue"></span>
   <span class="spacer"></span>
   <input id="tagInput" placeholder="tag selected request">
   <button id="tagBtn">Tag</button>
@@ -614,7 +740,7 @@ function render(){
   const r=records.find(x=>x.id===selected);
   const d=document.getElementById('detail');
   if(!r){d.innerHTML='<div class="empty">Select a request.</div>';return}
-  d.innerHTML=`<div class="panel"><h2>Decision</h2><div class="body"><strong>${esc(r.decision)}</strong> ${r.response_status||''}<div class="meta">${esc((r.tags||[]).join(', '))}</div>${r.decision==='pending'?`<p><button class="primary" onclick="approve('${r.id}')">Approve</button> <button class="danger" onclick="rejectReq('${r.id}')">Reject</button></p>`:''}</div></div><div class="panel"><h2>Tokens</h2><div class="body">${r.tokens.map(t=>`<span class="token" title="${esc(t.value)}">${esc(t.entity_kind)} ${esc(t.token)}</span>`).join('')||'<span class="meta">No tokens</span>'}</div></div><div class="panel"><h2>Masked Request</h2><div class="body"><pre>${esc(r.request_preview)}</pre></div></div><div class="panel"><h2>Response Preview</h2><div class="body"><pre>${esc(r.response_preview||'')}</pre></div></div>`;
+  d.innerHTML=`<div class="panel"><h2>Decision</h2><div class="body"><strong>${esc(r.decision)}</strong> ${r.response_status||''}<div class="meta">${esc((r.tags||[]).join(', '))}</div>${r.rejection_reason?`<div class="meta">${esc(r.rejection_reason)}</div>`:''}${r.decision==='pending'?`<p><button class="primary" onclick="approve('${r.id}')">Approve</button> <button class="danger" onclick="rejectReq('${r.id}')">Reject</button></p>`:''}</div></div><div class="panel"><h2>Tokens</h2><div class="body">${r.tokens.map(t=>`<span class="token" title="${esc(t.value)}">${esc(t.entity_kind)} ${esc(t.token)}</span>`).join('')||'<span class="meta">No tokens</span>'}</div></div><div class="panel"><h2>Masked Request</h2><div class="body"><pre>${renderPreview(r.request_preview,r.request_spans||[])}</pre></div></div><div class="panel"><h2>Response Preview</h2><div class="body"><pre>${renderPreview(r.response_preview||'',r.response_spans||[])}</pre></div></div>`;
 }
 window.selectReq=id=>{selected=id;render()}
 window.approve=id=>api(`/zlauder/monitor/requests/${id}/approve`,{method:'POST'}).then(load)
@@ -622,11 +748,22 @@ window.rejectReq=id=>api(`/zlauder/monitor/requests/${id}/reject`,{method:'POST'
 document.getElementById('saveMode').onclick=()=>api('/zlauder/monitor/mode',{method:'POST',body:JSON.stringify({mode:document.getElementById('mode').value})}).then(load)
 document.getElementById('tagBtn').onclick=()=>{if(!selected)return;api(`/zlauder/monitor/requests/${selected}/tags`,{method:'POST',body:JSON.stringify({tags:[document.getElementById('tagInput').value].filter(Boolean)})}).then(load)}
 document.getElementById('maskBtn').onclick=()=>{const s=getSelection().toString().trim();if(s)api('/zlauder/monitor/custom-mask',{method:'POST',body:JSON.stringify({pattern:s})}).then(load)}
-function load(){api('/zlauder/monitor/snapshot').then(r=>r.json()).then(s=>{records=s.records;document.getElementById('mode').value=s.mode;render()})}
+function load(){api('/zlauder/monitor/snapshot').then(r=>r.json()).then(s=>{records=s.records;document.getElementById('mode').value=s.mode;document.getElementById('queue').textContent=`pending ${s.pending_count}/${s.max_pending_approvals}`;render()})}
 function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function renderPreview(text,spans){
+  text=String(text||''); spans=[...(spans||[])].sort((a,b)=>a.start-b.start);
+  let out='', cursor=0;
+  for(const s of spans){
+    if(s.start<cursor||s.end>text.length||s.start>=s.end)continue;
+    out+=esc(text.slice(cursor,s.start));
+    out+=`<span class="mark" title="${esc(s.entity_kind)} ${esc(s.token)}">${esc(text.slice(s.start,s.end))}</span>`;
+    cursor=s.end;
+  }
+  return out+esc(text.slice(cursor));
+}
 load();
 const es=new EventSource(`/zlauder/monitor/events?key=${encodeURIComponent(key)}`);
-es.onmessage=e=>{const ev=JSON.parse(e.data); if(ev.event==='snapshot'){records=ev.data.records;document.getElementById('mode').value=ev.data.mode}else if(ev.event==='record'){records=[ev.data,...records.filter(r=>r.id!==ev.data.id)]} render()}
+es.onmessage=e=>{const ev=JSON.parse(e.data); if(ev.event==='snapshot'){records=ev.data.records;document.getElementById('mode').value=ev.data.mode;document.getElementById('queue').textContent=`pending ${ev.data.pending_count}/${ev.data.max_pending_approvals}`}else if(ev.event==='record'){records=[ev.data,...records.filter(r=>r.id!==ev.data.id)]} render()}
 </script>
 </body>
 </html>"#;
