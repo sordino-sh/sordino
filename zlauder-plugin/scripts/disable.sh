@@ -14,7 +14,7 @@ if ! command -v jq >/dev/null 2>&1; then
 fi
 
 if [[ ! -f "$settings" ]]; then
-  echo "zlauder already disabled: no $settings"
+  echo "ZlauDeR already disabled: no $settings"
   exit 0
 fi
 
@@ -25,7 +25,7 @@ if ! jq -e '
   ((.env? // {}) | (has("ANTHROPIC_BASE_URL") or has("ZLAUDER_PORT")))
   or (((.statusLine?.command) // "") | test("zlauder-hooks statusline"))
 ' "$settings" >/dev/null 2>&1; then
-  echo "zlauder already disabled: no zlauder wiring in $settings"
+  echo "ZlauDeR already disabled: no ZlauDeR wiring in $settings"
   exit 0
 fi
 
@@ -42,5 +42,5 @@ jq '
 mv -f "$tmp" "$settings"
 trap - EXIT
 
-echo "Removed the zlauder routing env (and status line, if it was ours) from $settings."
-echo "zlauder is now disabled. Restart Claude Code for this to take effect."
+echo "Removed the ZlauDeR routing env (and status line, if it was ours) from $settings."
+echo "ZlauDeR is now disabled. Restart Claude Code for this to take effect."

@@ -46,7 +46,7 @@ config_path() {
 # to PATH so the bare `zlauder-hooks` calls below and session-start's default
 # --proxy-bin "zlauder-proxy" both resolve.
 if ! zlauder_resolve_bins; then
-  warn "zlauder: proxy not started this session."
+  warn "ZlauDeR: proxy not started this session."
   exit 1
 fi
 
@@ -67,7 +67,7 @@ rc=$?
 set -e
 
 if [ "$rc" -ne 0 ]; then
-  warn "zlauder: zlauder-hooks session-start exited $rc."
+  warn "ZlauDeR: zlauder-hooks session-start exited $rc."
   exit "$rc"
 fi
 

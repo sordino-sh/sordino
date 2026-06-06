@@ -1,5 +1,5 @@
 ---
-description: View or change zlauder PII-masking privacy settings for this project
+description: View or change ZlauDeR PII-masking privacy settings for this project
 argument-hint: "[status | on | off | profile <name> | category <name> on|off | threshold <0-1>] [--scope session|project|user|local]"
 allowed-tools: Bash(zlauder-hooks config:*)
 ---
@@ -8,7 +8,7 @@ Privacy control output:
 
 !`zlauder-hooks config $ARGUMENTS`
 
-The block above is the result of the zlauder privacy CLI for the request
+The block above is the result of the ZlauDeR privacy CLI for the request
 "$ARGUMENTS" (empty means "show current status"). Settings apply only to **this
 project's** proxy — other projects/sessions are unaffected.
 

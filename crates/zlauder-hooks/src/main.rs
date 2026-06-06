@@ -217,7 +217,7 @@ fn session_start(port: Option<u16>, config: Option<PathBuf>, proxy_bin: String) 
         // that never enabled zlauder stays a silent no-op.
         if project_configures(&root, &base_url) {
             eprintln!(
-                "zlauder: this project is configured for masking but ANTHROPIC_BASE_URL is \
+                "ZlauDeR: this project is configured for masking but ANTHROPIC_BASE_URL is \
                  not {base_url} yet — RESTART Claude Code to route through the proxy. \
                  Traffic is currently NOT masked."
             );
@@ -227,7 +227,7 @@ fn session_start(port: Option<u16>, config: Option<PathBuf>, proxy_bin: String) 
                     "hookSpecificOutput": {
                         "hookEventName": "SessionStart",
                         "additionalContext":
-                            "zlauder is configured for this project but masking is NOT active \
+                            "ZlauDeR is configured for this project but masking is NOT active \
                              this session: Claude Code must be restarted to route through the \
                              proxy. Until then, outbound text reaches the model unmasked."
                     }
@@ -254,7 +254,7 @@ fn session_start(port: Option<u16>, config: Option<PathBuf>, proxy_bin: String) 
             // Another project's proxy holds our port — never touch it; warn.
             Some(st) if !st.project_root.is_empty() && st.project_root != root => {
                 eprintln!(
-                    "zlauder: WARNING — port {port} is serving a different project ({}). \
+                    "ZlauDeR: WARNING — port {port} is serving a different project ({}). \
                      Your traffic would be masked under that project. Run `/zlauder:disable` \
                      then `/zlauder:enable` in this project to get a fresh, isolated port.",
                     st.project_root
@@ -272,7 +272,7 @@ fn session_start(port: Option<u16>, config: Option<PathBuf>, proxy_bin: String) 
                     && running != ours
                 {
                     eprintln!(
-                        "zlauder: proxy on :{port} is build '{running}', current is '{ours}' \
+                        "ZlauDeR: proxy on :{port} is build '{running}', current is '{ours}' \
                          — restarting to apply the update."
                     );
                     stop_proxy(port, st.as_ref().map(|s| s.pid).unwrap_or(0));
@@ -340,7 +340,7 @@ fn session_start(port: Option<u16>, config: Option<PathBuf>, proxy_bin: String) 
         "hookSpecificOutput": {
             "hookEventName": "SessionStart",
             "additionalContext":
-                "zlauder PII masking proxy active for this project. Outbound text is masked \
+                "ZlauDeR PII masking proxy active for this project. Outbound text is masked \
                  before it reaches the model; responses are unmasked on return. Tokens look \
                  like [EMAIL_ADDRESS_xxxx]. Configure with the /zlauder:privacy command."
         },
@@ -377,7 +377,7 @@ fn statusline(port: Option<u16>) -> Result<()> {
     let port = port.unwrap_or_else(|| pick_port(&root));
 
     if !proxy_healthy(port) {
-        println!("\u{26a0} zlauder off");
+        println!("\u{26a0} ZlauDeR off");
         return Ok(());
     }
     // Try the (key-gated) config endpoint for a richer indicator. We only show the
@@ -388,15 +388,15 @@ fn statusline(port: Option<u16>) -> Result<()> {
         Ok(snap) => match serde_json::from_value::<Snapshot>(snap) {
             Ok(s) if s.enabled => {
                 println!(
-                    "\u{1f6e1} zlauder :{port} {}{}",
+                    "\u{1f6e1} ZlauDeR :{port} {}{}",
                     s.config.profile,
                     ml_indicator(s.ml.as_ref())
                 )
             }
-            Ok(_) => println!("\u{26a0} zlauder OFF :{port}"),
-            Err(_) => println!("\u{2754} zlauder :{port} (unverified)"),
+            Ok(_) => println!("\u{26a0} ZlauDeR OFF :{port}"),
+            Err(_) => println!("\u{2754} ZlauDeR :{port} (unverified)"),
         },
-        Err(_) => println!("\u{2754} zlauder :{port} (unverified)"),
+        Err(_) => println!("\u{2754} ZlauDeR :{port} (unverified)"),
     }
     Ok(())
 }
@@ -969,7 +969,7 @@ fn print_applied(snap: &Value, port: u16, scope: &str) -> Result<()> {
 fn print_snapshot(s: &Snapshot, port: u16) {
     let state = if s.enabled { "ON " } else { "OFF" };
     println!(
-        "zlauder privacy — {state}   (profile: {}, port {port})",
+        "ZlauDeR privacy — {state}   (profile: {}, port {port})",
         s.config.profile
     );
     if !s.project_root.is_empty() {
@@ -1127,7 +1127,7 @@ fn stop_proxy(port: u16, pid: u32) {
         std::thread::sleep(Duration::from_millis(50));
     }
     eprintln!(
-        "zlauder: WARNING — proxy on :{port} (pid {pid}) did not exit; the new one may fail to bind."
+        "ZlauDeR: WARNING — proxy on :{port} (pid {pid}) did not exit; the new one may fail to bind."
     );
 }
 

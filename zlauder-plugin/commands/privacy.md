@@ -1,5 +1,5 @@
 ---
-description: View or change zlauder PII-masking for this project — status, on/off, profile, category, threshold, ML model, and token reveal
+description: View or change ZlauDeR PII-masking for this project — status, on/off, profile, category, threshold, ML model, and token reveal
 argument-hint: "[status | on | off | profile <name> | category <name> on|off | threshold <0-1> | model <download|on|off|status> | reveal <token>] [--scope session|project|user|local]"
 allowed-tools: Bash(bash:*)
 ---
@@ -8,7 +8,7 @@ Privacy control output:
 
 !`bash "${CLAUDE_PLUGIN_ROOT}/scripts/privacy.sh" "$ARGUMENTS"`
 
-The block above is the result of the unified zlauder privacy control plane for the
+The block above is the result of the unified ZlauDeR privacy control plane for the
 request "$ARGUMENTS" (empty means "show status"). Everything here affects **only
 this project's** proxy — other projects/sessions are unaffected.
 
@@ -22,7 +22,7 @@ config.
 Report the result concisely:
 
 - For `status` (or no args): say whether the proxy is **up** (the `🛡` shield line
-  means up; `⚠ zlauder off` means down), whether this project is **routed** through
+  means up; `⚠ ZlauDeR off` means down), whether this project is **routed** through
   it (`ANTHROPIC_BASE_URL` = `http://127.0.0.1:<port>` vs `(unset)`/the Anthropic
   API), and the masking state (ON/OFF, profile, enabled categories). If the proxy is
   up but not routed, tell the user to run `/zlauder:enable` and **restart**.

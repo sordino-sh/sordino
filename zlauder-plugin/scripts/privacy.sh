@@ -15,7 +15,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 zlauder_resolve_bins --no-build || true
 
 if ! command -v zlauder-hooks >/dev/null 2>&1; then
-  echo "error: zlauder-hooks is not available for this project yet (the proxy is built and launched on session start). Start a Claude Code session in this project — or put the binaries on PATH — then retry." >&2
+  echo "error: zlauder-hooks is not available for this project yet (the ZlauDeR proxy is built and launched on session start). Start a Claude Code session in this project — or put the binaries on PATH — then retry." >&2
   exit 1
 fi
 

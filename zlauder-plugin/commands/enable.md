@@ -1,5 +1,5 @@
 ---
-description: Set up + route this project's Claude Code through the zlauder masking proxy (patches .claude/settings.json, seeds zlauder.toml; requires restart)
+description: Set up + route this project's Claude Code through the ZlauDeR masking proxy (patches .claude/settings.json, seeds zlauder.toml; requires restart)
 allowed-tools: Bash(bash:*)
 ---
 

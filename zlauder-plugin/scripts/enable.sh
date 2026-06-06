@@ -46,7 +46,7 @@ elif [ "$bins_ok" -eq 1 ]; then
 fi
 
 if [ -z "$port" ]; then
-  echo "error: could not resolve the zlauder proxy port. Ensure the zlauder binaries are available (on PATH, shipped in the plugin's bin/, or buildable from the cargo workspace), or set \$ZLAUDER_PORT explicitly, then re-run /zlauder:enable." >&2
+  echo "error: could not resolve the ZlauDeR proxy port. Ensure the zlauder binaries are available (on PATH, shipped in the plugin's bin/, or buildable from the cargo workspace), or set \$ZLAUDER_PORT explicitly, then re-run /zlauder:enable." >&2
   exit 1
 fi
 
@@ -95,7 +95,7 @@ jq --arg url "$base_url" --arg port "$port" --arg sl "$statusline_cmd" '
 mv -f "$tmp" "$settings_file"
 trap - EXIT
 
-echo "zlauder: set ANTHROPIC_BASE_URL=${base_url} and ZLAUDER_PORT=${port} in ${settings_file}"
+echo "ZlauDeR: set ANTHROPIC_BASE_URL=${base_url} and ZLAUDER_PORT=${port} in ${settings_file}"
 
 # Seed a starter zlauder.toml (commented, tunable) if the project has none. Copy the
 # bundled template; never clobber a config the user has tuned. Persistent settings are
@@ -104,12 +104,12 @@ proj_cfg="${project_dir}/zlauder.toml"
 tmpl="${CLAUDE_PLUGIN_ROOT:-}/zlauder.toml"
 if [ ! -f "$proj_cfg" ] && [ -n "${CLAUDE_PLUGIN_ROOT:-}" ] && [ -f "$tmpl" ]; then
   if cp "$tmpl" "$proj_cfg" 2>/dev/null; then
-    echo "zlauder: seeded ${proj_cfg} from the bundled template."
+    echo "ZlauDeR: seeded ${proj_cfg} from the bundled template."
   fi
 fi
 
 if [[ "$current" == "$base_url" && "$current_port" == "$port" ]]; then
-  echo "zlauder: already pointed at the proxy; nothing changed."
+  echo "ZlauDeR: already pointed at the proxy; nothing changed."
   exit 0
 fi
 

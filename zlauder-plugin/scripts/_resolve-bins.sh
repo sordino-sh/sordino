@@ -93,29 +93,29 @@ zlauder__build_bins() {
   local data_dir="${CLAUDE_PLUGIN_DATA:-}"
   local workspace; workspace="$(zlauder__workspace)"
   if [ -z "$workspace" ] || [ ! -f "$workspace/Cargo.toml" ]; then
-    zlauder__warn "zlauder: no prebuilt binary for this platform and no cargo workspace at \"${workspace:-<unset>}\"."
-    zlauder__warn "zlauder: install a release onto PATH, or set \$ZLAUDER_WORKSPACE to a zlauder checkout."
+    zlauder__warn "ZlauDeR: no prebuilt binary for this platform and no cargo workspace at \"${workspace:-<unset>}\"."
+    zlauder__warn "ZlauDeR: install a release onto PATH, or set \$ZLAUDER_WORKSPACE to a zlauder checkout."
     return 1
   fi
   if ! command -v cargo >/dev/null 2>&1; then
-    zlauder__warn "zlauder: no prebuilt binary for this platform and cargo not found; cannot build. Install a release onto PATH."
+    zlauder__warn "ZlauDeR: no prebuilt binary for this platform and cargo not found; cannot build. Install a release onto PATH."
     return 1
   fi
   if [ -z "$data_dir" ]; then
-    zlauder__warn "zlauder: CLAUDE_PLUGIN_DATA is unset; cannot cache a build."
+    zlauder__warn "ZlauDeR: CLAUDE_PLUGIN_DATA is unset; cannot cache a build."
     return 1
   fi
 
-  zlauder__warn "zlauder: building proxy/hooks from $workspace (first run; fetches pinned git deps, cached afterward)…"
+  zlauder__warn "ZlauDeR: building proxy/hooks from $workspace (first run; fetches pinned git deps, cached afterward)…"
   # cargo's own output goes to stderr to keep stdout clean for any hook JSON.
   if ! ( cd "$workspace" && cargo build --release --bin zlauder-proxy --bin zlauder-hooks ) >&2; then
-    zlauder__warn "zlauder: cargo build failed."
+    zlauder__warn "ZlauDeR: cargo build failed."
     return 1
   fi
 
   local rel="$workspace/target/release"
   if [ ! -x "$rel/zlauder-proxy" ] || [ ! -x "$rel/zlauder-hooks" ]; then
-    zlauder__warn "zlauder: build reported success but binaries are missing under $rel."
+    zlauder__warn "ZlauDeR: build reported success but binaries are missing under $rel."
     return 1
   fi
   mkdir -p "$data_dir/bin"

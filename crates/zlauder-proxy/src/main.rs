@@ -163,7 +163,7 @@ async fn download_model(mut ml: MlConfig, model_override: Option<String>) -> any
         ml.model = m;
     }
     println!(
-        "zlauder: downloading ML model '{}' for CPU inference. The first run can be \
+        "ZlauDeR: downloading ML model '{}' for CPU inference. The first run can be \
          large and slow; it caches under the HuggingFace cache (HF_HOME / \
          ~/.cache/huggingface).",
         ml.model
@@ -175,7 +175,7 @@ async fn download_model(mut ml: MlConfig, model_override: Option<String>) -> any
     match res {
         Ok(()) => {
             println!(
-                "zlauder: model '{model}' downloaded and cached. Enable it with \
+                "ZlauDeR: model '{model}' downloaded and cached. Enable it with \
                  `/zlauder:privacy model on`."
             );
             Ok(())
