@@ -119,7 +119,7 @@ dependencies = [
 [[package]]
 name = "anthropic-wire"
 version = "0.1.0"
-source = "git+https://github.com/FailSpy/llm-wires.git?branch=main#6c0b5dc5d28bb8f0287a216a769ffeeef09e1ab4"
+source = "git+https://github.com/FailSpy/llm-wires.git?branch=main#9290f0e223211c2b734cec5e08edcdb6ea0dc502"
 dependencies = [
  "bon",
  "http",
@@ -1852,7 +1852,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 [[package]]
 name = "openai-wire"
 version = "0.1.0"
-source = "git+https://github.com/FailSpy/llm-wires.git?branch=main#6c0b5dc5d28bb8f0287a216a769ffeeef09e1ab4"
+source = "git+https://github.com/FailSpy/llm-wires.git?branch=main#9290f0e223211c2b734cec5e08edcdb6ea0dc502"
 dependencies = [
  "bon",
  "http",
@@ -2662,7 +2662,7 @@ dependencies = [
 [[package]]
 name = "sse-core"
 version = "0.1.0"
-source = "git+https://github.com/FailSpy/llm-wires.git?branch=main#6c0b5dc5d28bb8f0287a216a769ffeeef09e1ab4"
+source = "git+https://github.com/FailSpy/llm-wires.git?branch=main#9290f0e223211c2b734cec5e08edcdb6ea0dc502"
 dependencies = [
  "bytes",
  "futures-core",
