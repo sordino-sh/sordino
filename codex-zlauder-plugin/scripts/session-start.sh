@@ -54,5 +54,5 @@ if [ "$rc" -ne 0 ]; then
   exit 0
 fi
 
-printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"ZlauDeR OpenAI proxy is listening for this project at %s. Route trusted Codex config with openai_base_url = \"%s\" to mask Chat Completions traffic. The Responses API is currently passthrough."},"env":{"OPENAI_BASE_URL":"%s","ZLAUDER_PORT":"%s"}}\n' \
+printf '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"ZlauDeR OpenAI proxy is listening for this project at %s. Route trusted Codex config with openai_base_url = \"%s\" to mask Chat Completions and Responses create traffic."},"env":{"OPENAI_BASE_URL":"%s","ZLAUDER_PORT":"%s"}}\n' \
   "$BASE_URL" "$OPENAI_BASE_URL" "$OPENAI_BASE_URL" "$PORT"

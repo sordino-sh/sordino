@@ -13,6 +13,5 @@ description: Use when working in a Codex project that routes OpenAI traffic thro
 openai_base_url = "http://127.0.0.1:<port>/v1"
 ```
 
-- Chat Completions traffic is masked on requests and unmasked on responses.
-- Responses API traffic is intentionally passthrough until typed
-  `openai-wire` Responses primitives are available.
+- Chat Completions and Responses create traffic are masked on requests and
+  unmasked on responses, including SSE streams.

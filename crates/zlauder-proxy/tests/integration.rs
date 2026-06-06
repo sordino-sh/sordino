@@ -130,7 +130,69 @@ async fn fake_responses_upstream(
     let s = String::from_utf8_lossy(&body).to_string();
     *cap.body.lock().unwrap() = s.clone();
     cap.bodies.lock().unwrap().push(s.clone());
-    Json(serde_json::from_str(&s).unwrap())
+    let tok = token_regex()
+        .find(&s)
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_default();
+    Json(serde_json::json!({
+        "id": "resp_test",
+        "object": "response",
+        "model": "gpt-test",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": format!("ack {tok}")}]
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "send",
+                "arguments": format!("{{\"email\":\"{tok}\"}}")
+            }
+        ],
+        "output_text": format!("ack {tok}")
+    }))
+}
+
+async fn fake_responses_stream_upstream(
+    State(cap): State<Captured>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let s = String::from_utf8_lossy(&body).to_string();
+    *cap.body.lock().unwrap() = s.clone();
+    cap.bodies.lock().unwrap().push(s.clone());
+    let tok = token_regex()
+        .find(&s)
+        .map(|m| m.as_str().to_string())
+        .unwrap_or_default();
+    let split = tok.len() / 2;
+    let (a, b) = tok.split_at(split);
+    let data1 = serde_json::json!({
+        "type": "response.output_text.delta",
+        "sequence_number": 1,
+        "item_id": "msg_1",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": format!("ack {a}")
+    });
+    let data2 = serde_json::json!({
+        "type": "response.output_text.delta",
+        "sequence_number": 2,
+        "item_id": "msg_1",
+        "output_index": 0,
+        "content_index": 0,
+        "delta": format!("{b} done")
+    });
+    let data3 = serde_json::json!({
+        "type": "response.completed",
+        "sequence_number": 3,
+        "response": {"id": "resp_stream", "object": "response", "model": "gpt-test", "output": []}
+    });
+    let body = format!(
+        "event: response.output_text.delta\ndata: {data1}\n\nevent: response.output_text.delta\ndata: {data2}\n\nevent: response.completed\ndata: {data3}\n\n"
+    );
+    (StatusCode::OK, [(CONTENT_TYPE, "text/event-stream")], body)
 }
 
 async fn spawn(router: Router) -> SocketAddr {
@@ -296,7 +358,7 @@ async fn openai_chat_completions_streaming_unmasks_and_preserves_done() {
 }
 
 #[tokio::test]
-async fn openai_responses_routes_through_passthrough_boundary() {
+async fn openai_responses_mask_unmask_json_response() {
     let cap = Captured::default();
     let upstream = Router::new()
         .route("/v1/responses", post(fake_responses_upstream))
@@ -307,27 +369,83 @@ async fn openai_responses_routes_through_passthrough_boundary() {
     let state = mk_state(engine, format!("http://{up_addr}"), "test-key");
     let proxy_addr = spawn(proxy_router(state)).await;
 
-    let body = serde_json::json!({
-        "model": "gpt-test",
-        "input": "leave response@example.com unchanged for now"
-    });
     let client = reqwest::Client::new();
-    let out: serde_json::Value = client
+    let out = client
         .post(format!("http://{proxy_addr}/v1/responses"))
-        .json(&body)
+        .json(&serde_json::json!({
+            "model": "gpt-test",
+            "input": "protect response@example.com now"
+        }))
         .send()
         .await
         .unwrap()
-        .json()
+        .text()
         .await
         .unwrap();
 
     let up_body = cap.body.lock().unwrap().clone();
     assert!(
-        up_body.contains("response@example.com"),
-        "Responses should currently pass through unchanged: {up_body}"
+        !up_body.contains("response@example.com"),
+        "plaintext leaked upstream: {up_body}"
     );
-    assert_eq!(out, body);
+    assert!(up_body.contains("[EMAIL_ADDRESS_"));
+    assert!(out.contains("response@example.com"), "not unmasked: {out}");
+    assert!(
+        !out.contains("[EMAIL_ADDRESS_"),
+        "token leaked to client: {out}"
+    );
+    assert!(
+        out.contains("{\\\"email\\\":\\\"response@example.com\\\"}"),
+        "function call arguments were not unmasked: {out}"
+    );
+}
+
+#[tokio::test]
+async fn openai_responses_streaming_unmasks_and_preserves_sse_events() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/responses", post(fake_responses_stream_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, format!("http://{up_addr}"), "test-key");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let client = reqwest::Client::new();
+    let text = client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&serde_json::json!({
+            "model": "gpt-test",
+            "stream": true,
+            "input": "stream to response-stream@example.com"
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    let up_body = cap.body.lock().unwrap().clone();
+    assert!(!up_body.contains("response-stream@example.com"));
+    assert!(up_body.contains("[EMAIL_ADDRESS_"));
+    assert!(
+        text.contains("response-stream@example.com"),
+        "not unmasked: {text}"
+    );
+    assert!(
+        text.contains("event: response.output_text.delta"),
+        "event framing not preserved: {text}"
+    );
+    assert!(
+        text.contains("event: response.completed"),
+        "completed event missing: {text}"
+    );
+    assert!(
+        !text.contains("[EMAIL_ADDRESS_"),
+        "token leaked to client: {text}"
+    );
 }
 
 // Deterministic placeholders within a session: the SAME request masked twice
