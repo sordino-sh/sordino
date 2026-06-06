@@ -12,8 +12,8 @@ name = "zlauder-hooks"
 path = "src/main.rs"
 
 [dependencies]
-zlauder-state  = { path = "../zlauder-state",  version = "0.5.0" }
-zlauder-engine = { path = "../zlauder-engine", version = "0.5.0" }
+zlauder-state  = { path = "../zlauder-state",  version = "0.5.1" }
+zlauder-engine = { path = "../zlauder-engine", version = "0.5.1" }
 
 clap       = { workspace = true }
 serde      = { workspace = true }
