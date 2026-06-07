@@ -74,6 +74,11 @@ cargo build --release --workspace
 
 Requires Rust ≥ 1.91 (the `anthropic-wire` dependency is edition 2024).
 
+## License
+
+ZlauDeR is licensed under the Business Source License 1.1
+(`BUSL-1.1`). See [LICENSE](LICENSE).
+
 ## Install into Claude Code
 
 zlauder installs as a **Claude Code plugin** — that is the only supported
