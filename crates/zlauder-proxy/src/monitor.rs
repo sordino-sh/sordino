@@ -697,7 +697,15 @@ aside{border-right:1px solid #d0d7de;background:#fff;padding:12px}
 .panel{background:#fff;border:1px solid #d0d7de;border-radius:8px;margin-bottom:12px}
 .panel h2{font-size:13px;margin:0;padding:10px 12px;border-bottom:1px solid #d8dee4}
 .panel .body{padding:12px}
+details.panel summary{font-size:13px;font-weight:650;padding:10px 12px;cursor:pointer;border-bottom:1px solid #d8dee4;list-style:none}
+details.panel summary::-webkit-details-marker{display:none}
+details.panel summary:before{content:'>';display:inline-block;width:16px;color:#57606a}
+details.panel[open] summary:before{content:'v'}
 pre{white-space:pre-wrap;word-break:break-word;margin:0;font:12px ui-monospace,SFMono-Regular,Menlo,monospace}
+.content-block{border-top:1px solid #d8dee4;padding-top:10px;margin-top:10px}
+.content-block:first-child{border-top:0;padding-top:0;margin-top:0}
+.kv{display:grid;grid-template-columns:130px 1fr;gap:6px 12px;font-size:12px}
+.kv code{font:12px ui-monospace,SFMono-Regular,Menlo,monospace}
 .token{display:inline-block;border:1px solid #d0d7de;border-radius:6px;padding:4px 6px;margin:3px;background:#fff8c5;font-size:12px}
 .mark{background:#fff8c5;border-bottom:2px solid #bf8700;border-radius:3px;padding:0 1px}
 .queue{font-size:12px;color:#57606a}
@@ -740,7 +748,7 @@ function render(){
   const r=records.find(x=>x.id===selected);
   const d=document.getElementById('detail');
   if(!r){d.innerHTML='<div class="empty">Select a request.</div>';return}
-  d.innerHTML=`<div class="panel"><h2>Decision</h2><div class="body"><strong>${esc(r.decision)}</strong> ${r.response_status||''}<div class="meta">${esc((r.tags||[]).join(', '))}</div>${r.rejection_reason?`<div class="meta">${esc(r.rejection_reason)}</div>`:''}${r.decision==='pending'?`<p><button class="primary" onclick="approve('${r.id}')">Approve</button> <button class="danger" onclick="rejectReq('${r.id}')">Reject</button></p>`:''}</div></div><div class="panel"><h2>Tokens</h2><div class="body">${r.tokens.map(t=>`<span class="token" title="${esc(t.value)}">${esc(t.entity_kind)} ${esc(t.token)}</span>`).join('')||'<span class="meta">No tokens</span>'}</div></div><div class="panel"><h2>Masked Request</h2><div class="body"><pre>${renderPreview(r.request_preview,r.request_spans||[])}</pre></div></div><div class="panel"><h2>Response Preview</h2><div class="body"><pre>${renderPreview(r.response_preview||'',r.response_spans||[])}</pre></div></div>`;
+  d.innerHTML=`<div class="panel"><h2>Decision</h2><div class="body"><strong>${esc(r.decision)}</strong> ${r.response_status||''}<div class="meta">${esc((r.tags||[]).join(', '))}</div>${r.rejection_reason?`<div class="meta">${esc(r.rejection_reason)}</div>`:''}${r.decision==='pending'?`<p><button class="primary" onclick="approve('${r.id}')">Approve</button> <button class="danger" onclick="rejectReq('${r.id}')">Reject</button></p>`:''}</div></div><div class="panel"><h2>Tokens</h2><div class="body">${r.tokens.map(t=>`<span class="token" title="${esc(t.value)}">${esc(t.entity_kind)} ${esc(t.token)}</span>`).join('')||'<span class="meta">No tokens</span>'}</div></div>${renderRequestSections(r)}${section('Response Preview',`<pre>${renderPreview(r.response_preview||'',r.response_spans||[])}</pre>`,false)}`;
 }
 window.selectReq=id=>{selected=id;render()}
 window.approve=id=>api(`/zlauder/monitor/requests/${id}/approve`,{method:'POST'}).then(load)
@@ -750,6 +758,88 @@ document.getElementById('tagBtn').onclick=()=>{if(!selected)return;api(`/zlauder
 document.getElementById('maskBtn').onclick=()=>{const s=getSelection().toString().trim();if(s)api('/zlauder/monitor/custom-mask',{method:'POST',body:JSON.stringify({pattern:s})}).then(load)}
 function load(){api('/zlauder/monitor/snapshot').then(r=>r.json()).then(s=>{records=s.records;document.getElementById('mode').value=s.mode;document.getElementById('queue').textContent=`pending ${s.pending_count}/${s.max_pending_approvals}`;render()})}
 function esc(s){return String(s||'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+function section(title,body,open=true){return `<details class="panel" ${open?'open':''}><summary>${esc(title)}</summary><div class="body">${body}</div></details>`}
+function renderRequestSections(r){
+  const full=String(r.request_preview||'');
+  const parsed=parseJsonPreview(full);
+  const content=parsed?messageBlocks(parsed):[];
+  const contentHtml=content.length?content.map(b=>`<div class="content-block"><div class="meta">${esc(b.label)}</div><pre>${renderTokenMatches(b.text,r.tokens||[])}</pre></div>`).join(''):'<span class="meta">No recognized message text surfaces.</span>';
+  const metaHtml=parsed?renderMetadata(parsed):'<span class="meta">Request preview is not complete JSON.</span>';
+  return section('Message Content',contentHtml,true)+section('Request Metadata',metaHtml,false)+section('Full Masked Request',`<pre>${renderPreview(full,r.request_spans||[])}</pre>`,false);
+}
+function parseJsonPreview(text){
+  try{return JSON.parse(text)}catch(_){return null}
+}
+function messageBlocks(root){
+  const out=[];
+  const add=(label,v)=>{for(const text of textValues(v)){if(text.trim())out.push({label,text})}};
+  if(root.system!==undefined)add('system',root.system);
+  if(root.instructions!==undefined)add('instructions',root.instructions);
+  if(Array.isArray(root.messages)){
+    root.messages.forEach((m,i)=>add(`messages[${i}]${m&&m.role?` - ${m.role}`:''}`,hasOwn(m,'content')?m.content:m));
+  }
+  if(root.input!==undefined){
+    if(Array.isArray(root.input))root.input.forEach((m,i)=>add(`input[${i}]${m&&m.role?` - ${m.role}`:''}`,hasOwn(m,'content')?m.content:m));
+    else add('input',root.input);
+  }
+  return out;
+}
+function hasOwn(v,k){return !!v&&typeof v==='object'&&Object.prototype.hasOwnProperty.call(v,k)}
+function textValues(v){
+  if(typeof v==='string')return [v];
+  if(Array.isArray(v))return v.flatMap((x,i)=>{
+    if(typeof x==='string')return [x];
+    if(x&&typeof x==='object'){
+      if(typeof x.text==='string')return [x.text];
+      if(typeof x.input_text==='string')return [x.input_text];
+      if(typeof x.output_text==='string')return [x.output_text];
+      if(typeof x.content==='string'||Array.isArray(x.content))return textValues(x.content);
+    }
+    return [];
+  });
+  if(v&&typeof v==='object'){
+    if(typeof v.text==='string')return [v.text];
+    if(typeof v.input_text==='string')return [v.input_text];
+    if(typeof v.output_text==='string')return [v.output_text];
+    if(typeof v.content==='string'||Array.isArray(v.content))return textValues(v.content);
+  }
+  return [];
+}
+function renderMetadata(root){
+  const rows=[];
+  for(const [k,v] of Object.entries(root)){
+    if(k==='messages'||k==='input'||k==='system'||k==='instructions')continue;
+    if(k==='tools'||k==='tool_choice'||k==='response_format')rows.push([k,summary(v)]);
+    else if(typeof v!=='object'||v===null)rows.push([k,String(v)]);
+  }
+  return rows.length?`<div class="kv">${rows.map(([k,v])=>`<strong>${esc(k)}</strong><code>${esc(v)}</code>`).join('')}</div>`:'<span class="meta">No envelope metadata outside message surfaces.</span>';
+}
+function summary(v){
+  if(Array.isArray(v))return `${v.length} item(s)`;
+  if(v&&typeof v==='object')return Object.keys(v).join(', ')||'{}';
+  return String(v);
+}
+function renderTokenMatches(text,tokens){
+  text=String(text||'');
+  const spans=[];
+  for(const t of tokens){
+    const needle=String(t.token||'');
+    if(!needle)continue;
+    let from=0;
+    while(from<text.length){
+      const at=text.indexOf(needle,from);
+      if(at<0)break;
+      spans.push({start:at,end:at+needle.length,token:t.token,entity_kind:t.entity_kind});
+      from=at+needle.length;
+    }
+  }
+  return renderPreview(text,dedupeSpans(spans.sort((a,b)=>a.start-b.start)));
+}
+function dedupeSpans(spans){
+  const out=[];
+  for(const s of spans){if(!out.some(o=>s.start<o.end&&o.start<s.end))out.push(s)}
+  return out;
+}
 function renderPreview(text,spans){
   text=String(text||''); spans=[...(spans||[])].sort((a,b)=>a.start-b.start);
   let out='', cursor=0;
