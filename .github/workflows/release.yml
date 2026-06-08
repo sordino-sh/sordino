@@ -35,8 +35,25 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Gate the whole release: a v0.6.1-style stale lock (a branch-tracked git dep
+  # frozen behind its upstream branch) must never reach the build matrix. Runs
+  # first and cheap; if a pin is behind, the tag fails here before any binary is
+  # built. A deliberate freeze must be expressed as `rev =` (which this skips).
+  deps-fresh:
+    name: deps freshness gate
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.tag || github.ref_name }}
+      - name: Fail if a branch-tracked git dep is behind upstream
+        env:
+          DEPS_TOKEN: ${{ secrets.DEPS_TOKEN }}
+        run: bash scripts/check-deps-fresh.sh --strict
+
   test:
     name: test
+    needs: deps-fresh
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4

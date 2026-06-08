@@ -38,6 +38,14 @@ jobs:
         run: cargo build --workspace --locked
       - name: Test workspace
         run: cargo test --workspace --locked
+      # Non-blocking drift signal: surfaces when a branch-tracked git dep's lock
+      # has fallen behind its upstream branch, so it is seen on PRs/main long
+      # before a tag turns it into a release gate (release.yml runs this --strict).
+      - name: Deps freshness (warn only)
+        if: always()
+        env:
+          DEPS_TOKEN: ${{ secrets.DEPS_TOKEN }}
+        run: bash scripts/check-deps-fresh.sh --warn
       - name: Validate Codex plugin package
         shell: bash
         run: |
