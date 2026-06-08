@@ -401,6 +401,82 @@ pub struct MlConfig {
     /// compiled in by default, so this falls through to CPU regardless.
     #[serde(default)]
     pub prefer_gpu: bool,
+    /// CPU activation-compute precision. **Default [`ComputePrecision::F32`]**
+    /// (today's behavior, output bit-identical to historical detections).
+    ///
+    /// [`ComputePrecision::F16`] is a **recall-risk opt-in**: it halves
+    /// activation memory and can speed up CPU matmul, but casting the
+    /// bf16-stored weights down to f16 narrows the exponent range and may drop a
+    /// true-positive PII span (a privacy regression). It MUST be validated by
+    /// the recall gate before it is trusted, and is NEVER made the default.
+    /// Ignored when the model runs on CUDA/Metal (those use BF16). Parsed even by
+    /// a regex-only build; it only has an effect when the `ml` backend is loaded.
+    #[serde(default)]
+    pub compute_precision: ComputePrecision,
+    /// MoE expert-weight quantization. **Default [`Quantization::None`]**
+    /// (today's behavior, dense F32 experts, output bit-identical to historical
+    /// detections).
+    ///
+    /// [`Quantization::Q8_0`] is a **recall-risk opt-in**: it quantizes each
+    /// expert's `gate_up`/`down` projection weight to 8-bit GGML Q8_0, shrinking
+    /// the dominant weight set ~4x and the resident MoE footprint with it, at the
+    /// cost of a small per-weight rounding error that may drop a true-positive
+    /// PII span (a privacy regression). Router, norms, embeddings, the score
+    /// head, attention sinks, and all biases stay F32. It MUST be validated by
+    /// the recall gate before it is trusted, and is NEVER made the default.
+    /// Applies on every device. Parsed even by a regex-only build; it only has an
+    /// effect when the `ml` backend is loaded.
+    #[serde(default)]
+    pub quant: Quantization,
+    /// Banded-attention sparsity for long sequences. **Default `false`** (dense
+    /// `T x T` attention, today's behavior, output bit-identical to historical
+    /// detections).
+    ///
+    /// When `true`, the backend computes attention block-by-block over only the
+    /// in-band key slice of each query block, skipping the fully out-of-band
+    /// region of the score matrix. The band half-width and the softmax
+    /// effective-logit set are identical to the dense path, so the output is
+    /// *designed* to be bit-equivalent — but it is treated as a **recall-risk
+    /// opt-in** until the recall gate proves zero dropped true-positives and
+    /// score delta < 1e-3 on the long-doc golden fixtures, and it is NEVER made
+    /// the default. The speedup is on inputs with `T` well beyond the band's
+    /// full width; short inputs use the dense path regardless. Parsed even by a
+    /// regex-only build; it only has an effect when the `ml` backend is loaded.
+    #[serde(default)]
+    pub banded_attention: bool,
+}
+
+/// MoE expert-weight quantization selector for the ML backend.
+///
+/// Serde wire form is lowercase (`"none"`, `"q8_0"`). **Default is `None`** —
+/// the safe, recall-neutral value; `Q8_0` is the recall-risk opt-in (see
+/// [`MlConfig::quant`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Quantization {
+    /// No quantization — dense F32 experts (default, bit-identical to historical
+    /// output).
+    #[default]
+    None,
+    /// Q8_0 quantization of MoE expert projection weights. Recall-risk; gate
+    /// before enabling.
+    #[serde(rename = "q8_0")]
+    Q8_0,
+}
+
+/// CPU activation-compute precision selector for the ML backend.
+///
+/// Serde wire form is lowercase (`"f32"`, `"f16"`). **Default is `F32`** — the
+/// safe, recall-neutral value; `F16` is the recall-risk opt-in (see
+/// [`MlConfig::compute_precision`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ComputePrecision {
+    /// Full F32 activations — default, bit-identical to historical output.
+    #[default]
+    F32,
+    /// F16 activations on CPU. Recall-risk; gate before enabling.
+    F16,
 }
 
 fn default_ml_model() -> String {
@@ -415,6 +491,9 @@ impl Default for MlConfig {
             revision: None,
             min_score: None,
             prefer_gpu: false,
+            compute_precision: ComputePrecision::F32,
+            quant: Quantization::None,
+            banded_attention: false,
         }
     }
 }
@@ -428,6 +507,9 @@ impl MlConfig {
             && self.revision == other.revision
             && self.min_score == other.min_score
             && self.prefer_gpu == other.prefer_gpu
+            && self.compute_precision == other.compute_precision
+            && self.quant == other.quant
+            && self.banded_attention == other.banded_attention
     }
 }
 

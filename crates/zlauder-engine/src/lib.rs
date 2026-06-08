@@ -18,8 +18,8 @@ mod surface;
 mod token;
 
 pub use config::{
-    AllowList, Category, CustomReplacement, EngineConfig, ExposureRedactionScope, MlConfig,
-    Operator, Profile, RevealMarker, SaltScope,
+    AllowList, Category, ComputePrecision, CustomReplacement, EngineConfig, ExposureRedactionScope,
+    MlConfig, Operator, Profile, Quantization, RevealMarker, SaltScope,
 };
 pub use error::EngineError;
 pub use manifest::{ManifestEntry, MaskOutcome, MaskStats, UnmaskManifest};
@@ -159,6 +159,30 @@ fn compute_ml_fp(rt: &MlRuntime) -> u64 {
             // (inert today since the GPU backends aren't compiled in, but the fingerprint
             // must stay complete). Keep this set in sync with `same_model_params`.
             h.update(&[d.prefer_gpu as u8]);
+            // `compute_precision` is likewise a recognizer-identity param: f16 vs
+            // f32 produce DIFFERENT detection output, so `same_model_params`
+            // includes it and the fingerprint must move with it or an f16 flip
+            // would serve stale f32-derived detections from a byte-identical leaf.
+            // Keep in sync with `same_model_params`.
+            h.update(&[match d.compute_precision {
+                crate::config::ComputePrecision::F32 => 0u8,
+                crate::config::ComputePrecision::F16 => 1u8,
+            }]);
+            // `quant` is likewise a recognizer-identity param: Q8_0 vs None produce
+            // DIFFERENT detection output, so `same_model_params` includes it and the
+            // fingerprint must move with it or a Q8 flip would serve stale F32-derived
+            // detections from a byte-identical leaf. Keep in sync with `same_model_params`.
+            h.update(&[match d.quant {
+                crate::config::Quantization::None => 0u8,
+                crate::config::Quantization::Q8_0 => 1u8,
+            }]);
+            // `banded_attention` is likewise a recognizer-identity param: the
+            // banded path is DESIGNED to be bit-equivalent to dense, but it is
+            // an unproven recall-risk opt-in, so `same_model_params` includes it
+            // and the fingerprint must move with it — a flip must never serve
+            // stale dense-derived detections from a byte-identical leaf. Keep in
+            // sync with `same_model_params`.
+            h.update(&[d.banded_attention as u8]);
         }
     } else {
         h.update(&[0]);

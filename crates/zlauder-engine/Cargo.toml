@@ -35,6 +35,20 @@ tracing   = { workspace = true }
 # `[engine.ml]` config (it just never loads a model).
 default = ["ml"]
 ml = ["dep:presidio-classifier"]
+# NOTE (R1, gemm-vs-MKL lever): an opt-in `mkl` passthrough feature was attempted
+# here (`mkl = ["ml", "presidio-classifier/mkl"]`) but it CANNOT be wired without
+# breaking the default build. presidio-classifier is consumed as a git dependency
+# (pinned in Cargo.lock); the `.cargo/config.toml` `[paths]` override substitutes
+# the local source for compilation but cargo still resolves the FEATURE GRAPH
+# against the git-pinned manifest, which has no `mkl` feature. Declaring a
+# passthrough to a non-existent upstream feature makes cargo fail resolution for
+# EVERY build (even ones that don't enable `mkl`), exit 101:
+#   "depends on `presidio-classifier` with feature `mkl` but ... does not have it"
+# Enabling MKL therefore requires committing+pushing the `mkl` feature to the
+# presidio-rs `main` branch and re-pinning Cargo.lock — a change to the default
+# build's inputs for all consumers. R1 is STOPPED here per the lever's guard
+# ("if wiring mkl cross-crate is infeasible without breaking the default build,
+# report that and STOP"). gemm remains the documented x86 default; see AUDIT notes.
 
 [dev-dependencies]
 serde_json = { workspace = true }
