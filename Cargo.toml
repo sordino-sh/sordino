@@ -68,3 +68,13 @@ lto = true
 codegen-units = 1
 strip = true
 opt-level = 3
+
+# Fast local iteration: release-grade codegen WITHOUT the `lto=true` +
+# `codegen-units=1` serialization that dominates compile wall-time. NOT a shipped
+# profile and NOT used by CI (which builds `--release`) — invoke explicitly with
+# `cargo build --profile quick`.
+[profile.quick]
+inherits = "release"
+lto = false
+codegen-units = 16
+strip = false
