@@ -763,13 +763,17 @@ fn run_wrapped(cmd: &str, stdin: &[u8]) -> Option<String> {
     use std::io::{Read, Write};
     use std::process::{Command, Stdio};
     use std::sync::mpsc;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     // A wrapped status line that hangs (slow git, blocking network, or a child that
     // floods stdout without draining stdin) must not stall our own shield. Claude
     // Code reaps slow status lines too, but we bound it ourselves so `🛡 …` still
     // renders promptly on its own.
     const WRAP_TIMEOUT: Duration = Duration::from_millis(2000);
+    // Grace for the child to exit on its own AFTER we already have its output — a
+    // command can close/redirect stdout (giving us EOF) yet keep running, so we
+    // never wait unbounded for exit; we force-kill the group once this elapses.
+    const REAP_GRACE: Duration = Duration::from_millis(200);
 
     let (sh, flag) = if cfg!(windows) {
         ("cmd", "/C")
@@ -816,7 +820,24 @@ fn run_wrapped(cmd: &str, stdin: &[u8]) -> Option<String> {
     });
     let buf = match rx.recv_timeout(WRAP_TIMEOUT) {
         Ok(buf) => {
-            let _ = child.wait();
+            // Output in hand — but stdout EOF only means the pipe closed, not that the
+            // command exited. A wrapped line that closes/redirects stdout and keeps
+            // running (`exec >/dev/null; sleep 30`) would hang an unbounded
+            // `child.wait()` here long past WRAP_TIMEOUT. Give it a short grace to exit
+            // cleanly (try_wait reaps that), then force-kill the group.
+            let deadline = Instant::now() + REAP_GRACE;
+            loop {
+                match child.try_wait() {
+                    Ok(Some(_)) => break,
+                    Ok(None) if Instant::now() < deadline => {
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    _ => {
+                        kill_group(&mut child);
+                        break;
+                    }
+                }
+            }
             buf
         }
         Err(_) => {
@@ -1800,6 +1821,18 @@ mod statusline_tests {
 
         // 3. A normal small command still returns its trimmed output.
         assert_eq!(run_wrapped("printf hello", b"").as_deref(), Some("hello"));
+
+        // 4. Closed/redirected stdout while still running: our reader hits EOF
+        //    immediately, but the child keeps going. The success (Ok) path must NOT
+        //    wait unbounded on child exit — it gives a short grace then kills the
+        //    group. Before that fix this hung for the full `sleep 30`.
+        let t4 = Instant::now();
+        assert_eq!(run_wrapped("exec >/dev/null; sleep 30", b""), None);
+        assert!(
+            t4.elapsed() < Duration::from_secs(5),
+            "closed-stdout child.wait hang: {:?}",
+            t4.elapsed()
+        );
     }
 }
 
