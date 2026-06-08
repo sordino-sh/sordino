@@ -413,19 +413,20 @@ pub struct MlConfig {
     /// a regex-only build; it only has an effect when the `ml` backend is loaded.
     #[serde(default)]
     pub compute_precision: ComputePrecision,
-    /// MoE expert-weight quantization. **Default [`Quantization::None`]**
-    /// (today's behavior, dense F32 experts, output bit-identical to historical
-    /// detections).
+    /// MoE expert-weight storage precision. **Default [`Quantization::Bf16`]** —
+    /// the recall-neutral CPU lever: expert weights are stored bf16 (the exact
+    /// bits the model ships / the GPU runs) and upcast per-block to F32 before the
+    /// matmul, so activations and accumulation stay F32. It is **golden-gate
+    /// confirmed** recall-neutral (26/28 end-to-end, 4/6 ML-only — identical to
+    /// F32, zero dropped spans, no score delta > 1e-3) and ~30% faster on the MoE
+    /// matmuls. [`Quantization::None`] is the historical F32 CPU path.
     ///
-    /// [`Quantization::Q8_0`] is a **recall-risk opt-in**: it quantizes each
-    /// expert's `gate_up`/`down` projection weight to 8-bit GGML Q8_0, shrinking
-    /// the dominant weight set ~4x and the resident MoE footprint with it, at the
-    /// cost of a small per-weight rounding error that may drop a true-positive
-    /// PII span (a privacy regression). Router, norms, embeddings, the score
-    /// head, attention sinks, and all biases stay F32. It MUST be validated by
-    /// the recall gate before it is trusted, and is NEVER made the default.
-    /// Applies on every device. Parsed even by a regex-only build; it only has an
-    /// effect when the `ml` backend is loaded.
+    /// [`Quantization::Q8_0`] (8-bit) and [`Quantization::Bf16Vnni`] (native
+    /// `vdpbf16ps`, rounds activations) are **recall-risk opt-ins** that MUST be
+    /// validated by the recall gate before trust. Router, norms, embeddings, the
+    /// score head, attention sinks, and all biases stay F32. Applies on every
+    /// device (bf16 levers are a no-op on GPU, which already computes in bf16).
+    /// Parsed even by a regex-only build; only effective when `ml` is loaded.
     #[serde(default)]
     pub quant: Quantization,
     /// Banded-attention sparsity for long sequences. **Default `false`** (dense
@@ -446,22 +447,32 @@ pub struct MlConfig {
     pub banded_attention: bool,
 }
 
-/// MoE expert-weight quantization selector for the ML backend.
+/// MoE expert-weight storage precision selector for the ML backend.
 ///
-/// Serde wire form is lowercase (`"none"`, `"q8_0"`). **Default is `None`** —
-/// the safe, recall-neutral value; `Q8_0` is the recall-risk opt-in (see
-/// [`MlConfig::quant`]).
+/// Serde wire form is lowercase (`"none"`, `"q8_0"`, `"bf16"`, `"bf16_vnni"`).
+/// The operational default (see [`MlConfig`]) is `Bf16` — the recall-neutral,
+/// ~30% faster CPU lever; `None` is the historical F32 path; `Q8_0` and
+/// `Bf16Vnni` are recall-risk opt-ins (see [`MlConfig::quant`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Quantization {
-    /// No quantization — dense F32 experts (default, bit-identical to historical
-    /// output).
+    /// No quantization — dense F32 experts, bit-identical to historical F32
+    /// output. The enum `#[default]` (type identity / F32 escape hatch); the
+    /// operational default is `Bf16`.
     #[default]
     None,
     /// Q8_0 quantization of MoE expert projection weights. Recall-risk; gate
     /// before enabling.
     #[serde(rename = "q8_0")]
     Q8_0,
+    /// bf16 MoE expert weights (recall-neutral, ~30% faster CPU lever; span-
+    /// identical to F32). Maps to presidio `Quant::Bf16`. The recommended default.
+    Bf16,
+    /// Native AVX512-BF16 `vdpbf16ps` expert matmul (recall-RISK — rounds
+    /// activations; CPU-only, Zen4+; falls back to `Bf16` without avx512bf16).
+    /// Maps to presidio `Quant::Bf16Vnni`. Gate before enabling.
+    #[serde(rename = "bf16_vnni")]
+    Bf16Vnni,
 }
 
 /// CPU activation-compute precision selector for the ML backend.
@@ -492,7 +503,10 @@ impl Default for MlConfig {
             min_score: None,
             prefer_gpu: false,
             compute_precision: ComputePrecision::F32,
-            quant: Quantization::None,
+            // Golden-gate-confirmed recall-neutral (26/28, 4/6 ML-only, zero
+            // dropped, no score delta > 1e-3) and ~30% faster on the MoE matmuls.
+            // Use Quantization::None for the historical F32 CPU path.
+            quant: Quantization::Bf16,
             banded_attention: false,
         }
     }

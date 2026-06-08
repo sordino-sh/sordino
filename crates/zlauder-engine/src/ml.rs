@@ -28,12 +28,15 @@ fn cpu_precision(p: ComputePrecision) -> CpuPrecision {
 }
 
 /// Map the engine-facing quantization selector onto the backend's `Quant` enum.
-/// Default `None` is recall-neutral; `Q8_0` is the recall-risk opt-in. Applies
-/// on every device (unlike `cpu_precision`, which is CPU-only).
+/// `Bf16` (the default) is recall-neutral and CPU-only; `None` is the historical
+/// F32 path; `Q8_0` and `Bf16Vnni` are recall-risk opt-ins. `Bf16`/`Bf16Vnni` are
+/// CPU-only levers (a no-op on GPU, which already computes in bf16).
 fn quant(q: Quantization) -> Quant {
     match q {
         Quantization::None => Quant::None,
         Quantization::Q8_0 => Quant::Q8_0,
+        Quantization::Bf16 => Quant::Bf16,
+        Quantization::Bf16Vnni => Quant::Bf16Vnni,
     }
 }
 

@@ -323,6 +323,10 @@ operating territories and partner facilities for the remainder of the calendar y
         // which stays dense F32 experts.
         let quant = match std::env::var("ZLAUDER_ML_QUANT").ok().as_deref() {
             Some("q8_0") | Some("Q8_0") | Some("q8") => zlauder_engine::Quantization::Q8_0,
+            Some("bf16") | Some("BF16") => zlauder_engine::Quantization::Bf16,
+            Some("bf16_vnni") | Some("bf16vnni") | Some("vnni") => {
+                zlauder_engine::Quantization::Bf16Vnni
+            }
             _ => zlauder_engine::Quantization::None,
         };
         // Default banded_attention is false (the real gate path). `ZLAUDER_ML_BANDED=1`

@@ -175,6 +175,8 @@ fn compute_ml_fp(rt: &MlRuntime) -> u64 {
             h.update(&[match d.quant {
                 crate::config::Quantization::None => 0u8,
                 crate::config::Quantization::Q8_0 => 1u8,
+                crate::config::Quantization::Bf16 => 2u8,
+                crate::config::Quantization::Bf16Vnni => 3u8,
             }]);
             // `banded_attention` is likewise a recognizer-identity param: the
             // banded path is DESIGNED to be bit-equivalent to dense, but it is
