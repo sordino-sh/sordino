@@ -3859,7 +3859,7 @@ dependencies = [
 
 [[package]]
 name = "zlauder-engine"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "aes-gcm",
  "blake3",
@@ -3880,7 +3880,7 @@ dependencies = [
 
 [[package]]
 name = "zlauder-hooks"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3896,7 +3896,7 @@ dependencies = [
 
 [[package]]
 name = "zlauder-proxy"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anthropic-wire",
  "anyhow",
@@ -3925,7 +3925,7 @@ dependencies = [
 
 [[package]]
 name = "zlauder-state"
-version = "0.6.0"
+version = "0.6.1"
 dependencies = [
  "anyhow",
  "blake3",
