@@ -36,9 +36,12 @@ to set that variable — routing is **per-project**, not global — and Claude C
    (override with `ZLAUDER_PORT`). Routing is **not** active yet.
 2. **Run `/zlauder:enable`.** This is the per-project setup step. It patches this
    project's `.claude/settings.json` with `env.ANTHROPIC_BASE_URL=http://127.0.0.1:<derived-port>`
-   (and `env.ZLAUDER_PORT`), adds a `🛡` status line, and seeds a practical
-   starter `zlauder.toml` if the project has none. The full annotated reference
-   is shipped as `zlauder.toml.example`.
+   (and `env.ZLAUDER_PORT`), adds a `🛡` status line — **wrapping any status line
+   you already have** as `🛡 … │ {your line}` rather than replacing it — and seeds a
+   practical starter `zlauder.toml` if the project has none. The full annotated
+   reference is shipped as `zlauder.toml.example`. Set `env.ZLAUDER_STATUSLINE` to
+   `off` to hide the `🛡` segment (your own line still shows), or `min`/`verbose` to
+   change how much it shows.
 3. **Restart Claude Code.** `env` is read only at startup; without a restart the
    new base URL is not picked up and traffic still bypasses the proxy.
 4. **Run `/zlauder:privacy`** to confirm the session is actually routed through
@@ -71,8 +74,8 @@ no restart).
 
 | Command | What it does |
 |---|---|
-| `/zlauder:enable` | Per-project setup: patch this project's `.claude/settings.json` to set `ANTHROPIC_BASE_URL` (and `ZLAUDER_PORT`) at the proxy's per-project derived port, add a status line, and seed a practical starter `zlauder.toml`. **Requires a Claude Code restart to take effect.** |
-| `/zlauder:disable` | Revert the routing change (and the zlauder status line) so traffic goes straight to Anthropic again. Also requires a restart. |
+| `/zlauder:enable` | Per-project setup: patch this project's `.claude/settings.json` to set `ANTHROPIC_BASE_URL` (and `ZLAUDER_PORT`) at the proxy's per-project derived port, take over the status-line slot (wrapping any existing line as `🛡 … │ {your line}`, original saved for restore), and seed a practical starter `zlauder.toml`. **Requires a Claude Code restart to take effect.** |
+| `/zlauder:disable` | Revert the routing change and restore your original status line (saved at enable time; if you had none, the zlauder line is just removed) so traffic goes straight to Anthropic again. Also requires a restart. |
 | `/zlauder:privacy [args]` | Unified masking control. With no args (or `status`): show proxy health, whether this session is routed, and the masking state (on/off, profile, categories, ML model). Also: `on` / `off`, `profile <name>`, `category <name> on\|off`, `threshold <0-1>` (each takes `--scope session\|project\|user\|local`), and `reveal <token>` to decode one masked token (e.g. `[EMAIL_ADDRESS_a47n1d8s9c0f]`) via the key-gated proxy. |
 | `/zlauder:privacy model …` | The optional `openai/privacy-filter` ML recognizer (CPU) for free-text PII (names, locations). `model download [<repo>]` caches the weights (large/slow first run); `model on`/`off` toggles it (on **loads in the background** — text is not filtered through the model until `model status` shows `ready`, so masking stays regex-only meanwhile); `model status` reports `disabled\|loading\|ready\|failed`. Pair with `category personal on`. |
 

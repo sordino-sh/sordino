@@ -9,8 +9,10 @@ Script output:
 
 This is the per-project setup step (the plugin can't set these itself). It patches
 this project's `.claude/settings.json` with `ANTHROPIC_BASE_URL` + `ZLAUDER_PORT`
-(routing) and a `🛡` status line, and seeds a practical starter `zlauder.toml`
-if absent. The exhaustive reference is `zlauder.toml.example`.
+(routing) and a `🛡` status line — wrapping any line you already had as
+`🛡 … │ {your line}` (the original is saved and restored on `/zlauder:disable`) —
+and seeds a practical starter `zlauder.toml` if absent. The exhaustive reference is
+`zlauder.toml.example`. Hide the `🛡` segment with `env.ZLAUDER_STATUSLINE=off`.
 
 Report the result above, then STRONGLY emphasize the one thing that matters: the
 `ANTHROPIC_BASE_URL` patch only takes effect on a fresh harness, so the user MUST

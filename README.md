@@ -92,8 +92,9 @@ interface. Add the marketplace and enable the plugin:
 Then, per project:
 
 1. **`/zlauder:enable`** — picks a free per-project port and writes
-   `.claude/settings.json` (`ANTHROPIC_BASE_URL` + `ZLAUDER_PORT` + a status line)
-   plus a practical starter `zlauder.toml`. The plugin's `SessionStart` hook resolves the
+   `.claude/settings.json` (`ANTHROPIC_BASE_URL` + `ZLAUDER_PORT` + a status line that
+   wraps any existing one as `🛡 … │ {your line}`; `ZLAUDER_STATUSLINE=off|min|verbose`
+   tunes or hides the `🛡` segment) plus a practical starter `zlauder.toml`. The plugin's `SessionStart` hook resolves the
    binaries and launches the proxy automatically. `zlauder-proxy` / `zlauder-hooks`
    are **shipped prebuilt per-platform** with the plugin (precedence: PATH →
    shipped `bin/<triple>` → cached/in-repo build), so a marketplace install needs
