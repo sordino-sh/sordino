@@ -13,13 +13,15 @@
 //! Because each project has its own proxy, a change here is scoped to this project
 //! only; concurrent sessions in other projects are untouched.
 
+use std::collections::HashMap;
+
 use axum::body::{Body, Bytes};
-use axum::extract::State;
+use axum::extract::{Path, Query, State};
 use axum::response::Response;
 use http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use zlauder_engine::{AllowList, EngineConfig, MlStatus};
+use zlauder_engine::{AllowList, EngineConfig, MlStatus, Profile};
 
 use crate::config;
 use crate::ml::reconcile_ml;
@@ -115,17 +117,70 @@ pub async fn get_config(State(st): State<AppState>, hdrs: HeaderMap) -> Response
     json_ok(&snapshot(&st))
 }
 
-/// `PUT /zlauder/config` — replace the live engine config with the posted one.
+/// Deep-merge `over` onto `base` (both `serde_json::Value`): objects recurse
+/// key-by-key; every other value (including arrays) replaces wholesale. A `null` in
+/// `over` overwrites with `null` (callers don't send nulls; this keeps the merge a
+/// pure overlay). This is what turns `PUT /zlauder/config` into a real partial
+/// merge: only the keys the client actually sent overlay the current config, so an
+/// omitted field is preserved instead of being reset to its serde default.
+fn merge_json(base: &mut serde_json::Value, over: serde_json::Value) {
+    match (base, over) {
+        (serde_json::Value::Object(b), serde_json::Value::Object(o)) => {
+            for (k, v) in o {
+                match b.get_mut(&k) {
+                    Some(bv) => merge_json(bv, v),
+                    None => {
+                        b.insert(k, v);
+                    }
+                }
+            }
+        }
+        (b, o) => *b = o,
+    }
+}
+
+/// `PUT /zlauder/config` — MERGE the posted (partial) config onto the live config.
+/// Only the keys present in the request body overlay the current effective config;
+/// every omitted field is preserved (a real merge, not a whole-object replace that
+/// resets omitted fields to serde defaults).
 pub async fn put_config(State(st): State<AppState>, hdrs: HeaderMap, body: Bytes) -> Response {
     if !st.authed(&hdrs) {
         return forbidden();
     }
-    let wire: WireConfig = match serde_json::from_slice(&body) {
-        Ok(w) => w,
+    // Parse the body as a raw JSON object so we can tell which keys were actually
+    // sent. A non-object body is the only hard parse error here.
+    let over: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(v @ serde_json::Value::Object(_)) => v,
+        Ok(_) => {
+            return text(StatusCode::BAD_REQUEST, "config body must be a JSON object");
+        }
         Err(e) => {
             return text(
                 StatusCode::BAD_REQUEST,
                 &format!("invalid config JSON: {e}"),
+            );
+        }
+    };
+    // Start from the live config in its wire form, overlay only the sent keys, then
+    // deserialize the merged whole.
+    let current = WireConfig::from_engine(&st.engine.config_snapshot());
+    let mut merged = match serde_json::to_value(&current) {
+        Ok(v) => v,
+        Err(e) => {
+            return text(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!("serializing current config: {e}"),
+            );
+        }
+    };
+    merge_json(&mut merged, over);
+
+    let wire: WireConfig = match serde_json::from_value(merged) {
+        Ok(w) => w,
+        Err(e) => {
+            return text(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid merged config: {e}"),
             );
         }
     };
@@ -147,6 +202,31 @@ pub async fn put_config(State(st): State<AppState>, hdrs: HeaderMap, body: Bytes
             ),
         );
     }
+    // Reject typo'd / alias / unknown entity_operators keys so a misspelled key
+    // stops being a silent no-op (item 2c). A custom_replacement.entity_type is its
+    // own detector and is never a no-op, so it is intentionally not validated here.
+    //
+    // Validate ONLY the DELTA this PUT introduces, not the whole merged config: a
+    // stale unknown key already in the live snapshot (the file loader only WARNS, it
+    // doesn't strip) would otherwise brick EVERY future merge-PUT — including an
+    // unrelated request that only lowers the threshold or enables a category — locking
+    // the operator out of TIGHTENING policy through the UI/CLI. We flag a key only if
+    // it is unknown AND it is genuinely new or changed relative to the current snapshot
+    // (`current_engine.entity_operators`). Pre-existing typo'd keys carry forward
+    // untouched (they were already warned about at file load), but they can no longer
+    // poison an unrelated edit.
+    let current_engine = st.engine.config_snapshot();
+    let new_unknown = new_unknown_entity_keys(&current_engine, &engine_cfg);
+    if !new_unknown.is_empty() {
+        return text(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "unknown entity type(s) {:?} — must be a canonical EntityType Display name \
+                 (an alias or typo here masks nothing)",
+                new_unknown
+            ),
+        );
+    }
     // `ml.enabled` is live-owned: ONLY `/zlauder/ml/{enable,disable}` flip it. A
     // generic PUT (even a stale/older client's) must not — so we override the posted
     // value with the live one and reconcile model-param changes only. Serialized
@@ -160,6 +240,124 @@ pub async fn put_config(State(st): State<AppState>, hdrs: HeaderMap, body: Bytes
     }
     reconcile_ml(&st, &new_ml, false);
     json_ok(&snapshot(&st))
+}
+
+/// `POST /zlauder/profile/{name}` — apply a detection profile (threshold +
+/// categories + default operator TOGETHER, from [`EngineConfig::for_profile`]) and
+/// persist per the `?scope=` query (default `session`). This is the SHARED path the
+/// CLI's `apply_profile` also routes through, so the UI and CLI can never drift on
+/// what a profile means or how it is persisted.
+///
+/// `{name}` is the snake_case profile id (`strict`/`balanced`/`minimal`/
+/// `secrets_only`, plus the `development_safe` back-compat alias). `?scope` is one
+/// of `session|project|user|local`. Live application always happens; a file scope
+/// additionally writes the profile's fields to that scope's TOML.
+pub async fn apply_profile(
+    State(st): State<AppState>,
+    hdrs: HeaderMap,
+    Path(name): Path<String>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Response {
+    if !st.authed(&hdrs) {
+        return forbidden();
+    }
+    // Parse the profile id via serde so the `development_safe` alias is honored.
+    let profile: Profile = match serde_json::from_value(json!(name)) {
+        Ok(p) => p,
+        Err(_) => {
+            return text(
+                StatusCode::BAD_REQUEST,
+                &format!(
+                    "unknown profile '{name}' (valid: strict, balanced, minimal, secrets_only)"
+                ),
+            );
+        }
+    };
+    let scope = match q.get("scope").map(String::as_str) {
+        None | Some("session") => Scope::Session,
+        Some("project") => Scope::Project,
+        Some("user") => Scope::User,
+        Some("local") => Scope::Local,
+        Some(other) => {
+            return text(
+                StatusCode::BAD_REQUEST,
+                &format!("unknown scope '{other}' (valid: session, project, user, local)"),
+            );
+        }
+    };
+
+    // Derive the profile's threshold/categories/operator from the single engine
+    // source, then overlay them onto the LIVE config (keeping entity_operators,
+    // allow_list, ml, custom rules, etc.). `enabled`/`ml.enabled` stay live-owned.
+    let defaults = EngineConfig::for_profile(profile);
+    let mut cfg = st.engine.config_snapshot();
+    cfg.profile = profile;
+    cfg.score_threshold = defaults.score_threshold;
+    cfg.enabled_categories = defaults.enabled_categories.clone();
+    cfg.default_operator = defaults.default_operator;
+    if let Err(e) = st.engine.set_config(cfg) {
+        return text(StatusCode::BAD_REQUEST, &format!("config rejected: {e}"));
+    }
+
+    // Persist per scope (file scopes only). Best-effort: a write failure leaves the
+    // live change in effect and surfaces a session-only signal.
+    let (persisted, persist_error) = if scope == Scope::Session {
+        (None, None)
+    } else {
+        match config::persist_profile(&st.layers, &st.project_root, scope, profile) {
+            Ok(path) => (Some(path.display().to_string()), None),
+            Err(e) => (None, Some(e.to_string())),
+        }
+    };
+
+    let mut snap = snapshot(&st);
+    if let Some(obj) = snap.as_object_mut() {
+        obj.insert("profile_applied".into(), json!(name));
+        obj.insert("scope".into(), json!(scope_label(scope)));
+        obj.insert("persisted".into(), json!(persisted));
+        obj.insert("session_only".into(), json!(scope == Scope::Session));
+        if let Some(e) = persist_error {
+            obj.insert("persist_error".into(), json!(e));
+        }
+    }
+    json_ok(&snap)
+}
+
+/// The unknown `entity_operators` keys that `merged` INTRODUCES or CHANGES relative
+/// to `current` — i.e. the validation delta a merge-PUT is responsible for. A key
+/// that is unknown but already present (same value) in `current` is NOT returned: it
+/// was carried forward from a previously-loaded file (which only warns on unknown
+/// keys), so failing the PUT on it would lock the operator out of tightening policy.
+/// Genuinely new or value-changed unknown keys ARE returned (still rejected).
+fn new_unknown_entity_keys(current: &EngineConfig, merged: &EngineConfig) -> Vec<String> {
+    let unknown: std::collections::HashSet<String> =
+        merged.unknown_entity_types().into_iter().collect();
+    merged
+        .entity_operators
+        .iter()
+        .filter(|(k, v)| {
+            unknown.contains(k.as_str()) && current.entity_operators.get(*k) != Some(*v)
+        })
+        .map(|(k, _)| k.clone())
+        .collect()
+}
+
+/// Scope a profile/config write targets. Mirrors the hooks CLI's `Scope`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Scope {
+    Session,
+    Project,
+    User,
+    Local,
+}
+
+fn scope_label(scope: Scope) -> &'static str {
+    match scope {
+        Scope::Session => "session",
+        Scope::Project => "project",
+        Scope::User => "user",
+        Scope::Local => "local",
+    }
 }
 
 /// `POST /zlauder/ml/enable` — turn the ML recognizer on. The model loads in the
@@ -276,6 +474,73 @@ fn text(status: StatusCode, msg: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use zlauder_engine::{Category, Operator, Profile};
+
+    // A partial PUT body must MERGE onto the live config: keys the client sent
+    // overlay; every omitted field is preserved (not reset to its serde default).
+    // This exercises the exact merge_json → WireConfig deserialize path put_config
+    // uses, minus the live engine/HTTP plumbing.
+    #[test]
+    fn merge_put_preserves_omitted_fields() {
+        // A non-default "live" config: strict-ish threshold + a custom entity op.
+        let mut live = EngineConfig {
+            score_threshold: 0.42,
+            profile: Profile::Strict,
+            enabled_categories: [Category::Secrets, Category::Personal]
+                .into_iter()
+                .collect(),
+            ..EngineConfig::default()
+        };
+        live.entity_operators
+            .insert("EMAIL_ADDRESS".into(), Operator::Redact);
+        live.allow_list.add_exact("keep-me@example.com");
+
+        let current = WireConfig::from_engine(&live);
+        let mut merged = serde_json::to_value(&current).unwrap();
+        // Client sends ONLY a new threshold.
+        merge_json(&mut merged, serde_json::json!({ "score_threshold": 0.8 }));
+
+        let wire: WireConfig = serde_json::from_value(merged).unwrap();
+        let out = wire.into_engine().unwrap();
+        assert_eq!(out.score_threshold, 0.8, "sent field overlaid");
+        // Everything omitted survived:
+        assert_eq!(out.profile, Profile::Strict);
+        assert_eq!(
+            out.enabled_categories,
+            [Category::Secrets, Category::Personal]
+                .into_iter()
+                .collect()
+        );
+        assert_eq!(
+            out.entity_operators.get("EMAIL_ADDRESS"),
+            Some(&Operator::Redact)
+        );
+        assert!(out.allow_list.is_allowed("keep-me@example.com"));
+    }
+
+    #[test]
+    fn merge_put_can_update_nested_and_arrays() {
+        let live = EngineConfig::default();
+        let current = WireConfig::from_engine(&live);
+        let mut merged = serde_json::to_value(&current).unwrap();
+        // Arrays replace wholesale; nested objects (ml) deep-merge.
+        merge_json(
+            &mut merged,
+            serde_json::json!({
+                "enabled_categories": ["secrets"],
+                "ml": { "model": "acme/x" }
+            }),
+        );
+        let out: WireConfig = serde_json::from_value(merged).unwrap();
+        let cfg = out.into_engine().unwrap();
+        assert_eq!(
+            cfg.enabled_categories,
+            [Category::Secrets].into_iter().collect()
+        );
+        assert_eq!(cfg.ml.model, "acme/x");
+        // ml.enabled (omitted in the nested object) kept its prior value.
+        assert!(!cfg.ml.enabled);
+    }
 
     // The allow-list is carried as a sibling field (`EngineConfig.allow_list` is
     // `#[serde(skip)]`, so the flattened struct never emits/reads it). Pin that
@@ -316,5 +581,74 @@ mod tests {
         assert!(rebuilt.allow_list.is_allowed("keep-me@example.com"));
         // Common-word defaults are re-seeded by from_specs (idempotent).
         assert!(rebuilt.allow_list.is_allowed("Anthropic"));
+    }
+
+    // A stale unknown entity_operators key already in the live config (the file loader
+    // only warns, never strips) must NOT brick an unrelated merge-PUT. Only the keys
+    // the PUT actually introduces or changes are validated.
+    #[test]
+    fn stale_unknown_key_does_not_brick_unrelated_put() {
+        // Live config carries a typo'd key (survived file load with only a warning).
+        let mut current = EngineConfig::default();
+        current
+            .entity_operators
+            .insert("EMIAL".into(), Operator::Redact);
+
+        // A merge-PUT that only lowers the threshold carries the stale key forward
+        // unchanged. The delta is empty → no rejection.
+        let mut merged = current.clone();
+        merged.score_threshold = 0.3;
+        assert!(
+            new_unknown_entity_keys(&current, &merged).is_empty(),
+            "carried-forward stale typo must not block an unrelated edit"
+        );
+    }
+
+    #[test]
+    fn newly_introduced_unknown_key_is_still_rejected() {
+        let current = EngineConfig::default();
+        // PUT introduces a fresh typo'd key.
+        let mut merged = current.clone();
+        merged
+            .entity_operators
+            .insert("EMIAL".into(), Operator::Redact);
+        assert_eq!(
+            new_unknown_entity_keys(&current, &merged),
+            vec!["EMIAL".to_string()],
+            "a brand-new typo'd key is still flagged"
+        );
+    }
+
+    #[test]
+    fn changed_value_on_stale_unknown_key_is_rejected() {
+        // A stale typo'd key that the PUT also re-points to a different operator IS a
+        // genuine new edit on that key → flag it (the operator is touching it now).
+        let mut current = EngineConfig::default();
+        current
+            .entity_operators
+            .insert("EMIAL".into(), Operator::Redact);
+        let mut merged = current.clone();
+        merged
+            .entity_operators
+            .insert("EMIAL".into(), Operator::Token);
+        assert_eq!(
+            new_unknown_entity_keys(&current, &merged),
+            vec!["EMIAL".to_string()]
+        );
+    }
+
+    #[test]
+    fn valid_opt_in_keys_pass_delta_validation() {
+        // DATE_TIME/DOMAIN are valid canonical Display names (opt-in levers) and must
+        // pass even when freshly introduced.
+        let current = EngineConfig::default();
+        let mut merged = current.clone();
+        merged
+            .entity_operators
+            .insert("DATE_TIME".into(), Operator::Redact);
+        merged
+            .entity_operators
+            .insert("DOMAIN".into(), Operator::Redact);
+        assert!(new_unknown_entity_keys(&current, &merged).is_empty());
     }
 }

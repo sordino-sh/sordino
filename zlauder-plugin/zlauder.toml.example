@@ -20,9 +20,14 @@ upstream_base_url = "https://api.anthropic.com"
 # response unmasking still runs so existing transcript tokens can decode.
 enabled = true
 
-# Presets: "strict", "balanced", "minimal", "development_safe".
-# The profile field is informational after config is written; explicit threshold,
-# categories, and operator fields below are what the engine uses.
+# Presets: "strict", "balanced", "minimal", "secrets_only".
+#   strict       threshold 0.4, all 5 categories, Token operator
+#   balanced     threshold 0.5, secrets+financial+identity+contact (default)
+#   minimal      threshold 0.6, secrets+financial
+#   secrets_only threshold 0.6, secrets only   (was "development_safe"; alias kept)
+# The profile SEEDS score_threshold / enabled_categories / default_operator: if you
+# set `profile` but OMIT those fields, they take the profile's values. Any field you
+# DO set explicitly below overrides the profile's seed.
 profile = "balanced"
 
 # Detection score floor, 0.0..1.0. Lower is more aggressive.

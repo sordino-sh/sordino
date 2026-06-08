@@ -183,7 +183,10 @@ enum ProfileArg {
     Strict,
     Balanced,
     Minimal,
-    DevelopmentSafe,
+    /// Secrets-only. Renamed from `development-safe`; the old spelling stays as a
+    /// hidden clap alias so existing scripts/docs keep working.
+    #[value(name = "secrets-only", alias = "development-safe")]
+    SecretsOnly,
 }
 
 impl From<ProfileArg> for Profile {
@@ -192,7 +195,7 @@ impl From<ProfileArg> for Profile {
             ProfileArg::Strict => Profile::Strict,
             ProfileArg::Balanced => Profile::Balanced,
             ProfileArg::Minimal => Profile::Minimal,
-            ProfileArg::DevelopmentSafe => Profile::DevelopmentSafe,
+            ProfileArg::SecretsOnly => Profile::SecretsOnly,
         }
     }
 }
@@ -780,46 +783,60 @@ fn f32_to_toml(v: f32) -> f64 {
     format!("{v}").parse().unwrap_or(v as f64)
 }
 
+/// Apply a detection profile. When the proxy is reachable, this routes through the
+/// SHARED `POST /zlauder/profile/{name}?scope=…` endpoint so the UI and CLI can
+/// never drift on what a profile means or how it is persisted — the proxy both
+/// applies it live AND persists it for a file scope. Only when the proxy is DOWN
+/// does the CLI fall back to writing the scope file itself (so a profile can still
+/// be persisted offline); the field shape it writes matches the proxy's
+/// `persist_profile`, both deriving from `EngineConfig::for_profile`.
 fn apply_profile(port: u16, root: &str, scope: Scope, profile: Profile) -> Result<()> {
-    // Authoritative profile defaults come from the engine (no CLI drift).
-    let defaults = EngineConfig::for_profile(profile);
-    let profile_str = serde_json::to_value(profile)?;
-    let threshold = defaults.score_threshold;
-    let categories = categories_to_json(&defaults.enabled_categories);
-    let operator = serde_json::to_value(defaults.default_operator)?;
+    let profile_id = serde_json::to_value(profile)?
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| "balanced".to_string());
 
-    if scope == Scope::Session {
-        let key =
-            key_for(port).context("proxy not running; use --scope project/user to persist")?;
-        let mut cfg = admin_get(port, &key)?;
-        cfg["config"]["profile"] = profile_str;
-        cfg["config"]["score_threshold"] = json!(threshold);
-        cfg["config"]["enabled_categories"] = categories;
-        cfg["config"]["default_operator"] = operator;
-        let snap = admin_put(port, &key, &cfg["config"])?;
-        print_applied(&snap, port, "session")?;
+    // Proxy up: the endpoint is the single source of truth for apply + persist.
+    if let Ok(key) = key_for(port) {
+        let path = format!("profile/{profile_id}?scope={}", scope_label(scope));
+        let snap = admin_post(port, &key, &path)?;
+        print_applied(&snap, port, scope_label(scope))?;
+        if scope != Scope::Session {
+            println!(
+                "persisted to {} ({} scope).",
+                scope_path(scope, root).display(),
+                scope_label(scope)
+            );
+        }
         return Ok(());
     }
-    let cats: Vec<String> = categories
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+
+    // Proxy down: a session-scope change has nowhere to live.
+    if scope == Scope::Session {
+        bail!("proxy not running; use --scope project/user/local to persist");
+    }
+
+    // Proxy down + file scope: persist offline, matching the proxy's field shape.
+    let defaults = EngineConfig::for_profile(profile);
+    let threshold = defaults.score_threshold;
+    let cats = category_set_to_vec(&defaults.enabled_categories);
+    let operator = serde_json::to_value(defaults.default_operator)?;
     edit_scope_file(scope, root, |doc| {
-        doc["engine"]["profile"] = toml_edit::value(profile_str.as_str().unwrap_or("balanced"));
+        doc["engine"]["profile"] = toml_edit::value(profile_id.as_str());
         doc["engine"]["score_threshold"] = toml_edit::value(f32_to_toml(threshold));
         doc["engine"]["enabled_categories"] = toml_edit::value(str_array(&cats));
-        // default_operator is a table { kind = "..." }; write its kind.
         if let Some(kind) = operator.get("kind").and_then(Value::as_str) {
             let mut t = toml_edit::InlineTable::new();
             t.insert("kind", kind.into());
             doc["engine"]["default_operator"] = toml_edit::value(t);
         }
     })?;
-    finish_file_scope(port, scope, root, "reload")
+    println!(
+        "saved to {} ({} scope). The proxy isn't running, so it will apply on the next session.",
+        scope_path(scope, root).display(),
+        scope_label(scope)
+    );
+    Ok(())
 }
 
 fn apply_category(port: u16, root: &str, scope: Scope, name: &str, on: bool) -> Result<()> {
@@ -997,10 +1014,6 @@ fn category_set_to_vec(cats: &std::collections::HashSet<zlauder_engine::Category
     v
 }
 
-fn categories_to_json(cats: &std::collections::HashSet<zlauder_engine::Category>) -> Value {
-    json!(category_set_to_vec(cats))
-}
-
 /// Effective categories to base a toggle on: the authoritative LIVE proxy if
 /// reachable, else computed from the config FILES (user < project < local) — NOT
 /// the balanced default, which would silently erase a custom persisted set when the
@@ -1020,11 +1033,12 @@ fn effective_categories(port: u16, root: &str) -> Vec<String> {
 }
 
 /// Merge `enabled_categories` across the config files (last layer that sets it
-/// wins). If no layer sets it explicitly, fall back to the **balanced default** —
-/// matching the proxy's actual deserialization, which uses the serde default and
-/// does NOT derive categories from `profile` (that field is informational). Keeping
-/// this identical to the proxy means an offline edit produces the same base the live
-/// proxy would (review re-pass: a profile-derived fallback diverged from the proxy).
+/// wins). If no layer sets it explicitly, fall back to the **last-set profile's**
+/// categories — matching the proxy's deserialization, which (since the load-bearing
+/// `profile=` change) SEEDS `enabled_categories` from `profile` when the field is
+/// absent. If no layer sets categories OR a profile, fall back to the default
+/// (Balanced) categories. Keeping this identical to the proxy means an offline edit
+/// produces the same base the live proxy would.
 fn categories_from_files(root: &str) -> Vec<String> {
     let layers = [
         zlauder_state::user_config_path(),
@@ -1032,6 +1046,7 @@ fn categories_from_files(root: &str) -> Vec<String> {
         Path::new(root).join("zlauder.local.toml"),
     ];
     let mut cats: Option<Vec<String>> = None;
+    let mut profile: Option<Profile> = None;
     for p in layers {
         let Ok(text) = std::fs::read_to_string(&p) else {
             continue;
@@ -1039,8 +1054,8 @@ fn categories_from_files(root: &str) -> Vec<String> {
         let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
             continue;
         };
-        if let Some(arr) = doc
-            .get("engine")
+        let engine = doc.get("engine");
+        if let Some(arr) = engine
             .and_then(|e| e.get("enabled_categories"))
             .and_then(|v| v.as_array())
         {
@@ -1050,8 +1065,21 @@ fn categories_from_files(root: &str) -> Vec<String> {
                     .collect(),
             );
         }
+        if let Some(name) = engine
+            .and_then(|e| e.get("profile"))
+            .and_then(|v| v.as_str())
+            && let Ok(p) = serde_json::from_value::<Profile>(json!(name))
+        {
+            profile = Some(p);
+        }
     }
-    cats.unwrap_or_else(|| category_set_to_vec(&EngineConfig::default().enabled_categories))
+    cats.unwrap_or_else(|| {
+        let base = profile
+            .map(EngineConfig::for_profile)
+            .unwrap_or_default()
+            .enabled_categories;
+        category_set_to_vec(&base)
+    })
 }
 
 // ---------------------------------------------------------------------------

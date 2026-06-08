@@ -1096,3 +1096,209 @@ async fn wait_for_pending(client: &reqwest::Client, proxy_addr: SocketAddr, key:
     }
     panic!("request never became pending");
 }
+
+/// Build an `AppState` whose Local layer + project_root point at a real temp dir so
+/// persistence (profile / custom-mask) can be exercised end-to-end.
+fn mk_state_in(
+    engine: MaskEngine,
+    upstream_base: String,
+    admin_key: &str,
+    root: &std::path::Path,
+) -> AppState {
+    AppState {
+        engine: Arc::new(engine),
+        http: reqwest::Client::new(),
+        upstream_base: Arc::new(upstream_base),
+        admin_key: Arc::new(admin_key.into()),
+        layers: Arc::new(ConfigLayers {
+            user: std::path::PathBuf::from("/nonexistent/zlauder/config.toml"),
+            project: Some(root.join("zlauder.toml")),
+            local: Some(root.join("zlauder.local.toml")),
+        }),
+        project_root: Arc::new(root.to_string_lossy().to_string()),
+        port: 0,
+        monitor: Monitor::new(),
+        ml_control: Arc::new(std::sync::Mutex::new(())),
+    }
+}
+
+// POST /zlauder/profile/{name} applies the profile (threshold+categories+operator
+// together) live, and a file scope persists to zlauder.local.toml.
+#[tokio::test]
+async fn profile_endpoint_applies_and_persists() {
+    let dir = std::env::temp_dir().join(format!(
+        "zlauder-prof-ep-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::create_dir_all(&dir);
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state_in(engine, "http://127.0.0.1:1".into(), "pk", &dir);
+    let proxy_addr = spawn(proxy_router(state)).await;
+    let client = reqwest::Client::new();
+
+    // Apply "strict" with local scope.
+    let resp: serde_json::Value = client
+        .post(format!(
+            "http://{proxy_addr}/zlauder/profile/strict?scope=local"
+        ))
+        .header("x-zlauder-key", "pk")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    // Live config reflects strict's seeded fields.
+    assert_eq!(resp["config"]["profile"], serde_json::json!("strict"));
+    assert!((resp["config"]["score_threshold"].as_f64().unwrap() - 0.4).abs() < 1e-6);
+    let cats = resp["config"]["enabled_categories"].as_array().unwrap();
+    assert!(cats.iter().any(|c| c == "personal"), "strict adds personal");
+    assert_eq!(resp["scope"], serde_json::json!("local"));
+    assert_eq!(resp["session_only"], serde_json::json!(false));
+
+    // Persisted to zlauder.local.toml.
+    let persisted = std::fs::read_to_string(dir.join("zlauder.local.toml")).unwrap();
+    assert!(persisted.contains("profile = \"strict\""), "{persisted}");
+    assert!(persisted.contains("score_threshold = 0.4"), "{persisted}");
+
+    // The back-compat alias resolves to secrets_only.
+    let resp: serde_json::Value = client
+        .post(format!(
+            "http://{proxy_addr}/zlauder/profile/development_safe?scope=session"
+        ))
+        .header("x-zlauder-key", "pk")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(resp["config"]["profile"], serde_json::json!("secrets_only"));
+    assert_eq!(resp["session_only"], serde_json::json!(true));
+
+    // An unknown profile is a 400.
+    let bad = client
+        .post(format!("http://{proxy_addr}/zlauder/profile/bogus"))
+        .header("x-zlauder-key", "pk")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// A PARTIAL PUT merges onto the live config: omitted fields are preserved.
+#[tokio::test]
+async fn put_config_merges_partial_body() {
+    let mut cfg = EngineConfig::default();
+    cfg.entity_operators
+        .insert("EMAIL_ADDRESS".into(), zlauder_engine::Operator::Redact);
+    let engine = MaskEngine::new(cfg).unwrap();
+    let state = mk_state(engine, "http://127.0.0.1:1".into(), "mp");
+    let proxy_addr = spawn(proxy_router(state)).await;
+    let client = reqwest::Client::new();
+
+    // PUT ONLY a new threshold.
+    let put: serde_json::Value = client
+        .put(format!("http://{proxy_addr}/zlauder/config"))
+        .header("x-zlauder-key", "mp")
+        .json(&serde_json::json!({ "score_threshold": 0.77 }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!((put["config"]["score_threshold"].as_f64().unwrap() - 0.77).abs() < 1e-6);
+    // The pre-existing entity_operators override survived the partial PUT.
+    assert_eq!(
+        put["config"]["entity_operators"]["EMAIL_ADDRESS"]["kind"],
+        serde_json::json!("redact")
+    );
+}
+
+// PUT with a typo'd entity_operators key is rejected (item 2c).
+#[tokio::test]
+async fn put_config_rejects_unknown_entity_operator_key() {
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, "http://127.0.0.1:1".into(), "uk");
+    let proxy_addr = spawn(proxy_router(state)).await;
+    let client = reqwest::Client::new();
+
+    let bad = client
+        .put(format!("http://{proxy_addr}/zlauder/config"))
+        .header("x-zlauder-key", "uk")
+        .json(&serde_json::json!({ "entity_operators": { "EMIAL": { "kind": "redact" } } }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bad.status(), 400);
+    let msg = bad.text().await.unwrap();
+    assert!(
+        msg.contains("EMIAL"),
+        "rejection should name the typo: {msg}"
+    );
+}
+
+// Custom-mask: add persists to zlauder.local.toml, list reflects it, remove clears
+// both live and the file.
+#[tokio::test]
+async fn custom_mask_persist_list_remove() {
+    let dir = std::env::temp_dir().join(format!("zlauder-cm-{}-{}", std::process::id(), line!()));
+    let _ = std::fs::create_dir_all(&dir);
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state_in(engine, "http://127.0.0.1:1".into(), "cm", &dir);
+    let proxy_addr = spawn(proxy_router(state)).await;
+    let client = reqwest::Client::new();
+
+    let add: serde_json::Value = client
+        .post(format!("http://{proxy_addr}/zlauder/monitor/custom-mask"))
+        .header("x-zlauder-key", "cm")
+        .json(&serde_json::json!({"pattern":"ACME-XYZ"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(add["session_only"], serde_json::json!(false));
+    assert!(add["persisted"].is_string());
+    let file = std::fs::read_to_string(dir.join("zlauder.local.toml")).unwrap();
+    assert!(file.contains("ACME-XYZ"), "{file}");
+
+    // List shows it.
+    let list: serde_json::Value = client
+        .get(format!("http://{proxy_addr}/zlauder/monitor/custom-mask"))
+        .header("x-zlauder-key", "cm")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rules = list["custom_replacements"].as_array().unwrap();
+    assert!(rules.iter().any(|r| r["pattern"] == "ACME-XYZ"));
+
+    // Remove clears both live and file.
+    let rm: serde_json::Value = client
+        .request(
+            reqwest::Method::DELETE,
+            format!("http://{proxy_addr}/zlauder/monitor/custom-mask"),
+        )
+        .header("x-zlauder-key", "cm")
+        .json(&serde_json::json!({"pattern":"ACME-XYZ"}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(rm["removed_live"], serde_json::json!(true));
+    assert_eq!(rm["removed_persisted"], serde_json::json!(true));
+    let file = std::fs::read_to_string(dir.join("zlauder.local.toml")).unwrap();
+    assert!(!file.contains("ACME-XYZ"), "file still has rule: {file}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -43,6 +43,8 @@
     <button id="saveMode" class="btn ghost">SET</button>
   </div>
 
+  <button id="policyOpen" class="btn ghost policy-open" title="masking policy — profile, threshold, categories, ML, custom masks">POLICY</button>
+
   <div class="queue-wrap">
     <div class="queue-meter" id="queueMeter" title="pending approval queue — click to review holds">
       <div class="queue-bar"><span class="queue-fill" id="queueFill"></span></div>
@@ -93,6 +95,97 @@
     </div>
   </section>
 </main>
+
+<!-- ============ POLICY DRAWER (the human policy surface) ============ -->
+<div class="policy-scrim" id="policyScrim" hidden></div>
+<aside class="policy-drawer" id="policyDrawer" hidden aria-label="masking policy">
+  <header class="policy-head">
+    <div class="policy-title">
+      <span class="policy-mark">&#9636;</span>
+      <span>MASKING POLICY</span>
+    </div>
+    <button class="chip-btn" id="policyClose" aria-label="close policy">&times; close</button>
+  </header>
+  <div class="policy-note">
+    This panel owns the <b>masking policy</b> (what gets detected &amp; how).
+    The header POSTURE owns the <b>review hold</b> (whether traffic pauses for approval).
+  </div>
+
+  <div class="policy-scroll" id="policyScroll">
+
+    <section class="pol-sec">
+      <div class="pol-sec-head">PROFILE</div>
+      <div class="pol-row">
+        <div class="select-wrap pol-grow">
+          <select id="polProfile">
+            <option value="strict">STRICT &middot; widest net</option>
+            <option value="balanced">BALANCED &middot; default</option>
+            <option value="minimal">MINIMAL &middot; secrets + financial</option>
+            <option value="secrets_only">SECRETS ONLY</option>
+          </select>
+        </div>
+        <div class="select-wrap">
+          <select id="polScope" title="where to persist the profile">
+            <option value="session">session (live only)</option>
+            <option value="project">project</option>
+            <option value="user">user</option>
+            <option value="local">local</option>
+          </select>
+        </div>
+        <button class="btn primary" id="polApplyProfile">APPLY</button>
+      </div>
+      <div class="pol-row pol-op-row">
+        <span class="pol-op-label">OPERATOR</span>
+        <span class="pol-val" id="polOperator">—</span>
+      </div>
+      <div class="pol-hint" id="polProfileHint">A profile sets threshold + categories + operator together.</div>
+    </section>
+
+    <section class="pol-sec">
+      <div class="pol-sec-head">SCORE THRESHOLD <span class="pol-val" id="polThreshVal">0.50</span></div>
+      <div class="pol-row">
+        <input type="range" id="polThresh" class="pol-range" min="0" max="1" step="0.01" value="0.5">
+        <button class="btn ghost" id="polApplyThresh">SET</button>
+      </div>
+      <div class="pol-hint">Lower = more aggressive (more detections, more false positives). Higher = looser. <b>Session-only</b> — lost on the next reload. Use a profile (with a scope) or the CLI <code>--scope</code> to persist.</div>
+    </section>
+
+    <section class="pol-sec">
+      <div class="pol-sec-head">CATEGORIES</div>
+      <div class="pol-cats" id="polCats">
+        <label class="pol-check"><input type="checkbox" value="secrets"><span>Secrets</span></label>
+        <label class="pol-check"><input type="checkbox" value="financial"><span>Financial</span></label>
+        <label class="pol-check"><input type="checkbox" value="identity"><span>Identity</span></label>
+        <label class="pol-check"><input type="checkbox" value="contact"><span>Contact</span></label>
+        <label class="pol-check"><input type="checkbox" value="personal"><span>Personal</span></label>
+      </div>
+      <div class="pol-row">
+        <button class="btn ghost" id="polApplyCats">SET CATEGORIES</button>
+      </div>
+      <div class="pol-hint"><b>Session-only</b> — lost on the next reload. Use a profile (with a scope) or the CLI <code>--scope</code> to persist.</div>
+    </section>
+
+    <section class="pol-sec">
+      <div class="pol-sec-head">ML RECOGNIZER <span class="pol-ml-status" id="polMlStatus">—</span></div>
+      <div class="pol-row">
+        <label class="pol-switch">
+          <input type="checkbox" id="polMlToggle">
+          <span class="pol-switch-track"><span class="pol-switch-knob"></span></span>
+          <span class="pol-switch-label" id="polMlLabel">disabled</span>
+        </label>
+        <span class="pol-hint pol-grow" id="polMlModel"></span>
+      </div>
+      <div class="pol-hint">Enabling loads the model in the background; masking stays regex-only until it is <b>ready</b>.</div>
+    </section>
+
+    <section class="pol-sec">
+      <div class="pol-sec-head">CUSTOM MASKS <span class="pol-val" id="polMaskCount">0</span></div>
+      <div class="pol-masks" id="polMasks"></div>
+      <div class="pol-hint">Select text anywhere in a request to add a new custom mask. Session-only rules vanish on the next reload.</div>
+    </section>
+
+  </div>
+</aside>
 
 <div class="toast-stack" id="toasts" aria-live="polite"></div>
 

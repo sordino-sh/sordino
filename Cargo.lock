@@ -3859,7 +3859,7 @@ dependencies = [
 
 [[package]]
 name = "zlauder-engine"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "aes-gcm",
  "blake3",
@@ -3873,13 +3873,14 @@ dependencies = [
  "serde_json",
  "smallvec",
  "thiserror 2.0.18",
+ "toml",
  "tracing",
  "uuid",
 ]
 
 [[package]]
 name = "zlauder-hooks"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3895,7 +3896,7 @@ dependencies = [
 
 [[package]]
 name = "zlauder-proxy"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anthropic-wire",
  "anyhow",
@@ -3913,6 +3914,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml",
+ "toml_edit",
  "tower-http",
  "tracing",
  "tracing-subscriber",
@@ -3923,7 +3925,7 @@ dependencies = [
 
 [[package]]
 name = "zlauder-state"
-version = "0.5.2"
+version = "0.6.0"
 dependencies = [
  "anyhow",
  "blake3",

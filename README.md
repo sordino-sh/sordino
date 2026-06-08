@@ -212,7 +212,20 @@ annotated reference that enumerates optional and advanced fields, see
 [`zlauder.toml.example`](./zlauder.toml.example). Highlights:
 
 - `enabled` — master switch (`/zlauder:privacy on`/`off`).
-- `profile` / `score_threshold` / `enabled_categories` — what to detect.
+- `profile` / `score_threshold` / `enabled_categories` — what to detect. The
+  presets are `strict` (0.4, all 5 categories), `balanced` (0.5, secrets +
+  financial + identity + contact — the default), `minimal` (0.6, secrets +
+  financial), and `secrets_only` (0.6, secrets only; the old `development_safe`
+  name still loads as an alias). Setting `profile` SEEDS threshold / categories /
+  operator; an explicit field overrides the seed.
+
+  > **Upgrade note (load-bearing profile):** a bare `profile = "minimal"` /
+  > `"secrets_only"` (no explicit `enabled_categories`) now applies that profile's
+  > **narrower** categories/threshold directly. Earlier builds silently fell back to
+  > `balanced` behavior for these, so on upgrade such configs **stop masking
+  > Identity (SSN/passport) and Contact (email/phone)**. The proxy prints a one-time
+  > NOTE on load. To keep the old behavior, add explicit `enabled_categories` /
+  > `score_threshold`. (`strict` only adds a category, so it is unaffected.)
 - `default_operator` and per-type `entity_operators`: `token` (reversible),
   `redact`, `mask` (keep last N), `hash`, `keep`.
 - `allow_list` (exact / case-insensitive / regex) — never tokenize these.

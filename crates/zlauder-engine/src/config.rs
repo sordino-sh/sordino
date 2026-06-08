@@ -13,16 +13,29 @@ pub enum Profile {
     #[default]
     Balanced,
     Minimal,
-    DevelopmentSafe,
+    /// Secrets-only profile. Renamed from the former `DevelopmentSafe`; the
+    /// `development_safe` serde alias keeps OLD configs/control-plane clients
+    /// loading after the rename.
+    #[serde(rename = "secrets_only", alias = "development_safe")]
+    SecretsOnly,
 }
 
 impl Profile {
+    /// Every profile variant, in lineup order. Single source of truth for any
+    /// caller that needs to enumerate the profiles (tests, validation).
+    pub const ALL: [Profile; 4] = [
+        Profile::Strict,
+        Profile::Balanced,
+        Profile::Minimal,
+        Profile::SecretsOnly,
+    ];
+
     pub fn default_threshold(self) -> f32 {
         match self {
-            Profile::Strict => 0.3,
+            Profile::Strict => 0.4,
             Profile::Balanced => 0.5,
-            Profile::DevelopmentSafe => 0.6,
-            Profile::Minimal => 0.8,
+            Profile::SecretsOnly => 0.6,
+            Profile::Minimal => 0.6,
         }
     }
 
@@ -32,16 +45,17 @@ impl Profile {
             Profile::Strict => &[Secrets, Financial, Identity, Contact, Personal],
             Profile::Balanced => &[Secrets, Financial, Identity, Contact],
             Profile::Minimal => &[Secrets, Financial],
-            Profile::DevelopmentSafe => &[Secrets],
+            Profile::SecretsOnly => &[Secrets],
         };
         v.iter().copied().collect()
     }
 
     pub fn default_operator(self) -> Operator {
-        match self {
-            Profile::Strict => Operator::Redact,
-            _ => Operator::Token,
-        }
+        // Every profile now masks with a REVERSIBLE deterministic token (so the
+        // operator can always reveal/audit). Strict was changed from the previous
+        // irreversible `Redact` to `Token` (approved owner change).
+        let _ = self;
+        Operator::Token
     }
 }
 
@@ -56,6 +70,27 @@ pub enum Category {
 }
 
 impl Category {
+    /// Every category, for callers that need to enumerate the whole set.
+    pub const ALL: [Category; 5] = [
+        Category::Secrets,
+        Category::Financial,
+        Category::Identity,
+        Category::Contact,
+        Category::Personal,
+    ];
+
+    /// The canonical, deduplicated set of every `EntityType` Display string the
+    /// categories cover. This is the SAME source `entity_types` returns, so a
+    /// config validator can reject an `entity_operators` key / `custom_replacement`
+    /// `entity_type` that names an alias or typo (which would otherwise be a silent
+    /// no-op against the category gate).
+    pub fn canonical_entity_types() -> HashSet<&'static str> {
+        Category::ALL
+            .iter()
+            .flat_map(|c| c.entity_types().iter().copied())
+            .collect()
+    }
+
     /// Entity-type strings (matching `presidio_core::EntityType`'s `Display`) that
     /// belong to this category.
     pub fn entity_types(self) -> &'static [&'static str] {
@@ -396,21 +431,16 @@ impl MlConfig {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize)]
 pub struct EngineConfig {
     /// Master switch. When `false` the engine is a transparent passthrough on the
     /// mask (request) path — no detection, no tokens. Unmasking (response path)
     /// still runs, so tokens already in the transcript keep decoding. Toggled live
     /// via the proxy's control endpoint or persisted per scope.
-    #[serde(default = "default_true")]
     pub enabled: bool,
-    #[serde(default)]
     pub profile: Profile,
-    #[serde(default = "default_threshold")]
     pub score_threshold: f32,
-    #[serde(default = "default_categories")]
     pub enabled_categories: HashSet<Category>,
-    #[serde(default)]
     pub default_operator: Operator,
     #[serde(default)]
     pub entity_operators: HashMap<String, Operator>,
@@ -472,17 +502,111 @@ pub struct EngineConfig {
     pub drop_contaminated_thinking: bool,
 }
 
+/// Shadow of [`EngineConfig`] used ONLY for deserialization, so we can tell an
+/// *absent* `score_threshold`/`enabled_categories`/`default_operator` apart from
+/// one explicitly set to a default-looking value. This is what makes a load-bearing
+/// `profile = "strict"` actually seed that profile's threshold/categories/operator:
+/// a field left out of the config is `None` here and gets filled from
+/// [`Profile::for_profile`]; an explicit field stays `Some` and OVERRIDES the seed.
+///
+/// `profile` itself keeps its serde default (Balanced) — the seed is a no-op when
+/// no profile is set, because Balanced's defaults equal the historical serde
+/// defaults, so a config with no `profile` is byte-for-byte unchanged.
+// NOTE: deliberately NOT `deny_unknown_fields` — `WireConfig` deserializes via
+// `#[serde(flatten)] engine: EngineConfig` alongside a sibling `allow_list` key,
+// and flatten + deny_unknown_fields is unsupported by serde (the flattened struct
+// would reject the sibling). Unknown keys are tolerated, matching prior behavior.
+#[derive(Deserialize)]
+struct EngineConfigShadow {
+    #[serde(default = "default_true")]
+    enabled: bool,
+    #[serde(default)]
+    profile: Profile,
+    // The three profile-derived fields: absent ⇒ `None` ⇒ seed from `profile`.
+    #[serde(default)]
+    score_threshold: Option<f32>,
+    #[serde(default)]
+    enabled_categories: Option<HashSet<Category>>,
+    #[serde(default)]
+    default_operator: Option<Operator>,
+    #[serde(default)]
+    entity_operators: HashMap<String, Operator>,
+    #[serde(default = "default_language")]
+    language: String,
+    #[serde(default = "default_true")]
+    fail_closed: bool,
+    #[serde(default)]
+    disabled_surfaces: HashSet<Surface>,
+    #[serde(default)]
+    custom_replacements: Vec<CustomReplacement>,
+    #[serde(default)]
+    ml: MlConfig,
+    #[serde(default)]
+    reveal_marker: RevealMarker,
+    #[serde(default = "default_cache_cap")]
+    detection_cache_cap: usize,
+    #[serde(default)]
+    detection_cache_persist: bool,
+    #[serde(default)]
+    detection_cache_path: Option<String>,
+    #[serde(default)]
+    redact_exposed_on_ml: bool,
+    #[serde(default)]
+    exposure_redaction_scope: ExposureRedactionScope,
+    #[serde(default)]
+    salt_scope: SaltScope,
+    #[serde(default)]
+    drop_contaminated_thinking: bool,
+}
+
+impl<'de> Deserialize<'de> for EngineConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = EngineConfigShadow::deserialize(deserializer)?;
+        // Seed any absent profile-derived field from the profile; an explicit value
+        // (Some) overrides. With the default (Balanced) profile and all three fields
+        // absent, this reproduces the historical serde defaults exactly.
+        let score_threshold = s
+            .score_threshold
+            .unwrap_or_else(|| s.profile.default_threshold());
+        let enabled_categories = s
+            .enabled_categories
+            .unwrap_or_else(|| s.profile.default_categories());
+        let default_operator = s
+            .default_operator
+            .unwrap_or_else(|| s.profile.default_operator());
+        Ok(EngineConfig {
+            enabled: s.enabled,
+            profile: s.profile,
+            score_threshold,
+            enabled_categories,
+            default_operator,
+            entity_operators: s.entity_operators,
+            language: s.language,
+            fail_closed: s.fail_closed,
+            disabled_surfaces: s.disabled_surfaces,
+            allow_list: AllowList::with_common_words(),
+            custom_replacements: s.custom_replacements,
+            ml: s.ml,
+            reveal_marker: s.reveal_marker,
+            detection_cache_cap: s.detection_cache_cap,
+            detection_cache_persist: s.detection_cache_persist,
+            detection_cache_path: s.detection_cache_path,
+            redact_exposed_on_ml: s.redact_exposed_on_ml,
+            exposure_redaction_scope: s.exposure_redaction_scope,
+            salt_scope: s.salt_scope,
+            drop_contaminated_thinking: s.drop_contaminated_thinking,
+        })
+    }
+}
+
 fn default_true() -> bool {
     true
 }
-fn default_threshold() -> f32 {
-    0.5
-}
 fn default_language() -> String {
     "en".to_string()
-}
-fn default_categories() -> HashSet<Category> {
-    Profile::Balanced.default_categories()
 }
 fn default_cache_cap() -> usize {
     50_000
@@ -525,6 +649,67 @@ impl EngineConfig {
             default_operator: profile.default_operator(),
             ..Self::default()
         }
+    }
+
+    /// Validate `entity_operators` keys against the FULL `presidio_core::EntityType`
+    /// canonical Display set — NOT category membership. Returns the list of unknown
+    /// / alias / typo'd keys so a caller can reject or warn.
+    ///
+    /// Why the full Display set, not [`Category::canonical_entity_types`]: a key is a
+    /// valid, functional `entity_operators` lever as long as it names a real canonical
+    /// `EntityType` Display string, even if that type is deliberately in NO category.
+    /// Two such types are documented opt-in levers driven exactly through this map:
+    /// `DATE_TIME` (re-enabled per deployment via an explicit `entity_operators` entry
+    /// — proven by `date_time_unmapped_by_default_but_opt_in` in lib.rs) and `DOMAIN`
+    /// (re-enable per deployment if wanted). Validating against category membership
+    /// wrongly flagged both as unknown, 400-ing valid configs.
+    ///
+    /// Detection of typos vs aliases: resolve each key with
+    /// [`presidio_core::EntityType::from_str`] (infallible — an unknown label becomes
+    /// `Custom`):
+    ///   - `Custom(_)`            ⇒ no canonical match at all ⇒ typo (e.g. "EMIAL"), flag.
+    ///   - `canonical_name() != key` ⇒ a known label but an ALIAS spelling (e.g.
+    ///     "IBAN" → "IBAN_CODE"); the lookup tables match on the canonical Display, so
+    ///     the alias key is a silent no-op ⇒ flag.
+    ///   - `canonical_name() == key` ⇒ a real canonical Display name (incl.
+    ///     DATE_TIME / DOMAIN) ⇒ accept.
+    ///
+    /// WHY only `entity_operators` keys: an `entity_operators` key is a SILENT NO-OP
+    /// if it is not a canonical Display name — `entity_enabled`/`operator_for` look it
+    /// up by exact Display, so a typo or alias never matches a real detection and masks
+    /// nothing. By contrast a `custom_replacement.entity_type` is NEVER a no-op: a
+    /// custom rule is its own detector (it emits detections directly, bypassing the
+    /// category gate — see `detect::run`), so it legitimately invents a fresh type
+    /// name. A key that names one of those custom types is therefore ALSO valid (you
+    /// can set an operator for your own custom type), so we treat a key as known if it
+    /// is a canonical Display name OR names a declared `custom_replacement.entity_type`.
+    pub fn unknown_entity_types(&self) -> Vec<String> {
+        use std::str::FromStr;
+        let custom: HashSet<&str> = self
+            .custom_replacements
+            .iter()
+            .map(|c| c.entity_type.as_str())
+            .collect();
+        self.entity_operators
+            .keys()
+            .filter(|k| {
+                if custom.contains(k.as_str()) {
+                    return false;
+                }
+                // Infallible: unknown labels become `Custom` verbatim.
+                let et = presidio_core::EntityType::from_str(k).expect("from_str is infallible");
+                match et {
+                    // No canonical match at all ⇒ typo (e.g. "EMIAL"). (Its
+                    // `canonical_name()` echoes the label, so we MUST match the
+                    // variant rather than compare strings.) Flag.
+                    presidio_core::EntityType::Custom(_) => true,
+                    // A known label: accept only the exact canonical Display spelling;
+                    // an ALIAS spelling (e.g. "IBAN" → "IBAN_CODE") differs ⇒ flag.
+                    other => other.canonical_name() != k.as_str(),
+                }
+            })
+            .cloned()
+            .collect()
     }
 
     /// Is `entity_type` subject to masking — either in an enabled category or with
@@ -663,5 +848,242 @@ fn fp_allow_list(h: &mut blake3::Hasher, al: &AllowList) {
     for p in &al.patterns {
         h.update(p.as_str().as_bytes());
         h.update(&[0]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn from_toml(s: &str) -> EngineConfig {
+        toml::from_str(s).expect("config should parse")
+    }
+
+    fn from_json(s: &str) -> EngineConfig {
+        serde_json::from_str(s).expect("config should parse")
+    }
+
+    // --- profile lineup -----------------------------------------------------
+
+    #[test]
+    fn profile_lineup_values() {
+        assert_eq!(Profile::Strict.default_threshold(), 0.4);
+        assert_eq!(Profile::Balanced.default_threshold(), 0.5);
+        assert_eq!(Profile::Minimal.default_threshold(), 0.6);
+        assert_eq!(Profile::SecretsOnly.default_threshold(), 0.6);
+        // Strict masks reversibly (Token), NOT an irreversible Redact.
+        assert_eq!(Profile::Strict.default_operator(), Operator::Token);
+        assert_eq!(
+            Profile::SecretsOnly.default_categories(),
+            [Category::Secrets].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn secrets_only_serializes_to_snake_case() {
+        let v = serde_json::to_value(Profile::SecretsOnly).unwrap();
+        assert_eq!(v, serde_json::json!("secrets_only"));
+    }
+
+    #[test]
+    fn development_safe_alias_still_parses() {
+        // Back-compat: an OLD config naming the renamed profile keeps loading and
+        // resolves to SecretsOnly (with that profile's seeded fields).
+        let cfg = from_toml("profile = \"development_safe\"\n");
+        assert_eq!(cfg.profile, Profile::SecretsOnly);
+        assert_eq!(cfg.score_threshold, 0.6);
+        assert_eq!(
+            cfg.enabled_categories,
+            [Category::Secrets].into_iter().collect()
+        );
+        // The new spelling parses too.
+        assert_eq!(
+            from_toml("profile = \"secrets_only\"\n").profile,
+            Profile::SecretsOnly
+        );
+    }
+
+    // --- load-bearing profile= seeding (item 2b) ----------------------------
+
+    #[test]
+    fn profile_only_seeds_threshold_categories_operator() {
+        // A config that sets ONLY `profile` must take that profile's threshold,
+        // categories, and operator — NOT the serde/Balanced defaults.
+        let cfg = from_toml("profile = \"strict\"\n");
+        assert_eq!(cfg.profile, Profile::Strict);
+        assert_eq!(cfg.score_threshold, 0.4, "strict threshold seeded");
+        assert_eq!(
+            cfg.enabled_categories,
+            Profile::Strict.default_categories(),
+            "strict categories seeded (incl. Personal)"
+        );
+        assert!(cfg.enabled_categories.contains(&Category::Personal));
+        assert_eq!(cfg.default_operator, Operator::Token);
+    }
+
+    #[test]
+    fn profile_only_minimal_seeds() {
+        let cfg = from_json(r#"{"profile":"minimal"}"#);
+        assert_eq!(cfg.score_threshold, 0.6);
+        assert_eq!(
+            cfg.enabled_categories,
+            [Category::Secrets, Category::Financial]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn explicit_field_overrides_profile_seed() {
+        // An explicit threshold beats the profile's seed; categories still seed.
+        let cfg = from_toml("profile = \"strict\"\nscore_threshold = 0.9\n");
+        assert_eq!(cfg.profile, Profile::Strict);
+        assert_eq!(cfg.score_threshold, 0.9, "explicit threshold wins");
+        assert_eq!(
+            cfg.enabled_categories,
+            Profile::Strict.default_categories(),
+            "categories still seeded from profile"
+        );
+
+        // Explicit categories beat the seed; threshold still seeds.
+        let cfg = from_toml("profile = \"strict\"\nenabled_categories = [\"secrets\"]\n");
+        assert_eq!(cfg.score_threshold, 0.4, "threshold still seeded");
+        assert_eq!(
+            cfg.enabled_categories,
+            [Category::Secrets].into_iter().collect(),
+            "explicit categories win"
+        );
+
+        // Explicit operator beats the seed.
+        let cfg = from_toml("profile = \"balanced\"\ndefault_operator = { kind = \"redact\" }\n");
+        assert_eq!(cfg.default_operator, Operator::Redact);
+    }
+
+    #[test]
+    fn no_profile_yields_historical_defaults() {
+        // With NO profile and NO explicit fields, the config is byte-for-byte the
+        // historical default (Balanced 0.5, Balanced categories, Token) — the seed
+        // is a no-op because the default profile (Balanced) equals those defaults.
+        let cfg = from_toml("");
+        let def = EngineConfig::default();
+        assert_eq!(cfg.profile, Profile::Balanced);
+        assert_eq!(cfg.score_threshold, def.score_threshold);
+        assert_eq!(cfg.enabled_categories, def.enabled_categories);
+        assert_eq!(cfg.default_operator, def.default_operator);
+        assert_eq!(cfg.score_threshold, 0.5);
+    }
+
+    #[test]
+    fn explicit_fields_without_profile_are_honored() {
+        // No profile, but explicit fields → exactly those values (default profile).
+        let cfg = from_toml("score_threshold = 0.2\nenabled_categories = [\"contact\"]\n");
+        assert_eq!(cfg.profile, Profile::Balanced);
+        assert_eq!(cfg.score_threshold, 0.2);
+        assert_eq!(
+            cfg.enabled_categories,
+            [Category::Contact].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn each_layer_independently_seeds_or_overrides() {
+        // Exhaustive small matrix over the four (profile?, threshold?) combos.
+        // (none,none) → balanced 0.5
+        assert_eq!(from_toml("").score_threshold, 0.5);
+        // (profile,none) → seed
+        assert_eq!(from_toml("profile=\"minimal\"").score_threshold, 0.6);
+        // (none,threshold) → explicit, balanced profile
+        assert_eq!(from_toml("score_threshold=0.33").score_threshold, 0.33);
+        // (profile,threshold) → explicit wins
+        assert_eq!(
+            from_toml("profile=\"minimal\"\nscore_threshold=0.11").score_threshold,
+            0.11
+        );
+    }
+
+    // --- entity-type validation (item 2c) -----------------------------------
+
+    #[test]
+    fn unknown_entity_types_flags_typos_and_aliases() {
+        let mut cfg = EngineConfig::default();
+        // Canonical key → fine.
+        cfg.entity_operators
+            .insert("EMAIL_ADDRESS".into(), Operator::Redact);
+        // Alias (IBAN is the parse alias for IBAN_CODE) → flagged.
+        cfg.entity_operators.insert("IBAN".into(), Operator::Redact);
+        // Typo → flagged.
+        cfg.entity_operators
+            .insert("EMIAL".into(), Operator::Redact);
+        let unknown = cfg.unknown_entity_types();
+        assert!(unknown.contains(&"IBAN".to_string()));
+        assert!(unknown.contains(&"EMIAL".to_string()));
+        assert!(!unknown.contains(&"EMAIL_ADDRESS".to_string()));
+    }
+
+    #[test]
+    fn entity_operators_opt_in_levers_not_flagged() {
+        // DATE_TIME and DOMAIN are real canonical `EntityType` Display names that are
+        // DELIBERATELY in NO category — they are the documented opt-in levers driven
+        // through `entity_operators`. They must NOT be flagged as unknown even though
+        // they appear in no `Category::entity_types()` list. (Validating against
+        // category membership instead of the full Display set was the bug.)
+        let mut cfg = EngineConfig::default();
+        cfg.entity_operators
+            .insert("DATE_TIME".into(), Operator::Redact);
+        cfg.entity_operators
+            .insert("DOMAIN".into(), Operator::Redact);
+        assert!(
+            cfg.unknown_entity_types().is_empty(),
+            "DATE_TIME/DOMAIN are valid opt-in entity_operators keys"
+        );
+
+        // Aliases and typos still get flagged alongside them.
+        cfg.entity_operators.insert("IBAN".into(), Operator::Redact); // alias of IBAN_CODE
+        cfg.entity_operators
+            .insert("EMIAL".into(), Operator::Redact); // typo
+        let unknown = cfg.unknown_entity_types();
+        assert!(unknown.contains(&"IBAN".to_string()));
+        assert!(unknown.contains(&"EMIAL".to_string()));
+        assert!(!unknown.contains(&"DATE_TIME".to_string()));
+        assert!(!unknown.contains(&"DOMAIN".to_string()));
+    }
+
+    #[test]
+    fn custom_replacement_type_is_never_flagged() {
+        let mut cfg = EngineConfig::default();
+        cfg.custom_replacements.push(CustomReplacement {
+            pattern: "ACME-1".into(),
+            entity_type: "PROJECT_CODE".into(),
+            is_regex: false,
+            case_sensitive: true,
+            priority: 0,
+            literal_token: false,
+            token: None,
+            apply_to_surfaces: None,
+        });
+        // A custom rule is its own detector (bypasses the category gate), so its
+        // invented entity_type is NEVER a no-op and is not flagged — even with no
+        // matching entity_operators entry. This is the `CUSTOM_KEYWORD` UI-mask case.
+        assert!(cfg.unknown_entity_types().is_empty());
+
+        // An entity_operators key that NAMES that custom type is also known (you can
+        // set the operator for your own custom type).
+        cfg.entity_operators
+            .insert("PROJECT_CODE".into(), Operator::Token);
+        assert!(cfg.unknown_entity_types().is_empty());
+
+        // But an operator key that is neither canonical NOR a custom type → flagged.
+        cfg.entity_operators.insert("TYPO".into(), Operator::Token);
+        assert_eq!(cfg.unknown_entity_types(), vec!["TYPO".to_string()]);
+    }
+
+    #[test]
+    fn canonical_entity_types_covers_all_categories() {
+        let canon = Category::canonical_entity_types();
+        for c in Category::ALL {
+            for et in c.entity_types() {
+                assert!(canon.contains(et), "{et} missing from canonical set");
+            }
+        }
     }
 }

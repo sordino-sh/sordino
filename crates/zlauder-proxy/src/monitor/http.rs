@@ -24,6 +24,7 @@ use crate::state::AppState;
 use super::model::{
     ApprovalDecision, CustomMaskRequest, ModeRequest, MonitorEvent, RejectRequest, TagsRequest,
 };
+use super::persist;
 use super::store::ReviewTicket;
 
 /// Wait for the operator's verdict on a held request, converting a rejection into
@@ -118,8 +119,7 @@ pub async fn custom_mask(
     if pattern.is_empty() {
         return text(StatusCode::BAD_REQUEST, "pattern must not be empty");
     }
-    let mut cfg = st.engine.config_snapshot();
-    cfg.custom_replacements.push(CustomReplacement {
+    let rule = CustomReplacement {
         pattern: pattern.to_string(),
         entity_type: req
             .entity_type
@@ -131,15 +131,106 @@ pub async fn custom_mask(
         literal_token: false,
         token: None,
         apply_to_surfaces: None,
-    });
+    };
+    let mut cfg = st.engine.config_snapshot();
+    cfg.custom_replacements.push(rule.clone());
     if let Err(e) = st.engine.set_config(cfg) {
         return text(
             StatusCode::BAD_REQUEST,
             &format!("custom mask rejected: {e}"),
         );
     }
+    // Persist to ./zlauder.local.toml so a later `/zlauder/reload` doesn't destroy
+    // it. If we can't reach/write that path, the live change stays in effect but we
+    // tell the UI it is session-only (lost on the next reload).
+    let (persisted, session_only, persist_error) =
+        match persist::persist_custom_replacement(&st.project_root, &rule) {
+            Ok(path) => (Some(path.display().to_string()), false, None),
+            Err(e) => (None, true, Some(e)),
+        };
     let wire = WireConfig::from_engine(&st.engine.config_snapshot());
-    json_response(&json!({ "ok": true, "config": wire }))
+    json_response(&json!({
+        "ok": true,
+        "config": wire,
+        "persisted": persisted,
+        "session_only": session_only,
+        "persist_error": persist_error,
+    }))
+}
+
+/// `GET` listing of the live custom-mask rules (pattern + entity_type + flags), for
+/// the UI's manage view. Reads the live config snapshot (the authoritative set,
+/// including session-only additions not yet — or never — persisted).
+pub async fn custom_masks_list(State(st): State<AppState>, hdrs: HeaderMap) -> Response {
+    if !st.authed(&hdrs) {
+        return forbidden();
+    }
+    let cfg = st.engine.config_snapshot();
+    let rules: Vec<_> = cfg
+        .custom_replacements
+        .iter()
+        .map(|c| {
+            json!({
+                "pattern": c.pattern,
+                "entity_type": c.entity_type,
+                "is_regex": c.is_regex,
+                "case_sensitive": c.case_sensitive,
+            })
+        })
+        .collect();
+    json_response(&json!({ "custom_replacements": rules }))
+}
+
+/// Remove a custom-mask rule (matched by `pattern` + `entity_type`) from BOTH the
+/// live config and the persisted `zlauder.local.toml`. Removing the live rule is
+/// authoritative; the file removal is best-effort (a session-only rule has nothing
+/// persisted to remove).
+pub async fn custom_masks_remove(
+    State(st): State<AppState>,
+    hdrs: HeaderMap,
+    axum::Json(req): axum::Json<super::model::CustomMaskRemoveRequest>,
+) -> Response {
+    if !st.authed(&hdrs) {
+        return forbidden();
+    }
+    let pattern = req.pattern.trim().to_string();
+    if pattern.is_empty() {
+        return text(StatusCode::BAD_REQUEST, "pattern must not be empty");
+    }
+    let entity_type = req
+        .entity_type
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "CUSTOM_KEYWORD".to_string());
+
+    let mut cfg = st.engine.config_snapshot();
+    let before = cfg.custom_replacements.len();
+    let mut removed_live = false;
+    cfg.custom_replacements.retain(|c| {
+        if !removed_live && c.pattern == pattern && c.entity_type == entity_type {
+            removed_live = true;
+            false
+        } else {
+            true
+        }
+    });
+    if cfg.custom_replacements.len() != before
+        && let Err(e) = st.engine.set_config(cfg)
+    {
+        return text(
+            StatusCode::BAD_REQUEST,
+            &format!("custom mask removal rejected: {e}"),
+        );
+    }
+    let removed_persisted =
+        persist::remove_custom_replacement(&st.project_root, &pattern, &entity_type)
+            .unwrap_or(false);
+    let wire = WireConfig::from_engine(&st.engine.config_snapshot());
+    json_response(&json!({
+        "ok": true,
+        "removed_live": removed_live,
+        "removed_persisted": removed_persisted,
+        "config": wire,
+    }))
 }
 
 pub async fn events(

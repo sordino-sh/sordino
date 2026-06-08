@@ -16,6 +16,7 @@
 mod delta;
 mod http;
 mod model;
+mod persist;
 mod spans;
 mod store;
 mod surfaces;
@@ -23,7 +24,10 @@ mod ui;
 
 // --- preserved public API surface ---
 
-pub use http::{approve, custom_mask, events, maybe_approve, reject, set_mode, snapshot, tags};
+pub use http::{
+    approve, custom_mask, custom_masks_list, custom_masks_remove, events, maybe_approve, reject,
+    set_mode, snapshot, tags,
+};
 pub use model::{
     ConversationMeta, CustomMaskRequest, ModeRequest, MonitorMode, MonitorSnapshot, PreviewSpan,
     RejectRequest, RequestDecision, RequestRecord, Run, Surface, TagsRequest, TokenPreview,

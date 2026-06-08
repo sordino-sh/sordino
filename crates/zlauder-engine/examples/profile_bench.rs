@@ -89,11 +89,21 @@ fn positives() -> Vec<Positive> {
             "+44 20 7946 0958",
             "call the office at +44 20 7946 0958 now",
         ),
-        // --- Phones WITHOUT context words (context-free; may stay below floor) -
+        // --- Phones WITHOUT context words (context-free) ----------------------
+        // These are EXPECTED to miss on every profile: a phone with no nearby context
+        // word stays at the 0.4 base, and the `PHONE_BASE_SCORE` tie-break drops the
+        // at-base run even at the Strict 0.4 floor (so a phone-shaped order/id number is
+        // never a false positive). Recorded here to document the tradeoff in the recall
+        // numbers (the lever for context-free phones is ML or an explicit operator).
         P::new("PHONE_NUMBER", "+1 415 555 0132", "+1 415 555 0132"),
         P::new("PHONE_NUMBER", "(415) 555-0188", "(415) 555-0188"),
         // --- Identity ---------------------------------------------------------
-        P::new("US_SSN", "123-45-6789", "ssn 123-45-6789 on file"),
+        // A REAL SSN shape: a non-sample area number (not 123/000/666/9xx) that passes
+        // presidio's `invalidate_result`, so the SSN5 pattern (score 0.5) actually fires.
+        // (The textbook "123-45-6789" is a placeholder presidio deliberately rejects —
+        // it only ever "masked" via a phone-recognizer coincidence, which the phone-FP
+        // tie-break now correctly drops, so it is not a meaningful SSN-recall sample.)
+        P::new("US_SSN", "536-90-4399", "ssn 536-90-4399 on file"),
         // --- Financial: credit cards (Luhn-valid), IBAN ----------------------
         P::new(
             "CREDIT_CARD",
@@ -285,12 +295,7 @@ fn run_profile(profile: Profile, pos: &[Positive], neg: &[(&str, &str)]) -> Prof
 fn main() {
     let pos = positives();
     let neg = hard_negatives();
-    let profiles = [
-        Profile::Strict,
-        Profile::Balanced,
-        Profile::Minimal,
-        Profile::DevelopmentSafe,
-    ];
+    let profiles = Profile::ALL;
 
     let results: Vec<ProfileResult> = profiles
         .iter()

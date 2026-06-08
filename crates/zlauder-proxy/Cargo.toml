@@ -14,8 +14,8 @@ path = "src/main.rs"
 [dependencies]
 # `features = ["ml"]` is explicit (not just relying on engine's default) so the
 # proxy always carries the openai/privacy-filter download + recognizer paths.
-zlauder-engine = { path = "../zlauder-engine", version = "0.5.2", features = ["ml"] }
-zlauder-state  = { path = "../zlauder-state",  version = "0.5.2" }
+zlauder-engine = { path = "../zlauder-engine", version = "0.6.0", features = ["ml"] }
+zlauder-state  = { path = "../zlauder-state",  version = "0.6.0" }
 
 anthropic-wire = { workspace = true }
 openai-wire    = { workspace = true }
@@ -34,6 +34,7 @@ serde_json = { workspace = true }
 blake3     = { workspace = true }
 thiserror  = { workspace = true }
 toml       = { workspace = true }
+toml_edit  = "0.22"
 clap       = { workspace = true }
 anyhow     = { workspace = true }
 tracing    = { workspace = true }

@@ -252,6 +252,15 @@ pub struct CustomMaskRequest {
     pub(crate) case_sensitive: bool,
 }
 
+/// Remove one custom-mask rule (matched by `pattern` + `entity_type`), both live
+/// and from the persisted `zlauder.local.toml`.
+#[derive(Deserialize)]
+pub struct CustomMaskRemoveRequest {
+    pub(crate) pattern: String,
+    #[serde(default)]
+    pub(crate) entity_type: Option<String>,
+}
+
 fn default_true() -> bool {
     true
 }

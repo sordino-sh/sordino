@@ -30,7 +30,12 @@ use crate::surface::Surface;
 // e.g. "call"/"number" lift a PHONE_NUMBER from its 0.4 base over the 0.5 floor). The
 // regex pass now runs with NLP artifacts and a lowered pre-enhancement floor, so
 // context-bearing text yields detections it didn't before — bump to abandon stale cache.
-pub const DETECTOR_VERSION: u64 = 4;
+// v5: context-free PHONE_NUMBER tie-break — a phone still at exactly the un-boosted
+// `PHONE_BASE_SCORE` (0.4, no context word) is dropped in `ingest_results`, so a
+// phone-shaped order/id number no longer false-positives at the Strict 0.4 floor.
+// Changes detection output for unchanged text (a context-free phone that previously
+// masked at a ≤0.4 floor no longer does) — bump to abandon stale cache.
+pub const DETECTOR_VERSION: u64 = 5;
 
 /// Score the [`LemmaContextAwareEnhancer`] adds when a recognizer's context word
 /// is found near a match (mirrors `LemmaContextAwareEnhancer::new`'s
@@ -39,6 +44,16 @@ pub const DETECTOR_VERSION: u64 = 4;
 /// over the floor survives presidio's filter-before-enhance step; the authoritative
 /// `score_threshold` gate is then re-applied in `ingest_results` on the boosted score.
 const CONTEXT_BOOST: f32 = 0.35;
+
+/// The flat base score presidio's `PhoneRecognizer` assigns to EVERY
+/// libphonenumber-valid candidate (mirrors `PHONE_SCORE` in
+/// `presidio-analyzer`'s `phone.rs`). A PHONE_NUMBER detection still sitting at
+/// exactly this value was NOT lifted by the context enhancer (which only ever adds
+/// `CONTEXT_BOOST`), i.e. it is context-free — the order-number / id-number
+/// false-positive shape. Used by `ingest_results` to drop the context-free phone
+/// tie that the Strict 0.4 floor would otherwise mask. Kept in lock-step with the
+/// upstream constant via `phone_base_score_matches_upstream` below.
+const PHONE_BASE_SCORE: f32 = 0.4;
 
 /// A custom rule compiled to a regex (literal rules are escaped). Matching via
 /// regex on the original text gives correct byte offsets for any case folding.
@@ -242,7 +257,25 @@ fn ingest_results(
         if r.score < cfg.score_threshold {
             continue;
         }
+        // Targeted precision gate for the context-free PHONE_NUMBER tie. The phone
+        // recognizer assigns EVERY libphonenumber-valid candidate the same flat base
+        // score (`PHONE_SCORE` = 0.4); the context enhancer only ever LIFTS that base
+        // (+`CONTEXT_BOOST` → 0.75) when a context word ("call"/"number"/…) sits near
+        // the match. So a PHONE_NUMBER still AT exactly the 0.4 base is, by definition,
+        // context-free — a phone-shaped run with no phone context, which is the
+        // order-number / id-number false-positive shape (e.g. "Order #4021558"). At the
+        // Strict profile the floor (0.4) ties that base, so the plain `<` gate above
+        // lets the bare run through. Drop a PHONE_NUMBER whose score is still exactly the
+        // un-boosted base: a real phone in prose almost always carries a context word
+        // (so it was boosted to 0.75 and is unaffected), while a context-free number is
+        // ambiguous enough that masking it is a net false positive. This is scoped to
+        // PHONE_NUMBER only, so SSN/email/card/secret detections at their own floors are
+        // untouched. (Documented tradeoff: a genuinely context-free phone needs ML or an
+        // explicit per-entity operator to mask — same lever the enhancer doc names.)
         let entity_type = r.entity_type.to_string();
+        if entity_type == "PHONE_NUMBER" && r.score <= PHONE_BASE_SCORE {
+            continue;
+        }
         if !cfg.entity_enabled(&entity_type) {
             continue;
         }
@@ -447,11 +480,105 @@ mod context_enhancer_tests {
     #[test]
     fn bare_phone_without_context_stays_below_threshold() {
         // No phone context word nearby: the 0.4 base stays below the 0.5 floor.
-        // (Documents the tradeoff — context boosts recall; lowering the threshold or
-        // the Strict profile is the lever for context-free phones.)
+        // (Documents the tradeoff — context boosts recall; ML or an explicit
+        // per-entity PHONE_NUMBER operator is the lever for context-free phones. Note
+        // even Strict's 0.4 floor no longer masks a context-free phone: the
+        // `PHONE_BASE_SCORE` tie-break in `ingest_results` drops the at-base run, so a
+        // phone-shaped order/id number is not a false positive there either.)
         assert!(
             !phone_detected("The reference value is +1 415 555 0132 exactly."),
             "a context-free phone should remain below the default threshold"
+        );
+    }
+
+    /// The Strict profile's floor (0.4) ties the phone base score (0.4), so the plain
+    /// `<` floor would let a context-free phone-shaped run through. The targeted
+    /// `PHONE_BASE_SCORE` tie-break must drop it (no context word ⇒ still at base), so a
+    /// bare order/id number does NOT mask even under Strict — while a context-bearing
+    /// phone (boosted to 0.75) still masks under Strict.
+    #[test]
+    fn strict_drops_context_free_phone_tie_but_keeps_boosted() {
+        fn phone_detected_strict(text: &str) -> bool {
+            let cfg = EngineConfig::for_profile(crate::Profile::Strict); // floor 0.4
+            run_detection(
+                &enhanced_analyzer(),
+                &cfg,
+                &[],
+                None,
+                text,
+                Surface::UserMessage,
+            )
+            .unwrap()
+            .iter()
+            .any(|d| d.entity_type == "PHONE_NUMBER")
+        }
+        // Context-free phone-shaped number at exactly the 0.4 base: dropped even at the
+        // Strict 0.4 floor (this is the "Order #4021558" false-positive shape).
+        assert!(
+            !phone_detected_strict("Order #4021558 shipped"),
+            "a context-free phone-shaped run must not mask at Strict (was the Order# FP)"
+        );
+        assert!(
+            !phone_detected_strict("The reference value is +1 415 555 0132 exactly."),
+            "a context-free phone stays unmasked at Strict (needs a context word or ML)"
+        );
+        // A context word lifts the same phone to 0.75 (> 0.4 base), so it still masks.
+        assert!(
+            phone_detected_strict("Call me at +1 415 555 0132 about the contract."),
+            "a context-bearing phone still masks under Strict"
+        );
+    }
+
+    /// Pins our local `PHONE_BASE_SCORE` to the upstream recognizer's flat phone score.
+    /// If a presidio bump changes the base, this fails loudly so the tie-break stays
+    /// aligned (a stale value would either re-admit the FP or over-drop real phones).
+    #[test]
+    fn phone_base_score_matches_upstream() {
+        // Pin the local constant to presidio's flat phone score. If a presidio bump
+        // changes the base, this fails loudly so the tie-break stays aligned (a stale
+        // value would either re-admit the order-number FP or over-drop real phones).
+        assert_eq!(PHONE_BASE_SCORE, 0.4, "phone base score constant");
+        // With the floor dropped below the base, the tie-break is the ONLY thing that can
+        // suppress a context-free phone — confirm it does (no PHONE_NUMBER survives).
+        let cfg = EngineConfig {
+            score_threshold: 0.0,
+            ..EngineConfig::default()
+        };
+        let dets = run_detection(
+            &enhanced_analyzer(),
+            &cfg,
+            &[],
+            None,
+            "The reference value is +1 415 555 0132 exactly.",
+            Surface::UserMessage,
+        )
+        .unwrap();
+        assert!(
+            !dets.iter().any(|d| d.entity_type == "PHONE_NUMBER"),
+            "context-free phone dropped by the PHONE_BASE_SCORE tie-break even at floor 0"
+        );
+    }
+
+    /// A real (non-placeholder) SSN is still detected and survives every profile floor
+    /// — the phone tie-break is scoped to PHONE_NUMBER and does NOT touch US_SSN. (The
+    /// SSN5 pattern scores 0.5, above Strict 0.4 and at/above the others, and a
+    /// non-sample area number passes presidio's `invalidate_result`.) This pins that the
+    /// phone-FP fix did not weaken SSN masking.
+    #[test]
+    fn real_ssn_still_masks_under_strict() {
+        let cfg = EngineConfig::for_profile(crate::Profile::Strict); // floor 0.4
+        let dets = run_detection(
+            &enhanced_analyzer(),
+            &cfg,
+            &[],
+            None,
+            "ssn 536-90-4399 on file",
+            Surface::UserMessage,
+        )
+        .unwrap();
+        assert!(
+            dets.iter().any(|d| d.entity_type == "US_SSN"),
+            "a real SSN must still mask under Strict after the phone-FP fix, got {dets:?}"
         );
     }
 

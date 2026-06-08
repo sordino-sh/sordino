@@ -11,7 +11,9 @@
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use zlauder_engine::{AllowList, EngineConfig};
+use zlauder_engine::{AllowList, EngineConfig, Profile};
+
+use crate::admin::Scope;
 
 /// The resolved file paths for each config scope, kept so `reload` can recompute.
 #[derive(Clone, Debug)]
@@ -90,6 +92,8 @@ pub fn load(project: Option<&Path>) -> anyhow::Result<LoadedConfig> {
     let file: FileConfig = merged.clone().try_into()?;
     let mut engine = file.engine;
     engine.allow_list = build_allow_list(Some(&merged))?;
+    warn_unknown_entity_types(&engine);
+    warn_narrowing_profile(&merged, &engine);
 
     Ok(LoadedConfig {
         port: file.proxy.port,
@@ -108,7 +112,144 @@ pub fn reload_engine(layers: &ConfigLayers) -> anyhow::Result<EngineConfig> {
     let file: FileConfig = merged.clone().try_into()?;
     let mut engine = file.engine;
     engine.allow_list = build_allow_list(Some(&merged))?;
+    warn_unknown_entity_types(&engine);
     Ok(engine)
+}
+
+/// Warn (don't reject) on `entity_operators` keys that aren't canonical `EntityType`
+/// Display names (nor a declared `custom_replacement.entity_type`) — a file-scope
+/// reload must not hard-fail a running proxy, but such a key is a SILENT NO-OP (it
+/// never matches a real detection, so it masks nothing) and deserves a loud line.
+/// The interactive `PUT /zlauder/config` REJECTS the same condition (admin.rs); this
+/// is the persistent-file counterpart.
+fn warn_unknown_entity_types(engine: &EngineConfig) {
+    let unknown = engine.unknown_entity_types();
+    if !unknown.is_empty() {
+        eprintln!(
+            "ZlauDeR: WARNING — config has entity_operators key(s) {unknown:?} that are not \
+             canonical EntityType Display names (alias or typo), so they mask NOTHING. Fix the \
+             entity_operators key, or declare a matching custom_replacement."
+        );
+    }
+}
+
+/// One-time migration surfacing for the load-bearing-`profile=` change (item 2b).
+///
+/// BEFORE the change, a config that set ONLY a narrowing `profile = "minimal"` /
+/// `"secrets_only"` (without explicit `enabled_categories`) ran with BALANCED
+/// fallback behavior: threshold 0.5 and categories {Secrets, Financial, Identity,
+/// Contact}. AFTER the change, that bare profile now seeds its own (narrower) fields:
+/// Minimal → {Secrets, Financial} @ 0.6, SecretsOnly → {Secrets} @ 0.6. On upgrade
+/// this SILENTLY drops Identity (SSN/passport) and Contact (email/phone) masking for
+/// any operator who relied on the old Balanced fallback. The behavior is approved and
+/// intended; this loud line is so the narrowing is not silent on first load. Strict
+/// only ADDS a category (Personal), so it is not warned.
+fn warn_narrowing_profile(merged: &toml::Value, engine: &EngineConfig) {
+    use zlauder_engine::Profile;
+    // Only the narrowing profiles, and only when the operator did NOT pin categories
+    // explicitly (an explicit `enabled_categories` already overrides the seed, so
+    // there is nothing to migrate).
+    let narrowing = matches!(engine.profile, Profile::Minimal | Profile::SecretsOnly);
+    if !narrowing {
+        return;
+    }
+    let engine_tbl = merged.get("engine").and_then(toml::Value::as_table);
+    let has_explicit_cats = engine_tbl
+        .map(|t| t.contains_key("enabled_categories"))
+        .unwrap_or(false);
+    if has_explicit_cats {
+        return;
+    }
+    let profile_name = serde_json::to_value(engine.profile)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "minimal".to_string());
+    eprintln!(
+        "ZlauDeR: NOTE — config sets `profile = \"{profile_name}\"` without an explicit \
+         `enabled_categories`. As of the load-bearing-profile change, this now applies that \
+         profile's NARROWER categories/threshold directly (it no longer falls back to Balanced). \
+         Identity and Contact masking are NOT active under this profile. If you relied on the old \
+         Balanced fallback, add explicit `enabled_categories`/`score_threshold` to retain it."
+    );
+}
+
+/// Resolve the file path a `scope` write targets. `Session` has no file (handled by
+/// the caller); `Project`/`Local` fall back to `<project_root>/zlauder.{,local.}toml`
+/// when the layers don't already carry an explicit path.
+fn scope_file_path(layers: &ConfigLayers, project_root: &str, scope: Scope) -> Option<PathBuf> {
+    match scope {
+        Scope::Session => None,
+        Scope::User => Some(layers.user.clone()),
+        Scope::Project => layers.project.clone().or_else(|| {
+            (!project_root.is_empty()).then(|| Path::new(project_root).join("zlauder.toml"))
+        }),
+        Scope::Local => layers.local.clone().or_else(|| {
+            (!project_root.is_empty()).then(|| Path::new(project_root).join("zlauder.local.toml"))
+        }),
+    }
+}
+
+/// Persist a detection profile (profile + threshold + categories + default operator,
+/// all from [`EngineConfig::for_profile`]) to the `scope`'s TOML file, preserving
+/// existing content/formatting via `toml_edit`. This is the SAME field shape the
+/// hooks CLI's `apply_profile` writes, so the proxy `POST /zlauder/profile/{name}`
+/// endpoint and the CLI converge on one persisted representation. Returns the path.
+pub fn persist_profile(
+    layers: &ConfigLayers,
+    project_root: &str,
+    scope: Scope,
+    profile: Profile,
+) -> anyhow::Result<PathBuf> {
+    let path = scope_file_path(layers, project_root, scope)
+        .ok_or_else(|| anyhow::anyhow!("scope {scope:?} has no persistable file path"))?;
+
+    let defaults = EngineConfig::for_profile(profile);
+    let profile_str = serde_json::to_value(profile)?
+        .as_str()
+        .map(str::to_string)
+        .unwrap_or_else(|| "balanced".to_string());
+    let mut cats: Vec<String> = defaults
+        .enabled_categories
+        .iter()
+        .filter_map(|c| serde_json::to_value(c).ok()?.as_str().map(str::to_string))
+        .collect();
+    cats.sort();
+    let operator = serde_json::to_value(defaults.default_operator)?;
+
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let mut doc = existing
+        .parse::<toml_edit::DocumentMut>()
+        .map_err(|e| anyhow::anyhow!("parsing {}: {e}", path.display()))?;
+    if !doc.contains_key("engine") {
+        doc["engine"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    doc["engine"]["profile"] = toml_edit::value(profile_str.as_str());
+    doc["engine"]["score_threshold"] = toml_edit::value(f32_to_toml(defaults.score_threshold));
+    let mut arr = toml_edit::Array::new();
+    for c in &cats {
+        arr.push(c.as_str());
+    }
+    doc["engine"]["enabled_categories"] = toml_edit::value(arr);
+    if let Some(kind) = operator.get("kind").and_then(|v| v.as_str()) {
+        let mut t = toml_edit::InlineTable::new();
+        t.insert("kind", kind.into());
+        doc["engine"]["default_operator"] = toml_edit::value(t);
+    }
+
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(&path, doc.to_string())
+        .map_err(|e| anyhow::anyhow!("writing {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// Widen an `f32` to `f64` via its shortest decimal form so e.g. `0.4` persists as
+/// `0.4`, not `0.4000000059604645`. Mirrors the hooks CLI helper of the same name.
+fn f32_to_toml(v: f32) -> f64 {
+    format!("{v}").parse().unwrap_or(v as f64)
 }
 
 /// Read every existing layer file and deep-merge them (user < project < local).

@@ -25,6 +25,7 @@ pub fn router(state: AppState) -> Router {
             "/zlauder/config",
             get(admin::get_config).put(admin::put_config),
         )
+        .route("/zlauder/profile/{name}", post(admin::apply_profile))
         .route("/zlauder/enable", post(admin::enable))
         .route("/zlauder/disable", post(admin::disable))
         .route("/zlauder/reload", post(admin::reload))
@@ -43,7 +44,12 @@ pub fn router(state: AppState) -> Router {
             post(monitor::reject),
         )
         .route("/zlauder/monitor/requests/{id}/tags", post(monitor::tags))
-        .route("/zlauder/monitor/custom-mask", post(monitor::custom_mask))
+        .route(
+            "/zlauder/monitor/custom-mask",
+            get(monitor::custom_masks_list)
+                .post(monitor::custom_mask)
+                .delete(monitor::custom_masks_remove),
+        )
         .route(
             "/zlauder/session/{conversation}/v1/messages",
             post(messages_session),
