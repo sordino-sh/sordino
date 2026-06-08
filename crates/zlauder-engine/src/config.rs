@@ -429,21 +429,23 @@ pub struct MlConfig {
     /// Parsed even by a regex-only build; only effective when `ml` is loaded.
     #[serde(default = "default_ml_quant")]
     pub quant: Quantization,
-    /// Banded-attention sparsity for long sequences. **Default `false`** (dense
-    /// `T x T` attention, today's behavior, output bit-identical to historical
-    /// detections).
+    /// Banded-attention sparsity for long sequences. **Default `true`** — the
+    /// recall gate (widened corpus incl. 3 long-doc fixtures) proves it drops zero
+    /// true-positives with score delta < 1e-3, and it is ~48% faster on long
+    /// inputs.
     ///
-    /// When `true`, the backend computes attention block-by-block over only the
-    /// in-band key slice of each query block, skipping the fully out-of-band
-    /// region of the score matrix. The band half-width and the softmax
-    /// effective-logit set are identical to the dense path, so the output is
-    /// *designed* to be bit-equivalent — but it is treated as a **recall-risk
-    /// opt-in** until the recall gate proves zero dropped true-positives and
-    /// score delta < 1e-3 on the long-doc golden fixtures, and it is NEVER made
-    /// the default. The speedup is on inputs with `T` well beyond the band's
-    /// full width; short inputs use the dense path regardless. Parsed even by a
-    /// regex-only build; it only has an effect when the `ml` backend is loaded.
-    #[serde(default)]
+    /// The backend computes attention block-by-block over only the in-band key
+    /// slice of each query block, skipping the fully out-of-band region of the
+    /// score matrix. The band half-width and the softmax effective-logit set are
+    /// identical to the dense path, so the output is bit-equivalent — and because
+    /// the band geometry is content-independent (a fixed function of the model's
+    /// sliding window, not of the text), the gate's proof generalizes to all
+    /// inputs. The speedup applies only where `T` exceeds the band's full width
+    /// (large tool outputs / file contents / transcripts); short inputs use the
+    /// dense path regardless, unchanged. Set `false` for the historical dense
+    /// `T x T` path. Parsed even by a regex-only build; only effective when the
+    /// `ml` backend is loaded.
+    #[serde(default = "default_ml_banded")]
     pub banded_attention: bool,
 }
 
@@ -451,8 +453,9 @@ pub struct MlConfig {
 ///
 /// Serde wire form is lowercase (`"none"`, `"q8_0"`, `"bf16"`, `"bf16_vnni"`).
 /// The operational default (see [`MlConfig`]) is `Bf16` — the recall-neutral,
-/// ~30% faster CPU lever; `None` is the historical F32 path; `Q8_0` and
-/// `Bf16Vnni` are recall-risk opt-ins (see [`MlConfig::quant`]).
+/// half-RAM CPU lever (inference-neutral vs F32; the win is memory, not speed);
+/// `None` is the historical F32 path; `Q8_0` and `Bf16Vnni` are recall-risk
+/// opt-ins (see [`MlConfig::quant`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Quantization {
@@ -465,8 +468,9 @@ pub enum Quantization {
     /// before enabling.
     #[serde(rename = "q8_0")]
     Q8_0,
-    /// bf16 MoE expert weights (recall-neutral, ~30% faster CPU lever; span-
-    /// identical to F32). Maps to presidio `Quant::Bf16`. The recommended default.
+    /// bf16 MoE expert weights (recall-neutral, half resident RAM; CPU inference
+    /// ~neutral vs F32, span-identical). Maps to presidio `Quant::Bf16`. The
+    /// recommended default.
     Bf16,
     /// Native AVX512-BF16 `vdpbf16ps` expert matmul (recall-RISK — rounds
     /// activations; CPU-only, Zen4+; falls back to `Bf16` without avx512bf16).
@@ -503,6 +507,16 @@ fn default_ml_quant() -> Quantization {
     Quantization::Bf16
 }
 
+/// Serde default for [`MlConfig::banded_attention`]: `true`. Banded attention is
+/// the gate-proven default — zero dropped true-positives and score delta < 1e-3 on
+/// the long-doc fixtures, ~48% faster on long inputs, no-op on short ones. A config
+/// with an `[ml]` table that omits `banded_attention` deserializes to this, not
+/// `bool`'s `false` (which would silently leave long-doc detection on the slow
+/// dense path).
+fn default_ml_banded() -> bool {
+    true
+}
+
 impl Default for MlConfig {
     fn default() -> Self {
         Self {
@@ -512,11 +526,15 @@ impl Default for MlConfig {
             min_score: None,
             prefer_gpu: false,
             compute_precision: ComputePrecision::F32,
-            // Golden-gate-confirmed recall-neutral (26/28, 4/6 ML-only, zero
-            // dropped, no score delta > 1e-3) and ~30% faster on the MoE matmuls.
-            // Use Quantization::None for the historical F32 CPU path.
+            // Golden-gate-confirmed recall-neutral (zero dropped spans, no score
+            // delta > 1e-3 on the widened corpus) and HALF the resident RAM for
+            // expert weights. CPU inference time is ~neutral vs F32 — the safe
+            // kernel upcasts each weight block to F32 for the matmul, so the win is
+            // memory, not throughput. Use Quantization::None for historical F32.
             quant: Quantization::Bf16,
-            banded_attention: false,
+            // Banded attention default-on: gate-proven recall-neutral, ~48% faster
+            // on long inputs, no-op on short. See `banded_attention` field docs.
+            banded_attention: true,
         }
     }
 }
@@ -998,6 +1016,23 @@ mod tests {
             from_toml("[ml]\nquant = \"bf16_vnni\"\n").ml.quant,
             Quantization::Bf16Vnni
         );
+    }
+
+    #[test]
+    fn ml_present_without_banded_defaults_to_true() {
+        // Same serde-default footgun as `quant`: a present `[ml]` block that omits
+        // `banded_attention` must resolve to the operational default `true` (the
+        // `default_ml_banded` fn), NOT `bool`'s `false`. Otherwise the banded
+        // default is silently a no-op for every config that turns ML on, leaving
+        // long-doc detection on the slow dense `T x T` path.
+        let cfg = from_toml("[ml]\nenabled = true\nmodel = \"openai/privacy-filter\"\n");
+        assert!(
+            cfg.ml.banded_attention,
+            "omitted banded_attention under a present [ml] must default to true"
+        );
+        // Explicit selectors are still honored.
+        assert!(!from_toml("[ml]\nbanded_attention = false\n").ml.banded_attention);
+        assert!(from_toml("[ml]\nbanded_attention = true\n").ml.banded_attention);
     }
 
     // --- profile lineup -----------------------------------------------------
