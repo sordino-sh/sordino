@@ -629,6 +629,12 @@ select:focus { outline: none; border-color: var(--cyan-dim); box-shadow: 0 0 0 1
 .policy-open { letter-spacing: .22em; }
 .policy-open:hover { border-color: var(--cyan-dim); color: #fff; box-shadow: 0 0 14px -6px var(--cyan); }
 
+/* The drawer/scrim are toggled via the [hidden] attribute (openPolicy/closePolicy).
+   `.policy-drawer { display:flex }` below would otherwise beat the UA [hidden]
+   rule, leaving the drawer permanently open (won't close, starts open, never runs
+   loadPolicy so the controls never sync). Make [hidden] win for both. */
+.policy-scrim[hidden], .policy-drawer[hidden] { display: none !important; }
+
 .policy-scrim {
   position: fixed; inset: 0; z-index: 60;
   background: rgba(4, 6, 9, .62); backdrop-filter: blur(2px);
