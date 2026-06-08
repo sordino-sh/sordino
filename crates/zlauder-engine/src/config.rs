@@ -427,7 +427,7 @@ pub struct MlConfig {
     /// score head, attention sinks, and all biases stay F32. Applies on every
     /// device (bf16 levers are a no-op on GPU, which already computes in bf16).
     /// Parsed even by a regex-only build; only effective when `ml` is loaded.
-    #[serde(default)]
+    #[serde(default = "default_ml_quant")]
     pub quant: Quantization,
     /// Banded-attention sparsity for long sequences. **Default `false`** (dense
     /// `T x T` attention, today's behavior, output bit-identical to historical
@@ -492,6 +492,15 @@ pub enum ComputePrecision {
 
 fn default_ml_model() -> String {
     "openai/privacy-filter".to_string()
+}
+
+/// Serde default for [`MlConfig::quant`]: the operational default is `Bf16` (the
+/// golden-gate-confirmed recall-neutral lever), NOT the enum `#[default]` (`None`,
+/// the F32 type-identity). Without an explicit serde default fn, a config that has
+/// an `[ml]` table but omits `quant` would deserialize to `None` (the enum default)
+/// and silently stay on F32 — which is *every* config that turns ML on.
+fn default_ml_quant() -> Quantization {
+    Quantization::Bf16
 }
 
 impl Default for MlConfig {
@@ -957,6 +966,38 @@ mod tests {
 
     fn from_json(s: &str) -> EngineConfig {
         serde_json::from_str(s).expect("config should parse")
+    }
+
+    #[test]
+    fn ml_present_without_quant_defaults_to_bf16() {
+        // A deployed `[ml]` block that ENABLES ml but omits `quant` must resolve to
+        // the operational default Bf16 — NOT the enum `#[default]` None. Otherwise
+        // the bf16 default is silently a no-op for every config that turns ML on
+        // (the case `[ml]` present + `quant` absent), which is the only case that
+        // matters since a fully-absent `[ml]` table means ML is off.
+        let cfg = from_toml("[ml]\nenabled = true\nmodel = \"openai/privacy-filter\"\n");
+        assert_eq!(
+            cfg.ml.quant,
+            Quantization::Bf16,
+            "omitted quant under a present [ml] must default to Bf16"
+        );
+        // Explicit selectors are still honored, and the new wire forms round-trip.
+        assert_eq!(
+            from_toml("[ml]\nquant = \"none\"\n").ml.quant,
+            Quantization::None
+        );
+        assert_eq!(
+            from_toml("[ml]\nquant = \"q8_0\"\n").ml.quant,
+            Quantization::Q8_0
+        );
+        assert_eq!(
+            from_toml("[ml]\nquant = \"bf16\"\n").ml.quant,
+            Quantization::Bf16
+        );
+        assert_eq!(
+            from_toml("[ml]\nquant = \"bf16_vnni\"\n").ml.quant,
+            Quantization::Bf16Vnni
+        );
     }
 
     // --- profile lineup -----------------------------------------------------

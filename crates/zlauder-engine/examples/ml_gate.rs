@@ -317,10 +317,12 @@ operating territories and partner facilities for the remainder of the calendar y
             Some("f16") | Some("F16") => zlauder_engine::ComputePrecision::F16,
             _ => zlauder_engine::ComputePrecision::F32,
         };
-        // Default quant is None (the real gate path). `ZLAUDER_ML_QUANT=q8_0`
-        // flips the recall-risk Q8_0 MoE-expert-weight lever ON for INFORMATIONAL
-        // recall measurement only — it never changes the default/golden path,
-        // which stays dense F32 experts.
+        // The gate's quant is F32/None UNLESS overridden here — this is the gate
+        // BASELINE, deliberately F32 so `--dump-golden` captures the F32 reference
+        // (independent of the production default, which is now Quantization::Bf16).
+        // `ZLAUDER_ML_QUANT` selects a lever to MEASURE against that F32 golden:
+        // `bf16` (recall-neutral), `bf16_vnni`/`q8_0` (recall-risk). It never
+        // changes the golden baseline itself.
         let quant = match std::env::var("ZLAUDER_ML_QUANT").ok().as_deref() {
             Some("q8_0") | Some("Q8_0") | Some("q8") => zlauder_engine::Quantization::Q8_0,
             Some("bf16") | Some("BF16") => zlauder_engine::Quantization::Bf16,
@@ -348,7 +350,7 @@ operating territories and partner facilities for the remainder of the calendar y
             ..Default::default()
         };
         eprintln!("compute_precision = {precision:?} (default F32; f16 is recall-risk, informational only)");
-        eprintln!("quant = {quant:?} (default None; q8_0 is recall-risk, informational only)");
+        eprintln!("quant = {quant:?} (gate baseline F32/None; set ZLAUDER_ML_QUANT=bf16|bf16_vnni|q8_0 to measure a lever vs the F32 golden)");
         eprintln!("banded_attention = {banded} (default false; banded is recall-risk opt-in, gate-only)");
 
         let engine = MaskEngine::new(cfg.clone()).map_err(|e| format!("build engine: {e}"))?;
