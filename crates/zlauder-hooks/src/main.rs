@@ -765,9 +765,10 @@ fn run_wrapped(cmd: &str, stdin: &[u8]) -> Option<String> {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    // A wrapped status line that hangs (slow git, blocking network, deadlock) must
-    // not stall our own shield indefinitely. Claude Code reaps slow status lines too,
-    // but we bound it ourselves so `🛡 …` still renders promptly on its own.
+    // A wrapped status line that hangs (slow git, blocking network, or a child that
+    // floods stdout without draining stdin) must not stall our own shield. Claude
+    // Code reaps slow status lines too, but we bound it ourselves so `🛡 …` still
+    // renders promptly on its own.
     const WRAP_TIMEOUT: Duration = Duration::from_millis(2000);
 
     let (sh, flag) = if cfg!(windows) {
@@ -775,19 +776,35 @@ fn run_wrapped(cmd: &str, stdin: &[u8]) -> Option<String> {
     } else {
         ("sh", "-c")
     };
-    let mut child = Command::new(sh)
+    let mut builder = Command::new(sh);
+    builder
         .arg(flag)
         .arg(cmd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .ok()?;
-    if let Some(mut si) = child.stdin.take() {
-        let _ = si.write_all(stdin);
-        // `si` drops here, closing the child's stdin so it can finish.
+        .stderr(Stdio::null());
+    // Lead our own process group so a timeout can signal the whole job tree, not
+    // just the immediate shell — a backgrounded grandchild could otherwise survive
+    // holding our stdout pipe open and strand the reader thread.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        builder.process_group(0);
     }
-    // Drain stdout on a worker thread so the wait never blocks past the timeout.
+    let mut child = builder.spawn().ok()?;
+
+    // Forward stdin on its OWN thread. Writing it synchronously here would deadlock
+    // when the command floods stdout (filling that pipe) before draining stdin, or
+    // never reads stdin and our payload exceeds the ~64KB pipe buffer — and that hang
+    // precedes the timeout below, so the timeout could never fire to break it.
+    if let Some(mut si) = child.stdin.take() {
+        let data = stdin.to_vec();
+        std::thread::spawn(move || {
+            let _ = si.write_all(&data);
+            // `si` drops here, closing the child's stdin so it can finish.
+        });
+    }
+    // Drain stdout on a worker thread so the recv below is the true worst-case bound.
     // `child` stays here so we can kill it if it overruns; the thread owns only the
     // pipe and gets EOF (then exits) once the child dies.
     let mut stdout = child.stdout.take()?;
@@ -803,14 +820,31 @@ fn run_wrapped(cmd: &str, stdin: &[u8]) -> Option<String> {
             buf
         }
         Err(_) => {
-            let _ = child.kill();
-            let _ = child.wait();
+            kill_group(&mut child);
             return None;
         }
     };
     let s = String::from_utf8_lossy(&buf);
     let s = s.trim_end_matches(['\n', '\r']);
     (!s.is_empty()).then(|| s.to_string())
+}
+
+/// Kill an overrunning wrapped status-line process and reap it. On Unix we signal
+/// the whole process group (the child leads its own group via `process_group(0)`)
+/// so a backgrounded grandchild can't survive holding our stdout pipe open;
+/// elsewhere we fall back to killing the child directly.
+fn kill_group(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    {
+        // SAFETY: kill(2) with a negative pid signals the process group led by
+        // `child`; a no-op (ESRCH) if the group already exited.
+        let pgid = child.id() as i32;
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 // ---------------------------------------------------------------------------
@@ -1732,6 +1766,40 @@ mod statusline_tests {
     fn read_wrap_original_none_without_sidecar() {
         let dir = std::env::temp_dir().join(format!("zl-sl-absent-{}", std::process::id()));
         assert_eq!(read_wrap_original(&dir), None);
+    }
+
+    // The wrap timeout must bound the WORST case, including the pipe-deadlock shape:
+    // a command that floods stdout (>64KB pipe buffer) before draining a >64KB stdin.
+    // Writing stdin synchronously deadlocked here before the fix; the timeout fired
+    // too late because the hang preceded the reader thread.
+    #[cfg(unix)]
+    #[test]
+    fn run_wrapped_bounds_hangs_and_pipe_deadlock() {
+        use super::run_wrapped;
+        use std::time::{Duration, Instant};
+
+        // 1. A command that never exits is cut off near the timeout, not hung forever.
+        let t = Instant::now();
+        assert_eq!(run_wrapped("sleep 30", b""), None);
+        assert!(
+            t.elapsed() < Duration::from_secs(5),
+            "hang not bounded: {:?}",
+            t.elapsed()
+        );
+
+        // 2. The deadlock shape: child floods stdout before draining a 200KB stdin.
+        //    With stdin forwarded on its own thread this completes instead of hanging.
+        let big = vec![b'x'; 200_000];
+        let t2 = Instant::now();
+        let _ = run_wrapped("head -c 100000 /dev/zero | tr '\\0' A; cat >/dev/null", &big);
+        assert!(
+            t2.elapsed() < Duration::from_secs(5),
+            "pipe deadlock not fixed: {:?}",
+            t2.elapsed()
+        );
+
+        // 3. A normal small command still returns its trimmed output.
+        assert_eq!(run_wrapped("printf hello", b"").as_deref(), Some("hello"));
     }
 }
 

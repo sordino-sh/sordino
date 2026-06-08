@@ -3885,6 +3885,7 @@ dependencies = [
  "anyhow",
  "blake3",
  "clap",
+ "libc",
  "rand 0.8.6",
  "reqwest",
  "serde",
