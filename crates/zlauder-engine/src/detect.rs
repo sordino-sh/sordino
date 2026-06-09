@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use crate::cache::{CachedDetection, Source};
 use crate::config::{CustomReplacement, EngineConfig, Operator};
 use crate::error::EngineError;
+use crate::secrets::{CompiledSecret, detect_secrets};
 use crate::surface::Surface;
 
 /// Identity of the bundled (compiled-in) regex/custom recognizer set. Folded into
@@ -107,7 +108,11 @@ pub fn compile_customs(rules: &[CustomReplacement]) -> Result<Vec<CompiledCustom
 /// custom is always `Token` (a structural property of the rule, captured in
 /// `det.literal`); everything else follows `operator_for`.
 pub fn resolve_operator(cfg: &EngineConfig, det: &CachedDetection) -> Operator {
-    if det.literal {
+    if let Some(op) = det.secret_op {
+        // A registered secret carries its resolved operator (Hash/Redact/Mask/Broker),
+        // keyed by `secrets_fp` in the cache key so it is safe to memoize.
+        op
+    } else if det.literal {
         Operator::Token
     } else {
         cfg.operator_for(&det.entity_type)
@@ -118,11 +123,12 @@ pub fn run_detection(
     analyzer: &AnalyzerEngine,
     cfg: &EngineConfig,
     customs: &[CompiledCustom],
+    secrets: &[CompiledSecret],
     ml: Option<&dyn Recognizer>,
     text: &str,
     surface: Surface,
 ) -> Result<Vec<CachedDetection>, EngineError> {
-    let (mut dets, mut allowed_spans) = detect_base(analyzer, cfg, customs, text, surface);
+    let (mut dets, mut allowed_spans) = detect_base(analyzer, cfg, customs, secrets, text, surface);
 
     // Pass 2b: the optional ML recognizer (openai/privacy-filter), if loaded. It
     // returns the same `RecognizerResult` type, so it flows through the identical
@@ -162,6 +168,7 @@ pub fn run_detection_batch(
     analyzer: &AnalyzerEngine,
     cfg: &EngineConfig,
     customs: &[CompiledCustom],
+    secrets: &[CompiledSecret],
     ml: &dyn Recognizer,
     leaves: &[(&str, Surface)],
 ) -> Result<Vec<Vec<CachedDetection>>, EngineError> {
@@ -180,7 +187,8 @@ pub fn run_detection_batch(
 
     let mut out = Vec::with_capacity(leaves.len());
     for ((text, surface), ml_results) in leaves.iter().zip(ml_batch) {
-        let (mut dets, mut allowed_spans) = detect_base(analyzer, cfg, customs, text, *surface);
+        let (mut dets, mut allowed_spans) =
+            detect_base(analyzer, cfg, customs, secrets, text, *surface);
         ingest_results(
             ml_results,
             cfg,
@@ -203,6 +211,7 @@ fn detect_base(
     analyzer: &AnalyzerEngine,
     cfg: &EngineConfig,
     customs: &[CompiledCustom],
+    secrets: &[CompiledSecret],
     text: &str,
     surface: Surface,
 ) -> (Vec<CachedDetection>, Vec<(usize, usize)>) {
@@ -211,6 +220,11 @@ fn detect_base(
     // is also suppressed (allow-listing "admin@example.com" covers its
     // "example.com" sub-domain too).
     let mut allowed_spans: Vec<(usize, usize)> = Vec::new();
+
+    // Pass 0: registered secrets (exact-literal). Highest overlap priority and EXEMPT
+    // from allow-list suppression (a registered secret is never silently passed
+    // through, even if it also matches an allow-list entry).
+    dets.extend(detect_secrets(secrets, text, surface));
 
     // Pass 1: custom rules (already priority-sorted).
     for c in customs {
@@ -239,6 +253,7 @@ fn detect_base(
                 } else {
                     None
                 },
+                secret_op: None,
             });
         }
     }
@@ -277,11 +292,14 @@ fn finish(
     mut dets: Vec<CachedDetection>,
     allowed_spans: Vec<(usize, usize)>,
 ) -> Vec<CachedDetection> {
+    // Suppress detections fully contained within an allow-listed span — EXCEPT
+    // registered secrets (Pass-0), which are never silently passed through.
     if !allowed_spans.is_empty() {
         dets.retain(|d| {
-            !allowed_spans
-                .iter()
-                .any(|(s, e)| *s <= d.start && d.end <= *e)
+            d.source == Source::Secret
+                || !allowed_spans
+                    .iter()
+                    .any(|(s, e)| *s <= d.start && d.end <= *e)
         });
     }
     resolve_overlaps(dets)
@@ -395,19 +413,29 @@ fn ingest_results(
             source,
             literal: false,
             fixed_token: None,
+            secret_op: None,
         });
     }
 }
 
-/// Keep the best detection on overlap: custom > presidio/ml, then higher score,
-/// then longer span. Returns the survivors sorted by `start`.
-fn resolve_overlaps(mut dets: Vec<CachedDetection>) -> Vec<CachedDetection> {
-    // Best first.
+/// Keep the best detection on overlap: secret > custom > presidio/ml, then higher
+/// score, then longer span. Returns the survivors sorted by `start`. `pub(crate)` so
+/// the secrets-only fast paths (disabled-surface / user-bypass) resolve overlaps
+/// among registered secrets too, never feeding `apply()` overlapping spans.
+pub(crate) fn resolve_overlaps(mut dets: Vec<CachedDetection>) -> Vec<CachedDetection> {
+    // Best first. Priority TIER (exhaustive `match` so a new `Source` variant
+    // compile-forces a decision here): a registered secret outranks a custom rule,
+    // which outranks regex/ML. Then higher score, then longer span.
+    fn tier(s: Source) -> u8 {
+        match s {
+            Source::Secret => 0,
+            Source::Custom => 1,
+            Source::Regex | Source::Ml => 2,
+        }
+    }
     dets.sort_by(|a, b| {
-        let a_custom = a.source == Source::Custom;
-        let b_custom = b.source == Source::Custom;
-        b_custom
-            .cmp(&a_custom)
+        tier(a.source)
+            .cmp(&tier(b.source))
             .then(
                 b.score
                     .partial_cmp(&a.score)
@@ -535,6 +563,7 @@ mod context_enhancer_tests {
             &enhanced_analyzer(),
             &cfg,
             &[],
+            &[],
             None,
             text,
             Surface::UserMessage,
@@ -584,6 +613,7 @@ mod context_enhancer_tests {
                 &enhanced_analyzer(),
                 &cfg,
                 &[],
+                &[],
                 None,
                 text,
                 Surface::UserMessage,
@@ -628,6 +658,7 @@ mod context_enhancer_tests {
             &enhanced_analyzer(),
             &cfg,
             &[],
+            &[],
             None,
             "The reference value is +1 415 555 0132 exactly.",
             Surface::UserMessage,
@@ -650,6 +681,7 @@ mod context_enhancer_tests {
         let dets = run_detection(
             &enhanced_analyzer(),
             &cfg,
+            &[],
             &[],
             None,
             "ssn 536-90-4399 on file",

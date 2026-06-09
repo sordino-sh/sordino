@@ -42,6 +42,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use lru::LruCache;
 
+use crate::config::Operator;
 use crate::surface::Surface;
 
 /// blake3 domain tag for cache-key text hashing. MUST differ from the token
@@ -64,6 +65,10 @@ pub(crate) enum Source {
     Regex,
     Ml,
     Custom,
+    /// A registered secret value matched exact-literal in Pass-0. Highest overlap
+    /// priority, and exempt from allow-list suppression (a registered secret is
+    /// never silently passed through).
+    Secret,
 }
 
 /// A raw, operator-free, plaintext-free detection (the cached value element).
@@ -81,6 +86,13 @@ pub(crate) struct CachedDetection {
     pub literal: bool,
     /// The fixed token for a `literal_token` custom rule (else `None`).
     pub fixed_token: Option<String>,
+    /// `Some(op)` iff this is a registered-secret detection (Pass-0); the operator
+    /// (`Hash`/`Redact`/`Mask`/`Broker`) is resolved at registration and carried
+    /// here. Safe to memoize because the secrets fingerprint (`secrets_fp`) is part
+    /// of the cache key, so a registration/operator change yields a fresh key space.
+    /// For a secret, `entity_type` holds the EXACT registered name (the broker mint /
+    /// policy authority). `None` ⇒ ordinary PII/custom (operator resolved live).
+    pub secret_op: Option<Operator>,
 }
 
 /// Full cache key. `text_hash` is the complete 256-bit blake3 digest of the leaf.
@@ -90,6 +102,11 @@ pub(crate) struct CacheKey {
     pub surface: Surface,
     pub policy_fp: u64,
     pub ml_fp: u64,
+    /// Fingerprint of the registered secret set (`secrets::secrets_fingerprint`).
+    /// Folded in like `ml_fp` so registering/rotating a secret yields a fresh key
+    /// space — stale detections (which lacked the Pass-0 secret spans) age out by
+    /// LRU instead of needing a hand-flush.
+    pub secrets_fp: u64,
 }
 
 /// blake3 of `text` under a cache-specific domain. The full 32-byte digest is

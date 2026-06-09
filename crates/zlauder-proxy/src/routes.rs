@@ -29,6 +29,7 @@ pub fn router(state: AppState) -> Router {
         .route("/zlauder/enable", post(admin::enable))
         .route("/zlauder/disable", post(admin::disable))
         .route("/zlauder/reload", post(admin::reload))
+        .route("/zlauder/broker/resolve", post(admin::broker_resolve))
         .route("/zlauder/ml/enable", post(admin::ml_enable))
         .route("/zlauder/ml/disable", post(admin::ml_disable))
         .route("/zlauder/ui", get(monitor::ui))
@@ -104,6 +105,9 @@ async fn messages_session(
 }
 
 async fn messages_inner(st: AppState, req: Request, conversation: Option<String>) -> Response {
+    if let Some(resp) = secrets_gate(&st) {
+        return resp;
+    }
     let (parts, body) = req.into_parts();
     let body_bytes = match to_bytes(body, MAX_BODY).await {
         Ok(b) => b,
@@ -180,6 +184,9 @@ async fn messages_inner(st: AppState, req: Request, conversation: Option<String>
 /// `/v1/messages/count_tokens` — mask request so counts reflect masked text;
 /// response is `{"input_tokens":N}` (no PII), relayed verbatim.
 async fn count_tokens(State(st): State<AppState>, req: Request) -> Response {
+    if let Some(resp) = secrets_gate(&st) {
+        return resp;
+    }
     let (parts, body) = req.into_parts();
     let body_bytes = match to_bytes(body, MAX_BODY).await {
         Ok(b) => b,
@@ -214,6 +221,13 @@ async fn count_tokens(State(st): State<AppState>, req: Request) -> Response {
 
 /// Everything else (`/v1/models`, `/v1/files`, batches, …): relay verbatim.
 async fn passthrough(State(st): State<AppState>, req: Request) -> Response {
+    // Fail-closed: while required secrets are unresolved, hold ALL upstream traffic —
+    // including this verbatim relay, which does NOT mask and is therefore the most
+    // dangerous path for an unresolved secret (e.g. a batches body). `/healthz` and
+    // the `/zlauder/*` control plane are explicit routes and never reach here.
+    if let Some(resp) = secrets_gate(&st) {
+        return resp;
+    }
     relay_verbatim(&st, req).await
 }
 
@@ -331,4 +345,18 @@ pub(crate) fn err(status: StatusCode, msg: &str) -> Response {
     let mut r = Response::new(Body::from(msg.to_string()));
     *r.status_mut() = status;
     r
+}
+
+/// Readiness gate for LLM intake: `Some(503)` while required secrets are unresolved
+/// (fail-closed), `None` once the gate is open. Only the upstream-bound intake
+/// handlers call this; `/healthz` and the control plane are never gated.
+pub(crate) fn secrets_gate(st: &AppState) -> Option<Response> {
+    if st.secrets_ready() {
+        None
+    } else {
+        Some(err(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "zlauder: required secrets are not yet resolved (or failed to resolve) — intake held",
+        ))
+    }
 }

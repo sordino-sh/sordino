@@ -296,20 +296,26 @@ impl TokenClass {
 
     /// THE single classification point for both value-bearing surfaces — the durable
     /// ledger ([`TokenLedgerEntry`]) and per-record token previews ([`TokenPreview`]).
-    /// Detector/keyword PII is [`TokenClass::AutoPii`] (peekable). The one structural
-    /// exception is CVV: PCI Sensitive Authentication Data that must never be stored.
-    /// CVV defaults to the irreversible `Redact` operator (which mints NO manifest
-    /// entry, so it never reaches here) — but a deployment may override CVV back to a
-    /// reversible `Token`, at which point it WOULD intern into the manifest. We classify
-    /// it [`TokenClass::Sad`] (non-peekable) so its plaintext is withheld from the ledger
-    /// snapshot and UI peek even when tokenized. Defense-in-depth backstop to the C8
-    /// `Redact` default (cvv-plan.md Part 3 C8). When the secrets engine tags manifest
-    /// entries with a source, extend the switch here (and nowhere else) for `Guard`/
-    /// `Broker`; `is_peekable()` then suppresses peek + plaintext transport on BOTH
-    /// surfaces at once.
+    /// Detector/keyword PII is [`TokenClass::AutoPii`] (peekable). Two structural
+    /// exceptions are withheld from peek + plaintext transport via [`is_peekable`]:
+    ///
+    /// - CVV: PCI Sensitive Authentication Data that must never be stored. CVV defaults
+    ///   to the irreversible `Redact` operator (which mints NO manifest entry, so it
+    ///   never reaches here) — but a deployment may override CVV back to a reversible
+    ///   `Token`, at which point it WOULD intern into the manifest. We classify it
+    ///   [`TokenClass::Sad`] (non-peekable) as a defense-in-depth backstop to the C8
+    ///   `Redact` default (cvv-plan.md Part 3 C8).
+    /// - Brokered secrets: a broker `ManifestEntry` carries the value in
+    ///   `canonical_form`; classify it [`TokenClass::Broker`] (non-peekable). (Guard/
+    ///   `hash` secrets are colon-form, never interned, so they never reach a manifest
+    ///   entry — there is no `Guard` manifest path to switch on here.)
+    ///
+    /// [`is_peekable`]: TokenClass::is_peekable
     pub fn for_manifest_entry(e: &ManifestEntry) -> TokenClass {
         if e.entity_kind == ENTITY_CVV {
             TokenClass::Sad
+        } else if e.broker {
+            TokenClass::Broker
         } else {
             TokenClass::AutoPii
         }

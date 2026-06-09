@@ -17,4 +17,6 @@ pub enum EngineError {
     },
     #[error("ml model: {0}")]
     Ml(String),
+    #[error("invalid secret rule: {0}")]
+    InvalidSecret(String),
 }

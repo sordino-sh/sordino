@@ -17,6 +17,10 @@ pub struct ManifestEntry {
     pub arrow_origin: Surface,
     /// Byte span of the token in the masked text (audit only).
     pub exposed_at: Option<Range<usize>>,
+    /// True iff this is a BROKER token (`Operator::Broker`): the value is resolvable
+    /// only at the tool-input boundary, never on display. The monitor reads this to
+    /// suppress the value from any `TokenPreview`, and the display unmask refuses it.
+    pub broker: bool,
 }
 
 #[derive(Clone, Debug)]

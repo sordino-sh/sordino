@@ -8,11 +8,13 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::RwLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
 use clap::Parser;
 use zlauder_engine::{EngineConfig, MaskEngine, MlConfig};
-use zlauder_proxy::{config, ml, monitor::Monitor, routes, state::AppState};
+use zlauder_proxy::{config, ml, monitor::Monitor, routes, secrets as proxy_secrets, state::AppState};
 
 #[derive(Parser, Debug)]
 #[command(name = "zlauder-proxy", version, about)]
@@ -64,9 +66,26 @@ async fn main() -> anyhow::Result<()> {
     let upstream = args.upstream.unwrap_or(cfg.upstream_base_url);
     let project_root = resolve_project_root(args.project_root);
 
+    // Registered-secret refs (resolved in the background after we bind). Captured
+    // before `cfg.engine` is moved into `build_engine`.
+    let secret_specs = cfg.secrets;
+    let broker_allows = cfg.broker_allows;
+    let secrets_gating = secret_specs.iter().any(|s| s.required);
+    let proot_for_secrets = project_root.clone();
+
     // Keep the ML config to drive the background load once we're serving.
     let ml_cfg = cfg.engine.ml.clone();
     let engine = build_engine(cfg.engine)?;
+    // Install the broker policy (glob-compiled). A bad rule fails CLOSED: log it and
+    // leave the default-deny policy so no broker secret can resolve.
+    if !broker_allows.is_empty() {
+        match proxy_secrets::build_broker_policy(&broker_allows) {
+            Ok(p) => engine.set_broker_policy(p),
+            Err(e) => tracing::error!(
+                "zlauder: invalid [broker] policy ({e}); broker resolution DISABLED (default-deny)"
+            ),
+        }
+    }
     let (_key, salt) = engine.session_handle();
     let salt_hex = hex_encode(&salt);
     // The `x-zlauder-key` is a control token DERIVED from the AES key (blake3), not
@@ -88,11 +107,18 @@ async fn main() -> anyhow::Result<()> {
         monitor: Monitor::new(),
         ml_control: Arc::new(std::sync::Mutex::new(())),
         config_control: Arc::new(std::sync::Mutex::new(())),
+        // Open immediately when nothing is `required` (zero overhead for no-secret
+        // projects); else closed until the background resolve confirms all required.
+        secrets_ready: Arc::new(AtomicBool::new(!secrets_gating)),
+        secrets_status: Arc::new(RwLock::new(proxy_secrets::SecretsStatus::default())),
     };
 
-    // Hold an engine handle so we can kick off the background model load after we
-    // start serving (the router consumes `state`).
+    // Hold engine/secrets handles so we can kick off background work after we start
+    // serving (the router consumes `state`).
     let engine_for_ml = state.engine.clone();
+    let engine_for_secrets = state.engine.clone();
+    let secrets_ready = state.secrets_ready.clone();
+    let secrets_status = state.secrets_status.clone();
     let app = routes::router(state);
     let addr = format!("{bind}:{port}");
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -120,6 +146,31 @@ async fn main() -> anyhow::Result<()> {
     // it's enabled in config — masking runs regex-only until it reports `Ready`.
     if ml_cfg.enabled {
         ml::spawn_ml_load(engine_for_ml, ml_cfg);
+    }
+
+    // Resolve registered secrets in the background (provider CLIs may block on
+    // gpg-agent etc.). Until all REQUIRED secrets resolve, the readiness gate holds
+    // LLM intake at 503 (fail-closed); `/healthz` already answers above for liveness.
+    if !secret_specs.is_empty() {
+        tokio::spawn(async move {
+            let registry =
+                zlauder_secrets::default_registry(Some(PathBuf::from(&proot_for_secrets)));
+            let (status, all_ok) =
+                proxy_secrets::resolve_and_install(&secret_specs, &engine_for_secrets, &registry)
+                    .await;
+            let (resolved, total) = (status.resolved(), status.entries.len());
+            if let Ok(mut slot) = secrets_status.write() {
+                *slot = status;
+            }
+            if all_ok {
+                secrets_ready.store(true, Ordering::Relaxed);
+                tracing::info!("zlauder: {resolved}/{total} secret(s) resolved; intake open");
+            } else {
+                tracing::warn!(
+                    "zlauder: required secret(s) unresolved ({resolved}/{total}); LLM intake held at 503"
+                );
+            }
+        });
     }
 
     axum::serve(listener, app)

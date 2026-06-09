@@ -21,7 +21,7 @@ use axum::response::Response;
 use http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use zlauder_engine::{AllowList, EngineConfig, MlStatus, Profile};
+use zlauder_engine::{AllowList, BrokerPolicy, EngineConfig, MlStatus, Profile};
 
 use crate::config;
 use crate::ml::reconcile_ml;
@@ -94,6 +94,15 @@ pub(crate) fn snapshot(st: &AppState) -> serde_json::Value {
     let cfg = st.engine.config_snapshot();
     let wire = WireConfig::from_engine(&cfg);
     let ml = st.engine.ml_snapshot();
+    // Registered-secret status: counts/names/operators/scheme/resolved/required +
+    // any error — NEVER a value (SecretRuntimeEntry has no value field, and the
+    // engine config WireConfig above carries no secret either).
+    // Recover a poisoned read guard rather than panic the snapshot handler — the
+    // status is value-free, so a degraded read is safe and keeps the endpoint up.
+    let secrets = st
+        .secrets_status
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
     json!({
         "enabled": cfg.enabled,
         "project_root": st.project_root.as_str(),
@@ -105,6 +114,13 @@ pub(crate) fn snapshot(st: &AppState) -> serde_json::Value {
             "model": cfg.ml.model,
             "status": ml.status,
             "error": ml.error,
+        },
+        "secrets": {
+            "ready": st.secrets_ready(),
+            "total": secrets.entries.len(),
+            "resolved": secrets.resolved(),
+            "required": secrets.required(),
+            "entries": secrets.entries,
         },
     })
 }
@@ -465,6 +481,9 @@ pub async fn reload(State(st): State<AppState>, hdrs: HeaderMap) -> Response {
     let mut cfg = match config::reload_engine(&st.layers) {
         Ok(c) => c,
         Err(e) => {
+            // A failed reload must not leave a stale (possibly permissive) broker
+            // policy live — fail closed to default-deny before returning.
+            st.engine.set_broker_policy(BrokerPolicy::default());
             return text(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 &format!("reload failed: {e}"),
@@ -483,6 +502,7 @@ pub async fn reload(State(st): State<AppState>, hdrs: HeaderMap) -> Response {
     cfg.ml.enabled = st.engine.ml_snapshot().status != MlStatus::Disabled;
     let new_ml = cfg.ml.clone();
     if let Err(e) = st.engine.set_config(cfg) {
+        st.engine.set_broker_policy(BrokerPolicy::default());
         return text(
             StatusCode::BAD_REQUEST,
             &format!("reloaded config rejected: {e}"),
@@ -492,9 +512,59 @@ pub async fn reload(State(st): State<AppState>, hdrs: HeaderMap) -> Response {
     // `enabled` preserved above, this never flips ML on/off — and `retry_failed =
     // false` means an unrelated edit won't re-stall a previously-failed load.
     reconcile_ml(&st, &new_ml, false);
+    // Rebuild the broker policy from the reloaded files so a removed/restricted rule
+    // takes effect live; any error swaps to default-deny (fail-closed).
+    let broker_policy = match config::reload_broker_allows(&st.layers) {
+        Ok(allows) => crate::secrets::build_broker_policy(&allows).unwrap_or_else(|e| {
+            tracing::error!(
+                "zlauder: reloaded [broker] policy invalid ({e}); broker DISABLED (default-deny)"
+            );
+            BrokerPolicy::default()
+        }),
+        Err(e) => {
+            tracing::error!(
+                "zlauder: could not reload [broker] policy ({e}); broker DISABLED (default-deny)"
+            );
+            BrokerPolicy::default()
+        }
+    };
+    st.engine.set_broker_policy(broker_policy);
     let snap = snapshot(&st);
     push_policy(&st, &hdrs, &snap);
     json_ok(&snap)
+}
+
+/// `POST /zlauder/broker/resolve` (x-zlauder-key) — the T2/T3 tool-boundary resolve.
+/// Body: `{ "tool_name": "...", "tool_input": { ... } }`. Resolves ALLOW-LISTED broker
+/// tokens in `tool_input` to their real values and returns the rewritten input. Local
+/// + key-gated: the resolved values are for the LOCAL tool only — this is the one
+/// place a broker value is spliced back in. Denied / unknown tokens stay tokenized.
+pub async fn broker_resolve(State(st): State<AppState>, hdrs: HeaderMap, body: Bytes) -> Response {
+    if !st.authed(&hdrs) {
+        return forbidden();
+    }
+    #[derive(Deserialize)]
+    struct Req {
+        tool_name: String,
+        #[serde(default)]
+        tool_input: serde_json::Value,
+    }
+    let req: Req = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(e) => {
+            return text(
+                StatusCode::BAD_REQUEST,
+                &format!("invalid broker resolve body: {e}"),
+            );
+        }
+    };
+    let mut input = req.tool_input;
+    let report = st.engine.broker_resolve_pointers(&req.tool_name, &mut input);
+    json_ok(&json!({
+        "tool_input": input,
+        "resolved": report.resolved,
+        "denied": report.denied.len(),
+    }))
 }
 
 // --- small response helpers (mirrors routes.rs style) -----------------------

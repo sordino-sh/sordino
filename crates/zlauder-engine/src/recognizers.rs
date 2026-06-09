@@ -1400,7 +1400,7 @@ mod tests {
         rec: &dyn Recognizer,
         text: &str,
     ) -> Vec<(String, String)> {
-        run_detection(&analyzer(), cfg, &[], Some(rec), text, Surface::UserMessage)
+        run_detection(&analyzer(), cfg, &[], &[], Some(rec), text, Surface::UserMessage)
             .unwrap()
             .into_iter()
             .filter_map(|d| {

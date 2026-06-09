@@ -267,6 +267,12 @@ pub enum Operator {
     Mask { char: char, from_end: usize },
     /// Irreversible: `[ENTITY:hash]`.
     Hash,
+    /// Reversible, but ONLY at the tool-input boundary (broker). The model never
+    /// sees the value and it is never display-revealable; the real value is spliced
+    /// in only at local tool execution (gated by `BrokerPolicy`). Reachable ONLY via
+    /// a registered secret — rejected in `default_operator`/`entity_operators`
+    /// (it is meaningless without a registered secret name + a broker rule).
+    Broker,
     /// Detected but left verbatim (e.g. an allow-list-by-policy passthrough).
     Keep,
 }

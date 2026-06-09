@@ -1298,6 +1298,7 @@ mod tests {
             entity_kind: "EMAIL_ADDRESS".to_string(),
             arrow_origin: zlauder_engine::Surface::UserMessage,
             exposed_at: None,
+            broker: false,
         });
         m
     }
@@ -1360,6 +1361,7 @@ mod tests {
                 entity_kind: "X".to_string(),
                 arrow_origin: zlauder_engine::Surface::UserMessage,
                 exposed_at: None,
+                broker: false,
             });
         }
         m.ingest_session_tokens(&man);
@@ -1382,6 +1384,7 @@ mod tests {
                 entity_kind: "X".to_string(),
                 arrow_origin: zlauder_engine::Surface::UserMessage,
                 exposed_at: None,
+                broker: false,
             });
         }
         m.ingest_session_tokens(&old);
@@ -1400,6 +1403,7 @@ mod tests {
                 entity_kind: "X".to_string(),
                 arrow_origin: zlauder_engine::Surface::UserMessage,
                 exposed_at: None,
+                broker: false,
             });
         }
         m.ingest_session_tokens(&fresh);
@@ -1421,6 +1425,7 @@ mod tests {
             entity_kind: entity_kind.to_string(),
             arrow_origin: zlauder_engine::Surface::UserMessage,
             exposed_at: None,
+            broker: false,
         });
         m
     }
@@ -1481,6 +1486,7 @@ mod tests {
                 entity_kind: "X".to_string(),
                 arrow_origin: zlauder_engine::Surface::UserMessage,
                 exposed_at: None,
+                broker: false,
             });
         }
         m.ingest_session_tokens(&fill);
@@ -1497,6 +1503,7 @@ mod tests {
                 entity_kind: "X".to_string(),
                 arrow_origin: zlauder_engine::Surface::UserMessage,
                 exposed_at: None,
+                broker: false,
             });
         }
         m.ingest_session_tokens(&reuse);
@@ -1529,6 +1536,7 @@ mod tests {
                 entity_kind: "X".to_string(),
                 arrow_origin: zlauder_engine::Surface::UserMessage,
                 exposed_at: None,
+                broker: false,
             });
         }
         ingest_tokens_into(&mut guard, &fill, t, &HashMap::new());
@@ -1541,6 +1549,7 @@ mod tests {
                 entity_kind: "X".to_string(),
                 arrow_origin: zlauder_engine::Surface::UserMessage,
                 exposed_at: None,
+                broker: false,
             });
         }
         ingest_tokens_into(&mut guard, &reuse, t, &HashMap::new()); // SAME `now` → ties the whole ledger
@@ -1596,6 +1605,7 @@ mod tests {
             entity_kind: kind.to_string(),
             arrow_origin: zlauder_engine::Surface::UserMessage,
             exposed_at: None,
+            broker: false,
         }
     }
 

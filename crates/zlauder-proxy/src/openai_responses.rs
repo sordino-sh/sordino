@@ -39,6 +39,9 @@ pub async fn responses_session(
 }
 
 async fn responses_inner(st: AppState, req: Request, conversation: Option<String>) -> Response {
+    if let Some(resp) = routes::secrets_gate(&st) {
+        return resp;
+    }
     let (parts, body) = req.into_parts();
     let body_bytes = match to_bytes(body, MAX_BODY).await {
         Ok(b) => b,

@@ -1,10 +1,12 @@
 //! Shared proxy state.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use zlauder_engine::MaskEngine;
 
 use crate::config::ConfigLayers;
 use crate::monitor::Monitor;
+use crate::secrets::SecretsStatus;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -38,6 +40,15 @@ pub struct AppState {
     /// across an `.await`. Lock order is fixed **`config_control` then `ml_control`**
     /// everywhere a writer needs both, to avoid deadlock.
     pub config_control: Arc<std::sync::Mutex<()>>,
+    /// Readiness gate for the secrets channel. `false` holds LLM intake at `503`
+    /// until all REQUIRED secrets have resolved from their backends (fail-closed: a
+    /// required secret that never resolves keeps intake closed). Starts `true` when
+    /// no secret is `required` (or none configured), so a no-secret project pays zero
+    /// overhead. `/healthz` is NOT gated (liveness answers immediately).
+    pub secrets_ready: Arc<AtomicBool>,
+    /// Per-secret resolution status for the admin snapshot (names/operators/scheme/
+    /// resolved/required + any error). NEVER contains a secret value.
+    pub secrets_status: Arc<std::sync::RwLock<SecretsStatus>>,
 }
 
 impl AppState {
@@ -49,6 +60,11 @@ impl AppState {
             .split('/')
             .next()
             .unwrap_or("api.anthropic.com")
+    }
+
+    /// Whether the secrets readiness gate is open (required secrets resolved).
+    pub fn secrets_ready(&self) -> bool {
+        self.secrets_ready.load(Ordering::Relaxed)
     }
 
     /// Constant-time-ish check of the `x-zlauder-key` header against the admin key.

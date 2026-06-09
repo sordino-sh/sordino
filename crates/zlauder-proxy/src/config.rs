@@ -28,7 +28,74 @@ pub struct LoadedConfig {
     pub bind: String,
     pub upstream_base_url: String,
     pub engine: EngineConfig,
+    /// Registered-secret REFERENCES (`[[secrets]]`), resolved at startup. Refs only —
+    /// a value can never appear here (the scope invariant rejects it pre-parse).
+    pub secrets: Vec<SecretSpec>,
+    /// Broker policy allow-rules (`[[broker.allow]]`), installed at startup.
+    pub broker_allows: Vec<BrokerAllowSpec>,
     pub layers: ConfigLayers,
+}
+
+/// A secret REFERENCE from `[[secrets]]`. The scope invariant
+/// ([`validate_no_inline_secret_values`]) forbids an inline value. Exactly one of
+/// `from_ref` / `from_env` selects the backend.
+#[derive(Deserialize, Clone, Debug)]
+pub struct SecretSpec {
+    pub name: String,
+    /// `hash` | `redact` | `mask` | `broker`; omitted ⇒ classifier default (Hash for
+    /// high-entropy, Redact for low). `broker` must be explicit.
+    #[serde(default)]
+    pub operator: Option<String>,
+    /// A provider ref `scheme:path[#field]` (pass/age/sops/dotenv/env).
+    #[serde(default)]
+    pub from_ref: Option<String>,
+    /// Sugar for `env:VAR`.
+    #[serde(default)]
+    pub from_env: Option<String>,
+    /// A required secret that fails to resolve holds LLM intake at 503 (fail-closed).
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default = "default_case_sensitive")]
+    pub case_sensitive: bool,
+}
+
+fn default_case_sensitive() -> bool {
+    true
+}
+
+/// `[broker]` — the default-deny broker policy. Each `[[broker.allow]]` rule names
+/// the secret + tool + param pointer (+ optional dest host allow-list) that may
+/// receive a brokered value at the local tool boundary.
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct BrokerSection {
+    #[serde(default)]
+    pub allow: Vec<BrokerAllowSpec>,
+}
+
+#[derive(Deserialize, Clone, Debug)]
+pub struct BrokerAllowSpec {
+    /// Glob over the registered secret name (`None` ⇒ any secret). Per-secret least
+    /// privilege: a DB password resolves only into the rule(s) that name it.
+    #[serde(default)]
+    pub secret: Option<String>,
+    /// Glob over the tool name (`psql`, `curl`, `mcp__*` — though egress tools are
+    /// denied regardless).
+    pub tool: String,
+    /// Glob over the RFC-6901 param pointer (`/connection_uri`, `/args/*`). Default
+    /// `*` = any param of the tool.
+    #[serde(default = "default_param_glob")]
+    pub param: String,
+    /// Destination constraint: `host_allowlist:db.internal,db2.internal` | `any` |
+    /// omitted (no host constraint).
+    #[serde(default)]
+    pub dest: Option<String>,
+    /// Optional TTL (seconds) hint for the minted broker token.
+    #[serde(default)]
+    pub ttl_secs: Option<u64>,
+}
+
+fn default_param_glob() -> String {
+    "*".to_string()
 }
 
 #[derive(Deserialize, Default)]
@@ -37,6 +104,10 @@ struct FileConfig {
     proxy: ProxySection,
     #[serde(default)]
     engine: EngineConfig,
+    #[serde(default)]
+    secrets: Vec<SecretSpec>,
+    #[serde(default)]
+    broker: BrokerSection,
 }
 
 #[derive(Deserialize)]
@@ -89,6 +160,9 @@ pub fn load(project: Option<&Path>) -> anyhow::Result<LoadedConfig> {
     let layers = resolve_layers(project);
     let merged = merged_value(&layers)?;
 
+    // Scope invariant: a secret VALUE must never live in a config file.
+    validate_no_inline_secret_values(&merged)?;
+
     let file: FileConfig = merged.clone().try_into()?;
     let mut engine = file.engine;
     engine.allow_list = build_allow_list(Some(&merged))?;
@@ -100,6 +174,8 @@ pub fn load(project: Option<&Path>) -> anyhow::Result<LoadedConfig> {
         bind: file.proxy.bind,
         upstream_base_url: file.proxy.upstream_base_url,
         engine,
+        secrets: file.secrets,
+        broker_allows: file.broker.allow,
         layers,
     })
 }
@@ -109,11 +185,47 @@ pub fn load(project: Option<&Path>) -> anyhow::Result<LoadedConfig> {
 /// can't change under a live socket.
 pub fn reload_engine(layers: &ConfigLayers) -> anyhow::Result<EngineConfig> {
     let merged = merged_value(layers)?;
+    // Re-enforce the scope invariant on reload — a value added to `[[secrets]]` after
+    // startup must be rejected here too, not just at load (defense consistency).
+    validate_no_inline_secret_values(&merged)?;
     let file: FileConfig = merged.clone().try_into()?;
     let mut engine = file.engine;
     engine.allow_list = build_allow_list(Some(&merged))?;
     warn_unknown_entity_types(&engine);
     Ok(engine)
+}
+
+/// Re-read the `[[broker.allow]]` rules from the current files (for `reload`), so a
+/// removed/restricted broker rule takes effect live. Re-runs the scope invariant.
+pub fn reload_broker_allows(layers: &ConfigLayers) -> anyhow::Result<Vec<BrokerAllowSpec>> {
+    let merged = merged_value(layers)?;
+    validate_no_inline_secret_values(&merged)?;
+    let file: FileConfig = merged.try_into()?;
+    Ok(file.broker.allow)
+}
+
+/// Scope invariant: a secret VALUE must NEVER live in a config file. Reject any
+/// `[[secrets]]` entry carrying an inline `value`/`literal`/`secret`/`plaintext` key
+/// (the channel is refs-only — `from_ref`/`from_env`). Rejected pre-parse so a value
+/// can never even be deserialized into a `SecretSpec`.
+fn validate_no_inline_secret_values(merged: &toml::Value) -> anyhow::Result<()> {
+    let Some(arr) = merged.get("secrets").and_then(toml::Value::as_array) else {
+        return Ok(());
+    };
+    for (i, item) in arr.iter().enumerate() {
+        if let Some(tbl) = item.as_table() {
+            for forbidden in ["value", "literal", "secret", "plaintext"] {
+                if tbl.contains_key(forbidden) {
+                    anyhow::bail!(
+                        "zlauder config: secrets[{i}] has a `{forbidden}` key — secret VALUES \
+                         must never live in a config file. Use `from_ref`/`from_env` to reference \
+                         a backend (pass/age/sops/dotenv/env)."
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Warn (don't reject) on `entity_operators` keys that aren't canonical `EntityType`
