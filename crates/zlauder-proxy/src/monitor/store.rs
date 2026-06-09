@@ -1053,6 +1053,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn session_token_eviction_drops_oldest_first() {
+        let m = Monitor::new();
+        // An OLD batch that nearly fills the cap, stamped at an earlier ms.
+        let mut old = UnmaskManifest::new();
+        for i in 0..(MAX_SESSION_TOKENS - 10) {
+            old.push(zlauder_engine::ManifestEntry {
+                canonical_form: format!("o{i}"),
+                token_handle: format!("[OLD_{i}]"),
+                entity_kind: "X".to_string(),
+                arrow_origin: zlauder_engine::Surface::UserMessage,
+                exposed_at: None,
+            });
+        }
+        m.ingest_session_tokens(&old);
+        // Force the next batch to carry a strictly greater first_seen_ms.
+        let t0 = now_ms();
+        while now_ms() == t0 {
+            std::hint::spin_loop();
+        }
+        // A NEW batch overshoots the cap (4990 + 50 = 5040, over = 40). The 40 victims
+        // must be the OLDEST — so every NEW entry survives.
+        let mut fresh = UnmaskManifest::new();
+        for i in 0..50 {
+            fresh.push(zlauder_engine::ManifestEntry {
+                canonical_form: format!("n{i}"),
+                token_handle: format!("[NEW_{i}]"),
+                entity_kind: "X".to_string(),
+                arrow_origin: zlauder_engine::Surface::UserMessage,
+                exposed_at: None,
+            });
+        }
+        m.ingest_session_tokens(&fresh);
+        let snap = m.snapshot();
+        assert_eq!(snap.session_tokens.len(), MAX_SESSION_TOKENS);
+        let new_present = snap
+            .session_tokens
+            .iter()
+            .filter(|e| e.token.starts_with("[NEW_"))
+            .count();
+        assert_eq!(new_present, 50, "eviction dropped the oldest, never the newest");
+    }
+
     fn find(m: &Monitor, id: &str) -> RequestRecord {
         m.snapshot()
             .records
