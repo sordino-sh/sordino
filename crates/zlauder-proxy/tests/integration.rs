@@ -38,6 +38,9 @@ fn mk_state(engine: MaskEngine, upstream_base: String, admin_key: &str) -> AppSt
         secrets_status: Arc::new(std::sync::RwLock::new(
             zlauder_proxy::secrets::SecretsStatus::default(),
         )),
+        zdr_targets: Arc::new(std::collections::HashMap::new()),
+        zdr_default: Arc::new(None),
+        zdr_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     }
 }
 
@@ -1326,6 +1329,9 @@ fn mk_state_in(
         secrets_status: Arc::new(std::sync::RwLock::new(
             zlauder_proxy::secrets::SecretsStatus::default(),
         )),
+        zdr_targets: Arc::new(std::collections::HashMap::new()),
+        zdr_default: Arc::new(None),
+        zdr_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     }
 }
 

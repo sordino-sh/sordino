@@ -8,6 +8,7 @@
 //! `enabled_categories` fully replaces the user's), which is the intuitive
 //! meaning of a scoped override.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -36,7 +37,50 @@ pub struct LoadedConfig {
     pub secrets: Vec<SecretSpec>,
     /// Broker policy allow-rules (`[[broker.allow]]`), installed at startup.
     pub broker_allows: Vec<BrokerAllowSpec>,
+    /// ZDR trust-routing targets (`[zdr]`), resolved to runtime targets at startup.
+    /// Refs only — a credential VALUE can never appear here (the scope invariant
+    /// rejects it pre-parse); the env var named by `from_env` is read in
+    /// [`crate::zdr::resolve_targets`].
+    pub zdr: ZdrSection,
     pub layers: ConfigLayers,
+}
+
+/// `[zdr]` — optional trust-routing config. Each `[[zdr.target]]` names a
+/// user-verified non-retaining endpoint a conversation may be routed to. Off by
+/// default; the product does not expect this configured.
+#[derive(Deserialize, Clone, Debug, Default)]
+pub struct ZdrSection {
+    /// The target `/zlauder:zdr` engages when given no explicit config name.
+    #[serde(default)]
+    pub default: Option<String>,
+    #[serde(default)]
+    pub target: Vec<ZdrTargetSpec>,
+}
+
+/// A ZDR routing destination REFERENCE. The credential is env-sourced
+/// (`from_env`); the scope invariant ([`validate_no_inline_zdr_creds`]) forbids an
+/// inline key value in a config file.
+#[derive(Deserialize, Clone, Debug)]
+pub struct ZdrTargetSpec {
+    pub name: String,
+    /// Upstream base URL (e.g. `http://127.0.0.1:8080`, a Bedrock anthropic endpoint).
+    pub base_url: String,
+    /// `contractual` | `provider_architecture` | `self_hosted` | `attested_tee`.
+    /// Omitted ⇒ `self_hosted` (the most conservative default — you are the anchor).
+    #[serde(default)]
+    pub trust_basis: Option<String>,
+    /// The user's independent assertion that this endpoint is non-retaining. A
+    /// target with `user_verified = false` is registered but cannot be ENGAGED (the
+    /// control endpoint refuses it) — the system cannot verify ZDR, only the user can.
+    #[serde(default)]
+    pub user_verified: bool,
+    /// Env var holding the ZDR API credential (refs-only). Unset/absent ⇒ no-auth
+    /// (a self-hosted box that needs no key).
+    #[serde(default)]
+    pub from_env: Option<String>,
+    /// Extra headers injected on every request to this target (non-secret).
+    #[serde(default)]
+    pub extra_headers: HashMap<String, String>,
 }
 
 /// A secret REFERENCE from `[[secrets]]`. The scope invariant
@@ -111,6 +155,8 @@ struct FileConfig {
     secrets: Vec<SecretSpec>,
     #[serde(default)]
     broker: BrokerSection,
+    #[serde(default)]
+    zdr: ZdrSection,
 }
 
 #[derive(Deserialize)]
@@ -163,6 +209,8 @@ pub fn load(project: Option<&Path>) -> anyhow::Result<LoadedConfig> {
 
     // Scope invariant: a secret VALUE must never live in a config file.
     validate_no_inline_secret_values(&merged)?;
+    // Same invariant for ZDR credentials — only an env-var reference is allowed.
+    validate_no_inline_zdr_creds(&merged)?;
 
     let file: FileConfig = merged.clone().try_into()?;
     let mut engine = file.engine;
@@ -177,6 +225,7 @@ pub fn load(project: Option<&Path>) -> anyhow::Result<LoadedConfig> {
         engine,
         secrets: file.secrets,
         broker_allows: file.broker.allow,
+        zdr: file.zdr,
         layers,
     })
 }
@@ -221,6 +270,35 @@ fn validate_no_inline_secret_values(merged: &toml::Value) -> anyhow::Result<()> 
                         "zlauder config: secrets[{i}] has a `{forbidden}` key — secret VALUES \
                          must never live in a config file. Use `from_ref`/`from_env` to reference \
                          a backend (pass/age/sops/dotenv/env)."
+                    );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Scope invariant for ZDR (mirrors [`validate_no_inline_secret_values`]): a ZDR
+/// credential VALUE must NEVER live in a config file — only an env-var reference
+/// (`from_env`). Reject any `[[zdr.target]]` carrying an inline key, so a credential
+/// can never even be deserialized into a [`ZdrTargetSpec`].
+fn validate_no_inline_zdr_creds(merged: &toml::Value) -> anyhow::Result<()> {
+    let Some(arr) = merged
+        .get("zdr")
+        .and_then(toml::Value::as_table)
+        .and_then(|z| z.get("target"))
+        .and_then(toml::Value::as_array)
+    else {
+        return Ok(());
+    };
+    for (i, item) in arr.iter().enumerate() {
+        if let Some(tbl) = item.as_table() {
+            for forbidden in ["key", "api_key", "apikey", "auth", "token", "secret", "value"] {
+                if tbl.contains_key(forbidden) {
+                    anyhow::bail!(
+                        "zlauder config: zdr.target[{i}] has a `{forbidden}` key — a ZDR \
+                         credential VALUE must never live in a config file. Use `from_env` to \
+                         reference an environment variable holding the key."
                     );
                 }
             }
@@ -564,6 +642,65 @@ mod tests {
         let d = zlauder_engine::EngineConfig::default();
         assert!(d.reveal_marker.enabled);
         assert_eq!(d.reveal_marker.prefix, "\u{27e6}");
+
+        unsafe { std::env::remove_var("ZLAUDER_USER_CONFIG") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_zdr_section() {
+        let dir = std::env::temp_dir().join(format!("zlauder-zdr-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let project = dir.join("zlauder.toml");
+        std::fs::write(
+            &project,
+            "[zdr]\ndefault = \"box\"\n\n[[zdr.target]]\nname = \"box\"\n\
+             base_url = \"http://127.0.0.1:8080\"\ntrust_basis = \"self_hosted\"\n\
+             user_verified = true\nfrom_env = \"ZDR_BOX_KEY\"\n",
+        )
+        .unwrap();
+        // SAFETY: single-threaded unit test.
+        unsafe { std::env::set_var("ZLAUDER_USER_CONFIG", "/nonexistent/zlauder/config.toml") };
+
+        let cfg = load(Some(&project)).expect("zdr section load");
+        assert_eq!(cfg.zdr.default.as_deref(), Some("box"));
+        assert_eq!(cfg.zdr.target.len(), 1);
+        let t = &cfg.zdr.target[0];
+        assert_eq!(t.name, "box");
+        assert_eq!(t.base_url, "http://127.0.0.1:8080");
+        assert_eq!(t.trust_basis.as_deref(), Some("self_hosted"));
+        assert!(t.user_verified);
+        assert_eq!(t.from_env.as_deref(), Some("ZDR_BOX_KEY"));
+        // A config without `[zdr]` still defaults cleanly (empty).
+        assert!(ZdrSection::default().target.is_empty());
+
+        unsafe { std::env::remove_var("ZLAUDER_USER_CONFIG") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_inline_zdr_credential() {
+        let dir = std::env::temp_dir().join(format!("zlauder-zdrbad-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let project = dir.join("zlauder.toml");
+        // An inline `key` value must be refused pre-parse (scope invariant).
+        std::fs::write(
+            &project,
+            "[[zdr.target]]\nname = \"box\"\nbase_url = \"http://127.0.0.1:8080\"\n\
+             key = \"sk-ant-api03-should-not-be-here\"\n",
+        )
+        .unwrap();
+        // SAFETY: single-threaded unit test.
+        unsafe { std::env::set_var("ZLAUDER_USER_CONFIG", "/nonexistent/zlauder/config.toml") };
+
+        // `LoadedConfig` isn't `Debug`, so match rather than `expect_err`.
+        match load(Some(&project)) {
+            Ok(_) => panic!("inline zdr key must be rejected"),
+            Err(err) => assert!(
+                err.to_string().contains("never live in a config file"),
+                "got: {err}"
+            ),
+        }
 
         unsafe { std::env::remove_var("ZLAUDER_USER_CONFIG") };
         let _ = std::fs::remove_dir_all(&dir);

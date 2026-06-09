@@ -58,6 +58,14 @@ pub fn router(state: AppState) -> Router {
             "/zlauder/monitor/reveal",
             post(monitor::reveal_keyphrase).delete(monitor::remask_keyphrase),
         )
+        // ZDR (Trust switch) control plane for a conversation: GET status, POST to
+        // engage a verified target, DELETE to disengage. All key-gated.
+        .route(
+            "/zlauder/session/{conversation}/zdr",
+            get(admin::zdr_get)
+                .post(admin::zdr_set)
+                .delete(admin::zdr_clear),
+        )
         .route(
             "/zlauder/session/{conversation}/v1/messages",
             post(messages_session),
