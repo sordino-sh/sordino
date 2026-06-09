@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/zlauder-state",
     "crates/zlauder-engine",
+    "crates/zlauder-secrets",
     "crates/zlauder-proxy",
     "crates/zlauder-hooks",
 ]
