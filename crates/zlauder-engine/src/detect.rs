@@ -122,6 +122,90 @@ pub fn run_detection(
     text: &str,
     surface: Surface,
 ) -> Result<Vec<CachedDetection>, EngineError> {
+    let (mut dets, mut allowed_spans) = detect_base(analyzer, cfg, customs, text, surface);
+
+    // Pass 2b: the optional ML recognizer (openai/privacy-filter), if loaded. It
+    // returns the same `RecognizerResult` type, so it flows through the identical
+    // category gate / allow-list / overlap dedup below — e.g. its PERSON/LOCATION
+    // spans only mask when the `personal` category is on. Tagged `Source::Ml` so the
+    // deferred Component-3 burn can single it out.
+    if let Some(rec) = ml {
+        let ml_results = rec.analyze(text, None, None);
+        ingest_results(
+            ml_results,
+            cfg,
+            text,
+            &mut dets,
+            &mut allowed_spans,
+            Source::Ml,
+        );
+    }
+
+    Ok(finish(dets, allowed_spans))
+}
+
+/// Batched sibling of [`run_detection`]: detect across MANY leaves with a SINGLE
+/// ML forward. The expensive ML token-classification runs once over all texts via
+/// [`Recognizer::analyze_batch`] (which the candle recognizer overrides to a padded
+/// batched forward — span-equivalent to looping `analyze` within a tight score
+/// tolerance); the cheap per-leaf regex/custom passes still run per leaf via the
+/// shared [`detect_base`]. Result `[i]` is the detection list for `leaves[i]`,
+/// IDENTICAL to `run_detection(.., Some(ml), leaves[i].0, leaves[i].1)` up to that
+/// ML tolerance — this is the engine-side recall contract gated by the prewarm
+/// parity test.
+///
+/// `analyze_batch` is all-or-nothing: any backend error aborts the whole batch.
+/// The caller (`prewarm_batch`) treats an `Err` as "skip the prewarm" and lets the
+/// per-leaf `mask` path re-run (and fail-safe) on its own, so a batched failure
+/// never changes a request's outcome.
+pub fn run_detection_batch(
+    analyzer: &AnalyzerEngine,
+    cfg: &EngineConfig,
+    customs: &[CompiledCustom],
+    ml: &dyn Recognizer,
+    leaves: &[(&str, Surface)],
+) -> Result<Vec<Vec<CachedDetection>>, EngineError> {
+    let texts: Vec<&str> = leaves.iter().map(|(t, _)| *t).collect();
+    let ml_batch = ml.analyze_batch(&texts, None, None);
+    // The trait contract is one result vector per input, index-aligned. Guard it:
+    // a wrong-length response would mis-route ML spans to the wrong leaf (a silent
+    // cross-leaf leak), so refuse the batch instead and fall back to per-leaf.
+    if ml_batch.len() != leaves.len() {
+        return Err(EngineError::Ml(format!(
+            "analyze_batch returned {} result(s) for {} input(s)",
+            ml_batch.len(),
+            leaves.len()
+        )));
+    }
+
+    let mut out = Vec::with_capacity(leaves.len());
+    for ((text, surface), ml_results) in leaves.iter().zip(ml_batch) {
+        let (mut dets, mut allowed_spans) = detect_base(analyzer, cfg, customs, text, *surface);
+        ingest_results(
+            ml_results,
+            cfg,
+            text,
+            &mut dets,
+            &mut allowed_spans,
+            Source::Ml,
+        );
+        out.push(finish(dets, allowed_spans));
+    }
+    Ok(out)
+}
+
+/// Pass 1 (custom rules) + Pass 2 (presidio regex analyzer) for one leaf, BEFORE
+/// the ML pass and BEFORE allow-list suppression / overlap resolution. Returns the
+/// partial detection list plus the allow-listed spans. Shared verbatim by per-leaf
+/// [`run_detection`] and batched [`run_detection_batch`] so the non-ML detection is
+/// byte-identical across both paths.
+fn detect_base(
+    analyzer: &AnalyzerEngine,
+    cfg: &EngineConfig,
+    customs: &[CompiledCustom],
+    text: &str,
+    surface: Surface,
+) -> (Vec<CachedDetection>, Vec<(usize, usize)>) {
     let mut dets: Vec<CachedDetection> = Vec::new();
     // Spans of allow-listed values; any detection fully contained in one of these
     // is also suppressed (allow-listing "admin@example.com" covers its
@@ -183,24 +267,16 @@ pub fn run_detection(
         Source::Regex,
     );
 
-    // Pass 2b: the optional ML recognizer (openai/privacy-filter), if loaded. It
-    // returns the same `RecognizerResult` type, so it flows through the identical
-    // category gate / allow-list / overlap dedup below — e.g. its PERSON/LOCATION
-    // spans only mask when the `personal` category is on. Tagged `Source::Ml` so the
-    // deferred Component-3 burn can single it out.
-    if let Some(rec) = ml {
-        let ml_results = rec.analyze(text, None, None);
-        ingest_results(
-            ml_results,
-            cfg,
-            text,
-            &mut dets,
-            &mut allowed_spans,
-            Source::Ml,
-        );
-    }
+    (dets, allowed_spans)
+}
 
-    // Suppress detections fully contained within an allow-listed span.
+/// Suppress detections fully contained within an allow-listed span, then resolve
+/// overlaps into the final sorted, non-overlapping list. Shared tail of
+/// [`run_detection`] and [`run_detection_batch`].
+fn finish(
+    mut dets: Vec<CachedDetection>,
+    allowed_spans: Vec<(usize, usize)>,
+) -> Vec<CachedDetection> {
     if !allowed_spans.is_empty() {
         dets.retain(|d| {
             !allowed_spans
@@ -208,8 +284,7 @@ pub fn run_detection(
                 .any(|(s, e)| *s <= d.start && d.end <= *e)
         });
     }
-
-    Ok(resolve_overlaps(dets))
+    resolve_overlaps(dets)
 }
 
 /// Build lightweight NLP artifacts for the context-aware enhancer.

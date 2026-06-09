@@ -27,10 +27,13 @@ pub use manifest::{ManifestEntry, MaskOutcome, MaskStats, UnmaskManifest};
 pub use surface::{Direction, Surface};
 pub use token::{MAX_TOKEN_LEN, TOKEN_HASH_HEX_LEN, make_token, token_regex};
 
+use std::borrow::Cow;
 use std::sync::{Arc, Mutex, RwLock};
 
 use cache::{CacheKey, CachedDetection, DetectionCache, hash_text};
-use detect::{CompiledCustom, compile_customs, resolve_operator, run_detection};
+use detect::{
+    CompiledCustom, compile_customs, resolve_operator, run_detection, run_detection_batch,
+};
 use store::SessionStore;
 use token::hash_value;
 
@@ -480,17 +483,10 @@ impl MaskEngine {
         // makes the re-minted token byte-identical to a no-marker round-trip — so the
         // decoration adds zero noise upstream and keeps the prompt-cache prefix stable.
         // Cheap-guarded so a marker-free leaf never allocates; keyed on the cleaned
-        // text below, so a marker change can't serve a stale entry.
-        let stripped;
-        let text: &str = if surface == Surface::AssistantText
-            && policy.config.reveal_marker.is_active()
-            && policy.config.reveal_marker.contained_in(text)
-        {
-            stripped = policy.config.reveal_marker.strip(text);
-            &stripped
-        } else {
-            text
-        };
+        // text below, so a marker change can't serve a stale entry. Shared with
+        // `prewarm_batch` so both derive the SAME key for the same leaf.
+        let stripped = stripped_for_key(&policy, text, surface);
+        let text: &str = stripped.as_ref();
 
         // Snapshot the ML recognizer + its fingerprint together (atomic across an ML
         // transition). `None` while loading/disabled ⇒ regex-only key space.
@@ -591,6 +587,127 @@ impl MaskEngine {
             manifest,
             stats,
         })
+    }
+
+    /// Batched detection PREWARM — the throughput lever for ML-active turns.
+    ///
+    /// Given every text leaf of a request (the proxy walker collects them in one
+    /// read-only pass), run the EXPENSIVE ML detection for all cache-missing leaves
+    /// in a SINGLE batched forward ([`run_detection_batch`] →
+    /// [`Recognizer::analyze_batch`](presidio_core::Recognizer::analyze_batch)) and
+    /// populate the detection cache. The subsequent per-leaf [`Self::mask`] calls
+    /// then all hit cache and pay no per-leaf inference — collapsing N serialized
+    /// tiny forwards (each starving the MoE expert pool) into one padded batch that
+    /// feeds the cores and amortizes fixed per-call cost.
+    ///
+    /// PURELY ADDITIVE — it only ever inserts cache entries that [`Self::mask`] would
+    /// compute identically for the same `(text_hash, surface, policy_fp, ml_fp)` key
+    /// (the key is derived here by the very same [`stripped_for_key`] +
+    /// `surface`/`policy_fp`/`ml_fp` logic `mask` uses). So the masked output is
+    /// unchanged whether or not this ran. Every leaf it deliberately skips — a
+    /// user-bypass leaf, a policy-disabled surface, an already-cached leaf, or the
+    /// whole batch on an error — simply runs per-leaf in `mask` exactly as before.
+    /// Errors are swallowed (logged): a prewarm failure must NEVER change a request's
+    /// outcome; the per-leaf path re-runs and fails safe on its own.
+    ///
+    /// Gated on a `Ready` ML recognizer: with no ML active there is nothing
+    /// expensive to batch (regex/custom detection is cheap and `mask` caches it
+    /// per-leaf), so this no-ops. The `ml_gate` is taken ONCE here for the whole
+    /// batch — and ONLY ever on a `spawn_blocking` thread, because the proxy offloads
+    /// the mask walk whenever ML is `Ready`/`Loading` (invariant #5); the prewarmed
+    /// leaves then hit cache in `mask` and never re-take the gate, so there is no
+    /// nesting and no double-run.
+    pub fn prewarm_batch(&self, leaves: &[(&str, Surface)]) {
+        if leaves.is_empty() {
+            return;
+        }
+        // Snapshot policy as a cheap `Arc` clone, then release the lock (audit #2).
+        let policy = Arc::clone(&self.policy.read().expect("policy rwlock poisoned"));
+        if !policy.config.enabled {
+            return; // master switch off ⇒ `mask` early-returns passthrough, no detection
+        }
+        // Snapshot the ML recognizer + its fingerprint together (atomic across an ML
+        // transition, audit #1). `None` unless `Ready` ⇒ nothing worth batching.
+        let (ml, ml_fp) = self.ml_snapshot_with_fp();
+        let Some(ml) = ml else {
+            return;
+        };
+
+        // Plan: derive each leaf's cache key EXACTLY as `mask` does (surface gate,
+        // user-bypass skip, reveal-marker strip), drop the already-cached, and dedupe
+        // identical leaves so a repeated tool-result is detected once.
+        let mut planned: Vec<(CacheKey, Cow<'_, str>, Surface)> = Vec::new();
+        let mut seen: std::collections::HashSet<CacheKey> = std::collections::HashSet::new();
+        for &(raw, surface) in leaves {
+            // A surface disabled by policy is an un-cached passthrough in `mask` — its
+            // key is never read, so don't prewarm it (mirrors `mask`'s early return).
+            if !policy.config.surface_enabled(surface) {
+                continue;
+            }
+            // A user-bypass leaf (`>>secret<<`) takes the segment-split path in `mask`
+            // and is never keyed on the full text — let it run per-leaf.
+            if surface == Surface::UserMessage && user_bypass_segments(raw).is_some() {
+                continue;
+            }
+            let text = stripped_for_key(&policy, raw, surface);
+            let key = CacheKey {
+                text_hash: hash_text(&text),
+                surface,
+                policy_fp: policy.policy_fp,
+                ml_fp,
+            };
+            if self.cache.get(&key).is_some() {
+                continue; // already detected (this turn or a prior one)
+            }
+            if !seen.insert(key.clone()) {
+                continue; // duplicate leaf within this request — detect once
+            }
+            planned.push((key, text, surface));
+        }
+        if planned.is_empty() {
+            return;
+        }
+
+        // Single-flight: hold the ML gate once for the whole batch (recovering a
+        // poisoned guard — one panicked inference must not wedge all future masking,
+        // matching `mask`). Re-check the cache under the gate so a concurrent
+        // request's prewarm/mask can't double-run the same leaf.
+        let _gate = self
+            .ml_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let pending: Vec<(CacheKey, Cow<'_, str>, Surface)> = planned
+            .into_iter()
+            .filter(|(k, _, _)| self.cache.get(k).is_none())
+            .collect();
+        if pending.is_empty() {
+            return;
+        }
+
+        // Run the one batched detection, then drop the borrow before consuming `pending`.
+        let result = {
+            let batch: Vec<(&str, Surface)> =
+                pending.iter().map(|(_, t, s)| (t.as_ref(), *s)).collect();
+            run_detection_batch(
+                &self.analyzer,
+                &policy.config,
+                &policy.customs,
+                ml.as_ref(),
+                &batch,
+            )
+        };
+        match result {
+            Ok(det_lists) => {
+                for ((key, _, _), dets) in pending.into_iter().zip(det_lists) {
+                    self.cache.insert(key, Arc::new(dets));
+                }
+            }
+            Err(e) => {
+                // Per-leaf `mask` will re-run detection (and fail-safe if it genuinely
+                // errors). Prewarm is an optimization; never let it change the outcome.
+                tracing::warn!("prewarm_batch detection failed, falling back to per-leaf: {e}");
+            }
+        }
     }
 
     /// One-shot user-message bypass: `>>secret<<` is sent upstream as `secret`
@@ -744,6 +861,26 @@ impl MaskEngine {
     pub fn session_handle(&self) -> ([u8; 32], [u8; 16]) {
         let store = self.store.lock().expect("store mutex poisoned");
         (*store.key(), *store.salt())
+    }
+}
+
+/// Resolve the cache-key text for a leaf: peel a reveal-marker decoration off
+/// re-sent assistant history so detection sees the original value and the key
+/// matches a no-marker round-trip. Returns a borrowed [`Cow`] for the common
+/// (un-decorated) leaf, allocating only when a marker is actually stripped.
+///
+/// SHARED by [`MaskEngine::mask`] and [`MaskEngine::prewarm_batch`]: deriving the
+/// key text from one place is what guarantees a prewarmed entry is found by the
+/// later per-leaf `mask` (a divergence here would silently bypass the prewarm —
+/// perf, not correctness, but still the thing to keep honest).
+fn stripped_for_key<'a>(policy: &Policy, text: &'a str, surface: Surface) -> Cow<'a, str> {
+    if surface == Surface::AssistantText
+        && policy.config.reveal_marker.is_active()
+        && policy.config.reveal_marker.contained_in(text)
+    {
+        Cow::Owned(policy.config.reveal_marker.strip(text))
+    } else {
+        Cow::Borrowed(text)
     }
 }
 
@@ -1902,5 +2039,167 @@ mod tests {
         for raw in ["1990-01-02", "4111111111111111", "03/27"] {
             assert!(!m.contains(raw), "{raw} leaked: {m}");
         }
+    }
+
+    // ---- prewarm_batch parity (Phase A: engine batched-detection primitive) ----
+
+    /// A deterministic stand-in for the ML recognizer: flags every occurrence of a
+    /// fixed `marker` as an `EmailAddress` (whose default operator is `Token`, so it
+    /// is reversible) — letting the prewarm path be exercised WITHOUT loading the
+    /// ~2.8 GB model. The marker is a shape the regex analyzer never detects, so on
+    /// it the ONLY detection is this mock's, isolating the ML batch path.
+    ///
+    /// `analyze_batch` is left at the trait default (loops `analyze`) — which is
+    /// exactly what `mask`'s per-leaf path calls — so this pins the PLUMBING: key
+    /// derivation, dedupe, cache insert/hit, and `run_detection_batch` ≡ per-leaf
+    /// `run_detection`. The real-model recall parity (batched forward ≡ looped
+    /// forward) is gated separately by the ignored `prewarm_parity` integration test.
+    #[derive(Debug)]
+    struct MarkerRecognizer {
+        entities: Vec<presidio_core::EntityType>,
+        marker: &'static str,
+    }
+
+    impl MarkerRecognizer {
+        fn new(marker: &'static str) -> Self {
+            Self {
+                entities: vec![presidio_core::EntityType::EmailAddress],
+                marker,
+            }
+        }
+    }
+
+    impl presidio_core::Recognizer for MarkerRecognizer {
+        fn name(&self) -> &str {
+            "marker-mock"
+        }
+        fn supported_entities(&self) -> &[presidio_core::EntityType] {
+            &self.entities
+        }
+        fn supported_languages(&self) -> &[&str] {
+            &["en"]
+        }
+        fn analyze(
+            &self,
+            text: &str,
+            _entities: Option<&[presidio_core::EntityType]>,
+            _nlp: Option<&presidio_core::NlpArtifacts>,
+        ) -> Vec<presidio_core::RecognizerResult> {
+            let mut out = Vec::new();
+            let mut from = 0;
+            while let Some(i) = text[from..].find(self.marker) {
+                let start = from + i;
+                let end = start + self.marker.len();
+                out.push(presidio_core::RecognizerResult::new(
+                    presidio_core::EntityType::EmailAddress,
+                    start,
+                    end,
+                    0.99,
+                ));
+                from = end;
+            }
+            out
+        }
+    }
+
+    /// An engine with the mock ML recognizer `Ready`. Fixed session bytes ⇒
+    /// deterministic token minting, so two engines' masked outputs (which embed
+    /// minted tokens) are byte-comparable.
+    fn engine_with_mock_ml(marker: &'static str) -> MaskEngine {
+        let e = MaskEngine::with_session(EngineConfig::default(), [7u8; 32], [9u8; 16]).unwrap();
+        let generation = e.ml_begin_load(MlConfig::default());
+        e.ml_set_ready(generation, Arc::new(MarkerRecognizer::new(marker)));
+        assert!(e.ml_active(), "mock ML should be Ready");
+        e
+    }
+
+    /// The load-bearing engine-side contract: prewarming the whole request then
+    /// masking per-leaf yields byte-IDENTICAL output to masking each leaf straight,
+    /// across duplicates, a no-detection leaf, multiple surfaces, and a user-bypass
+    /// leaf (which prewarm must skip). And prewarm is effective: the non-bypass
+    /// leaves come back as cache HITS with zero per-leaf inference.
+    #[test]
+    fn prewarm_then_mask_matches_unprewarmed() {
+        let marker = "ZZMARK";
+        let leaves: Vec<(&str, Surface)> = vec![
+            ("contact ZZMARK now", Surface::UserMessage),
+            ("nothing to see here", Surface::ToolResult),
+            ("two ZZMARK and ZZMARK again", Surface::SystemPrompt),
+            ("contact ZZMARK now", Surface::UserMessage), // duplicate ⇒ dedupe path
+            ("user said >>ZZMARK<< verbatim", Surface::UserMessage), // bypass ⇒ skipped
+        ];
+
+        // Path A: no prewarm — straight per-leaf mask (the proven reference).
+        let a = engine_with_mock_ml(marker);
+        let out_a: Vec<String> = leaves
+            .iter()
+            .map(|(t, s)| a.mask(t, *s).unwrap().masked_text)
+            .collect();
+
+        // Path B: prewarm the whole request, then per-leaf mask.
+        let b = engine_with_mock_ml(marker);
+        b.prewarm_batch(&leaves);
+        let outcomes_b: Vec<MaskOutcome> =
+            leaves.iter().map(|(t, s)| b.mask(t, *s).unwrap()).collect();
+        let out_b: Vec<String> = outcomes_b.iter().map(|o| o.masked_text.clone()).collect();
+
+        // Correctness contract: prewarm NEVER changes the masked output.
+        assert_eq!(out_a, out_b, "prewarm altered masked output");
+
+        // The mock masks the marker as an email token.
+        assert!(
+            out_b[0].contains("[EMAIL_ADDRESS_"),
+            "marker should be masked: {}",
+            out_b[0]
+        );
+        // Bypass span passes through verbatim (prewarm correctly skipped this leaf).
+        assert!(
+            out_b[4].contains("ZZMARK"),
+            "bypass span should pass through: {}",
+            out_b[4]
+        );
+
+        // Effectiveness: every non-bypass leaf (incl. the no-marker leaf 1, whose
+        // empty detection list is still cached by prewarm) is a HIT with no re-run.
+        for i in [0usize, 1, 2, 3] {
+            assert_eq!(
+                outcomes_b[i].stats.ml_ran, 0,
+                "leaf {i} must not re-run ML after prewarm: {:?}",
+                outcomes_b[i].stats
+            );
+            assert_eq!(
+                outcomes_b[i].stats.hit, 1,
+                "leaf {i} must be a prewarm cache hit: {:?}",
+                outcomes_b[i].stats
+            );
+        }
+    }
+
+    /// With no ML recognizer active, prewarm is a no-op: it must not panic and must
+    /// not pre-populate the (no-ML key space) cache — the per-leaf regex path runs
+    /// fresh exactly as before.
+    #[test]
+    fn prewarm_without_ml_is_noop_and_safe() {
+        let e = MaskEngine::new(EngineConfig::default()).unwrap();
+        let leaves = vec![("contact alice@example.com please", Surface::UserMessage)];
+        e.prewarm_batch(&leaves); // must be a safe no-op
+        let out = e.mask(leaves[0].0, leaves[0].1).unwrap();
+        assert!(out.masked_text.contains("[EMAIL_ADDRESS_"));
+        assert_eq!(out.stats.hit, 0, "no-ML prewarm must not pre-populate");
+        assert_eq!(out.stats.fresh_miss, 1);
+    }
+
+    /// Prewarm honors the master switch (disabled ⇒ no-op) and tolerates empty input.
+    #[test]
+    fn prewarm_respects_master_switch_and_empty_input() {
+        let e = engine_with_mock_ml("ZZMARK");
+        e.set_enabled(false);
+        e.prewarm_batch(&[("ZZMARK", Surface::UserMessage)]); // master off ⇒ no-op
+        e.prewarm_batch(&[]); // empty ⇒ no-op
+        e.set_enabled(true);
+        // Re-enabled: mask runs fresh (prewarm cached nothing while disabled) and still
+        // masks the marker.
+        let out = e.mask("ZZMARK", Surface::UserMessage).unwrap();
+        assert!(out.masked_text.contains("[EMAIL_ADDRESS_"));
     }
 }
