@@ -57,6 +57,20 @@ struct Inner {
     /// one re-mints from scratch on return anyway (its anchor is gone too), so the
     /// counter is never dropped out from under an in-flight lineage.
     turn_counts: HashMap<String, u32>,
+    /// Per-conversation HUMAN-turn counter (monotonic, 1-based) — the source of
+    /// `RequestRecord::human_turn_index`. Incremented only when a request carries MORE
+    /// `user_input` surfaces than the prior turn (a genuine new human prompt), so the N
+    /// tool-cycle requests of one prompt share its index. Evicted as a SET with the other
+    /// per-conversation maps (see [`evict_stale_conversation_state`]); a returning cold
+    /// conversation re-mints a fresh id anyway, so the counter is never dropped under an
+    /// in-flight lineage.
+    human_turn_counts: HashMap<String, u32>,
+    /// Per-conversation count of `user_input` surfaces in the most recent turn. A new human
+    /// turn is "this turn has MORE user_input surfaces than last" — counting (not a
+    /// hash-delta) so a repeated byte-identical prompt still registers, and persisting it
+    /// here (rather than reading the prior record) keeps the signal alive after the prior
+    /// turn's record is evicted from the ring. Evicted with the per-conversation map set.
+    prev_user_input_counts: HashMap<String, u32>,
     /// Per-conversation cache of the most recent turn's `(turn_index, surface
     /// block_hashes)`. Lets the delta survive eviction of the prior turn's full
     /// record from the global ring, so a resent transcript is not mis-flagged as
@@ -99,6 +113,8 @@ impl Monitor {
                 records: VecDeque::new(),
                 waiters: HashMap::new(),
                 turn_counts: HashMap::new(),
+                human_turn_counts: HashMap::new(),
+                prev_user_input_counts: HashMap::new(),
                 last_turn_hashes: HashMap::new(),
                 conversation_anchors: HashMap::new(),
                 last_seen: HashMap::new(),
@@ -135,7 +151,11 @@ impl Monitor {
         }
         let now = now_ms();
         let mut inner = self.inner.lock().expect("monitor mutex poisoned");
-        ingest_tokens_into(&mut inner, manifest, now);
+        // The count_tokens path masks + forwards but never builds surfaces, so there is no
+        // provenance to attach here. The ledger still records the value (exhaustive); its
+        // lane stays `None` ("unclassified", always shown) until a real recorded request
+        // re-sights it in a classified surface and upgrades it.
+        ingest_tokens_into(&mut inner, manifest, now, &HashMap::new());
     }
 
     pub fn set_mode(
@@ -191,11 +211,17 @@ impl Monitor {
         // `metadata.user_id`) — the exact conversation key when present. Parsed before
         // the lock (it is a JSON parse of a possibly-100KB+ body).
         let body_session_id = session_id_from_body(masked_body);
+        // Map each masked token handle to the highest-signal provenance lane it appears in
+        // this request, so the durable ledger can GROUP (never gate) by lane. Built from the
+        // already-computed surfaces, before the lock. A handle seen in multiple lanes takes
+        // the most-sensitive (least-foldable) one, so a value ever seen in USERCTX/TOOL_io/
+        // USER_input is never folded as harness scaffolding.
+        let token_provenance = token_provenance_map(&request_surfaces);
 
         let mut inner = self.inner.lock().expect("monitor mutex poisoned");
         // Fold this request's masked values into the durable ledger under the same
         // lock (a separate `ingest_session_tokens` call would deadlock the std mutex).
-        ingest_tokens_into(&mut inner, manifest, now);
+        ingest_tokens_into(&mut inner, manifest, now, &token_provenance);
         let id = format!("req-{}", inner.next_seq);
         inner.next_seq += 1;
 
@@ -251,6 +277,34 @@ impl Monitor {
             TurnDelta::first()
         } else {
             TurnDelta::prev_unavailable(turn_index - 1)
+        };
+
+        // Bracket tool-cycle requests under their human turn. The full transcript is resent
+        // every turn, so a NEW human turn is one that carries MORE `user_input` surfaces than
+        // the prior turn — counting (not a hash-delta) so a repeated byte-identical prompt
+        // still registers, and reading the persisted prior count (not the prior record) keeps
+        // the signal alive after that record is evicted from the ring. Drives UI nesting only
+        // — never detection. (Monotonic within a conversation since the transcript only grows;
+        // a `/compact` rewrite that shrinks the count just resets the baseline and fails
+        // toward showing — a genuine later prompt still exceeds it.)
+        let user_input_count = request_surfaces
+            .iter()
+            .filter(|s| s.provenance == "user_input")
+            .count() as u32;
+        let prev_user_input = inner
+            .prev_user_input_counts
+            .insert(conversation_id.clone(), user_input_count)
+            .unwrap_or(0);
+        let new_human_turn = user_input_count > prev_user_input;
+        let human_turn_index = {
+            let c = inner
+                .human_turn_counts
+                .entry(conversation_id.clone())
+                .or_insert(0);
+            if new_human_turn {
+                *c += 1;
+            }
+            *c
         };
 
         // Cache this turn's surface hashes (computed before the lock) for future
@@ -310,6 +364,7 @@ impl Monitor {
             request_surfaces,
             response_surfaces: Vec::new(),
             delta,
+            human_turn_index,
         };
         push_record(&mut inner.records, record.clone());
         drop(inner);
@@ -553,7 +608,47 @@ impl ReviewTicket {
 /// it here to set [`TokenClass::Guard`]/`Broker`; `is_peekable()` then suppresses
 /// both the stored plaintext (`value` left empty) and UI peek — so a brokered secret
 /// that interns into the manifest never reaches the snapshot in cleartext.
-fn ingest_tokens_into(inner: &mut Inner, manifest: &UnmaskManifest, now: u128) {
+/// Map each masked token handle in `surfaces` to the highest-signal provenance lane it
+/// appears in (merge rule: a handle in several lanes keeps the least-foldable one). This
+/// is presentation grouping metadata for the durable ledger — it never gates detection.
+fn token_provenance_map(surfaces: &[Surface]) -> HashMap<String, String> {
+    let mut map: HashMap<String, String> = HashMap::new();
+    for s in surfaces {
+        for run in &s.runs {
+            if let Some(tref) = &run.token {
+                let cur = map
+                    .entry(tref.token.clone())
+                    .or_insert_with(|| s.provenance.clone());
+                if provenance_rank(&s.provenance) > provenance_rank(cur) {
+                    *cur = s.provenance.clone();
+                }
+            }
+        }
+    }
+    map
+}
+
+/// Signal rank of a provenance lane for ledger grouping (higher = more likely a real
+/// exposure to verify; the two lowest are display-foldable scaffolding). An unknown lane
+/// ranks as `user_input` — shown, never folded (fail toward showing).
+fn provenance_rank(lane: &str) -> u8 {
+    match lane {
+        "userctx" => 5,
+        "tool_io" => 4,
+        "user_input" => 3,
+        "assistant" => 2,
+        "harness_frame" => 1,
+        "harness_meta" => 0,
+        _ => 3,
+    }
+}
+
+fn ingest_tokens_into(
+    inner: &mut Inner,
+    manifest: &UnmaskManifest,
+    now: u128,
+    prov: &HashMap<String, String>,
+) {
     for e in &manifest.entries {
         if let Some(existing) = inner.session_tokens.get_mut(&e.token_handle) {
             existing.count = existing.count.saturating_add(1);
@@ -561,6 +656,18 @@ fn ingest_tokens_into(inner: &mut Inner, manifest: &UnmaskManifest, now: u128) {
             // not the eviction victim while still masking. `first_seen_ms` (the
             // display sort key) is deliberately left untouched.
             existing.last_seen_ms = now;
+            // Promote (never demote) the ledger lane: a value re-sighted in a
+            // higher-signal lane (e.g. first folded via count_tokens, then seen in
+            // TOOL_io) must surface — "any non-frame sighting disqualifies suppression".
+            if let Some(lane) = prov.get(&e.token_handle) {
+                let upgrade = match &existing.provenance {
+                    Some(cur) => provenance_rank(lane) > provenance_rank(cur),
+                    None => true,
+                };
+                if upgrade {
+                    existing.provenance = Some(lane.clone());
+                }
+            }
             continue;
         }
         let class = TokenClass::for_manifest_entry(e);
@@ -581,6 +688,7 @@ fn ingest_tokens_into(inner: &mut Inner, manifest: &UnmaskManifest, now: u128) {
                 first_seen_ms: now,
                 last_seen_ms: now,
                 count: 1,
+                provenance: prov.get(&e.token_handle).cloned(),
             },
         );
     }
@@ -639,9 +747,10 @@ fn previous_turn_surfaces(
 }
 
 /// Bound every per-conversation map by evicting the least-recently-seen
-/// conversations until back under cap. All five maps (`turn_counts`,
-/// `last_seen`, `last_turn_hashes`, `conversation_anchors`, `labels`) are evicted
-/// as a SET for the same victim, so they never disagree. Choosing the victim by
+/// conversations until back under cap. All seven maps (`turn_counts`,
+/// `human_turn_counts`, `prev_user_input_counts`, `last_seen`, `last_turn_hashes`,
+/// `conversation_anchors`, `labels`) are evicted as a SET for the same victim, so they
+/// never disagree. Choosing the victim by
 /// `last_seen` (recency) — not by turn count — guarantees the victim is genuinely
 /// cold: a live conversation has a recent `last_seen` and is never selected. A
 /// cold conversation that later returns re-mints a fresh id (its anchor is gone),
@@ -658,6 +767,8 @@ fn evict_stale_conversation_state(inner: &mut Inner) {
         };
         inner.last_seen.remove(&victim);
         inner.turn_counts.remove(&victim);
+        inner.human_turn_counts.remove(&victim);
+        inner.prev_user_input_counts.remove(&victim);
         inner.last_turn_hashes.remove(&victim);
         inner.conversation_anchors.remove(&victim);
         inner.labels.remove(&victim);
@@ -1369,7 +1480,7 @@ mod tests {
                 exposed_at: None,
             });
         }
-        ingest_tokens_into(&mut guard, &fill, t);
+        ingest_tokens_into(&mut guard, &fill, t, &HashMap::new());
         assert_eq!(guard.session_tokens.len(), MAX_SESSION_TOKENS);
         let mut reuse = UnmaskManifest::new();
         for (h, v) in [("[FILL_0]", "f0"), ("[NEW]", "new")] {
@@ -1381,7 +1492,7 @@ mod tests {
                 exposed_at: None,
             });
         }
-        ingest_tokens_into(&mut guard, &reuse, t); // SAME `now` → ties the whole ledger
+        ingest_tokens_into(&mut guard, &reuse, t, &HashMap::new()); // SAME `now` → ties the whole ledger
         assert_eq!(guard.session_tokens.len(), MAX_SESSION_TOKENS);
         assert!(
             guard.session_tokens.contains_key("[FILL_0]"),
@@ -1409,6 +1520,9 @@ mod tests {
         .unwrap();
         assert_eq!(e.last_seen_ms, 0);
         assert_eq!(e.first_seen_ms, 5);
+        // A ledger entry serialized before `provenance` existed → `None` (unclassified,
+        // always shown), never a fabricated lane.
+        assert_eq!(e.provenance, None);
     }
 
     fn find(m: &Monitor, id: &str) -> RequestRecord {
@@ -1420,6 +1534,191 @@ mod tests {
     }
     fn convo_decision(m: &Monitor, id: &str) -> RequestDecision {
         find(m, id).decision
+    }
+
+    // ---- provenance-lane ledger grouping + human-turn bracketing (denoise chunk) ----
+
+    fn manifest_entry(handle: &str, value: &str, kind: &str) -> zlauder_engine::ManifestEntry {
+        zlauder_engine::ManifestEntry {
+            canonical_form: value.to_string(),
+            token_handle: handle.to_string(),
+            entity_kind: kind.to_string(),
+            arrow_origin: zlauder_engine::Surface::UserMessage,
+            exposed_at: None,
+        }
+    }
+
+    fn record_with(m: &Monitor, b: &[u8], manifest: &UnmaskManifest) -> String {
+        m.record_llm_request("/v1/messages", "POST", None, b, manifest)
+            .id()
+            .to_string()
+    }
+
+    fn human_turn_of(m: &Monitor, id: &str) -> u32 {
+        find(m, id).human_turn_index
+    }
+
+    fn ledger_lane(m: &Monitor, handle: &str) -> Option<String> {
+        m.snapshot()
+            .session_tokens
+            .into_iter()
+            .find(|e| e.token == handle)
+            .and_then(|e| e.provenance)
+    }
+
+    #[test]
+    fn ledger_lane_is_attributed_from_the_surface_that_carried_the_value() {
+        // The SAME entity kind from two surfaces lands in two lanes: a value in the system
+        // prompt is harness scaffolding; the same-kind value in tool output is real egress.
+        let m = Monitor::new();
+        let b = serde_json::to_vec(&json!({
+            "system": "contact [EMAIL_ADDRESS_sys] for help",
+            "messages": [
+                {"role": "user", "content": "run it"},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "tu1", "content": "leaked [EMAIL_ADDRESS_tool]"}
+                ]}
+            ]
+        }))
+        .unwrap();
+        let mut manifest = UnmaskManifest::new();
+        manifest.push(manifest_entry("[EMAIL_ADDRESS_sys]", "a@sys.com", "EMAIL_ADDRESS"));
+        manifest.push(manifest_entry("[EMAIL_ADDRESS_tool]", "b@tool.com", "EMAIL_ADDRESS"));
+        record_with(&m, &b, &manifest);
+        assert_eq!(ledger_lane(&m, "[EMAIL_ADDRESS_sys]").as_deref(), Some("harness_frame"));
+        assert_eq!(ledger_lane(&m, "[EMAIL_ADDRESS_tool]").as_deref(), Some("tool_io"));
+    }
+
+    #[test]
+    fn ledger_lane_upgrades_to_higher_signal_sighting_and_never_downgrades() {
+        // "Any non-frame sighting disqualifies suppression": a value first folded in via
+        // scaffolding must promote — and stay promoted — once it appears in a real lane.
+        let m = Monitor::new();
+        let handle = "[CRYPTO_x]";
+        let mut man = UnmaskManifest::new();
+        man.push(manifest_entry(handle, "wallet123", "CRYPTO"));
+
+        let sys_body = serde_json::to_vec(&json!({
+            "system": format!("example wallet {handle}"),
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .unwrap();
+        record_with(&m, &sys_body, &man);
+        assert_eq!(ledger_lane(&m, handle).as_deref(), Some("harness_frame"));
+
+        let tool_body = serde_json::to_vec(&json!({
+            "system": format!("example wallet {handle}"),
+            "messages": [
+                {"role": "user", "content": "hi"},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "t", "content": format!("found {handle}")}
+                ]}
+            ]
+        }))
+        .unwrap();
+        record_with(&m, &tool_body, &man);
+        assert_eq!(
+            ledger_lane(&m, handle).as_deref(),
+            Some("tool_io"),
+            "a non-frame sighting promotes the lane out of foldable scaffolding"
+        );
+
+        // A later scaffolding-only resend must NOT pull it back into the foldable bucket.
+        record_with(&m, &sys_body, &man);
+        assert_eq!(
+            ledger_lane(&m, handle).as_deref(),
+            Some("tool_io"),
+            "promotion is monotonic — a value seen in a real lane is never re-folded"
+        );
+    }
+
+    #[test]
+    fn count_tokens_only_value_stays_unclassified_until_a_surface_carries_it() {
+        // The count_tokens path has no surfaces, so its values are ledgered with no lane
+        // (always shown), then upgraded when a recorded request sights them in a surface.
+        let m = Monitor::new();
+        let mut man = UnmaskManifest::new();
+        man.push(manifest_entry("[EMAIL_ADDRESS_q]", "q@x.com", "EMAIL_ADDRESS"));
+        m.ingest_session_tokens(&man);
+        assert_eq!(ledger_lane(&m, "[EMAIL_ADDRESS_q]"), None, "no surface ⇒ no lane (shown)");
+
+        let b = serde_json::to_vec(&json!({
+            "messages": [{"role": "user", "content": "mail [EMAIL_ADDRESS_q]"}]
+        }))
+        .unwrap();
+        record_with(&m, &b, &man);
+        assert_eq!(ledger_lane(&m, "[EMAIL_ADDRESS_q]").as_deref(), Some("user_input"));
+    }
+
+    #[test]
+    fn human_turn_index_brackets_tool_cycle_under_one_prompt() {
+        let m = Monitor::new();
+        // Turn 1: the human prompt.
+        let t1 = record(&m, &body(&[("user", json!("summarize the repo"))]));
+        // Turn 2: a tool cycle — assistant tool_use + user tool_result, NO new human text.
+        let t2 = record(
+            &m,
+            &body(&[
+                ("user", json!("summarize the repo")),
+                ("assistant", json!([{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"ls"}}])),
+                ("user", json!([{"type":"tool_result","tool_use_id":"tu1","content":"src/ lib.rs"}])),
+            ]),
+        );
+        // Turn 3: a genuine new human message.
+        let t3 = record(
+            &m,
+            &body(&[
+                ("user", json!("summarize the repo")),
+                ("assistant", json!([{"type":"tool_use","id":"tu1","name":"Bash","input":{"command":"ls"}}])),
+                ("user", json!([{"type":"tool_result","tool_use_id":"tu1","content":"src/ lib.rs"}])),
+                ("assistant", json!("It has two files.")),
+                ("user", json!("now write a test")),
+            ]),
+        );
+        // Per-request turns are monotonic (egress granularity is preserved)...
+        assert_eq!(turn_of(&m, &t1), 1);
+        assert_eq!(turn_of(&m, &t2), 2);
+        assert_eq!(turn_of(&m, &t3), 3);
+        // ...but there are only TWO human turns: the tool cycle stays under prompt 1.
+        assert_eq!(human_turn_of(&m, &t1), 1);
+        assert_eq!(human_turn_of(&m, &t2), 1, "a tool-cycle continuation is not a new human turn");
+        assert_eq!(human_turn_of(&m, &t3), 2, "a fresh user message opens human turn 2");
+        // The sidebar reports human turns, not raw API requests.
+        let convo = m.snapshot().conversations.into_iter().next().unwrap();
+        assert_eq!(convo.turn_count, 2);
+    }
+
+    #[test]
+    fn human_turn_index_counts_a_repeated_identical_prompt_as_a_new_turn() {
+        // A byte-identical resent prompt is invisible to a hash-delta (same block_hash), but
+        // the COUNT of user_input surfaces grows — so it still opens a new human turn (the
+        // edge a hash-only delta would mis-group under the prior turn).
+        let m = Monitor::new();
+        let t1 = record(&m, &body(&[("user", json!("ping"))]));
+        let t2 = record(
+            &m,
+            &body(&[
+                ("user", json!("ping")),
+                ("assistant", json!("pong")),
+                ("user", json!("ping")),
+            ]),
+        );
+        assert_eq!(convo_of(&m, &t1), convo_of(&m, &t2), "same conversation");
+        assert_eq!(human_turn_of(&m, &t1), 1);
+        assert_eq!(human_turn_of(&m, &t2), 2, "a repeated identical prompt is still a new human turn");
+    }
+
+    #[test]
+    fn human_turn_index_defaults_on_old_records() {
+        // A record serialized before `human_turn_index` existed deserializes to 0
+        // (shown ungrouped), never a fabricated turn number.
+        let m = Monitor::new();
+        record(&m, &body(&[("user", json!("hi"))]));
+        let rec = find(&m, "req-1");
+        let mut v = serde_json::to_value(&rec).unwrap();
+        v.as_object_mut().unwrap().remove("human_turn_index");
+        let back: RequestRecord = serde_json::from_value(v).unwrap();
+        assert_eq!(back.human_turn_index, 0);
     }
 }
 
@@ -1445,7 +1744,15 @@ fn conversations_from_records(
                 last_updated_ms: 0,
                 pending_count: 0,
             });
-        m.turn_count = m.turn_count.max(r.turn_index);
+        // Count HUMAN turns (what a person means by "turns"), not raw API requests: one
+        // prompt that spawns N tool-cycle round-trips is ONE turn. Falls back to the
+        // per-request index for pre-`human_turn_index` records (deserialized as 0).
+        let human_turns = if r.human_turn_index > 0 {
+            r.human_turn_index
+        } else {
+            r.turn_index
+        };
+        m.turn_count = m.turn_count.max(human_turns);
         m.last_updated_ms = m.last_updated_ms.max(r.updated_ms);
         if pending {
             m.pending_count += 1;

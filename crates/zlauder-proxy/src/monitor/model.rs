@@ -239,6 +239,18 @@ pub struct RequestRecord {
     pub response_surfaces: Vec<Surface>,
     /// What is new this turn vs the previous turn of the same conversation.
     pub delta: TurnDelta,
+    /// 1-based index of the HUMAN turn this request belongs to within its conversation
+    /// — the user message that began this tool-cycle, NOT the per-request `turn_index`.
+    /// One human prompt that spawns N tool round-trips shares ONE `human_turn_index`
+    /// across all N requests, so the UI nests the tool-cycle under its human turn. A new
+    /// human turn is detected when this request carries MORE `user_input` surfaces than the
+    /// prior turn of the same conversation (the whole transcript is resent every turn, so
+    /// presence alone is not enough; counting also catches a repeated byte-identical prompt
+    /// that a hash-delta would miss, and survives record-ring eviction of the prior turn).
+    /// `0` means no human turn observed yet (pre-prompt / old snapshot) → shown ungrouped
+    /// (fail toward showing). Presentation grouping only. Additive; deserializes to `0`.
+    #[serde(default)]
+    pub human_turn_index: u32,
 }
 
 /// Provenance class of a masked value, carried on every [`TokenLedgerEntry`].
@@ -314,6 +326,16 @@ pub struct TokenLedgerEntry {
     pub last_seen_ms: u128,
     /// How many times the value has been masked this session.
     pub count: u64,
+    /// Highest-signal provenance lane this value has been seen in this session
+    /// (presentation hint for ledger grouping; plan §1A): `userctx | tool_io |
+    /// user_input | assistant | harness_frame | harness_meta`. A value EVER seen in a
+    /// non-scaffolding lane is recorded as that lane, so it is never folded as
+    /// scaffolding ("any non-frame sighting disqualifies suppression"). `None` when no
+    /// classified surface carried it (e.g. a `count_tokens`-only sighting) → rendered
+    /// "unclassified" (always shown). Presentation only — NEVER gates detection,
+    /// masking, or eviction. Additive; deserializes to `None` on old snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<String>,
 }
 
 /// A conversation grouping shown in the sidebar/timeline.

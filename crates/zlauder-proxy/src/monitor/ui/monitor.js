@@ -44,6 +44,7 @@ let ledgerAllow = { exact: [], exact_ci: [] };  // GET /zlauder/config .config.a
 let ledgerCustomRules = [];          // GET /zlauder/monitor/custom-mask
 const peeked = new Set();            // row keys currently peeked (local plaintext, anti shoulder-surf)
 let peekAll = false;                  // PEEK ALL master: force every peekable row open (local only, default off)
+let denoise = localStorage.getItem('zlDenoise') === '1';  // DE-NOISE: group ledger by lane + fold scaffolding (default OFF — the complete view is the baseline)
 const MAX_SESSION_TOKENS = 5000;     // mirror the server cap so live SSE augmentation stays bounded
 // The four common-word defaults are always re-seeded; only NON-default allow-list
 // entries are operator-configured / reveal-created "passing plaintext".
@@ -127,11 +128,35 @@ function rollup(tokens) {
   }
   return Object.entries(counts).sort((a, b) => b[1] - a[1]);
 }
+
+/* ---------- entity SEVERITY tiers (presentation re-rank — NEVER detection) ----------
+   Signal-to-noise in the live data is inverted: the loudest chips are the false positives
+   (tool-name PERSON, session-UUID US_BANK_NUMBER, infra URL/IP). Sort + saturate genuine,
+   high-confidence exposures FIRST; demote the low-precision ML/loose-regex kinds to a muted
+   tier. Every kind is still masked, counted, and in the ledger — only the VISUAL order and
+   weight change. UNCERTAIN: ideally these tiers come from the engine's Category list so they
+   can't drift; mirrored here for now (see isSecretClass for the same drift caveat). */
+const SEV_CRITICAL = /API_KEY|AWS_|AZURE_KEY|GCP_|PRIVATE_KEY|JWT|CREDIT_CARD|IBAN|CRYPTO|ROUTING|SSN|ITIN|NATIONAL_ID|PASSPORT|DRIVER_LICEN|DRIVING_LICEN|MEDICAL_LICENSE|NPI|MBI|NHS|NINO|EMAIL|PHONE/;
+const SEV_LOW = /PERSON|LOCATION|ORGANIZATION|US_BANK_NUMBER|URL|IP_ADDRESS|MAC_ADDRESS|DATE_TIME|DOMAIN/;
+function entityTier(kind) {
+  const k = String(kind || '').toUpperCase();
+  if (SEV_CRITICAL.test(k)) return 0;   // genuine high-confidence PII/secret — saturated, first
+  if (SEV_LOW.test(k)) return 2;        // low-precision / false-positive-heavy — muted, last
+  return 1;                              // everything else — default amber
+}
+function sevClass(kind) { const t = entityTier(kind); return t === 0 ? 'sev-crit' : t === 2 ? 'sev-low' : ''; }
+/* rollup() re-ordered by sensitivity tier first, then count desc. */
+function rollupTiered(tokens) {
+  return rollup(tokens).sort((a, b) => {
+    const ta = entityTier(a[0]), tb = entityTier(b[0]);
+    return ta !== tb ? ta - tb : b[1] - a[1];
+  });
+}
 function rollupChips(tokens, cls) {
-  const r = rollup(tokens);
+  const r = rollupTiered(tokens);
   if (!r.length) return '';
   return r.map(([k, n]) =>
-    `<span class="kind-chip ${cls || ''}">${n}× ${esc(k)}</span>`).join('');
+    `<span class="kind-chip ${sevClass(k)} ${cls || ''}">${n}× ${esc(k)}</span>`).join('');
 }
 
 /* ---------- risk: non-empty surfaces but nothing masked ---------- */
@@ -396,9 +421,12 @@ function renderReview() {
 
   const rollHead = tokens.length ? `<div class="rh-rollup">${rollupChips(tokens)}</div>` : '';
 
+  const turnLabel = r.human_turn_index > 0 ? r.human_turn_index : r.turn_index;
+  const egressNote = (r.human_turn_index > 0 && r.turn_index !== r.human_turn_index)
+    ? ` &middot; egress T${r.turn_index}` : '';
   const head = `<div class="review-head">`
-    + `<div><div class="rh-id">TURN ${r.turn_index}`
-    +   `<small title="${esc(r.id)}">${esc(r.method)} ${esc(r.endpoint)} &middot; ${esc(r.id)}</small></div>${rollHead}</div>`
+    + `<div><div class="rh-id">TURN ${turnLabel}`
+    +   `<small title="${esc(r.id)}">${esc(r.method)} ${esc(r.endpoint)} &middot; ${esc(r.id)}${egressNote}</small></div>${rollHead}</div>`
     + `<div class="rh-spacer"></div>`
     + `<div class="rh-controls">`
     +   `<label class="reveal-toggle" title="show masked values inline in this browser — local only, never sent"><input type="checkbox" id="revealToggle" ${revealValues ? 'checked' : ''}> peek values</label>`
@@ -573,6 +601,20 @@ function renderTraffic(flashId) {
   $('clearFilter').hidden = !channelFilter;
   renderFilterCounts();
 
+  // Bracket tool-cycle requests under their human turn (chunk 3): the head of a human turn
+  // is its lowest-turn_index request; later requests sharing the same (conversation,
+  // human_turn) are tool-cycle continuations, shown indented under it. Computed over ALL
+  // records so a filtered-out head still demotes its children. No reordering — the triage
+  // sort (pending-first) is untouched; this only relabels + indents.
+  const headTurn = {};
+  for (const r of records) {
+    if (!r.human_turn_index) continue;
+    const k = r.conversation_id + ' ' + r.human_turn_index;
+    if (!(k in headTurn) || r.turn_index < headTurn[k]) headTurn[k] = r.turn_index;
+  }
+  const isToolCycle = r => r.human_turn_index > 0
+    && headTurn[r.conversation_id + ' ' + r.human_turn_index] !== r.turn_index;
+
   $('records').innerHTML = visible.length ? visible.map(r => {
     const tc = (r.tokens || []).length;
     const di = decisionInfo(r.decision);
@@ -583,11 +625,18 @@ function renderTraffic(flashId) {
     const inflight = r.decision === 'in_flight';
     const rem = remainingMs(r);
     const ela = elapsedMs(r);
-    const roll = rollup(r.tokens).slice(0, 3)
-      .map(([k, n]) => `<span class="rec-kind">${n}×${esc(k)}</span>`).join('');
-    return `<div class="rec ${pending ? 'pending' : ''} ${inflight ? 'inflight' : ''} ${risk ? 'risk' : ''} ${selectedId === r.id ? 'active' : ''} ${flashId === r.id ? 'flash' : ''}" data-rec="${esc(r.id)}">`
+    const roll = rollupTiered(r.tokens).slice(0, 3)
+      .map(([k, n]) => `<span class="rec-kind ${sevClass(k)}">${n}×${esc(k)}</span>`).join('');
+    const ht = r.human_turn_index;
+    const child = isToolCycle(r);
+    const turnPip = ht > 0
+      ? (child
+          ? `<span class="rec-turn child" title="tool-cycle egress within human turn ${ht} &middot; request ${r.turn_index}">&#8627; T${ht}</span><span class="rec-cycle">req ${r.turn_index}</span>`
+          : `<span class="rec-turn" title="human turn ${ht} &middot; request ${r.turn_index}">T${ht}</span>`)
+      : `<span class="rec-turn">T${r.turn_index}</span>`;
+    return `<div class="rec ${pending ? 'pending' : ''} ${inflight ? 'inflight' : ''} ${risk ? 'risk' : ''} ${child ? 'tool-cycle' : ''} ${selectedId === r.id ? 'active' : ''} ${flashId === r.id ? 'flash' : ''}" data-rec="${esc(r.id)}">`
       + `<div class="rec-top">`
-      +   `<span class="rec-turn">T${r.turn_index}</span>`
+      +   turnPip
       +   `<span class="rec-endpoint">${esc(r.endpoint)}</span>`
       +   (pending ? `<span class="rec-clock ${clockClass(rem)}" data-countdown="${esc(r.id)}">&#9201; ${fmtClock(rem)}</span>` : '')
       +   (inflight ? `<span class="rec-clock live" data-elapsed="${esc(r.id)}">&#9201; ${fmtClock(ela)} streaming</span>` : '')
@@ -624,12 +673,76 @@ function renderHeader(snap) {
   }
 }
 
+/* ---------- protection status: the plain-language "am I protected?" line ----------
+   Reads only state the UI already holds (snapshot mode/pending + the durable ledger size +
+   the live policy categories). Aggregate-only by design — no per-entity breakdown leaks
+   here (the ledger below is where details live). */
+function renderProtectionStatus() {
+  const el = $('protectionStatus');
+  if (!el) return;
+  if (!lastSnap) { el.hidden = true; return; }
+  el.hidden = false;
+  // Masking is genuinely active only if the engine master switch is ON and at least one
+  // detector can ACTUALLY produce masks. The complete set of masking sources (each
+  // independent of the others): any regex category (secrets/financial/identity/contact)
+  // masks immediately; `personal` masks ONLY once the ML model is `ready`; any custom
+  // keyphrase rule masks; and any per-entity operator that is not `keep` masks even with no
+  // category selected. Counting only categories would BOTH overstate (personal-only, ML off)
+  // AND understate (custom/operator-only) — the line claims a security property, so it must
+  // reflect every path.
+  const cfg = (committedPolicy && committedPolicy.config) || null;
+  const cats = (cfg && cfg.enabled_categories) || null;
+  const masterOff = !!(committedPolicy && committedPolicy.enabled === false); // top-level engine switch
+  const regexCat = !!(cats && cats.some(c => c !== 'personal'));
+  const personalActive = !!(cats && cats.includes('personal') && mlStatus === 'ready');
+  const customActive = !!(cfg && Array.isArray(cfg.custom_replacements) && cfg.custom_replacements.length);
+  // A detected entity is only MASKED if its RESOLVED operator is not `keep` (`keep` = detected
+  // but left verbatim). Categories/personal use the default operator unless a per-entity
+  // override applies, so an enabled category masks only when the default operator masks
+  // (`defaultMasks`) OR some per-entity operator masks (`opMasks`). A `keep` default
+  // (observe-without-masking) means those categories mask nothing.
+  // RESIDUAL (documented, not handled): default masks but EVERY entity is individually
+  // keep-overridden — would need the engine's category→entity map to detect; no realistic
+  // config does this, and the precise check belongs server-side if ever needed.
+  const defaultMasks = !(cfg && cfg.default_operator && cfg.default_operator.kind === 'keep');
+  const opMasks = !!(cfg && cfg.entity_operators
+      && Object.values(cfg.entity_operators).some(op => op && op.kind && op.kind !== 'keep'));
+  const catMasks = (regexCat || personalActive) && defaultMasks;
+  // Before the policy loads (committedPolicy null) assume ON — we ARE a masking proxy; it
+  // self-corrects on the first config load.
+  const maskingOn = committedPolicy
+      ? (!masterOff && (catMasks || customActive || opMasks))
+      : true;
+  const personalOnly = !!(cats && cats.length === 1 && cats[0] === 'personal');
+  const offReason = masterOff ? ' &mdash; engine disabled'
+      : personalOnly ? ' &mdash; only Personal is on and the ML model is not ready'
+      : !defaultMasks ? ' &mdash; detectors set to keep (observing, not masking)'
+      : ' &mdash; no active detectors';
+  const masked = sessionTokens.length;
+  const pend = lastSnap.pending_count || 0;
+  const modeText = lastSnap.mode === 'off'
+      ? 'OBSERVE — nothing held for approval'
+      : lastSnap.mode === 'manual_all_llm'
+      ? `HOLD ALL LLM — ${pend} held for approval`
+      : `HOLD ON DETECTION — ${pend} held for approval`;
+  const mlNote = (mlStatus && mlStatus !== 'disabled' && mlStatus !== 'ready')
+      ? ` &middot; names/locations masking <b>${esc(mlStatus)}</b>` : '';
+  el.className = 'protection-status ' + (maskingOn ? 'ok' : 'off');
+  const lead = maskingOn
+      ? `<span class="ps-dot good">&#9679;</span><b>Masking ON</b>`
+      : `<span class="ps-dot bad">&#9888;</span><b>Masking OFF</b>${offReason}`;
+  el.innerHTML = lead
+    + ` &middot; <b>${masked}</b> value${masked === 1 ? '' : 's'} masked before leaving this machine`
+    + ` &middot; ${esc(modeText)}${mlNote}`;
+}
+
 function render(flashId) {
   renderChannels();
   renderTraffic(flashId);
   renderReview();
   renderLedger();
   renderViewState();
+  renderProtectionStatus();
 }
 
 /* ============================================================
@@ -679,6 +792,28 @@ function peekChip(rowKey, value, peekable) {
     + `${on ? esc(value) : '••••••'}</span>`;
 }
 
+/* ---------- ledger provenance lanes (chunk 1) ----------
+   Each durable ledger entry carries a server-derived `provenance` lane (a HINT, never a
+   detection gate). The ledger GROUPS by lane so real-exposure lanes (your files, tool I/O,
+   your messages) read first, and the fixed Claude Code scaffolding folds into one
+   still-scanned, one-click-restorable group when DE-NOISE is on. `fold:true` lanes are the
+   only ones ever collapsed; everything else (incl. unclassified) is always shown. */
+const LANE_META = {
+  userctx:       { tag: 'ctx',  label: 'your files (CLAUDE.md / MEMORY.md)', rank: 5, fold: false },
+  tool_io:       { tag: 'tool', label: 'tool input / output',               rank: 4, fold: false },
+  user_input:    { tag: 'you',  label: 'your messages',                     rank: 3, fold: false },
+  assistant:     { tag: 'llm',  label: 'model output',                      rank: 2, fold: false },
+  harness_frame: { tag: 'sys',  label: 'Claude Code system scaffolding',    rank: 1, fold: true  },
+  harness_meta:  { tag: 'meta', label: 'transport / billing metadata',      rank: 0, fold: true  },
+};
+function laneMeta(lane) {
+  return LANE_META[lane] || { tag: '?', label: 'unclassified — shown', rank: 3, fold: false };
+}
+function laneChip(lane) {
+  const m = laneMeta(lane);
+  return `<span class="lane-chip lane-${esc(lane || 'none')}" title="${attr(m.label)}">${esc(m.tag)}</span>`;
+}
+
 function renderLedger() {
   // ---- holds strip (keeps approve/reject reachable from the ledger) ----
   const holds = records.filter(r => r.decision === 'pending')
@@ -687,7 +822,7 @@ function renderLedger() {
   $('ledgerHolds').innerHTML = holds.map(r => {
     const rem = remainingMs(r);
     return `<div class="lhold" data-hold-select="${esc(r.id)}" title="open in inspector">`
-      + `<span class="lhold-turn">T${r.turn_index}</span>`
+      + `<span class="lhold-turn">T${r.human_turn_index > 0 ? r.human_turn_index : r.turn_index}</span>`
       + `<span class="lhold-ep">${esc(r.endpoint)}</span>`
       + `<span class="lhold-clock ${clockClass(rem)}" data-countdown="${esc(r.id)}">⏱ ${fmtClock(rem)}</span>`
       + `<span class="lhold-tok">${(r.tokens || []).length} tok</span>`
@@ -741,18 +876,43 @@ function renderLedger() {
     seen.add(t.token); return true;
   });
   $('ledgerTokensCount').textContent = autoRows.length;
-  $('ledgerTokens').innerHTML = autoRows.length ? autoRows.map(t => {
+  const autoRowHtml = t => {
     const key = 'tok:' + t.token;
     const canReveal = t.peekable !== false && !!t.value;
     return `<div class="lrow">`
       + `<span class="lcell lrow-handle">${esc(t.token)}</span>`
       + `<span class="lcell lc-val">${peekChip(key, t.value, t.peekable)}</span>`
-      + `<span class="lcell lrow-kind">${esc(t.entity_kind)}</span>`
-      + `<span class="lcell lc-meta">${t.count > 1 ? `<span class="lrow-tag">×${t.count}</span>` : ''}</span>`
+      + `<span class="lcell lrow-kind ${sevClass(t.entity_kind)}">${esc(t.entity_kind)}</span>`
+      + `<span class="lcell lc-meta">${laneChip(t.provenance)}${t.count > 1 ? `<span class="lrow-tag">×${t.count}</span>` : ''}</span>`
       + `<span class="lcell lspace"></span>`
       + `<span class="lcell lc-act">${canReveal ? `<button class="btn ghost sm warn" data-lact="reveal" data-value="${attr(t.value)}" data-entity="${attr(t.entity_kind)}">REVEAL TO MODEL</button>` : ''}</span>`
       + `</div>`;
-  }).join('') : `<div class="empty-note">No PII auto-detected yet this session.</div>`;
+  };
+  let autoHtml;
+  if (!autoRows.length) {
+    autoHtml = `<div class="empty-note">No PII auto-detected yet this session.</div>`;
+  } else if (!denoise) {
+    // Complete view (default): every value, in server order. Nothing folded.
+    autoHtml = autoRows.map(autoRowHtml).join('');
+  } else {
+    // DE-NOISE: real-exposure lanes first (sorted by signal), Claude Code scaffolding folded
+    // into ONE still-scanned, one-click-restorable group. Folding is display-only — the count
+    // is shown and every value stays in the ledger and is still detected.
+    const foldable = t => laneMeta(t.provenance).fold;
+    const shown = autoRows.filter(t => !foldable(t))
+      .sort((a, b) => laneMeta(b.provenance).rank - laneMeta(a.provenance).rank);
+    const folded = autoRows.filter(foldable);
+    autoHtml = (shown.length ? shown.map(autoRowHtml).join('')
+                             : `<div class="empty-note">No content-lane PII this session — only system scaffolding below.</div>`)
+      + (folded.length
+          ? `<details class="ledger-fold">`
+            + `<summary><span class="fold-tag">SYSTEM SCAFFOLDING</span>`
+            +   `<span class="fold-sub">${folded.length} value${folded.length === 1 ? '' : 's'} masked in Claude Code framing &middot; still scanned &amp; ledgered &middot; click to show</span></summary>`
+            + `<div class="ledger-rows ledger-fold-rows">${folded.map(autoRowHtml).join('')}</div>`
+            + `</details>`
+          : '');
+  }
+  $('ledgerTokens').innerHTML = autoHtml;
 }
 
 /* ---- ledger sources: allow-list + custom rules (fetched once + after edits) ---- */
@@ -850,6 +1010,16 @@ $('ledgerAddEntity').addEventListener('keydown', e => { if (e.key === 'Enter') {
 
 /* PEEK ALL master switch: flip every peekable row open/closed at once (local only). */
 $('peekAllToggle').addEventListener('change', e => { peekAll = e.target.checked; renderLedger(); });
+
+/* DE-NOISE: group the ledger by provenance lane and fold Claude Code scaffolding. Default
+   OFF — the complete (overly-complete) view is the baseline; this only ever hides values
+   into a still-scanned, one-click group, never drops them. Persisted locally. */
+$('denoiseToggle').checked = denoise;
+$('denoiseToggle').addEventListener('change', e => {
+  denoise = e.target.checked;
+  localStorage.setItem('zlDenoise', denoise ? '1' : '0');
+  renderLedger();
+});
 
 /* ledger-local delegation: peek toggle, hold-select, reveal/remask/remove */
 $('viewLedger').addEventListener('click', e => {
@@ -1136,7 +1306,10 @@ es.onmessage = e => {
         // Honor the server's redaction seam: a non-peekable (secret-class) token
         // carries no plaintext and must not become peekable in the live ledger.
         const peekable = t.peekable !== false;
-        sessionTokens.push({ token: t.token, value: peekable ? t.value : '', entity_kind: t.entity_kind, class: t.class || 'auto_pii', peekable, count: 1 });
+        // Per-record token previews carry no provenance lane (that lives on the durable
+        // ledger entry); leave it undefined → "unclassified" (always shown) until the next
+        // snapshot reconciles the authoritative lane.
+        sessionTokens.push({ token: t.token, value: peekable ? t.value : '', entity_kind: t.entity_kind, class: t.class || 'auto_pii', peekable, count: 1, provenance: t.provenance });
       }
     }
     // Bound the client ledger like the server (oldest-first; live appends are newest).
@@ -1396,6 +1569,9 @@ function applyPolicyConfig(snap) {
   $('polMlModel').textContent = ml.model ? `model: ${ml.model}${ml.error ? ' — ' + ml.error : ''}` : '';
 
   refreshPersonalTier();
+  // The protection-status line reads enabled_categories + ml status, so re-render it
+  // whenever the live policy moves (the drawer is closed most of the time).
+  renderProtectionStatus();
 }
 
 /* Tick the category checkboxes from a snapshot. Skips a checkbox being actively toggled

@@ -973,3 +973,70 @@ select:focus { outline: none; border-color: var(--cyan-dim); box-shadow: 0 0 0 1
 }
 .pol-mask-x:hover { box-shadow: 0 0 12px -4px var(--bad); }
 .pol-masks-empty { font-size: 10.5px; color: var(--ink-faint); padding: 8px 0; }
+
+/* ============================================================
+   DE-NOISE / RE-RANK / HUMAN-TURN  (monitor UX chunk)
+   ============================================================ */
+
+/* ---- protection status line (plain-language "am I protected?") ---- */
+.protection-status {
+  position: relative; z-index: 3; display: flex; align-items: center; gap: 8px;
+  padding: 7px 16px; font-size: 11px; letter-spacing: .02em; color: var(--ink-dim);
+  background: var(--bg-panel); border-bottom: 1px solid var(--line);
+  border-left: 3px solid var(--good);
+}
+.protection-status.off { border-left-color: var(--bad); color: var(--bad); }
+.protection-status b { color: var(--ink); font-weight: 600; }
+.protection-status.off b { color: var(--bad); }
+.ps-dot { font-size: 9px; }
+.ps-dot.good { color: var(--good); }
+.ps-dot.bad { color: var(--bad); }
+
+/* ---- entity severity tiers: genuine PII/secrets saturated + first; low-precision
+   kinds muted + last. Colorblind-safe (weight + border-style, not hue alone). ---- */
+.kind-chip.sev-crit {
+  color: #ffd9dd; border-color: var(--bad); background: rgba(255,93,108,.14); font-weight: 600;
+}
+.kind-chip.sev-low {
+  color: var(--ink-faint); border-color: var(--line); border-style: dashed;
+  background: transparent; opacity: .8;
+}
+.rec-kind.sev-crit { color: #ffd9dd; border-color: var(--bad); font-weight: 600; }
+.rec-kind.sev-low  { color: var(--ink-faint); border-color: var(--line); border-style: dashed; opacity: .8; }
+.lrow-kind.sev-crit { color: var(--bad); }
+.lrow-kind.sev-low  { color: var(--ink-faint); }
+
+/* ---- de-noise toggle: reuses the PEEK ALL switch chrome but accents in cyan so the
+   two master switches are never confused. ---- */
+.denoise-toggle input:checked + .peek-all-track { background: var(--cyan-glow); border-color: var(--cyan); }
+.denoise-toggle input:checked + .peek-all-track .peek-all-knob { left: 22px; background: var(--cyan); box-shadow: 0 0 10px var(--cyan); }
+.denoise-toggle input:checked ~ .peek-all-label { color: var(--cyan); }
+
+/* ---- ledger provenance lane chip (where each masked value came from) ---- */
+.lane-chip {
+  font-size: 8px; letter-spacing: .1em; text-transform: uppercase; font-weight: 600;
+  color: var(--ink-faint); border: 1px solid var(--line); border-radius: 3px;
+  padding: 0 4px; white-space: nowrap;
+}
+.lane-tool_io, .lane-userctx { color: var(--cyan); border-color: var(--cyan-dim); }
+.lane-user_input { color: var(--ink-dim); border-color: var(--line); }
+.lane-harness_frame, .lane-harness_meta { color: var(--ink-faint); border-color: var(--line-soft); opacity: .8; }
+
+/* ---- folded "system scaffolding" group in the ledger (de-noise on) ---- */
+.ledger-fold { grid-column: 1 / -1; margin-top: 6px; border: 1px dashed var(--line); border-radius: 6px; background: var(--bg-inset); }
+.ledger-fold > summary {
+  cursor: pointer; list-style: none; display: flex; align-items: baseline; gap: 10px;
+  padding: 8px 12px; user-select: none;
+}
+.ledger-fold > summary::-webkit-details-marker { display: none; }
+.ledger-fold > summary::before { content: '▸'; color: var(--ink-faint); font-size: 10px; }
+.ledger-fold[open] > summary::before { content: '▾'; }
+.fold-tag { font-family: var(--disp); font-size: 10px; letter-spacing: .2em; font-weight: 600; color: var(--ink-dim); text-transform: uppercase; }
+.fold-sub { font-size: 9.5px; color: var(--ink-faint); }
+.ledger-fold-rows { padding: 4px 10px 10px; }
+
+/* ---- human-turn bracketing in the traffic list: tool-cycle continuations indent
+   under their human turn (no reordering — the triage sort is untouched). ---- */
+.rec.tool-cycle { margin-left: 14px; border-left: 1px dashed var(--line); opacity: .92; }
+.rec-turn.child { color: var(--ink-faint); font-size: 11px; min-width: 0; }
+.rec-cycle { font-size: 8.5px; letter-spacing: .08em; color: var(--ink-faint); text-transform: uppercase; }

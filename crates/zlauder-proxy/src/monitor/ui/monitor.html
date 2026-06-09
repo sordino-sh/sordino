@@ -68,6 +68,8 @@
   <span class="view-tabs-note">secrets masked this session &middot; what plaintext leaves this machine</span>
 </nav>
 
+<div class="protection-status" id="protectionStatus" hidden></div>
+
 <!-- ============ LEDGER VIEW (default) ============ -->
 <main class="ledger" id="viewLedger">
   <div class="ledger-bar">
@@ -75,6 +77,11 @@
       <input type="checkbox" id="peekAllToggle">
       <span class="peek-all-track"><span class="peek-all-knob"></span></span>
       <span class="peek-all-label">PEEK ALL</span>
+    </label>
+    <label class="peek-all denoise-toggle" title="group the ledger by where each value came from and fold Claude Code system scaffolding — every value stays scanned &amp; ledgered; one click restores the full list">
+      <input type="checkbox" id="denoiseToggle">
+      <span class="peek-all-track"><span class="peek-all-knob"></span></span>
+      <span class="peek-all-label">DE-NOISE</span>
     </label>
     <span class="ledger-bar-note">peek every value locally &middot; plaintext never leaves this machine</span>
   </div>
