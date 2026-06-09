@@ -17,7 +17,7 @@ use serde_json::json;
 use tokio::sync::broadcast;
 use zlauder_engine::CustomReplacement;
 
-use crate::admin::{WireConfig, snapshot as policy_snapshot};
+use crate::admin::{WireConfig, push_policy, snapshot as policy_snapshot};
 use crate::routes;
 use crate::state::AppState;
 
@@ -154,7 +154,7 @@ pub async fn custom_mask(
         };
     let wire = WireConfig::from_engine(&st.engine.config_snapshot());
     // Live-sync open policy panels in every window (custom masks are shown there).
-    st.monitor.broadcast_policy(policy_snapshot(&st));
+    push_policy(&st, &hdrs, &policy_snapshot(&st));
     json_response(&json!({
         "ok": true,
         "config": wire,
@@ -233,7 +233,7 @@ pub async fn custom_masks_remove(
             .unwrap_or(false);
     let wire = WireConfig::from_engine(&st.engine.config_snapshot());
     if removed_live {
-        st.monitor.broadcast_policy(policy_snapshot(&st));
+        push_policy(&st, &hdrs, &policy_snapshot(&st));
     }
     json_response(&json!({
         "ok": true,
@@ -340,7 +340,7 @@ pub async fn reveal_keyphrase(
     let (persisted, session_only, persist_error) = persist_allow_lists(&st, &live.allow_list);
     let wire = WireConfig::from_engine(&live);
     // A reveal changes the live allow-list (what egresses plaintext) — sync open panels.
-    st.monitor.broadcast_policy(policy_snapshot(&st));
+    push_policy(&st, &hdrs, &policy_snapshot(&st));
     json_response(&json!({
         "ok": true,
         "config": wire,
@@ -380,7 +380,7 @@ pub async fn remask_keyphrase(
     let (persisted, session_only, persist_error) = persist_allow_lists(&st, &live.allow_list);
     let wire = WireConfig::from_engine(&live);
     if removed_live {
-        st.monitor.broadcast_policy(policy_snapshot(&st));
+        push_policy(&st, &hdrs, &policy_snapshot(&st));
     }
     json_response(&json!({
         "ok": true,

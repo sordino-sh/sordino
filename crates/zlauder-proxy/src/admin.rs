@@ -109,6 +109,22 @@ pub(crate) fn snapshot(st: &AppState) -> serde_json::Value {
     })
 }
 
+/// Broadcast the live policy to monitor subscribers after a config mutation, tagging it
+/// with the caller's `x-zlauder-write-id` (if the request carried one). The ORIGINATING
+/// browser tab recognizes its own echo by that id and suppresses its redundant
+/// "policy changed" toast (it already toasted the specific change); OTHER tabs and the
+/// CLI (no matching id) treat the frame as a genuine external change and DO toast. This
+/// makes external-change notification precise even when it races a local write in flight.
+pub(crate) fn push_policy(st: &AppState, hdrs: &HeaderMap, snap: &serde_json::Value) {
+    let mut tagged = snap.clone();
+    if let Some(wid) = hdrs.get("x-zlauder-write-id").and_then(|v| v.to_str().ok()) {
+        if let Some(obj) = tagged.as_object_mut() {
+            obj.insert("write_id".into(), json!(wid));
+        }
+    }
+    st.monitor.broadcast_policy(tagged);
+}
+
 /// `GET /zlauder/config` — current effective config + live state.
 pub async fn get_config(State(st): State<AppState>, hdrs: HeaderMap) -> Response {
     if !st.authed(&hdrs) {
@@ -244,7 +260,7 @@ pub async fn put_config(State(st): State<AppState>, hdrs: HeaderMap, body: Bytes
     }
     reconcile_ml(&st, &new_ml, false);
     let snap = snapshot(&st);
-    st.monitor.broadcast_policy(snap.clone());
+    push_policy(&st, &hdrs, &snap);
     json_ok(&snap)
 }
 
@@ -320,7 +336,7 @@ pub async fn apply_profile(
     // Push the new live policy to open panels (plain config snapshot, before the
     // action-specific fields below — the panel only reads `config`/`ml`).
     let mut snap = snapshot(&st);
-    st.monitor.broadcast_policy(snap.clone());
+    push_policy(&st, &hdrs, &snap);
 
     if let Some(obj) = snap.as_object_mut() {
         obj.insert("profile_applied".into(), json!(name));
@@ -390,7 +406,7 @@ pub async fn ml_enable(State(st): State<AppState>, hdrs: HeaderMap) -> Response 
     // An explicit enable retries a previously-failed load.
     reconcile_ml(&st, &ml, true);
     let snap = snapshot(&st);
-    st.monitor.broadcast_policy(snap.clone());
+    push_policy(&st, &hdrs, &snap);
     json_ok(&snap)
 }
 
@@ -409,7 +425,7 @@ pub async fn ml_disable(State(st): State<AppState>, hdrs: HeaderMap) -> Response
     }
     st.engine.ml_disable();
     let snap = snapshot(&st);
-    st.monitor.broadcast_policy(snap.clone());
+    push_policy(&st, &hdrs, &snap);
     json_ok(&snap)
 }
 
@@ -477,7 +493,7 @@ pub async fn reload(State(st): State<AppState>, hdrs: HeaderMap) -> Response {
     // false` means an unrelated edit won't re-stall a previously-failed load.
     reconcile_ml(&st, &new_ml, false);
     let snap = snapshot(&st);
-    st.monitor.broadcast_policy(snap.clone());
+    push_policy(&st, &hdrs, &snap);
     json_ok(&snap)
 }
 

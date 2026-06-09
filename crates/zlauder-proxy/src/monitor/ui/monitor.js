@@ -1194,10 +1194,9 @@ let committedPolicy = null;
    serialized promise chain, so two fast edits — e.g. category toggles that each PUT the
    WHOLE set — can never be reordered on the wire and lost-update each other. The server's
    live snapshot always re-renders the controls afterward, so ordering is the only thing
-   the client must guarantee. `selfWriteInFlight` counts queued+in-flight writes: while it
-   is > 0 an arriving `policy` SSE frame is OUR OWN echo, so the external-change toast is
-   suppressed PRECISELY — no time-window guess that could swallow a real external change or
-   misclassify a slow self-write. */
+   the client must guarantee. `selfWriteInFlight` counts queued+in-flight writes; it guards
+   the focusout reconcile (don't snap a control back to a not-yet-applied live value while
+   our own write is in flight). */
 let policyWriteChain = Promise.resolve();
 let selfWriteInFlight = 0;
 function policyWrite(doFetch) {
@@ -1207,6 +1206,23 @@ function policyWrite(doFetch) {
     selfWriteInFlight = Math.max(0, selfWriteInFlight - 1);
   });
   return policyWriteChain;
+}
+
+/* Per-write correlation id. Each write tags its request with a unique `x-zlauder-write-id`;
+   the server echoes it on the resulting `policy` SSE frame. THIS tab recognizes its own
+   echo (id in `pendingWids`) and suppresses the redundant external-change toast — while a
+   genuinely concurrent change from the CLI or ANOTHER tab (no matching id) still toasts,
+   even if it races one of our writes in flight. This is the precise origin marker the
+   coarse in-flight counter couldn't be. The 30s sweep keeps the set bounded if an echo is
+   never delivered (e.g. the SSE link dropped); 30s dwarfs any real round-trip. */
+const pendingWids = new Set();
+let widSeq = 0;
+function apiWrite(path, opts = {}) {
+  const wid = 'w' + (++widSeq) + '.' + Math.floor(Math.random() * 1e9).toString(36);
+  pendingWids.add(wid);
+  setTimeout(() => pendingWids.delete(wid), 30000);
+  opts.headers = { ...(opts.headers || {}), 'x-zlauder-write-id': wid };
+  return api(path, opts);
 }
 
 /* Esc inside the drawer is a TWO-STAGE key: if a policy control is focused it reverts
@@ -1402,11 +1418,16 @@ function refreshDivergence() {
    this panel, the /zlauder:privacy CLI, custom-mask / reveal endpoints, or another browser
    window) re-renders the panel so it is ALWAYS an accurate mirror of the live policy.
    - The dropdown/threshold/category/ML CONTROLS moving externally raises one confirming
-     toast (suppressed while one of OUR writes is in flight — that's just our own echo).
+     toast — UNLESS the frame is the echo of OUR OWN write (matched precisely by write-id,
+     whose own handler already toasted). A concurrent change from the CLI / another tab is
+     NOT our echo (no matching id), so it still toasts even mid-write.
    - custom-mask / allow-list (reveal) edits move the masks list and the ledger but not the
      controls; those views are refreshed silently (those ops carry their own UI feedback). */
 function onPolicyEvent(snap) {
   const prev = committedPolicy;
+  const wid = snap.write_id;
+  const ownEcho = !!wid && pendingWids.has(wid);
+  if (ownEcho) pendingWids.delete(wid);
   const controlsChanged = prev && !samePolicy(prev, snap);
   const sourcesChanged  = prev && !sameSources(prev, snap);
   applyPolicyConfig(snap);
@@ -1414,7 +1435,7 @@ function onPolicyEvent(snap) {
     if (!$('policyDrawer').hidden) loadCustomMasks();
     refreshLedgerSources();
   }
-  if (controlsChanged && selfWriteInFlight === 0)
+  if (controlsChanged && !ownEcho)
     policyToast('policy changed — following turns use the new policy', 'good');
 }
 /* Did the panel's editable CONTROLS move? (profile / threshold / categories / operator /
@@ -1479,7 +1500,7 @@ $('polProfile').addEventListener('change', () => {
   const name = $('polProfile').value;
   const scope = $('polScope').value;
   policyWrite(() =>
-    api(`/zlauder/profile/${encodeURIComponent(name)}?scope=${encodeURIComponent(scope)}`, { method: 'POST' })
+    apiWrite(`/zlauder/profile/${encodeURIComponent(name)}?scope=${encodeURIComponent(scope)}`, { method: 'POST' })
       .then(r => r.ok ? r.json() : Promise.reject(new Error('profile rejected')))
       .then(snap => {
         applyPolicyConfig(snap);
@@ -1523,7 +1544,7 @@ function revertPanelToCommitted() {
 /* shared merge-PUT helper. On success the server's authoritative snapshot re-renders the
    controls; on failure roll the controls back to the committed policy and surface why. */
 function putConfigMerge(body, label) {
-  return api('/zlauder/config', { method: 'PUT', body: JSON.stringify(body) })
+  return apiWrite('/zlauder/config', { method: 'PUT', body: JSON.stringify(body) })
     .then(r => r.ok ? r.json() : r.text().then(t => Promise.reject(new Error(t))))
     .then(snap => { applyPolicyConfig(snap); policyToast(label, 'good'); })
     .catch(err => { revertPanelToCommitted(); toast(`set failed: ${esc(err.message || 'rejected')}`, 'bad'); });
@@ -1533,7 +1554,7 @@ function putConfigMerge(body, label) {
 $('polMlToggle').addEventListener('change', e => {
   const on = e.target.checked;
   policyWrite(() =>
-    api(`/zlauder/ml/${on ? 'enable' : 'disable'}`, { method: 'POST' })
+    apiWrite(`/zlauder/ml/${on ? 'enable' : 'disable'}`, { method: 'POST' })
       .then(r => r.ok ? r.json() : Promise.reject(new Error('ml toggle failed')))
       .then(snap => {
         applyPolicyConfig(snap);
