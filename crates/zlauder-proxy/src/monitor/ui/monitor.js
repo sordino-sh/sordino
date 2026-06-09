@@ -142,6 +142,23 @@ function isNothingMaskedRisk(r) {
   return !tokenRuns;
 }
 
+/* B2: a tool surface (tool_result / tool_use) that carries text but ZERO masked
+   tokens is data pulled off this machine with nothing redacted — exactly where an
+   undetected secret (internal hostname, ticket id, key the classifier missed) leaks.
+   isNothingMaskedRisk() is all-or-nothing per record, so it stays silent whenever ANY
+   other surface is masked; this catches it per-surface. Scoped to tool_* kinds, which
+   are never harness boilerplate, so it never lights up the base prompt. */
+function isUnmaskedToolSurface(s) {
+  if (!s || (s.kind !== 'tool_result' && s.kind !== 'tool_use')) return false;
+  const runs = s.runs || [];
+  const hasText = runs.some(run => run.text && run.text.trim());
+  const hasToken = runs.some(run => run.token);
+  return hasText && !hasToken;
+}
+function unmaskedToolSurfaces(r) {
+  return (r.request_surfaces || []).filter(isUnmaskedToolSurface);
+}
+
 /* ============================================================
    SURFACE / RUN RENDERING  (zero offset arithmetic)
    A run with a `token` is a masked occurrence -> chip that reveals
@@ -171,6 +188,7 @@ function renderSurface(s, addedSet) {
     +   `<span class="kind-tag ${kindClass}">${esc(s.kind)}</span>`
     +   `<span class="surface-label">${esc(s.label)}${role}</span>`
     +   (isNew ? `<span class="new-flag">NEW</span>` : '')
+    +   (isUnmaskedToolSurface(s) ? `<span class="new-flag warn-flag" title="tool output with nothing masked — eyeball for unredacted data">UNMASKED</span>` : '')
     +   `<span class="surface-hash" title="block hash ${esc(s.block_hash)}">${esc(s.block_hash)}</span>`
     + `</div>`
     + `<pre class="payload">${renderRuns(s.runs)}</pre>`
@@ -208,6 +226,12 @@ function newPlaintext(r) {
   }
   return out;
 }
+
+/* Distinct NEW plaintext values about to leave this turn — the number the operator
+   actually cares about (vs. raw "+N surfaces", which is mostly resent plumbing).
+   Reuses newPlaintext()'s new-surface scoping, so it works on every record, incl.
+   observe mode where the held-request plaintext block never renders. */
+function newPiiCount(r) { return newPlaintext(r).length; }
 
 /* ============================================================
    DELTA SPOTLIGHT  (the heart of the review)
@@ -269,6 +293,21 @@ function renderSpotlight(r) {
   }
 
   if (!newSurfaces.length) {
+    // B2: "no NEW surface" is not "no risk" — a resent tool surface that ships data
+    // with nothing masked is silenced by the all-or-nothing isNothingMaskedRisk when
+    // any other surface is masked. Surface it here instead of a falsely-calm card.
+    const unmaskedTools = unmaskedToolSurfaces(r);
+    if (unmaskedTools.length) {
+      return `<div class="spotlight warn">`
+        + `<div class="spotlight-head">`
+        +   `<span class="spotlight-icon">&#9888;</span>`
+        +   `<span class="spotlight-title">UNMASKED TOOL OUTPUT</span>`
+        +   `<span class="spotlight-sub">${unmaskedTools.length} resent tool surface(s) ship data with nothing masked &mdash; eyeball for unredacted secrets</span>`
+        + `</div>`
+        + `<div class="spotlight-body">`
+        +   unmaskedTools.map(s => renderSurface(s, null)).join('')
+        + `</div></div>`;
+    }
     return `<div class="spotlight calm">`
       + `<div class="spotlight-head">`
       +   `<span class="spotlight-icon">&#9679;</span>`
@@ -280,10 +319,12 @@ function renderSpotlight(r) {
       + `</div></div></div>`;
   }
 
+  const piiCount = newPiiCount(r);
   return `<div class="spotlight">`
     + `<div class="spotlight-head">`
     +   `<span class="spotlight-icon">&#9650;</span>`
-    +   `<span class="spotlight-title">DELTA &middot; ${newSurfaces.length} NEW SURFACE${newSurfaces.length === 1 ? '' : 'S'}</span>`
+    +   `<span class="spotlight-title">DELTA &middot; ${newSurfaces.length} NEW SURFACE${newSurfaces.length === 1 ? '' : 'S'}`
+    +     (piiCount ? ` &middot; <span class="spotlight-pii">${piiCount} NEW PII</span>` : '') + `</span>`
     +   `<span class="spotlight-sub">new this turn vs turn ${delta.prev_turn ?? '-'}</span>`
     + `</div>`
     + `<div class="spotlight-body">`
@@ -537,6 +578,7 @@ function renderTraffic(flashId) {
     const di = decisionInfo(r.decision);
     const risk = isNothingMaskedRisk(r);
     const newCount = (r.delta && !r.delta.is_first) ? (r.delta.added_surface_hashes || []).length : -1;
+    const piiCount = newPiiCount(r);
     const pending = r.decision === 'pending';
     const inflight = r.decision === 'in_flight';
     const rem = remainingMs(r);
@@ -552,6 +594,7 @@ function renderTraffic(flashId) {
       +   (r.delta && r.delta.is_first ? `<span class="new-flag">FIRST</span>`
             : (r.delta && r.delta.prev_unavailable ? `<span class="new-flag warn-flag">?</span>`
             : (newCount > 0 ? `<span class="new-flag">+${newCount}</span>` : '')))
+      +   (piiCount > 0 ? `<span class="new-flag pii-flag" title="${piiCount} new plaintext value(s) about to leave this machine this turn">${piiCount} PII</span>` : '')
       + `</div>`
       + `<div class="rec-meta">`
       +   `<span class="status-tag ${di.cls}">${esc(di.label)}</span>`
@@ -707,7 +750,7 @@ function renderLedger() {
       + `<span class="lcell lrow-kind">${esc(t.entity_kind)}</span>`
       + `<span class="lcell lc-meta">${t.count > 1 ? `<span class="lrow-tag">×${t.count}</span>` : ''}</span>`
       + `<span class="lcell lspace"></span>`
-      + `<span class="lcell lc-act">${canReveal ? `<button class="btn ghost sm warn" data-lact="reveal" data-value="${attr(t.value)}">REVEAL TO MODEL</button>` : ''}</span>`
+      + `<span class="lcell lc-act">${canReveal ? `<button class="btn ghost sm warn" data-lact="reveal" data-value="${attr(t.value)}" data-entity="${attr(t.entity_kind)}">REVEAL TO MODEL</button>` : ''}</span>`
       + `</div>`;
   }).join('') : `<div class="empty-note">No PII auto-detected yet this session.</div>`;
 }
@@ -723,14 +766,29 @@ function refreshLedgerSources() {
 }
 
 /* ---- ledger actions ---- */
+/* B3: "reveal to model" allow-lists the value, which STOPS DETECTION for it (it
+   egresses unmasked AND is never re-flagged). Operators were not told that, and were
+   nudged onto it to quiet ledger noise. Warn hard when the value looks like a secret. */
+function isSecretClass(entity) {
+  // Covers the engine's Category::Secrets kinds (incl. JWT and the auth-credential family)
+  // plus financial/identity. Over-matching only adds friction to a privacy-reducing action
+  // (safe direction); under-matching a credential is the risk. UNCERTAIN: ideally derived
+  // from the backend Category::Secrets list so it can't drift from the engine taxonomy.
+  return /KEY|SECRET|TOKEN|PASSWORD|CREDENTIAL|BANK|IBAN|CRYPTO|SSN|SWIFT|ROUTING|PRIVATE|CARD|CREDIT|PASSPORT|JWT|AUTH|BEARER|OAUTH|SESSION|COOKIE/
+    .test(String(entity || '').toUpperCase());
+}
 function revealToModel(value, pattern, entity) {
   if (!value) return;
+  const secret = isSecretClass(entity);
+  const head = secret
+    ? `⚠ This looks like a SECRET (${entity}). Reveal it to the model anyway?\n\n  ${value}\n\n`
+    : `Reveal to the model?\n\n  ${value}\n\n`;
   const ok = window.confirm(
-    `Reveal to the model?\n\n  ${value}\n\n`
-    + `This value will be sent to the model UNMASKED from now on, and the choice is `
-    + `persisted to zlauder.local.toml. Note: this does not touch values masked by a `
-    + `config regex pattern, nor masking-exempt control/schema keys. You can RE-MASK `
-    + `any time from PASSING PLAINTEXT.`
+    head
+    + `This STOPS MASKING this exact value: it is sent to the model UNMASKED from now on AND `
+    + `detection is turned OFF for it (it will not be re-flagged), persisted to zlauder.local.toml. `
+    + `It does not touch values masked by a config regex pattern, nor masking-exempt control/schema `
+    + `keys. You can RE-MASK any time from PASSING PLAINTEXT.`
   );
   if (!ok) return;
   const body = { value };

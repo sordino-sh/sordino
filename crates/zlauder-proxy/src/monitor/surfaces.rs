@@ -243,14 +243,65 @@ fn text_values_from_block(
 /// [`str::find`], so a multi-byte char before a token cannot shift a highlight.
 fn segment(raw: RawSurface, tokens: &[TokenPreview], mode: NeedleMode) -> Surface {
     let hash = block_hash(&raw.text);
+    let provenance = provenance_of(&raw.kind, raw.role.as_deref(), &raw.text).to_string();
     let runs = segment_runs_with(&raw.text, tokens, mode);
     Surface {
         label: raw.label,
         role: raw.role,
         kind: raw.kind,
+        provenance,
         runs,
         block_hash: hash,
     }
+}
+
+/// Server-side provenance lane for a surface — a HINT derived from `kind` + `role` +
+/// stable text-prefix markers (plan §1A). It drives labels / ledger / de-noise but
+/// NEVER gates detection, and anything unrecognized falls through to `user_input`
+/// (shown), so harness drift can only ever over-show, never hide.
+fn provenance_of(kind: &str, role: Option<&str>, text: &str) -> &'static str {
+    let t = text.trim_start();
+    match kind {
+        // The cc_version / billing header is pure transport metadata.
+        "system" | "instructions" if t.starts_with("x-anthropic") => "harness_meta",
+        "system" | "instructions" => "harness_frame",
+        "tool_use" | "tool_result" => "tool_io",
+        // message-kind: separate harness scaffolding from genuine user content.
+        _ => match role {
+            // SessionStart hook & other injected system-role messages.
+            Some("system") => "harness_frame",
+            Some("assistant") => "assistant",
+            _ => {
+                if let Some(rest) = t.strip_prefix("<system-reminder>") {
+                    // CLAUDE.md / MEMORY.md ride a system-reminder and are USER-authored
+                    // (secrets can live here); other reminders are harness framing.
+                    if is_userctx_reminder(rest) {
+                        "userctx"
+                    } else {
+                        "harness_frame"
+                    }
+                } else if t.starts_with("<command-message>") || t.starts_with("<command-name>") {
+                    "harness_frame" // slash-command invocation wrapper
+                } else {
+                    "user_input" // genuine human utterance (the safe default)
+                }
+            }
+        },
+    }
+}
+
+/// Does a `<system-reminder>` body carry CLAUDE.md / MEMORY.md (user-authored context,
+/// where real secrets live) rather than pure harness framing? Matched on stable,
+/// case-insensitive markers over a bounded, char-safe prefix. A miss is harmless: it
+/// is treated as `harness_frame` — still scanned, never hidden by this classification.
+fn is_userctx_reminder(body: &str) -> bool {
+    let head: String = body.chars().take(600).collect::<String>().to_ascii_lowercase();
+    head.contains("claudemd")
+        || head.contains("claude.md")
+        || head.contains("memory.md")
+        || head.contains("# memory")
+        || head.contains("codebase and user instructions")
+        || head.contains("user's private global instructions")
 }
 
 /// Locate all non-overlapping masked-token-handle occurrences in `text`
@@ -336,6 +387,29 @@ fn segment_runs_with(text: &str, tokens: &[TokenPreview], mode: NeedleMode) -> V
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provenance_of_classifies_each_lane() {
+        // Pins the classifier's lanes so a marker that silently rots (CC re-wording a
+        // wrapper) is caught here. Provenance is a hint and fails toward `user_input`.
+        let cases: &[(&str, Option<&str>, &str, &str)] = &[
+            ("system", None, "x-anthropic-billing-header: cc_version=1", "harness_meta"),
+            ("system", None, "You are Claude Code, Anthropic's CLI", "harness_frame"),
+            ("instructions", None, "follow these instructions", "harness_frame"),
+            ("tool_use", Some("assistant"), "Bash({\"command\":\"ls\"})", "tool_io"),
+            ("tool_result", Some("user"), "total 12\nfile.txt", "tool_io"),
+            ("message", Some("system"), "SessionStart hook additional context: ...", "harness_frame"),
+            ("message", Some("assistant"), "I'll take a look.", "assistant"),
+            ("message", Some("user"), "<system-reminder> ... # claudeMd ... </system-reminder>", "userctx"),
+            ("message", Some("user"), "<system-reminder> generic framing only </system-reminder>", "harness_frame"),
+            ("message", Some("user"), "<command-message>/x</command-message>", "harness_frame"),
+            ("message", Some("user"), "What's in this project?", "user_input"),
+            ("message", None, "bare prompt with no role", "user_input"),
+        ];
+        for (kind, role, text, want) in cases {
+            assert_eq!(provenance_of(kind, *role, text), *want, "kind={kind} text={text:?}");
+        }
+    }
 
     fn tok(handle: &str, value: &str) -> TokenPreview {
         TokenPreview {

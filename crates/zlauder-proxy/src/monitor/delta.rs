@@ -83,6 +83,7 @@ mod tests {
             label: hash.to_string(),
             role: None,
             kind: "message".to_string(),
+            provenance: "user_input".to_string(),
             runs: vec![Run {
                 text: hash.to_string(),
                 token: None,

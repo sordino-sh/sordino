@@ -1,7 +1,7 @@
 //! Monitor state: ring buffer, broadcast channel, approval waiters, and the
 //! conversation/turn index. Holds all state-mutating methods.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -187,6 +187,10 @@ impl Monitor {
             .filter(|s| s.kind != "system" && s.kind != "instructions")
             .map(|s| s.block_hash.clone())
             .collect();
+        // Claude Code's authoritative per-conversation session id (from the body's
+        // `metadata.user_id`) — the exact conversation key when present. Parsed before
+        // the lock (it is a JSON parse of a possibly-100KB+ body).
+        let body_session_id = session_id_from_body(masked_body);
 
         let mut inner = self.inner.lock().expect("monitor mutex poisoned");
         // Fold this request's masked values into the durable ledger under the same
@@ -195,14 +199,20 @@ impl Monitor {
         let id = format!("req-{}", inner.next_seq);
         inner.next_seq += 1;
 
-        // Resolve the conversation id. An explicit id (session URL / header) always
-        // wins. Otherwise derive it from the transcript prefix; a body with no
-        // anchorable surface (e.g. metadata-only) falls back to the shared
-        // `"unknown"` bucket (no prefix matching — never mint from an empty head).
+        // Resolve the conversation id. Precedence: an explicit id (session URL /
+        // header) always wins; else Claude Code's authoritative `session_id` (exact,
+        // and stable across `/compact` and content drift, where the content heuristic
+        // fragments); else the transcript-prefix heuristic; else the shared `"unknown"`
+        // bucket for a body with no anchorable surface (never mint from an empty head).
+        // EVERY caller-controlled id (explicit header/URL and the body session_id) is run
+        // through `bound_id` so none can inject an oversized / control-character key.
         let conversation_id = match conversation_id {
-            Some(id) => id,
-            None if anchor_seq.is_empty() => "unknown".to_string(),
-            None => resolve_content_conversation(&mut inner.conversation_anchors, &anchor_seq),
+            Some(id) => bound_id(&id),
+            None => match body_session_id {
+                Some(sid) => format!("cc-{sid}"),
+                None if anchor_seq.is_empty() => "unknown".to_string(),
+                None => resolve_content_conversation(&mut inner.conversation_anchors, &anchor_seq),
+            },
         };
         let should_hold = match inner.mode {
             MonitorMode::Off => false,
@@ -531,8 +541,11 @@ impl ReviewTicket {
 }
 
 /// Accumulate a manifest's entries into the durable session-token ledger held in
-/// `inner`. New tokens are inserted with their first-seen timestamp; repeats bump
-/// the count. Over [`MAX_SESSION_TOKENS`] the oldest entries are evicted (logged).
+/// `inner`. New tokens are inserted with their first-/last-seen timestamp; repeats
+/// bump the count AND refresh `last_seen_ms`. Over [`MAX_SESSION_TOKENS`] the
+/// LEAST-RECENTLY-seen entries are evicted (logged) — so a value that is still
+/// actively masked is never evicted out from under the session, and every entry in
+/// the request being ingested right now (newest `last_seen_ms`) is eviction-safe.
 ///
 /// FORWARD-COMPAT SEAM (plan A): classification lives here, the single ingest point.
 /// Today every manifest entry is detector/keyword PII → [`TokenClass::AutoPii`],
@@ -544,6 +557,10 @@ fn ingest_tokens_into(inner: &mut Inner, manifest: &UnmaskManifest, now: u128) {
     for e in &manifest.entries {
         if let Some(existing) = inner.session_tokens.get_mut(&e.token_handle) {
             existing.count = existing.count.saturating_add(1);
+            // Refresh the eviction key so an actively-reused value stays warm and is
+            // not the eviction victim while still masking. `first_seen_ms` (the
+            // display sort key) is deliberately left untouched.
+            existing.last_seen_ms = now;
             continue;
         }
         let class = TokenClass::for_manifest_entry(e);
@@ -562,6 +579,7 @@ fn ingest_tokens_into(inner: &mut Inner, manifest: &UnmaskManifest, now: u128) {
                 class,
                 peekable,
                 first_seen_ms: now,
+                last_seen_ms: now,
                 count: 1,
             },
         );
@@ -569,23 +587,34 @@ fn ingest_tokens_into(inner: &mut Inner, manifest: &UnmaskManifest, now: u128) {
     if inner.session_tokens.len() > MAX_SESSION_TOKENS {
         let over = inner.session_tokens.len() - MAX_SESSION_TOKENS;
         tracing::warn!(
-            "session-token ledger over cap ({MAX_SESSION_TOKENS}); evicting {over} oldest entr{}",
+            "session-token ledger over cap ({MAX_SESSION_TOKENS}); evicting {over} least-recently-seen entr{}",
             if over == 1 { "y" } else { "ies" }
         );
-        // O(n) eviction: quickselect the `over` oldest into the prefix, then drop
-        // them. Strictly cheaper than both the old min-scan-per-victim loop
-        // (O(over * n)) and a full sort (O(n log n)) — and it runs under the global
-        // monitor mutex, so the common one-over case must stay linear: a single large
-        // request body can mint thousands of entries at once.
-        let mut by_age: Vec<(u128, String)> = inner
+        // O(n) eviction: quickselect the `over` victims into the prefix, then drop them
+        // — cheaper than a min-scan-per-victim loop (O(over*n)) or a full sort
+        // (O(n log n)), and it runs under the global mutex, so the common one-over case
+        // stays linear (one request can mint thousands of entries). Victims are chosen
+        // by `(is_current, last_seen_ms)` ascending: NON-current entries first (oldest
+        // first), and a current-manifest entry only when non-current candidates cannot
+        // cover `over` (a single request minting > cap distinct values). Keying on
+        // `last_seen_ms` makes an actively-reused value the newest; explicitly ranking
+        // current-manifest entries last closes the residual same-millisecond tie where
+        // unstable selection could otherwise drop a value being masked right now
+        // (a prior ingest that shares this `now`).
+        let current: HashSet<&str> = manifest
+            .entries
+            .iter()
+            .map(|e| e.token_handle.as_str())
+            .collect();
+        let mut by_age: Vec<(bool, u128, String)> = inner
             .session_tokens
             .values()
-            .map(|e| (e.first_seen_ms, e.token.clone()))
+            .map(|e| (current.contains(e.token.as_str()), e.last_seen_ms, e.token.clone()))
             .collect();
         let over = over.min(by_age.len());
         if over > 0 {
-            by_age.select_nth_unstable_by_key(over - 1, |(t, _)| *t);
-            for (_, tok) in by_age.into_iter().take(over) {
+            by_age.select_nth_unstable_by(over - 1, |a, b| (a.0, a.1).cmp(&(b.0, b.1)));
+            for (_, _, tok) in by_age.into_iter().take(over) {
                 inner.session_tokens.remove(&tok);
             }
         }
@@ -695,15 +724,67 @@ fn resolve_content_conversation(anchors: &mut HashMap<String, Vec<String>>, seq:
     id
 }
 
-/// A human conversation label: a short snippet of the first user message
-/// (masked — safe to show), falling back to the endpoint + id tail. Computed
-/// from `request_surfaces`, which on every turn carry the full resent transcript,
-/// so the first message is present even on a mid-conversation cold start.
+/// Extract Claude Code's authoritative per-conversation session id from the request
+/// body's `metadata.user_id` — itself a JSON string carrying `{device_id, account_uuid,
+/// session_id}`. A normal `session_id` is returned verbatim (masked or plaintext, it is
+/// stable within a session, so it is an exact conversation key); an oversized or
+/// control-character id is hashed to a bounded printable handle (stable grouping kept).
+/// `None` when the body carries no parseable session id (any non-Anthropic / malformed).
+fn session_id_from_body(body: &[u8]) -> Option<String> {
+    let root: serde_json::Value = serde_json::from_slice(body).ok()?;
+    let user_id = root.get("metadata")?.get("user_id")?.as_str()?;
+    let inner: serde_json::Value = serde_json::from_str(user_id).ok()?;
+    let sid = inner.get("session_id")?.as_str()?.trim();
+    if sid.is_empty() {
+        return None;
+    }
+    Some(bound_id(sid))
+}
+
+/// Bound a caller-controlled conversation id to a printable, length-capped key. A
+/// well-formed id (non-empty, `<=128` bytes, no control chars) passes through verbatim;
+/// an empty id becomes `"unknown"`; anything else is hashed to a stable `h-<16hex>`
+/// handle (same input → same key, so grouping is preserved). Applied to EVERY externally
+/// supplied id source — the `x-zlauder-conversation` header, the session URL segment, and
+/// the body `session_id` — so none can inject an oversized / control-character id into the
+/// conversation HashMap keys, the SSE stream, or the UI titles (defense-in-depth: these are
+/// only HTML-escaped downstream, not length/charset-bounded).
+fn bound_id(raw: &str) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return "unknown".to_string();
+    }
+    if raw.len() <= 128 && raw.chars().all(|c| !c.is_control()) {
+        return raw.to_string();
+    }
+    let h: String = blake3::hash(raw.as_bytes())
+        .to_hex()
+        .as_str()
+        .chars()
+        .take(16)
+        .collect();
+    format!("h-{h}")
+}
+
+/// A human conversation label: a short snippet of the first GENUINE user message —
+/// the first `user_input`-provenance surface, so the injected `<system-reminder>` /
+/// CLAUDE.md / slash-command wrappers (identical across every session) are skipped in
+/// favour of what the human actually typed. Falls back to any message, then the
+/// endpoint + id tail. Computed from `request_surfaces`, which on every turn carry the
+/// full resent transcript, so the first message is present even on a cold start.
 fn first_message_label(surfaces: &[Surface], endpoint: &str, conversation_id: &str) -> String {
+    let is_harness = |s: &&Surface| s.provenance == "harness_frame" || s.provenance == "harness_meta";
     let snippet = surfaces
         .iter()
-        .find(|s| s.kind == "message" && s.role.as_deref() == Some("user"))
-        .or_else(|| surfaces.iter().find(|s| s.kind == "message"))
+        .find(|s| s.provenance == "user_input")
+        // Fallbacks (provenance missed): still skip recognized harness scaffolding so a
+        // misclassification never lets the label fall back onto the system-reminder.
+        .or_else(|| {
+            surfaces
+                .iter()
+                .find(|s| s.kind == "message" && s.role.as_deref() == Some("user") && !is_harness(s))
+        })
+        .or_else(|| surfaces.iter().find(|s| s.kind == "message" && !is_harness(s)))
         .map(|s| s.runs.iter().map(|r| r.text.as_str()).collect::<String>());
     match snippet {
         Some(t) => {
@@ -894,6 +975,114 @@ mod tests {
     fn label_is_first_user_message_snippet() {
         let m = Monitor::new();
         let id = record(&m, &body(&[("user", json!("refactor the CPU hot loop"))]));
+        let cid = convo_of(&m, &id);
+        let label = m
+            .snapshot()
+            .conversations
+            .into_iter()
+            .find(|c| c.id == cid)
+            .unwrap()
+            .label;
+        assert_eq!(label, "refactor the CPU hot loop");
+    }
+
+    /// A body carrying Claude Code's `metadata.user_id.session_id`.
+    fn body_with_session(sid: &str, msgs: &[(&str, Value)]) -> Vec<u8> {
+        let arr: Vec<Value> = msgs
+            .iter()
+            .map(|(role, content)| json!({ "role": role, "content": content }))
+            .collect();
+        let user_id = serde_json::to_string(
+            &json!({ "device_id": "d", "account_uuid": "a", "session_id": sid }),
+        )
+        .unwrap();
+        serde_json::to_vec(&json!({ "messages": arr, "metadata": { "user_id": user_id } })).unwrap()
+    }
+
+    #[test]
+    fn session_id_overrides_content_identity() {
+        let m = Monitor::new();
+        // Two DISTINCT sessions whose first message is byte-identical — content
+        // anchoring would merge them; the authoritative session_id keeps them apart.
+        let a = record(&m, &body_with_session("sess-A", &[("user", json!("identical opener"))]));
+        let b = record(&m, &body_with_session("sess-B", &[("user", json!("identical opener"))]));
+        assert_eq!(convo_of(&m, &a), "cc-sess-A");
+        assert_ne!(convo_of(&m, &a), convo_of(&m, &b));
+        // Same session across turns stays one conversation with incrementing turns,
+        // even though the per-turn transcript grows.
+        let a2 = record(
+            &m,
+            &body_with_session(
+                "sess-A",
+                &[
+                    ("user", json!("identical opener")),
+                    ("assistant", json!("ok")),
+                    ("user", json!("next")),
+                ],
+            ),
+        );
+        assert_eq!(convo_of(&m, &a2), "cc-sess-A");
+        assert_eq!(turn_of(&m, &a2), 2);
+    }
+
+    #[test]
+    fn session_id_oversized_or_control_is_bounded() {
+        let m = Monitor::new();
+        // An absurdly long session id is hashed to a short, stable handle.
+        let huge = "x".repeat(5000);
+        let id = record(&m, &body_with_session(&huge, &[("user", json!("hi"))]));
+        let cid = convo_of(&m, &id);
+        assert!(cid.starts_with("cc-h-"), "oversized id is hashed: {cid}");
+        assert!(cid.len() <= 24, "bounded length: {cid}");
+        // Control characters likewise route through the bounded hash, never verbatim.
+        let ctrl = record(&m, &body_with_session("a\nb\tc\u{7}", &[("user", json!("hi2"))]));
+        assert!(convo_of(&m, &ctrl).starts_with("cc-h-"));
+        // A normal session id is preserved verbatim (exact grouping).
+        let ok = record(
+            &m,
+            &body_with_session("5c37888a-371d-4623-9a60-3a900986da07", &[("user", json!("hi3"))]),
+        );
+        assert_eq!(convo_of(&m, &ok), "cc-5c37888a-371d-4623-9a60-3a900986da07");
+    }
+
+    #[test]
+    fn explicit_conversation_id_is_bounded() {
+        // The higher-precedence explicit id (x-zlauder-conversation header / session URL
+        // segment) must also be bounded — it wins over the body session_id, so leaving it
+        // unbounded would reopen the same HashMap/SSE/UI footgun (paired-audit finding).
+        let m = Monitor::new();
+        let manifest = UnmaskManifest::new();
+        let huge = "y".repeat(9000);
+        let id = m
+            .record_llm_request("/v1/messages", "POST", Some(huge), &body(&[("user", json!("hi"))]), &manifest)
+            .id()
+            .to_string();
+        let cid = convo_of(&m, &id);
+        assert!(cid.starts_with("h-"), "oversized explicit id is hashed: {cid}");
+        assert!(cid.len() <= 18, "bounded length: {cid}");
+        // A normal explicit id still passes through verbatim and still wins over content.
+        let ok = m
+            .record_llm_request("/v1/messages", "POST", Some("session-xyz".to_string()), &body(&[("user", json!("hi"))]), &manifest)
+            .id()
+            .to_string();
+        assert_eq!(convo_of(&m, &ok), "session-xyz");
+    }
+
+    #[test]
+    fn label_skips_injected_reminder_for_the_real_prompt() {
+        let m = Monitor::new();
+        // Turn-1 transcript as Claude Code actually sends it: the first user message is
+        // the injected CLAUDE.md system-reminder; the real prompt is the next message.
+        let id = record(
+            &m,
+            &body(&[
+                (
+                    "user",
+                    json!("<system-reminder> As you answer the user's questions, you can use the following context: # claudeMd ... </system-reminder>"),
+                ),
+                ("user", json!("refactor the CPU hot loop")),
+            ]),
+        );
         let cid = convo_of(&m, &id);
         let label = m
             .snapshot()
@@ -1103,6 +1292,123 @@ mod tests {
             .filter(|e| e.token.starts_with("[NEW_"))
             .count();
         assert_eq!(new_present, 50, "eviction dropped the oldest, never the newest");
+    }
+
+    #[test]
+    fn session_token_reused_value_survives_eviction() {
+        // Regression (B1): a value FIRST seen long ago but RE-MASKED right now must not
+        // be evicted just for its age. Eviction keys on `last_seen_ms` (LRU), and a
+        // repeat sighting refreshes it; under the old `first_seen_ms` eviction this
+        // entry was the prime victim while still actively masking.
+        let spin = || {
+            let t = now_ms();
+            while now_ms() == t {
+                std::hint::spin_loop();
+            }
+        };
+        let m = Monitor::new();
+        // 1. An old, soon-to-be-reused secret.
+        m.ingest_session_tokens(&manifest_with("[REUSED]", "s3cr3t"));
+        spin();
+        // 2. Fill exactly to the cap with distinct fresh tokens (no eviction yet).
+        let mut fill = UnmaskManifest::new();
+        for i in 0..(MAX_SESSION_TOKENS - 1) {
+            fill.push(zlauder_engine::ManifestEntry {
+                canonical_form: format!("f{i}"),
+                token_handle: format!("[FILL_{i}]"),
+                entity_kind: "X".to_string(),
+                arrow_origin: zlauder_engine::Surface::UserMessage,
+                exposed_at: None,
+            });
+        }
+        m.ingest_session_tokens(&fill);
+        assert_eq!(m.snapshot().session_tokens.len(), MAX_SESSION_TOKENS);
+        spin();
+        // 3. Re-mask the OLD secret (refreshes its last_seen) AND add one new token,
+        //    overshooting the cap by 1. The single victim must be a least-recently-seen
+        //    FILL entry — never the just-reused secret.
+        let mut reuse = UnmaskManifest::new();
+        for (handle, value) in [("[REUSED]", "s3cr3t"), ("[FRESH]", "new")] {
+            reuse.push(zlauder_engine::ManifestEntry {
+                canonical_form: value.to_string(),
+                token_handle: handle.to_string(),
+                entity_kind: "X".to_string(),
+                arrow_origin: zlauder_engine::Surface::UserMessage,
+                exposed_at: None,
+            });
+        }
+        m.ingest_session_tokens(&reuse);
+        let snap = m.snapshot();
+        assert_eq!(snap.session_tokens.len(), MAX_SESSION_TOKENS);
+        let reused = snap.session_tokens.iter().find(|e| e.token == "[REUSED]");
+        assert!(
+            reused.is_some(),
+            "a value re-masked this turn must survive LRU eviction"
+        );
+        assert_eq!(reused.unwrap().count, 2, "repeat sighting bumped the count");
+    }
+
+    #[test]
+    fn session_token_same_ms_tie_protects_current_manifest() {
+        // Deterministic same-MILLISECOND tie (impossible via the public helper, which pins
+        // now_ms() internally): drive `ingest_tokens_into` directly with a FIXED `now`.
+        // Fill to cap at T, then a SECOND ingest at the SAME T re-masks one cap-resident
+        // value and adds one new value (over = 1). The victim must be a NON-current entry;
+        // the re-masked + new (current-manifest) values survive — which pure-`last_seen_ms`
+        // eviction (unstable on the tie) could NOT guarantee. This is the B1 headline fix.
+        let m = Monitor::new();
+        let t: u128 = 1_000_000;
+        let mut guard = m.inner.lock().expect("monitor mutex poisoned");
+        let mut fill = UnmaskManifest::new();
+        for i in 0..MAX_SESSION_TOKENS {
+            fill.push(zlauder_engine::ManifestEntry {
+                canonical_form: format!("f{i}"),
+                token_handle: format!("[FILL_{i}]"),
+                entity_kind: "X".to_string(),
+                arrow_origin: zlauder_engine::Surface::UserMessage,
+                exposed_at: None,
+            });
+        }
+        ingest_tokens_into(&mut guard, &fill, t);
+        assert_eq!(guard.session_tokens.len(), MAX_SESSION_TOKENS);
+        let mut reuse = UnmaskManifest::new();
+        for (h, v) in [("[FILL_0]", "f0"), ("[NEW]", "new")] {
+            reuse.push(zlauder_engine::ManifestEntry {
+                canonical_form: v.to_string(),
+                token_handle: h.to_string(),
+                entity_kind: "X".to_string(),
+                arrow_origin: zlauder_engine::Surface::UserMessage,
+                exposed_at: None,
+            });
+        }
+        ingest_tokens_into(&mut guard, &reuse, t); // SAME `now` → ties the whole ledger
+        assert_eq!(guard.session_tokens.len(), MAX_SESSION_TOKENS);
+        assert!(
+            guard.session_tokens.contains_key("[FILL_0]"),
+            "a value re-masked this turn survives the same-ms tie"
+        );
+        assert!(
+            guard.session_tokens.contains_key("[NEW]"),
+            "a value first masked this turn survives the same-ms tie"
+        );
+    }
+
+    #[test]
+    fn additive_serde_fields_default_on_old_snapshots() {
+        // A Surface serialized before `provenance` existed deserializes to the safe,
+        // fail-toward-showing default; a ledger entry without `last_seen_ms` -> 0.
+        let s: Surface = serde_json::from_value(json!({
+            "label": "m", "kind": "message", "runs": [], "block_hash": "h"
+        }))
+        .unwrap();
+        assert_eq!(s.provenance, "user_input");
+        let e: TokenLedgerEntry = serde_json::from_value(json!({
+            "token": "[T]", "value": "v", "entity_kind": "X", "class": "auto_pii",
+            "peekable": true, "first_seen_ms": 5, "count": 1
+        }))
+        .unwrap();
+        assert_eq!(e.last_seen_ms, 0);
+        assert_eq!(e.first_seen_ms, 5);
     }
 
     fn find(m: &Monitor, id: &str) -> RequestRecord {

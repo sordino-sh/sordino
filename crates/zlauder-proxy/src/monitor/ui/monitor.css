@@ -433,6 +433,9 @@ select:focus { outline: none; border-color: var(--cyan-dim); box-shadow: 0 0 0 1
   background: var(--amber); border-radius: 3px; padding: 1px 6px;
   box-shadow: 0 0 12px -2px var(--amber);
 }
+/* PII egress badge: red (real plaintext leaving), distinct from the amber "+N surfaces". */
+.new-flag.pii-flag { color: #fff; background: var(--bad); box-shadow: 0 0 12px -2px var(--bad); margin-left: 4px; }
+.spotlight-pii { color: var(--bad); font-weight: 700; }
 
 /* ---------- review pane ---------- */
 .review { position: relative; z-index: 1; overflow-y: auto; padding: 20px 22px 60px; min-height: 0; }

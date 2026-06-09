@@ -94,6 +94,11 @@ fn default_token_class() -> TokenClass {
 fn default_peekable() -> bool {
     true
 }
+/// Fail-toward-showing default for [`Surface::provenance`]: an entry whose lane is
+/// unknown is treated as genuine user content (shown), never as collapsible scaffolding.
+fn default_provenance() -> String {
+    "user_input".to_string()
+}
 
 /// A legacy byte-offset span over a preview string, used only for the raw
 /// "Full Masked Request" / response previews. New UI rendering uses
@@ -144,6 +149,13 @@ pub struct Surface {
     pub role: Option<String>,
     /// Coarse classification: `system|instructions|message|tool_result|other`.
     pub kind: String,
+    /// Provenance lane (server-derived HINT): one of `harness_meta | harness_frame |
+    /// userctx | user_input | tool_io | assistant`. Drives labels / ledger grouping /
+    /// de-noise (plan §1A/§1B). A hint only — unrecognized content falls through to
+    /// `user_input` (shown), and provenance NEVER gates detection. Additive;
+    /// deserializes to `user_input` (the fail-toward-showing default) when absent.
+    #[serde(default = "default_provenance")]
+    pub provenance: String,
     /// Pre-segmented runs; concatenating `run.text` reproduces the surface text.
     pub runs: Vec<Run>,
     /// Short blake3 hex of the surface masked text (delta / dedupe key).
@@ -290,8 +302,16 @@ pub struct TokenLedgerEntry {
     /// know the class taxonomy.
     pub peekable: bool,
     /// First time this token was seen this session (ms since epoch); the ledger
-    /// sort key and the eviction (oldest-first) key.
+    /// sort key. (Eviction keys on `last_seen_ms`, not this — a value first seen
+    /// long ago but still actively masked must not be evicted.)
     pub first_seen_ms: u128,
+    /// Most recent time this token was masked this session (ms since epoch); the
+    /// eviction key (least-recently-seen evicted first), so a frequently-reused
+    /// secret is not dropped while still active. Additive; deserializes to `0` when
+    /// absent (an old snapshot then treats the entry as eviction-eligible-first,
+    /// which is harmless for display-only historical data).
+    #[serde(default)]
+    pub last_seen_ms: u128,
     /// How many times the value has been masked this session.
     pub count: u64,
 }
