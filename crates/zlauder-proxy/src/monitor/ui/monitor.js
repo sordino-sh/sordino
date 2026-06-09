@@ -43,6 +43,7 @@ let sessionTokens = [];              // snapshot.session_tokens (durable, sessio
 let ledgerAllow = { exact: [], exact_ci: [] };  // GET /zlauder/config .config.allow_list
 let ledgerCustomRules = [];          // GET /zlauder/monitor/custom-mask
 const peeked = new Set();            // row keys currently peeked (local plaintext, anti shoulder-surf)
+const MAX_SESSION_TOKENS = 5000;     // mirror the server cap so live SSE augmentation stays bounded
 // The four common-word defaults are always re-seeded; only NON-default allow-list
 // entries are operator-configured / reveal-created "passing plaintext".
 const DEFAULT_ALLOW = { exact: new Set(['Anthropic', 'Claude', '127.0.0.1']), exact_ci: new Set(['localhost']) };
@@ -1063,6 +1064,8 @@ es.onmessage = e => {
         sessionTokens.push({ token: t.token, value: t.value, entity_kind: t.entity_kind, class: 'auto_pii', peekable: true, count: 1 });
       }
     }
+    // Bound the client ledger like the server (oldest-first; live appends are newest).
+    if (sessionTokens.length > MAX_SESSION_TOKENS) sessionTokens.splice(0, sessionTokens.length - MAX_SESSION_TOKENS);
     if (lastSnap) {
       const pending = records.filter(r => r.decision === 'pending').length;
       renderHeader({ ...lastSnap, pending_count: pending });

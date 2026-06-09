@@ -563,18 +563,22 @@ fn ingest_tokens_into(inner: &mut Inner, manifest: &UnmaskManifest, now: u128) {
             "session-token ledger over cap ({MAX_SESSION_TOKENS}); evicting {over} oldest entr{}",
             if over == 1 { "y" } else { "ies" }
         );
-        // One-shot eviction: a single sort, then drop the oldest `over`. A previous
-        // min-scan-per-victim loop was O(over * n) under the global monitor mutex —
-        // a single large request body can mint thousands of entries, so a huge
-        // over-cap could stall snapshots/approvals. O(n log n) once instead.
+        // O(n) eviction: quickselect the `over` oldest into the prefix, then drop
+        // them. Strictly cheaper than both the old min-scan-per-victim loop
+        // (O(over * n)) and a full sort (O(n log n)) — and it runs under the global
+        // monitor mutex, so the common one-over case must stay linear: a single large
+        // request body can mint thousands of entries at once.
         let mut by_age: Vec<(u128, String)> = inner
             .session_tokens
             .values()
             .map(|e| (e.first_seen_ms, e.token.clone()))
             .collect();
-        by_age.sort_unstable_by_key(|(t, _)| *t);
-        for (_, tok) in by_age.into_iter().take(over) {
-            inner.session_tokens.remove(&tok);
+        let over = over.min(by_age.len());
+        if over > 0 {
+            by_age.select_nth_unstable_by_key(over - 1, |(t, _)| *t);
+            for (_, tok) in by_age.into_iter().take(over) {
+                inner.session_tokens.remove(&tok);
+            }
         }
     }
 }
@@ -1025,6 +1029,28 @@ mod tests {
         let seens: Vec<u128> = snap.session_tokens.iter().map(|e| e.first_seen_ms).collect();
         assert!(seens.windows(2).all(|w| w[0] <= w[1]), "ledger sorted by first_seen_ms");
         assert_eq!(email.count, 2, "repeat masks bump the count");
+    }
+
+    #[test]
+    fn session_token_ledger_is_capped() {
+        let m = Monitor::new();
+        // One manifest that overshoots the cap exercises the quickselect eviction path.
+        let mut man = UnmaskManifest::new();
+        for i in 0..(MAX_SESSION_TOKENS + 50) {
+            man.push(zlauder_engine::ManifestEntry {
+                canonical_form: format!("v{i}"),
+                token_handle: format!("[T_{i}]"),
+                entity_kind: "X".to_string(),
+                arrow_origin: zlauder_engine::Surface::UserMessage,
+                exposed_at: None,
+            });
+        }
+        m.ingest_session_tokens(&man);
+        assert_eq!(
+            m.snapshot().session_tokens.len(),
+            MAX_SESSION_TOKENS,
+            "ledger is bounded at the cap after an over-cap ingest"
+        );
     }
 
     fn find(m: &Monitor, id: &str) -> RequestRecord {
