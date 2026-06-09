@@ -141,6 +141,183 @@ fn engine_at(floor: f32) -> MaskEngine {
     MaskEngine::new(cfg).expect("build engine")
 }
 
+// ---------------------------------------------------------------------------
+// Hard-context recognizer FP corpus (DATE_OF_BIRTH / CREDIT_CARD_EXPIRATION / CVV)
+//
+// These three recognizers are a SEPARATE FP class from the PHONE/SSN floor decision
+// above: they carry their context IN the regex and fire at a flat 0.85 (above every
+// profile floor), so the floor table never charges them. The hazard instead is
+// code/log shapes whose VALUE looks like a date/expiry/CVV — `port 8080`,
+// `status 200`, `ratio 01/12`, `the cache expires 12/24`. The card-context gate +
+// month whitelist + dropped `cid/cvn/csc` labels are what keep these at zero.
+//
+// This section prints the count of DATE_OF_BIRTH/CREDIT_CARD_EXPIRATION/CVV masks the
+// live Balanced default charges over the plan's revised C2 corpus — the expectation is
+// ZERO. (The unit test `detect::cvv_plan_detect_tests::c2_fp_corpus_zero_masks_under_balanced`
+// asserts it; this surfaces the same corpus in the bench for eyeballing.)
+// ---------------------------------------------------------------------------
+
+/// Hard-context entity kinds whose FP-safety this section measures. EXPIRATION_DATE
+/// (the neutral, weak-evidence expiry label, FIX 1b) is included so the FP corpus
+/// charges it too — a word-boundary FP like `discard exp` or `the discovery expires`
+/// must mask ZERO of all four kinds, not silently leak as the neutral label.
+const HARD_CONTEXT_KINDS: [&str; 4] = [
+    "DATE_OF_BIRTH",
+    "CREDIT_CARD_EXPIRATION",
+    "EXPIRATION_DATE",
+    "CVV",
+];
+
+/// The plan's revised C2 FP corpus + FIX 6 adversarial NO-MASK rows: code/log lines
+/// whose values look like a date, expiry, or CVV but carry no real PII. Every one must
+/// mask ZERO of the four. The FIX 6 additions exercise the word-boundary keyword scan
+/// (`discard`≁`card`, `discovery`≁`discover`, `scorecard`≁`card`), the PAN
+/// plausibility guard (`0000000000000`), the restricted CVV `is`-connector
+/// (`the security code is 200 lines`), and the standalone-expiry FP class.
+fn hard_context_fp_corpus() -> Vec<Decoy> {
+    vec![
+        d("port", "port 8080"),
+        d("ratio", "ratio 01/12"),
+        d("build", "build 20240115"),
+        d("status", "status 200"),
+        d("cid", "cid=4096"),
+        d("export", "export 03/27"),
+        d("json-csc", r#"{"csc": 4096}"#),
+        d("expires", "the cache expires 12/24"),
+        d("cert", "certificate expires Jan 2026"),
+        d("cvv-multiline", "CVV:\n\n\n\n123"),
+        // --- FIX 6 NO-MASK (word-boundary, PAN-plausibility, CVV-`is`-scope) ---
+        d("discard", "discard exp 03/27"),
+        d("discovery", "the discovery expires 03/27"),
+        d("scorecard", "scorecard 1234 03/27"),
+        d("zero-pan", "0000000000000 exp 03/27"),
+        d("security-prose", "the security code is 200 lines long"),
+        d("cache", "the cache expires 12/24"),
+        d("cert-jan", "certificate expires Jan 2026"),
+    ]
+}
+
+/// Count DOB/expiry/CVV masks a Balanced engine charges for `text`.
+fn hard_context_hits(engine: &MaskEngine, text: &str) -> Vec<(String, String)> {
+    let out = engine.mask(text, Surface::UserMessage).expect("mask");
+    out.manifest
+        .entries
+        .iter()
+        .filter(|e| HARD_CONTEXT_KINDS.contains(&e.entity_kind.as_str()))
+        .map(|e| (e.entity_kind.clone(), e.canonical_form.clone()))
+        .collect()
+}
+
+/// Run the C2 corpus through the live Balanced default and print the (expected-zero)
+/// DOB/expiry/CVV false-mask tally.
+fn report_hard_context_fp() {
+    let engine = MaskEngine::new(EngineConfig::for_profile(Profile::Balanced)).expect("engine");
+    let corpus = hard_context_fp_corpus();
+    let mut false_masks: Vec<(&'static str, String, String)> = Vec::new();
+    for dc in &corpus {
+        for (kind, val) in hard_context_hits(&engine, dc.text) {
+            false_masks.push((dc.label, kind, val));
+        }
+    }
+
+    println!("\n== hard-context FP corpus (DOB / expiry / CVV) — live Balanced default ==");
+    println!(
+        "kinds: {} | corpus: {} code/log shapes | expected false masks: 0",
+        HARD_CONTEXT_KINDS.join(", "),
+        corpus.len(),
+    );
+    if false_masks.is_empty() {
+        println!(
+            "result: clean (0 DOB/expiry/CVV false masks over {} inputs)",
+            corpus.len()
+        );
+    } else {
+        println!("result: {} false mask(s):", false_masks.len());
+        for (label, kind, val) in &false_masks {
+            println!("    [{label}] {kind} = {val:?}");
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// LABEL-CORRECTNESS corpus (FIX 1b confidence-tiered expiry relabel)
+//
+// A masked token is visible to the upstream LLM, so a travel-visa / gift-card expiry
+// masked as CREDIT_CARD_EXPIRATION would corrupt the model's reasoning. This section
+// asserts each row masks under the EXPECTED label: ambiguous context → EXPIRATION_DATE;
+// PAN / unambiguous payment term → CREDIT_CARD_EXPIRATION.
+// ---------------------------------------------------------------------------
+
+/// A label-correctness expectation: `text` must mask `value` under `expect_kind`.
+struct LabelCase {
+    text: &'static str,
+    value: &'static str,
+    expect_kind: &'static str,
+}
+
+const fn lc(text: &'static str, value: &'static str, expect_kind: &'static str) -> LabelCase {
+    LabelCase {
+        text,
+        value,
+        expect_kind,
+    }
+}
+
+fn label_corpus() -> Vec<LabelCase> {
+    vec![
+        // Ambiguous context (bare visa / gift card / subscription) → neutral label.
+        lc("my travel visa expires 03/26", "03/26", "EXPIRATION_DATE"),
+        lc("my gift card expires 03/26", "03/26", "EXPIRATION_DATE"),
+        lc("subscription valid thru 12/25", "12/25", "EXPIRATION_DATE"),
+        // Strong payment evidence (PAN / unambiguous term) → specific label.
+        lc(
+            "4111 1111 1111 1111 exp 03/27",
+            "03/27",
+            "CREDIT_CARD_EXPIRATION",
+        ),
+        lc(
+            "credit card on file, exp 03/27",
+            "03/27",
+            "CREDIT_CARD_EXPIRATION",
+        ),
+    ]
+}
+
+/// Report the FIX-1b label-correctness corpus through the live Balanced default.
+fn report_label_correctness() {
+    let engine = MaskEngine::new(EngineConfig::for_profile(Profile::Balanced)).expect("engine");
+    let corpus = label_corpus();
+    println!("\n== expiry label-correctness corpus (FIX 1b confidence-tiered relabel) ==");
+    println!(
+        "rows: {} | ambiguous → EXPIRATION_DATE, PAN/unambiguous-term → CREDIT_CARD_EXPIRATION",
+        corpus.len()
+    );
+    let mut wrong = 0usize;
+    for c in &corpus {
+        let hits = hard_context_hits(&engine, c.text);
+        let ok = hits
+            .iter()
+            .any(|(kind, val)| kind == c.expect_kind && val == c.value);
+        if ok {
+            println!("    OK   {:?} → {} {:?}", c.text, c.expect_kind, c.value);
+        } else {
+            wrong += 1;
+            println!(
+                "    WRONG {:?} → expected {} {:?}, got {:?}",
+                c.text, c.expect_kind, c.value, hits
+            );
+        }
+    }
+    println!(
+        "result: {}",
+        if wrong == 0 {
+            format!("all {} rows labeled correctly", corpus.len())
+        } else {
+            format!("{wrong} row(s) mislabeled")
+        }
+    );
+}
+
 /// Manifest entries of the target (PHONE/SSN) kinds produced for `text`.
 fn target_hits(engine: &MaskEngine, text: &str) -> Vec<(String, String)> {
     let out = engine.mask(text, Surface::UserMessage).expect("mask");
@@ -278,4 +455,10 @@ fn main() {
     println!(
         "Each lowered floor's FP count above is the price of the recall it buys on the same line."
     );
+
+    // --- hard-context recognizer FP corpus (separate decision) ------------
+    report_hard_context_fp();
+
+    // --- expiry label-correctness corpus (FIX 1b) -------------------------
+    report_label_correctness();
 }

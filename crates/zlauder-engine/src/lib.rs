@@ -13,13 +13,14 @@ mod error;
 mod manifest;
 #[cfg(feature = "ml")]
 pub mod ml;
+mod recognizers;
 mod store;
 mod surface;
 mod token;
 
 pub use config::{
-    AllowList, Category, ComputePrecision, CustomReplacement, EngineConfig, ExposureRedactionScope,
-    MlConfig, Operator, Profile, Quantization, RevealMarker, SaltScope,
+    AllowList, Category, ComputePrecision, CustomReplacement, ENTITY_CVV, EngineConfig,
+    ExposureRedactionScope, MlConfig, Operator, Profile, Quantization, RevealMarker, SaltScope,
 };
 pub use error::EngineError;
 pub use manifest::{ManifestEntry, MaskOutcome, MaskStats, UnmaskManifest};
@@ -257,8 +258,16 @@ impl MaskEngine {
         // clear the 0.5 floor. `run_detection` feeds it lightweight NLP artifacts and
         // pre-filters below the boost band so a boostable candidate survives to be
         // enhanced (presidio filters before enhancing — see detect.rs).
-        let analyzer = presidio_analyzer::default_analyzer(&config.language)
+        let mut analyzer = presidio_analyzer::default_analyzer(&config.language)
             .with_context_enhancer(presidio_analyzer::LemmaContextAwareEnhancer::new());
+        // zlauder-local hard-context, value-only-capture recognizers (the three PII
+        // misses whose value shape is ambiguous in code/log traffic). They impl
+        // `Recognizer` directly over a raw regex and emit `Custom(...)` entities that
+        // the category gate (config.rs) now enables under Identity/Financial. Run in
+        // Pass 2 → `ingest_results`, so they share the gate/allow-list/overlap path.
+        analyzer.add_recognizer(Arc::new(recognizers::DateOfBirthRecognizer::new()));
+        analyzer.add_recognizer(Arc::new(recognizers::CardExpiryRecognizer::new()));
+        analyzer.add_recognizer(Arc::new(recognizers::CvvRecognizer::new()));
         let cache_cap = config.detection_cache_cap;
         let policy = Policy::new(config)?;
         Ok(Self {
@@ -1776,5 +1785,122 @@ mod tests {
             "presidio email is regex-sourced"
         );
         assert!(!a[0].literal);
+    }
+
+    // ----- zlauder-local hard-context recognizers (DOB / expiry / CVV) ----------
+    //
+    // These prove the recognizers are REGISTERED in `from_parts` and run in Pass 2 →
+    // `ingest_results` (the Custom entities the category gate now enables), end-to-end
+    // through a real `MaskEngine` under the default Balanced profile.
+
+    // CVV defaults to the irreversible Redact (PCI SAD), so it masks to `[REDACTED]`
+    // and leaves no reversible manifest entry; DOB/expiry tokenize.
+    #[test]
+    fn cvv_plan_recall_corpus_masks_end_to_end() {
+        let e = engine(); // Balanced: Identity + Financial on
+
+        // DOB → tokenized (reversible), value-only span (label "DOB:" survives).
+        let dob = e.mask("DOB: 1990-01-02", Surface::UserMessage).unwrap();
+        assert!(
+            dob.masked_text.starts_with("DOB: ") && dob.masked_text.contains("[DATE_OF_BIRTH_"),
+            "DOB value-only token: {}",
+            dob.masked_text
+        );
+        assert!(!dob.masked_text.contains("1990-01-02"));
+        assert_eq!(
+            e.unmask(&dob.masked_text, &dob.manifest).unwrap(),
+            "DOB: 1990-01-02",
+            "DOB round-trips"
+        );
+
+        // DOB year-first full-capture regression (audit V2): the FULL date is captured
+        // (the longest-first day reorder fixes the `2023-11-15` → `2023-11-1`
+        // truncation). The authoritative proof is the round-trip to the full original
+        // AND that no truncated remnant ("-15" / a stray "5") is left beside the token.
+        let dob2 = e.mask("DOB: 2023-11-15", Surface::UserMessage).unwrap();
+        assert!(!dob2.masked_text.contains("2023-11-15"));
+        assert!(
+            dob2.masked_text.starts_with("DOB: ")
+                && dob2.masked_text.contains("[DATE_OF_BIRTH_")
+                && !dob2.masked_text.contains("-1")
+                && !dob2.masked_text.ends_with('5'),
+            "full date masked, no truncated remnant: {}",
+            dob2.masked_text
+        );
+        assert_eq!(
+            e.unmask(&dob2.masked_text, &dob2.manifest).unwrap(),
+            "DOB: 2023-11-15",
+            "full-date round-trips (no truncated trailing digit)"
+        );
+
+        // Card expiry with card context → tokenized, value-only span.
+        let exp = e
+            .mask("card 4111111111111111 exp 03/27", Surface::UserMessage)
+            .unwrap();
+        assert!(
+            exp.masked_text.contains("[CREDIT_CARD_EXPIRATION_"),
+            "expiry masked with card context: {}",
+            exp.masked_text
+        );
+        assert!(!exp.masked_text.contains("03/27"));
+
+        // CVV → Redact-by-default (PCI SAD), value-only (label "CVV:" survives), no
+        // reversible manifest entry for the redacted value.
+        let cvv = e.mask("CVV: 123", Surface::UserMessage).unwrap();
+        assert_eq!(cvv.masked_text, "CVV: [REDACTED]", "CVV redacted, value-only");
+        assert!(
+            !cvv.manifest.entries.iter().any(|m| m.canonical_form == "123"),
+            "redacted CVV leaves no reversible manifest entry"
+        );
+    }
+
+    // FP-safety: the card-context gate kills the ubiquitous-log expiry FP, and bare
+    // cid/csc never mask — end-to-end, 0 masks.
+    #[test]
+    fn cvv_plan_fp_corpus_zero_masks_end_to_end() {
+        let e = engine();
+        for text in [
+            "the cache expires 12/24",
+            "certificate expires Jan 2026",
+            "export 03/27",
+            "cid=4096",
+            r#"{"csc": 200}"#,
+        ] {
+            let out = e.mask(text, Surface::UserMessage).unwrap();
+            assert_eq!(
+                out.masked_text, text,
+                "FP-safety: {text:?} must pass through unmasked, got {:?}",
+                out.masked_text
+            );
+        }
+    }
+
+    // C6 combined-overlap regression: DOB + CREDIT_CARD + CREDIT_CARD_EXPIRATION + CVV
+    // all survive zlauder's type-guard-less `resolve_overlaps` (value-only spans do not
+    // collide with the PAN span). All four entity kinds must appear.
+    #[test]
+    fn cvv_plan_combined_overlap_all_four_survive() {
+        let e = engine();
+        let text = "DOB: 1990-01-02, card 4111111111111111 exp 03/27 cvv 123";
+        let out = e.mask(text, Surface::UserMessage).unwrap();
+        let m = &out.masked_text;
+        assert!(m.contains("[DATE_OF_BIRTH_"), "DOB survived: {m}");
+        assert!(
+            m.contains("[CREDIT_CARD_EXPIRATION_"),
+            "expiry survived: {m}"
+        );
+        // CREDIT_CARD (the PAN) is a distinct `[CREDIT_CARD_<hex>]` token, NOT the
+        // `[CREDIT_CARD_EXPIRATION_...]` one — strip the expiry token form first so the
+        // substring check can't be satisfied by the expiration prefix.
+        let without_expiry = m.replace("[CREDIT_CARD_EXPIRATION_", "[__EXP_");
+        assert!(
+            without_expiry.contains("[CREDIT_CARD_"),
+            "CREDIT_CARD (PAN) survived as its own token: {m}"
+        );
+        assert!(m.contains("[REDACTED]"), "CVV (redacted) survived: {m}");
+        // None of the raw values leak.
+        for raw in ["1990-01-02", "4111111111111111", "03/27"] {
+            assert!(!m.contains(raw), "{raw} leaked: {m}");
+        }
     }
 }

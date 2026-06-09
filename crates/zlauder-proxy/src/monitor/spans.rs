@@ -22,7 +22,9 @@ pub(crate) fn token_previews(manifest: &UnmaskManifest) -> Vec<TokenPreview> {
         .map(|e| {
             // Mirror the ledger's structural redaction: withhold plaintext for a
             // non-peekable (secret-class) token so it never rides a record/SSE frame.
-            // Today everything is AutoPii ⇒ peekable, so this is a no-op now.
+            // CVV is the live non-peekable case here ([`TokenClass::Sad`], mirroring the
+            // ledger guard): its plaintext is withheld from this per-record/SSE preview
+            // surface too. Ordinary detector/keyword PII stays AutoPii ⇒ peekable.
             let class = TokenClass::for_manifest_entry(e);
             let peekable = class.is_peekable();
             TokenPreview {

@@ -35,7 +35,12 @@ use crate::surface::Surface;
 // phone-shaped order/id number no longer false-positives at the Strict 0.4 floor.
 // Changes detection output for unchanged text (a context-free phone that previously
 // masked at a ≤0.4 floor no longer does) — bump to abandon stale cache.
-pub const DETECTOR_VERSION: u64 = 5;
+// v6: added the zlauder-local hard-context recognizers — DATE_OF_BIRTH,
+// CREDIT_CARD_EXPIRATION / EXPIRATION_DATE (confidence-tiered), and CVV — registered in
+// `MaskEngine::from_parts`, plus the ML `private_date` → PRIVATE_DATE remap. New
+// recognizers + the remap change detection output for unchanged text, so bump to abandon
+// stale cache entries that predate them.
+pub const DETECTOR_VERSION: u64 = 6;
 
 /// Score the [`LemmaContextAwareEnhancer`] adds when a recognizer's context word
 /// is found near a match (mirrors `LemmaContextAwareEnhancer::new`'s

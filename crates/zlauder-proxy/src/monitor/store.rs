@@ -535,11 +535,15 @@ impl ReviewTicket {
 /// the count. Over [`MAX_SESSION_TOKENS`] the oldest entries are evicted (logged).
 ///
 /// FORWARD-COMPAT SEAM (plan A): classification lives here, the single ingest point.
-/// Today every manifest entry is detector/keyword PII → [`TokenClass::AutoPii`],
-/// peekable. When the secrets engine tags manifest entries with a source, switch on
-/// it here to set [`TokenClass::Guard`]/`Broker`; `is_peekable()` then suppresses
-/// both the stored plaintext (`value` left empty) and UI peek — so a brokered secret
-/// that interns into the manifest never reaches the snapshot in cleartext.
+/// Detector/keyword PII is [`TokenClass::AutoPii`] (peekable); CVV is the live
+/// exception — it is classified [`TokenClass::Sad`] (non-peekable), so its plaintext is
+/// withheld from the ledger (`value` left empty) even when it rode the reversible
+/// `Token` path (an overridden CVV operator; the default `Redact` mints no manifest
+/// entry and never reaches here). When the secrets engine tags manifest entries with a
+/// source, extend the switch in [`TokenClass::for_manifest_entry`] to set
+/// [`TokenClass::Guard`]/`Broker`; `is_peekable()` then suppresses both the stored
+/// plaintext and UI peek — so a brokered secret that interns into the manifest never
+/// reaches the snapshot in cleartext.
 fn ingest_tokens_into(inner: &mut Inner, manifest: &UnmaskManifest, now: u128) {
     for e in &manifest.entries {
         if let Some(existing) = inner.session_tokens.get_mut(&e.token_handle) {
@@ -1103,6 +1107,49 @@ mod tests {
             .filter(|e| e.token.starts_with("[NEW_"))
             .count();
         assert_eq!(new_present, 50, "eviction dropped the oldest, never the newest");
+    }
+
+    fn manifest_kind(token: &str, value: &str, entity_kind: &str) -> UnmaskManifest {
+        let mut m = UnmaskManifest::new();
+        m.push(zlauder_engine::ManifestEntry {
+            canonical_form: value.to_string(),
+            token_handle: token.to_string(),
+            entity_kind: entity_kind.to_string(),
+            arrow_origin: zlauder_engine::Surface::UserMessage,
+            exposed_at: None,
+        });
+        m
+    }
+
+    /// C8 defense-in-depth: a CVV manifest entry (PCI SAD) is classified non-peekable
+    /// so its plaintext is structurally withheld from the in-memory ledger snapshot even
+    /// when it rode the reversible `Token` path (an overridden CVV operator). Ordinary
+    /// PII (EMAIL_ADDRESS) stays AutoPii/peekable with its value present — unchanged.
+    #[test]
+    fn cvv_manifest_entry_is_non_peekable_and_value_withheld() {
+        let m = Monitor::new();
+        // entity_kind "CVV" matches zlauder_engine::ENTITY_CVV (the recognizer's stamp).
+        m.ingest_session_tokens(&manifest_kind("[CVV_0001]", "123", "CVV"));
+        m.ingest_session_tokens(&manifest_kind("[EMAIL_0002]", "alice@example.com", "EMAIL_ADDRESS"));
+        let snap = m.snapshot();
+
+        let cvv = snap
+            .session_tokens
+            .iter()
+            .find(|e| e.token == "[CVV_0001]")
+            .expect("CVV token interned into the ledger");
+        assert!(!cvv.peekable, "CVV is SAD → non-peekable");
+        assert_eq!(cvv.class, TokenClass::Sad, "CVV classifies as Sad");
+        assert_eq!(cvv.value, "", "CVV plaintext withheld from the ledger snapshot");
+
+        let email = snap
+            .session_tokens
+            .iter()
+            .find(|e| e.token == "[EMAIL_0002]")
+            .expect("EMAIL token interned into the ledger");
+        assert!(email.peekable, "ordinary PII stays peekable");
+        assert_eq!(email.class, TokenClass::AutoPii, "EMAIL classifies as AutoPii");
+        assert_eq!(email.value, "alice@example.com", "EMAIL plaintext present (unchanged)");
     }
 
     fn find(m: &Monitor, id: &str) -> RequestRecord {

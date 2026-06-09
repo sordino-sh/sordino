@@ -6,7 +6,7 @@
 //! be renamed or removed; additive fields are safe.
 
 use serde::{Deserialize, Serialize};
-use zlauder_engine::ManifestEntry;
+use zlauder_engine::{ENTITY_CVV, ManifestEntry};
 
 /// Monitor operating mode. Decides whether requests are held for approval.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -253,23 +253,42 @@ pub enum TokenClass {
     /// (interned, so it WOULD appear in the manifest). Not produced yet; tool-only,
     /// peek + value transport suppressed.
     Broker,
+    /// PCI Sensitive Authentication Data (CVV/CVC) that nonetheless rode the reversible
+    /// `Token` path — only reachable if a deployment overrode the built-in CVV→`Redact`
+    /// default back to a reversible operator. SAD must never be stored, so even when a
+    /// reversible token mints a manifest entry, its plaintext is withheld from the ledger
+    /// (non-peekable). Defense-in-depth backstop to the C8 `Redact` default (cvv-plan.md
+    /// Part 3 C8); the primary protection is that CVV redacts out of the box.
+    Sad,
 }
 
 impl TokenClass {
     /// Whether a value of this class may have its plaintext shown (peek) and carried
-    /// in the snapshot. Secret classes (guard/broker) are never peekable.
+    /// in the snapshot. Secret classes (guard/broker) and PCI SAD ([`TokenClass::Sad`])
+    /// are never peekable.
     pub fn is_peekable(self) -> bool {
         matches!(self, TokenClass::AutoPii | TokenClass::Custom)
     }
 
     /// THE single classification point for both value-bearing surfaces — the durable
     /// ledger ([`TokenLedgerEntry`]) and per-record token previews ([`TokenPreview`]).
-    /// Today every masked token is detector/keyword PII ⇒ [`TokenClass::AutoPii`].
-    /// When the secrets engine tags manifest entries with a source, switch on it here
-    /// (and nowhere else) to return `Guard`/`Broker`; `is_peekable()` then suppresses
-    /// peek + plaintext transport on BOTH surfaces at once.
-    pub fn for_manifest_entry(_e: &ManifestEntry) -> TokenClass {
-        TokenClass::AutoPii
+    /// Detector/keyword PII is [`TokenClass::AutoPii`] (peekable). The one structural
+    /// exception is CVV: PCI Sensitive Authentication Data that must never be stored.
+    /// CVV defaults to the irreversible `Redact` operator (which mints NO manifest
+    /// entry, so it never reaches here) — but a deployment may override CVV back to a
+    /// reversible `Token`, at which point it WOULD intern into the manifest. We classify
+    /// it [`TokenClass::Sad`] (non-peekable) so its plaintext is withheld from the ledger
+    /// snapshot and UI peek even when tokenized. Defense-in-depth backstop to the C8
+    /// `Redact` default (cvv-plan.md Part 3 C8). When the secrets engine tags manifest
+    /// entries with a source, extend the switch here (and nowhere else) for `Guard`/
+    /// `Broker`; `is_peekable()` then suppresses peek + plaintext transport on BOTH
+    /// surfaces at once.
+    pub fn for_manifest_entry(e: &ManifestEntry) -> TokenClass {
+        if e.entity_kind == ENTITY_CVV {
+            TokenClass::Sad
+        } else {
+            TokenClass::AutoPii
+        }
     }
 }
 

@@ -6,6 +6,51 @@ use std::collections::{HashMap, HashSet};
 
 use crate::surface::Surface;
 
+// --- Custom entity-string contract (shared recognizer ↔ config gate) ---------
+//
+// These four `Custom` entity types are NOT canonical `presidio_core::EntityType`
+// Display names — they are zlauder-local labels emitted by the hard-context regex
+// recognizers (DOB / card-expiry / CVV) and by the ML `private_date` remap. The
+// category gate (`entity_enabled`) matches on the EXACT emitted string, so the
+// recognizer's emitted label and the `Category::entity_types()` entry MUST be the
+// SAME string — a desync silently no-ops the gate (every detection of that type is
+// dropped). Defining them as `pub const`s here is the single source of truth both
+// sides reference, so a rename is a compile-wide change, never a silent drift.
+//
+// Later stages (recognizers.rs, ml.rs) import these instead of repeating literals.
+
+/// Date of birth (hard-context regex recognizer) → [`Category::Identity`].
+pub const ENTITY_DATE_OF_BIRTH: &str = "DATE_OF_BIRTH";
+/// Credit-card expiration date (hard-context regex recognizer) →
+/// [`Category::Financial`]. Emitted ONLY when the expiry match carries STRONG
+/// payment evidence (a plausible Luhn-valid PAN or an unambiguous payment term in
+/// window). See [`ENTITY_EXPIRATION_DATE`] for the neutral, weak-evidence sibling.
+pub const ENTITY_CREDIT_CARD_EXPIRATION: &str = "CREDIT_CARD_EXPIRATION";
+/// Neutral expiration date (hard-context regex recognizer) → BOTH
+/// [`Category::Financial`] AND [`Category::Identity`]. The weak-evidence sibling of
+/// [`ENTITY_CREDIT_CARD_EXPIRATION`]: the same EMIT gate fires, but when only an
+/// AMBIGUOUS keyword (`card`/`visa`/`discover`/`valid thru`) is present — i.e. no
+/// PAN and no unambiguous payment term — the value is labeled neutrally so a travel
+/// visa / gift-card / subscription expiry is NOT mislabeled as a credit-card expiry.
+/// Masked tokens are visible to the upstream LLM, so a wrong CREDIT_CARD label would
+/// corrupt the model's reasoning. NEVER suppresses the mask — only relabels it.
+///
+/// Dual category membership (FIX 1a): the neutral trigger case spans identity
+/// documents (travel visas) AND financial cards (gift / credit cards), so it masks
+/// when EITHER Financial OR Identity is enabled. `entity_enabled` ORs across the
+/// enabled categories, so membership in both is the lever for that OR semantics.
+pub const ENTITY_EXPIRATION_DATE: &str = "EXPIRATION_DATE";
+/// Card verification value (hard-context regex recognizer) →
+/// [`Category::Financial`]. PCI Sensitive Authentication Data — defaults to the
+/// irreversible [`Operator::Redact`] (see [`EngineConfig::operator_for`]).
+pub const ENTITY_CVV: &str = "CVV";
+/// ML `private_date` remap target → [`Category::Identity`]. Deliberately NOT
+/// `DATE_OF_BIRTH`: the model's `private_date` label covers ALL private dates, so
+/// relabeling generic dates as births would be an audit-trail lie in every
+/// `entity_kind`-displaying surface. `DATE_OF_BIRTH` stays reserved for the
+/// hard-context regex recognizer.
+pub const ENTITY_PRIVATE_DATE: &str = "PRIVATE_DATE";
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Profile {
@@ -117,6 +162,16 @@ impl Category {
                 "CRYPTO",
                 "US_BANK_NUMBER",
                 "ABA_ROUTING_NUMBER",
+                // zlauder-local Custom entities (hard-context regex recognizers).
+                // Referenced via the shared consts so the gate string can never drift
+                // from the recognizer's emitted label. `EXPIRATION_DATE` is the
+                // neutral, weak-evidence sibling of `CREDIT_CARD_EXPIRATION` (emitted
+                // when only an ambiguous card keyword fired — travel visa / gift card /
+                // subscription expiry), so the upstream LLM never sees a generic expiry
+                // mislabeled as a credit-card one.
+                ENTITY_CREDIT_CARD_EXPIRATION,
+                ENTITY_EXPIRATION_DATE,
+                ENTITY_CVV,
             ],
             Category::Identity => &[
                 "US_SSN",
@@ -136,6 +191,20 @@ impl Category {
                 "US_MBI",
                 "UK_NHS",
                 "UK_NINO",
+                // zlauder-local Custom entities. `DATE_OF_BIRTH` is the hard-context
+                // regex recognizer; `PRIVATE_DATE` is the ML `private_date` remap
+                // target (kept distinct so generic private dates are not mislabeled as
+                // births). Referenced via the shared consts to prevent gate drift.
+                ENTITY_DATE_OF_BIRTH,
+                ENTITY_PRIVATE_DATE,
+                // `EXPIRATION_DATE` lives in BOTH Financial AND Identity (FIX 1a):
+                // its trigger case spans identity docs (travel visas) and financial
+                // cards (gift / credit cards). Because `entity_enabled` ORs across the
+                // enabled categories (`.any()`), dual membership means a neutral expiry
+                // masks when EITHER Financial OR Identity is on — the intended behavior.
+                // Dual membership is safe: `canonical_entity_types()` is a HashSet
+                // (dedups) and `entity_enabled` uses `.any()` (idempotent).
+                ENTITY_EXPIRATION_DATE,
             ],
             // URL relies on presidio's strict `UrlRecognizer` (the default since
             // its strict-mode change), which drops scheme-less `file.ext`/`opts.la`
@@ -837,6 +906,16 @@ impl EngineConfig {
     /// name. A key that names one of those custom types is therefore ALSO valid (you
     /// can set an operator for your own custom type), so we treat a key as known if it
     /// is a canonical Display name OR names a declared `custom_replacement.entity_type`.
+    ///
+    /// THIRD known-key source — zlauder-local Custom entities in a CATEGORY. The four
+    /// `Custom` labels emitted by the hard-context regex recognizers + the ML
+    /// `private_date` remap (`DATE_OF_BIRTH`, `CREDIT_CARD_EXPIRATION`, `CVV`,
+    /// `PRIVATE_DATE`) are NOT canonical `EntityType` Display names (they round-trip as
+    /// `Custom(_)`), but they ARE wired into a real category via
+    /// [`Category::entity_types`]. So `entity_operators.CVV = {kind="redact"}` is a
+    /// FUNCTIONAL lever (it both gates and sets the operator) and must NOT be flagged
+    /// as a typo. We accept any key that is a member of
+    /// [`Category::canonical_entity_types`] before the canonical-Display check.
     pub fn unknown_entity_types(&self) -> Vec<String> {
         use std::str::FromStr;
         let custom: HashSet<&str> = self
@@ -844,10 +923,17 @@ impl EngineConfig {
             .iter()
             .map(|c| c.entity_type.as_str())
             .collect();
+        let category_members = Category::canonical_entity_types();
         self.entity_operators
             .keys()
             .filter(|k| {
                 if custom.contains(k.as_str()) {
+                    return false;
+                }
+                // A zlauder-local Custom entity that lives in a category (e.g. CVV,
+                // DATE_OF_BIRTH) is a real, functional gate/operator lever — accept it
+                // even though it round-trips as `Custom(_)`.
+                if category_members.contains(k.as_str()) {
                     return false;
                 }
                 // Infallible: unknown labels become `Custom` verbatim.
@@ -877,12 +963,25 @@ impl EngineConfig {
             .any(|c| c.entity_types().contains(&entity_type))
     }
 
-    /// Resolve the operator for an entity type (per-type override else default).
+    /// Resolve the operator for an entity type. Precedence (highest first):
+    /// 1. an explicit per-type `entity_operators` override (user/project/local config);
+    /// 2. a built-in per-type SAD default ([`ENTITY_CVV`] → [`Operator::Redact`]);
+    /// 3. the profile/config `default_operator`.
+    ///
+    /// CVV is PCI Sensitive Authentication Data ("never store"). The reversible
+    /// `Token` default would retain CVV in the in-memory `SessionStore` and surface
+    /// its plaintext in the local monitor ledger for the session lifetime, so CVV
+    /// masks irreversibly (`Redact`) OUT OF THE BOX. This is the LOWEST-precedence
+    /// default, not a hard lock — an explicit `entity_operators.CVV` entry still wins
+    /// (zlauder's everything-configurable contract), with a documented PCI-SAD warning.
     pub fn operator_for(&self, entity_type: &str) -> Operator {
-        self.entity_operators
-            .get(entity_type)
-            .copied()
-            .unwrap_or(self.default_operator)
+        if let Some(op) = self.entity_operators.get(entity_type) {
+            return *op;
+        }
+        if entity_type == ENTITY_CVV {
+            return Operator::Redact;
+        }
+        self.default_operator
     }
 
     pub fn surface_enabled(&self, surface: Surface) -> bool {
@@ -1288,5 +1387,183 @@ mod tests {
                 assert!(canon.contains(et), "{et} missing from canonical set");
             }
         }
+    }
+
+    // --- C3/C4/C8: zlauder-local Custom entity contract ---------------------
+
+    #[test]
+    fn custom_entity_consts_match_expected_strings() {
+        // The literal contract later stages key on. A rename here is intentional and
+        // must be reflected everywhere the consts are referenced (compile-wide).
+        assert_eq!(ENTITY_DATE_OF_BIRTH, "DATE_OF_BIRTH");
+        assert_eq!(ENTITY_CREDIT_CARD_EXPIRATION, "CREDIT_CARD_EXPIRATION");
+        assert_eq!(ENTITY_EXPIRATION_DATE, "EXPIRATION_DATE");
+        assert_eq!(ENTITY_CVV, "CVV");
+        assert_eq!(ENTITY_PRIVATE_DATE, "PRIVATE_DATE");
+    }
+
+    #[test]
+    fn expiration_date_neutral_sibling_in_financial_and_identity() {
+        // FIX 1a: the neutral `EXPIRATION_DATE` label (weak-evidence sibling of
+        // `CREDIT_CARD_EXPIRATION`) parses and lives in BOTH Financial AND Identity —
+        // its trigger case spans financial cards (gift/credit) AND identity docs
+        // (travel visas). `entity_enabled` ORs across enabled categories, so dual
+        // membership means it masks when EITHER category is on.
+        assert!(Category::Financial
+            .entity_types()
+            .contains(&ENTITY_EXPIRATION_DATE));
+        assert!(Category::Identity
+            .entity_types()
+            .contains(&ENTITY_EXPIRATION_DATE));
+        // The strong sibling stays Financial-only.
+        assert!(Category::Financial
+            .entity_types()
+            .contains(&ENTITY_CREDIT_CARD_EXPIRATION));
+        // Round-trips through the canonical (deduped) set — dual membership is safe
+        // because the set dedups — so it is a valid entity_operators key, not a typo.
+        assert!(Category::canonical_entity_types().contains(ENTITY_EXPIRATION_DATE));
+
+        // Enabled under Balanced (Financial + Identity both on).
+        let balanced = EngineConfig::default();
+        assert!(
+            balanced.entity_enabled(ENTITY_EXPIRATION_DATE),
+            "EXPIRATION_DATE enabled under Balanced"
+        );
+        // Enabled under a Financial-ONLY profile (Identity off) — proves OR semantics.
+        let financial_only = EngineConfig {
+            enabled_categories: [Category::Financial].into_iter().collect(),
+            ..EngineConfig::default()
+        };
+        assert!(
+            financial_only.entity_enabled(ENTITY_EXPIRATION_DATE),
+            "EXPIRATION_DATE enabled with ONLY Financial on"
+        );
+        // Enabled under an Identity-ONLY profile (Financial off) — proves OR semantics.
+        let identity_only = EngineConfig {
+            enabled_categories: [Category::Identity].into_iter().collect(),
+            ..EngineConfig::default()
+        };
+        assert!(
+            identity_only.entity_enabled(ENTITY_EXPIRATION_DATE),
+            "EXPIRATION_DATE enabled with ONLY Identity on"
+        );
+        // Gated off when NEITHER category is on (secrets_only → Secrets only).
+        let secrets = EngineConfig::for_profile(Profile::SecretsOnly);
+        assert!(!secrets.entity_enabled(ENTITY_EXPIRATION_DATE));
+    }
+
+    #[test]
+    fn custom_entities_are_in_their_categories() {
+        // The four Custom labels must be category members on the EXACT string the
+        // recognizers emit — a desync silently no-ops the category gate.
+        assert!(Category::Identity
+            .entity_types()
+            .contains(&ENTITY_DATE_OF_BIRTH));
+        assert!(Category::Identity
+            .entity_types()
+            .contains(&ENTITY_PRIVATE_DATE));
+        assert!(Category::Financial
+            .entity_types()
+            .contains(&ENTITY_CREDIT_CARD_EXPIRATION));
+        assert!(Category::Financial.entity_types().contains(&ENTITY_CVV));
+
+        // And they round-trip through the canonical (deduped) set.
+        let canon = Category::canonical_entity_types();
+        for et in [
+            ENTITY_DATE_OF_BIRTH,
+            ENTITY_CREDIT_CARD_EXPIRATION,
+            ENTITY_CVV,
+            ENTITY_PRIVATE_DATE,
+        ] {
+            assert!(canon.contains(et), "{et} missing from canonical set");
+        }
+    }
+
+    #[test]
+    fn custom_entities_category_enabled_under_balanced() {
+        // Balanced enables Secrets, Financial, Identity, Contact. All four Custom
+        // entities are in Financial/Identity → enabled with NO per-type override.
+        let cfg = EngineConfig::default(); // Balanced
+        assert!(cfg.entity_enabled(ENTITY_DATE_OF_BIRTH), "DOB ∈ Identity");
+        assert!(
+            cfg.entity_enabled(ENTITY_CREDIT_CARD_EXPIRATION),
+            "card expiry ∈ Financial"
+        );
+        assert!(cfg.entity_enabled(ENTITY_CVV), "CVV ∈ Financial");
+        assert!(
+            cfg.entity_enabled(ENTITY_PRIVATE_DATE),
+            "PRIVATE_DATE ∈ Identity"
+        );
+    }
+
+    #[test]
+    fn custom_entities_disabled_under_secrets_only() {
+        // secrets_only enables ONLY Secrets, so Financial/Identity Custom entities are
+        // gated off (no per-type override) — the category gate is the lever.
+        let cfg = EngineConfig::for_profile(Profile::SecretsOnly);
+        assert!(!cfg.entity_enabled(ENTITY_DATE_OF_BIRTH));
+        assert!(!cfg.entity_enabled(ENTITY_CREDIT_CARD_EXPIRATION));
+        assert!(!cfg.entity_enabled(ENTITY_CVV));
+        assert!(!cfg.entity_enabled(ENTITY_PRIVATE_DATE));
+    }
+
+    #[test]
+    fn unknown_entity_types_accepts_custom_entities_but_flags_typo() {
+        // The four zlauder-local Custom entities are valid entity_operators keys (they
+        // are category members), so naming one is NOT a typo. A genuine typo alongside
+        // them is still flagged.
+        let mut cfg = EngineConfig::default();
+        cfg.entity_operators
+            .insert(ENTITY_CVV.into(), Operator::Redact);
+        cfg.entity_operators
+            .insert(ENTITY_DATE_OF_BIRTH.into(), Operator::Token);
+        cfg.entity_operators
+            .insert(ENTITY_CREDIT_CARD_EXPIRATION.into(), Operator::Token);
+        cfg.entity_operators
+            .insert(ENTITY_PRIVATE_DATE.into(), Operator::Token);
+        assert!(
+            cfg.unknown_entity_types().is_empty(),
+            "the four Custom entities are valid entity_operators keys"
+        );
+
+        // A real typo is still caught alongside them.
+        cfg.entity_operators
+            .insert("CVVV".into(), Operator::Redact); // typo
+        let unknown = cfg.unknown_entity_types();
+        assert_eq!(unknown, vec!["CVVV".to_string()]);
+    }
+
+    #[test]
+    fn cvv_defaults_to_redact_but_is_overridable() {
+        // C8: CVV is PCI SAD → defaults to the irreversible Redact OUT OF THE BOX,
+        // even though the profile default_operator is the reversible Token.
+        let cfg = EngineConfig::default();
+        assert_eq!(cfg.default_operator, Operator::Token);
+        assert_eq!(
+            cfg.operator_for(ENTITY_CVV),
+            Operator::Redact,
+            "CVV masks irreversibly by default (PCI SAD), not the Token default"
+        );
+        // Other entities still follow the profile default_operator. CVV is the ONLY
+        // built-in Redact; the neutral date labels (EXPIRATION_DATE / PRIVATE_DATE) are
+        // reversible tokens, NOT SAD — assert by name so the no-SAD fall-through is locked.
+        assert_eq!(cfg.operator_for(ENTITY_CREDIT_CARD_EXPIRATION), Operator::Token);
+        assert_eq!(cfg.operator_for(ENTITY_DATE_OF_BIRTH), Operator::Token);
+        assert_eq!(cfg.operator_for(ENTITY_EXPIRATION_DATE), Operator::Token);
+        assert_eq!(cfg.operator_for(ENTITY_PRIVATE_DATE), Operator::Token);
+
+        // LOWEST precedence: an explicit user override wins (not hard-locked).
+        let mut cfg = EngineConfig::default();
+        cfg.entity_operators
+            .insert(ENTITY_CVV.into(), Operator::Token);
+        assert_eq!(
+            cfg.operator_for(ENTITY_CVV),
+            Operator::Token,
+            "an explicit CVV override beats the built-in Redact default"
+        );
+        // Override to a different irreversible op is also honored.
+        cfg.entity_operators
+            .insert(ENTITY_CVV.into(), Operator::Hash);
+        assert_eq!(cfg.operator_for(ENTITY_CVV), Operator::Hash);
     }
 }

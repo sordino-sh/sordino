@@ -37,10 +37,19 @@ language = "en"
 # Categories:
 #   secrets   API_KEY, AWS_ACCESS_KEY, AWS_SECRET_KEY, AZURE_KEY, GCP_API_KEY,
 #             PRIVATE_KEY, JWT
-#   financial CREDIT_CARD, IBAN_CODE, CRYPTO, US_BANK_NUMBER, ABA_ROUTING_NUMBER
-#   identity  SSN/ITIN, national IDs, passports, driver's licenses, medical IDs
+#   financial CREDIT_CARD, IBAN_CODE, CRYPTO, US_BANK_NUMBER, ABA_ROUTING_NUMBER,
+#             CREDIT_CARD_EXPIRATION, CVV
+#   identity  SSN/ITIN, national IDs, passports, driver's licenses, medical IDs,
+#             DATE_OF_BIRTH, PRIVATE_DATE
 #   contact   EMAIL_ADDRESS, PHONE_NUMBER, IP_ADDRESS, URL, MAC_ADDRESS
 #   personal  PERSON, LOCATION, ORGANIZATION; requires [engine.ml] to be ready
+#
+# DATE_OF_BIRTH / CREDIT_CARD_EXPIRATION / CVV are hard-context recognizers: they only
+# fire when a label sits next to the value (e.g. "DOB: 1990-01-02", "exp 03/27" near a
+# card, "CVV: 123"), so a bare port/ratio/status number is not a false positive.
+# PRIVATE_DATE is emitted only by the optional [engine.ml] recognizer (it remaps the
+# model's generic private-date signal; DATE_OF_BIRTH stays reserved for the labeled
+# regex match, so a non-birth date is never mislabeled as a birth).
 enabled_categories = ["secrets", "financial", "identity", "contact"]
 
 # Default operator for enabled entity types:
@@ -104,6 +113,28 @@ CREDIT_CARD = { kind = "mask", char = "*", from_end = 4 }
 # PASSWORD = { kind = "redact" }
 # DATE_TIME = { kind = "keep" }
 # DOMAIN = { kind = "token" }
+
+# Hard-context PII recognizers (financial + identity). Each masks the VALUE only;
+# the label ("CVV:", "DOB:", "exp") is left in place, so a redacted CVV reads
+# "CVV: [REDACTED]" and a tokenized DOB reads "DOB: [DATE_OF_BIRTH_...]".
+#
+# CVV is PCI Sensitive Authentication Data — it MUST NEVER be stored, even encrypted.
+# So CVV defaults to `redact` (irreversible) OUT OF THE BOX: no reversible session
+# token is minted and the value never reaches the local monitor ledger. `redact` is the
+# built-in default, so the line below is shown COMMENTED — copying this file as-is does
+# NOT add CVV to entity_operators (which would change the policy fingerprint) or alter
+# the SAD-safe default; uncomment only to make the default explicit.
+# CVV = { kind = "redact" }
+#
+# Overriding CVV to a reversible `token` still mints a reversible engine token (so the
+# value round-trips in the transcript), BUT the monitor ledger/preview WITHHOLDS the
+# CVV plaintext by design: CVV is classified as a non-peekable Sad TokenClass, so its
+# value is never surfaced in the local monitor even when tokenized.
+# CVV = { kind = "token" }
+# CREDIT_CARD_EXPIRATION is Cardholder Data (storable); a reversible token is fine.
+# CREDIT_CARD_EXPIRATION = { kind = "token" }
+# DATE_OF_BIRTH = { kind = "token" }
+# PRIVATE_DATE = { kind = "token" }   # ML-emitted; only when [engine.ml] is enabled
 
 [engine.allow_list]
 # Values that must never be tokenized. Common defaults are seeded internally too,
