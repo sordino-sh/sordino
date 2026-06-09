@@ -90,7 +90,7 @@ impl WireConfig {
 /// state. `ml.enabled` is the desired flag; `ml.status` is the live runtime
 /// lifecycle (`disabled`/`loading`/`ready`/`failed`) — the latter is what tells
 /// the user whether their text is actually being filtered through the model yet.
-fn snapshot(st: &AppState) -> serde_json::Value {
+pub(crate) fn snapshot(st: &AppState) -> serde_json::Value {
     let cfg = st.engine.config_snapshot();
     let wire = WireConfig::from_engine(&cfg);
     let ml = st.engine.ml_snapshot();
@@ -319,9 +319,9 @@ pub async fn apply_profile(
 
     // Push the new live policy to open panels (plain config snapshot, before the
     // action-specific fields below — the panel only reads `config`/`ml`).
-    st.monitor.broadcast_policy(snapshot(&st));
-
     let mut snap = snapshot(&st);
+    st.monitor.broadcast_policy(snap.clone());
+
     if let Some(obj) = snap.as_object_mut() {
         obj.insert("profile_applied".into(), json!(name));
         obj.insert("scope".into(), json!(scope_label(scope)));

@@ -1189,8 +1189,25 @@ $('policyScrim').addEventListener('click', closePolicy);
    field reverts to on Esc, and the baseline that separates our own writes from external
    ones (so an external change toasts but our own echo does not double-toast). */
 let committedPolicy = null;
-let selfWriteUntil = 0;            // performance.now() ceiling: suppress the external-change toast just after our own write
-function markSelfWrite() { selfWriteUntil = performance.now() + 1500; }
+
+/* Every policy-control write (profile / threshold / category / ML) runs through ONE
+   serialized promise chain, so two fast edits — e.g. category toggles that each PUT the
+   WHOLE set — can never be reordered on the wire and lost-update each other. The server's
+   live snapshot always re-renders the controls afterward, so ordering is the only thing
+   the client must guarantee. `selfWriteInFlight` counts queued+in-flight writes: while it
+   is > 0 an arriving `policy` SSE frame is OUR OWN echo, so the external-change toast is
+   suppressed PRECISELY — no time-window guess that could swallow a real external change or
+   misclassify a slow self-write. */
+let policyWriteChain = Promise.resolve();
+let selfWriteInFlight = 0;
+function policyWrite(doFetch) {
+  selfWriteInFlight++;
+  const run = () => doFetch().catch(() => {});   // each write owns its outcome; never break the chain
+  policyWriteChain = policyWriteChain.then(run, run).finally(() => {
+    selfWriteInFlight = Math.max(0, selfWriteInFlight - 1);
+  });
+  return policyWriteChain;
+}
 
 /* Esc inside the drawer is a TWO-STAGE key: if a policy control is focused it reverts
    that field to the live policy and unfocuses it (the in-progress edit is abandoned,
@@ -1200,7 +1217,8 @@ $('policyDrawer').addEventListener('keydown', e => {
   if (e.key !== 'Escape') return;
   const el = document.activeElement;
   if (el && $('policyDrawer').contains(el) && el.matches('select, input')) {
-    e.preventDefault();
+    // stopPropagation (NOT preventDefault) so the document-level closer is suppressed for
+    // this Esc, while a native <select>'s own "Esc closes its open popup" still works.
     e.stopPropagation();
     revertControl(el);
     el.blur();
@@ -1216,6 +1234,17 @@ document.addEventListener('keydown', e => {
    value, never a stale one. */
 $('policyDrawer').addEventListener('focusin', e => {
   if (e.target.matches('#polProfile, #polScope, #polThresh')) e.target._baseline = e.target.value;
+});
+
+/* Close the activeElement-skip seam: applyPolicyConfig deliberately won't overwrite the
+   control you're actively editing, so an external change that arrives mid-edit is held off
+   that one control. The MOMENT focus leaves it, reconcile every control to the live policy
+   — so "displayed == live policy" holds for any control that isn't this instant being
+   edited. Skipped while one of our own writes is in flight (its result is the authoritative
+   re-render, and a select's value-commit fires `change` just before `focusout`). */
+$('policyDrawer').addEventListener('focusout', () => {
+  if (selfWriteInFlight > 0 || !committedPolicy) return;
+  applyPolicyConfig(committedPolicy);
 });
 
 /* Revert one focused control to the committed (live) policy — the Esc action. */
@@ -1252,9 +1281,11 @@ function applyPolicyConfig(snap) {
   const ml = snap.ml || {};
   const active = document.activeElement;
 
-  // profile
-  if (cfg.profile && $('polProfile') !== active) $('polProfile').value = cfg.profile;
-  $('polProfile')._baseline = $('polProfile').value;
+  // profile — render unless this control is mid-edit; the Esc baseline ALWAYS tracks the
+  // LIVE value (even when the render is skipped) so Esc reverts to the newest policy.
+  const liveProfile = cfg.profile || $('polProfile').value;
+  if ($('polProfile') !== active) $('polProfile').value = liveProfile;
+  $('polProfile')._baseline = liveProfile;
 
   // operator (read-only display; profiles differ on this axis — e.g. Strict now
   // tokenizes (reversible) rather than redacting, so the user must be able to SEE it)
@@ -1263,12 +1294,16 @@ function applyPolicyConfig(snap) {
                               : op === 'redact' ? 'redact (irreversible)'
                               : op;
 
-  // threshold
-  if (typeof cfg.score_threshold === 'number' && $('polThresh') !== active) {
-    $('polThresh').value = cfg.score_threshold;
-    $('polThreshVal').textContent = cfg.score_threshold.toFixed(2);
+  // threshold — same rule: skip the live re-render only for the slider being dragged, but
+  // keep its Esc baseline pinned to the LIVE value.
+  if (typeof cfg.score_threshold === 'number') {
+    const liveThresh = String(cfg.score_threshold);
+    if ($('polThresh') !== active) {
+      $('polThresh').value = liveThresh;
+      $('polThreshVal').textContent = cfg.score_threshold.toFixed(2);
+    }
+    $('polThresh')._baseline = liveThresh;
   }
-  $('polThresh')._baseline = $('polThresh').value;
 
   // categories
   renderCategories(snap, false);
@@ -1364,20 +1399,26 @@ function refreshDivergence() {
 }
 
 /* ---- live policy sync. A server `policy` SSE frame (from ANY control-plane writer —
-   this panel, the /zlauder:privacy CLI, or another browser window) re-renders the
-   controls so the panel is ALWAYS an accurate mirror of the live policy. A change we did
-   NOT initiate raises its own confirming toast; our own writes are toasted by their
-   handler (the selfWriteUntil window suppresses the echo), and an identical frame is
-   silent so nothing flashes for a no-op. ---- */
+   this panel, the /zlauder:privacy CLI, custom-mask / reveal endpoints, or another browser
+   window) re-renders the panel so it is ALWAYS an accurate mirror of the live policy.
+   - The dropdown/threshold/category/ML CONTROLS moving externally raises one confirming
+     toast (suppressed while one of OUR writes is in flight — that's just our own echo).
+   - custom-mask / allow-list (reveal) edits move the masks list and the ledger but not the
+     controls; those views are refreshed silently (those ops carry their own UI feedback). */
 function onPolicyEvent(snap) {
-  const seeded = !!committedPolicy;
-  const changed = seeded && !samePolicy(committedPolicy, snap);
+  const prev = committedPolicy;
+  const controlsChanged = prev && !samePolicy(prev, snap);
+  const sourcesChanged  = prev && !sameSources(prev, snap);
   applyPolicyConfig(snap);
-  if (changed && performance.now() >= selfWriteUntil) {
-    policyToast('policy changed — following turns use the new policy', 'good');
+  if (sourcesChanged) {
     if (!$('policyDrawer').hidden) loadCustomMasks();
+    refreshLedgerSources();
   }
+  if (controlsChanged && selfWriteInFlight === 0)
+    policyToast('policy changed — following turns use the new policy', 'good');
 }
+/* Did the panel's editable CONTROLS move? (profile / threshold / categories / operator /
+   ML) — drives the external-change toast. */
 function samePolicy(a, b) {
   const ca = (a && a.config) || {}, cb = (b && b.config) || {};
   const ma = (a && a.ml) || {}, mb = (b && b.ml) || {};
@@ -1391,6 +1432,13 @@ function samePolicy(a, b) {
   if ((ma.status || '') !== (mb.status || '')) return false;
   if ((ma.model || '') !== (mb.model || '')) return false;
   return true;
+}
+/* Did the masking SOURCES move? (custom-mask rules / reveal allow-list) — drives the masks
+   + ledger refresh. Cheap stable-JSON compare (the server serializes both deterministically). */
+function sameSources(a, b) {
+  const ca = (a && a.config) || {}, cb = (b && b.config) || {};
+  return JSON.stringify(ca.custom_replacements || []) === JSON.stringify(cb.custom_replacements || [])
+      && JSON.stringify(ca.allow_list || {})         === JSON.stringify(cb.allow_list || {});
 }
 
 /* ---- singleton policy-change toast with the gentle re-flicker (CSS .flick). One
@@ -1430,17 +1478,17 @@ function dismissPolicyToast() {
 $('polProfile').addEventListener('change', () => {
   const name = $('polProfile').value;
   const scope = $('polScope').value;
-  markSelfWrite();
-  api(`/zlauder/profile/${encodeURIComponent(name)}?scope=${encodeURIComponent(scope)}`, { method: 'POST' })
-    .then(r => r.ok ? r.json() : Promise.reject(new Error('profile rejected')))
-    .then(snap => {
-      applyPolicyConfig(snap);
-      const where = snap.session_only ? 'session-only'
-                  : (snap.persisted ? `persisted → ${esc(snap.persisted)}` : 'applied');
-      if (snap.persist_error) policyToast(`profile <b>${esc(name)}</b> applied LIVE — following turns use it · persist failed: ${esc(snap.persist_error)}`, 'bad');
-      else policyToast(`profile <b>${esc(name)}</b> — following turns use it · ${where}`, 'good');
-    })
-    .catch(() => { revertPanelToCommitted(); toast('profile change failed', 'bad'); });
+  policyWrite(() =>
+    api(`/zlauder/profile/${encodeURIComponent(name)}?scope=${encodeURIComponent(scope)}`, { method: 'POST' })
+      .then(r => r.ok ? r.json() : Promise.reject(new Error('profile rejected')))
+      .then(snap => {
+        applyPolicyConfig(snap);
+        const where = snap.session_only ? 'session-only'
+                    : (snap.persisted ? `persisted → ${esc(snap.persisted)}` : 'applied');
+        if (snap.persist_error) policyToast(`profile <b>${esc(name)}</b> applied LIVE — following turns use it · persist failed: ${esc(snap.persist_error)}`, 'bad');
+        else policyToast(`profile <b>${esc(name)}</b> — following turns use it · ${where}`, 'good');
+      })
+      .catch(() => { revertPanelToCommitted(); toast('profile change failed', 'bad'); }));
 });
 
 /* scope is a DESTINATION, not a policy value: changing it applies nothing now — it sets
@@ -1451,17 +1499,16 @@ $('polScope').addEventListener('change', refreshDivergence);
 $('polThresh').addEventListener('input', e => { $('polThreshVal').textContent = Number(e.target.value).toFixed(2); refreshDivergence(); });
 $('polThresh').addEventListener('change', () => {
   const v = Number($('polThresh').value);
-  markSelfWrite();
-  putConfigMerge({ score_threshold: v }, `threshold <b>${v.toFixed(2)}</b> — following turns mask at this cutoff`);
+  policyWrite(() => putConfigMerge({ score_threshold: v }, `threshold <b>${v.toFixed(2)}</b> — following turns mask at this cutoff`));
 });
 
-/* ---- categories: each toggle applies the new set immediately ---- */
+/* ---- categories: each toggle applies the new set immediately (serialized so two fast
+   toggles can't reorder their whole-set PUTs and lost-update each other) ---- */
 $('polCats').addEventListener('change', () => {
   refreshDivergence();
   refreshPersonalTier();
   const sel = [...$('polCats').querySelectorAll('input:checked')].map(cb => cb.value);
-  markSelfWrite();
-  putConfigMerge({ enabled_categories: sel }, `categories <b>${esc(sel.join(', ') || 'none')}</b> — following turns use them`);
+  policyWrite(() => putConfigMerge({ enabled_categories: sel }, `categories <b>${esc(sel.join(', ') || 'none')}</b> — following turns use them`));
 });
 
 /* A rejected write must leave NO trace of the rejected value: blur the focused control
@@ -1476,7 +1523,7 @@ function revertPanelToCommitted() {
 /* shared merge-PUT helper. On success the server's authoritative snapshot re-renders the
    controls; on failure roll the controls back to the committed policy and surface why. */
 function putConfigMerge(body, label) {
-  api('/zlauder/config', { method: 'PUT', body: JSON.stringify(body) })
+  return api('/zlauder/config', { method: 'PUT', body: JSON.stringify(body) })
     .then(r => r.ok ? r.json() : r.text().then(t => Promise.reject(new Error(t))))
     .then(snap => { applyPolicyConfig(snap); policyToast(label, 'good'); })
     .catch(err => { revertPanelToCommitted(); toast(`set failed: ${esc(err.message || 'rejected')}`, 'bad'); });
@@ -1485,15 +1532,15 @@ function putConfigMerge(body, label) {
 /* ---- ML toggle (already immediate) ---- */
 $('polMlToggle').addEventListener('change', e => {
   const on = e.target.checked;
-  markSelfWrite();
-  api(`/zlauder/ml/${on ? 'enable' : 'disable'}`, { method: 'POST' })
-    .then(r => r.ok ? r.json() : Promise.reject(new Error('ml toggle failed')))
-    .then(snap => {
-      applyPolicyConfig(snap);
-      policyToast(on ? 'ML enabling — following turns mask names/locations once the model is <b>ready</b>'
-                     : 'ML disabled — following turns are regex-only', on ? 'good' : 'bad');
-    })
-    .catch(() => { e.target.checked = !on; toast('ML toggle failed', 'bad'); });
+  policyWrite(() =>
+    api(`/zlauder/ml/${on ? 'enable' : 'disable'}`, { method: 'POST' })
+      .then(r => r.ok ? r.json() : Promise.reject(new Error('ml toggle failed')))
+      .then(snap => {
+        applyPolicyConfig(snap);
+        policyToast(on ? 'ML enabling — following turns mask names/locations once the model is <b>ready</b>'
+                       : 'ML disabled — following turns are regex-only', on ? 'good' : 'bad');
+      })
+      .catch(() => { e.target.checked = !on; toast('ML toggle failed', 'bad'); }));
 });
 
 /* ---- custom masks: list + remove ---- */
