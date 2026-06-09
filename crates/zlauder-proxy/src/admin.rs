@@ -94,6 +94,15 @@ fn snapshot(st: &AppState) -> serde_json::Value {
     let cfg = st.engine.config_snapshot();
     let wire = WireConfig::from_engine(&cfg);
     let ml = st.engine.ml_snapshot();
+    // Registered-secret status: counts/names/operators/scheme/resolved/required +
+    // any error — NEVER a value (SecretRuntimeEntry has no value field, and the
+    // engine config WireConfig above carries no secret either).
+    // Recover a poisoned read guard rather than panic the snapshot handler — the
+    // status is value-free, so a degraded read is safe and keeps the endpoint up.
+    let secrets = st
+        .secrets_status
+        .read()
+        .unwrap_or_else(|p| p.into_inner());
     json!({
         "enabled": cfg.enabled,
         "project_root": st.project_root.as_str(),
@@ -105,6 +114,13 @@ fn snapshot(st: &AppState) -> serde_json::Value {
             "model": cfg.ml.model,
             "status": ml.status,
             "error": ml.error,
+        },
+        "secrets": {
+            "ready": st.secrets_ready(),
+            "total": secrets.entries.len(),
+            "resolved": secrets.resolved(),
+            "required": secrets.required(),
+            "entries": secrets.entries,
         },
     })
 }

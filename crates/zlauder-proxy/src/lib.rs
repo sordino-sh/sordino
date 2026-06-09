@@ -9,6 +9,7 @@ pub mod monitor;
 pub mod openai_chat;
 pub mod openai_responses;
 pub mod routes;
+pub mod secrets;
 pub mod sse;
 pub mod state;
 pub mod walk;

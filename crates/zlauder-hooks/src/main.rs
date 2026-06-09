@@ -73,6 +73,12 @@ enum Cmd {
     Reveal { token: String },
     /// Print the keyed local web monitor URL for this project's proxy.
     Monitor,
+    /// View registered-secret status (backs `/zlauder:secrets`). Read-only — secret
+    /// VALUES never appear (registration is by reference in `[[secrets]]`).
+    Secrets {
+        #[command(subcommand)]
+        action: Option<SecretsAction>,
+    },
     /// Redact burned plaintext values from a Claude Code transcript JSONL file.
     Scrub {
         /// Transcript JSONL file to mutate.
@@ -138,6 +144,14 @@ fn default_proxy_bin() -> String {
     } else {
         "zlauder-proxy".to_string()
     }
+}
+
+#[derive(Subcommand)]
+enum SecretsAction {
+    /// Show the readiness gate + resolved/required counts + any unresolved (default).
+    Status,
+    /// List each registered secret: name, operator, scheme, resolved — never values.
+    List,
 }
 
 #[derive(Subcommand)]
@@ -251,6 +265,7 @@ fn main() -> Result<()> {
         Cmd::Config { action } => config_cmd(cli.port, action),
         Cmd::Reveal { token } => reveal(cli.port, token),
         Cmd::Monitor => monitor_cmd(cli.port),
+        Cmd::Secrets { action } => secrets_cmd(cli.port, action),
         Cmd::Scrub {
             transcript,
             values,
@@ -990,24 +1005,42 @@ fn render_on(s: &Snapshot, port: u16, mode: SlMode) -> String {
         SlMode::Off => String::new(),
         SlMode::Min => "\u{1f6e1}".to_string(), // 🛡 only
         SlMode::Compact => format!(
-            "\u{1f6e1} :{port} {}{}{}",
+            "\u{1f6e1} :{port} {}{}{}{}",
             s.config.profile,
             ml,
-            pii_suffix(s.token_count)
+            pii_suffix(s.token_count),
+            key_suffix(s.secrets.as_ref())
         ),
         SlMode::Verbose => format!(
-            "\u{1f6e1} ON :{port} {} t={:.2}{} {} PII [{}]",
+            "\u{1f6e1} ON :{port} {} t={:.2}{} {} PII [{}]{}",
             s.config.profile,
             s.config.score_threshold,
             ml,
             s.token_count,
-            s.config.enabled_categories.join(",")
+            s.config.enabled_categories.join(","),
+            key_suffix(s.secrets.as_ref())
         ),
     }
 }
 
 /// `" 7 PII"` once anything has been caught; empty until then (keeps a fresh session's
 /// line tight rather than reading `0 PII`).
+/// ` 🔑N/M` when registered secrets exist (M>0); `🔑⚠N/M` when the gate is held
+/// (a required secret unresolved). Empty when none configured (no visual noise for
+/// no-secret projects).
+fn key_suffix(secrets: Option<&SecretsSummary>) -> String {
+    match secrets {
+        Some(s) if s.total > 0 => {
+            if s.ready {
+                format!(" \u{1f511}{}/{}", s.resolved, s.total)
+            } else {
+                format!(" \u{1f511}\u{26a0}{}/{}", s.resolved, s.total)
+            }
+        }
+        _ => String::new(),
+    }
+}
+
 fn pii_suffix(n: u64) -> String {
     if n == 0 {
         String::new()
@@ -1544,6 +1577,57 @@ fn monitor_cmd(port: Option<u16>) -> Result<()> {
     Ok(())
 }
 
+/// `/zlauder:secrets` — read-only view of the registered-secret gate + status. Pulls
+/// the value-free `secrets` block from the proxy snapshot. (Registration is by
+/// reference in `[[secrets]]`; secret VALUES never transit this command.)
+fn secrets_cmd(port: Option<u16>, action: Option<SecretsAction>) -> Result<()> {
+    let root = canonical(&project_root());
+    let port = port.unwrap_or_else(|| pick_port(&root));
+    let snap = live_snapshot(port).context("reading secrets status (is the proxy running?)")?;
+    let secrets = snap.get("secrets").cloned().unwrap_or(Value::Null);
+    let ready = secrets.get("ready").and_then(Value::as_bool).unwrap_or(true);
+    let total = secrets.get("total").and_then(Value::as_u64).unwrap_or(0);
+    let resolved = secrets.get("resolved").and_then(Value::as_u64).unwrap_or(0);
+    let required = secrets.get("required").and_then(Value::as_u64).unwrap_or(0);
+    let empty: Vec<Value> = Vec::new();
+    let entries = secrets
+        .get("entries")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+
+    match action.unwrap_or(SecretsAction::Status) {
+        SecretsAction::Status => {
+            let gate = if ready {
+                "open"
+            } else {
+                "HELD (required secret unresolved — LLM intake 503)"
+            };
+            println!("secrets: {resolved}/{total} resolved, {required} required — intake {gate}");
+            for e in entries {
+                if !e.get("resolved").and_then(Value::as_bool).unwrap_or(false) {
+                    let name = e.get("name").and_then(Value::as_str).unwrap_or("?");
+                    let err = e.get("error").and_then(Value::as_str).unwrap_or("");
+                    println!("  ✗ {name}: {err}");
+                }
+            }
+        }
+        SecretsAction::List => {
+            if entries.is_empty() {
+                println!("(no registered secrets)");
+            }
+            for e in entries {
+                let name = e.get("name").and_then(Value::as_str).unwrap_or("?");
+                let op = e.get("operator").and_then(Value::as_str).unwrap_or("?");
+                let scheme = e.get("scheme").and_then(Value::as_str).unwrap_or("?");
+                let ok = e.get("resolved").and_then(Value::as_bool).unwrap_or(false);
+                let mark = if ok { "✓" } else { "✗" };
+                println!("{mark} {name}  [{op}]  {scheme}");
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // admin HTTP helpers
 // ---------------------------------------------------------------------------
@@ -1758,6 +1842,21 @@ struct Snapshot {
     /// Optional ML runtime block (absent on older proxies).
     #[serde(default)]
     ml: Option<MlSnap>,
+    /// Optional registered-secret summary (absent on older proxies). Counts only —
+    /// never values.
+    #[serde(default)]
+    secrets: Option<SecretsSummary>,
+}
+
+/// The proxy's `secrets` block, counts only.
+#[derive(serde::Deserialize)]
+struct SecretsSummary {
+    #[serde(default)]
+    ready: bool,
+    #[serde(default)]
+    total: u64,
+    #[serde(default)]
+    resolved: u64,
 }
 
 #[derive(serde::Deserialize)]

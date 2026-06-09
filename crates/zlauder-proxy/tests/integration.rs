@@ -34,6 +34,10 @@ fn mk_state(engine: MaskEngine, upstream_base: String, admin_key: &str) -> AppSt
         monitor: Monitor::new(),
         ml_control: Arc::new(std::sync::Mutex::new(())),
         config_control: Arc::new(std::sync::Mutex::new(())),
+        secrets_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        secrets_status: Arc::new(std::sync::RwLock::new(
+            zlauder_proxy::secrets::SecretsStatus::default(),
+        )),
     }
 }
 
@@ -1121,6 +1125,10 @@ fn mk_state_in(
         monitor: Monitor::new(),
         ml_control: Arc::new(std::sync::Mutex::new(())),
         config_control: Arc::new(std::sync::Mutex::new(())),
+        secrets_ready: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        secrets_status: Arc::new(std::sync::RwLock::new(
+            zlauder_proxy::secrets::SecretsStatus::default(),
+        )),
     }
 }
 
