@@ -259,10 +259,16 @@ fn resolve_one(spec: &ZdrTargetSpec) -> Result<ZdrTarget, String> {
         None => ZdrKey(String::new()),
     };
     reject_subscription_shaped(key.as_str())?;
-    let host = host_of(&spec.base_url)?;
+    // Defense-in-depth: a credential pasted into a (benign-named) extra header is
+    // still a credential. Refuse an OAuth/subscription-shaped value in ANY header.
+    // (Auth-bearing header NAMES are rejected earlier, at config validation.)
+    for (hk, hv) in &spec.extra_headers {
+        reject_subscription_shaped(hv).map_err(|e| format!("extra_headers['{hk}'] {e}"))?;
+    }
+    let (base_url, host) = parse_base_url(&spec.base_url)?;
     Ok(ZdrTarget {
         name: spec.name.clone(),
-        base_url: spec.base_url.trim().trim_end_matches('/').to_string(),
+        base_url,
         host,
         trust_basis,
         user_verified: spec.user_verified,
@@ -288,8 +294,13 @@ fn reject_subscription_shaped(key: &str) -> Result<(), String> {
         return Ok(());
     }
     let lower = k.to_ascii_lowercase();
-    if lower.starts_with("sk-ant-oat") || lower.starts_with("bearer ") || lower.starts_with("oauth")
-    {
+    // Anthropic OAuth subscription access token.
+    let oat = lower.starts_with("sk-ant-oat");
+    // A `Bearer <tok>` / `OAuth …` paste — tolerant of ANY ASCII whitespace after the
+    // scheme word (a literal-space prefix check missed `Bearer\t…`).
+    let scheme = lower.split_ascii_whitespace().next().unwrap_or("");
+    let bearer = scheme == "bearer" || scheme == "oauth";
+    if oat || bearer {
         return Err("credential looks like a subscription / OAuth token (sk-ant-oat… / Bearer …). \
                     A ZDR key MUST be a non-subscription API key — using an OAuth subscription \
                     token in a third-party tool violates Anthropic's ToS. Refusing to register \
@@ -299,18 +310,42 @@ fn reject_subscription_shaped(key: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Host (+ port) portion of a base URL, for the rewritten `Host` header. Mirrors
-/// `AppState::upstream_host`'s parsing so we add no `url` dependency.
-fn host_of(base: &str) -> Result<String, String> {
-    let after = base
-        .trim()
-        .trim_start_matches("https://")
-        .trim_start_matches("http://");
-    let host = after.split('/').next().unwrap_or("").trim();
-    if host.is_empty() {
-        return Err(format!("base_url '{base}' has no host"));
+/// Validate and split a ZDR `base_url` into `(canonical_base, host[:port])`. Uses a
+/// real URL parser (not the lenient scheme-strip) so an ambiguous or hostile URL is
+/// rejected at startup rather than silently routed somewhere unexpected:
+///   - require an `http`/`https` scheme (a schemeless `localhost:8080` is refused);
+///   - reject **userinfo** (`user:pass@host`) — `https://verified.example@evil.example`
+///     routes to `evil.example`, NOT the reassuring name before the `@`, so it is a
+///     spoofing footgun and a credential-in-URL smell. Refuse it outright;
+///   - require a host.
+/// The canonical base preserves the user's `scheme://host[:port][/path]` minus a
+/// trailing slash (so `base + "/v1/messages"` is well-formed).
+fn parse_base_url(base: &str) -> Result<(String, String), String> {
+    let trimmed = base.trim();
+    let u = url::Url::parse(trimmed)
+        .map_err(|e| format!("base_url '{base}' is not a valid URL: {e}"))?;
+    match u.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Err(format!(
+                "base_url '{base}' must use http/https (got scheme '{other}')"
+            ));
+        }
     }
-    Ok(host.to_string())
+    if !u.username().is_empty() || u.password().is_some() {
+        return Err(format!(
+            "base_url '{base}' must not embed userinfo (user:pass@host) — it would route to the \
+             host AFTER the '@', not the name before it. Refusing."
+        ));
+    }
+    let host = u
+        .host_str()
+        .ok_or_else(|| format!("base_url '{base}' has no host"))?;
+    let host_port = match u.port() {
+        Some(p) => format!("{host}:{p}"),
+        None => host.to_string(),
+    };
+    Ok((trimmed.trim_end_matches('/').to_string(), host_port))
 }
 
 #[cfg(test)]
@@ -330,21 +365,38 @@ mod tests {
     }
 
     #[test]
-    fn host_parsing() {
-        assert_eq!(host_of("http://127.0.0.1:8080").unwrap(), "127.0.0.1:8080");
+    fn base_url_parsing() {
         assert_eq!(
-            host_of("https://bedrock.us-east-1.amazonaws.com/x").unwrap(),
-            "bedrock.us-east-1.amazonaws.com"
+            parse_base_url("http://127.0.0.1:8080").unwrap(),
+            ("http://127.0.0.1:8080".into(), "127.0.0.1:8080".into())
         );
-        assert!(host_of("http://").is_err());
+        assert_eq!(
+            parse_base_url("https://bedrock.us-east-1.amazonaws.com/x/").unwrap(),
+            (
+                "https://bedrock.us-east-1.amazonaws.com/x".into(),
+                "bedrock.us-east-1.amazonaws.com".into()
+            )
+        );
+        // No host, non-http scheme, and schemeless are all refused.
+        assert!(parse_base_url("http://").is_err());
+        assert!(parse_base_url("ftp://host").is_err());
+        assert!(parse_base_url("localhost:8080").is_err());
+        // Userinfo spoofing is refused (would route to evil.example).
+        assert!(parse_base_url("https://verified.example@evil.example").is_err());
+        assert!(parse_base_url("https://u:p@host.example").is_err());
     }
 
     #[test]
     fn oauth_shaped_credential_is_rejected() {
         assert!(reject_subscription_shaped("sk-ant-oat01-abc").is_err());
         assert!(reject_subscription_shaped("Bearer sk-ant-oat01-abc").is_err());
-        // A real API key shape and an empty (no-auth) credential pass.
+        // Whitespace-tolerant: a tab after the scheme is still a bearer paste.
+        assert!(reject_subscription_shaped("Bearer\tsk-ant-api03-abc").is_err());
+        assert!(reject_subscription_shaped("  oauth   tok").is_err());
+        // A real API key shape and an empty (no-auth) credential pass; a token that
+        // merely starts with the letters "bearer" (no whitespace) is not a paste.
         assert!(reject_subscription_shaped("sk-ant-api03-abc").is_ok());
+        assert!(reject_subscription_shaped("bearertoken-not-a-scheme").is_ok());
         assert!(reject_subscription_shaped("").is_ok());
     }
 
@@ -391,6 +443,22 @@ mod tests {
         assert!(resolved.default.is_none(), "dangling default dropped");
         assert!(resolved.errors.iter().any(|e| e.contains("ToS")));
         unsafe { std::env::remove_var("ZDR_TEST_KEY_OAUTH") };
+    }
+
+    #[test]
+    fn oauth_value_in_benign_header_is_rejected_at_resolution() {
+        // A benign-named header (config validator wouldn't flag the NAME) carrying an
+        // OAuth-shaped VALUE must still be refused at resolution (defense-in-depth).
+        let mut s = spec("box", "http://127.0.0.1:8080", None);
+        s.extra_headers
+            .insert("x-custom".into(), "Bearer sk-ant-oat01-subscription".into());
+        let section = ZdrSection {
+            default: None,
+            target: vec![s],
+        };
+        let resolved = resolve_targets(&section);
+        assert!(!resolved.targets.contains_key("box"));
+        assert!(resolved.errors.iter().any(|e| e.contains("extra_headers")));
     }
 
     #[test]

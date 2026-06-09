@@ -59,8 +59,11 @@ pub struct ZdrSection {
 
 /// A ZDR routing destination REFERENCE. The credential is env-sourced
 /// (`from_env`); the scope invariant ([`validate_no_inline_zdr_creds`]) forbids an
-/// inline key value in a config file.
+/// inline key value in a config file. `deny_unknown_fields` makes any stray key a
+/// hard load error (so a capitalized/typo'd `Key`/`API_KEY` can't sit silently in a
+/// security-sensitive section), complementing the pre-parse scope check.
 #[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
 pub struct ZdrTargetSpec {
     pub name: String,
     /// Upstream base URL (e.g. `http://127.0.0.1:8080`, a Bedrock anthropic endpoint).
@@ -235,9 +238,11 @@ pub fn load(project: Option<&Path>) -> anyhow::Result<LoadedConfig> {
 /// can't change under a live socket.
 pub fn reload_engine(layers: &ConfigLayers) -> anyhow::Result<EngineConfig> {
     let merged = merged_value(layers)?;
-    // Re-enforce the scope invariant on reload — a value added to `[[secrets]]` after
-    // startup must be rejected here too, not just at load (defense consistency).
+    // Re-enforce the scope invariant on reload — a value added to `[[secrets]]` or
+    // `[[zdr.target]]` after startup must be rejected here too, not just at load
+    // (defense consistency: the on-disk effective config must never hold a value).
     validate_no_inline_secret_values(&merged)?;
+    validate_no_inline_zdr_creds(&merged)?;
     let file: FileConfig = merged.clone().try_into()?;
     let mut engine = file.engine;
     engine.allow_list = build_allow_list(Some(&merged))?;
@@ -250,6 +255,7 @@ pub fn reload_engine(layers: &ConfigLayers) -> anyhow::Result<EngineConfig> {
 pub fn reload_broker_allows(layers: &ConfigLayers) -> anyhow::Result<Vec<BrokerAllowSpec>> {
     let merged = merged_value(layers)?;
     validate_no_inline_secret_values(&merged)?;
+    validate_no_inline_zdr_creds(&merged)?;
     let file: FileConfig = merged.try_into()?;
     Ok(file.broker.allow)
 }
@@ -291,15 +297,44 @@ fn validate_no_inline_zdr_creds(merged: &toml::Value) -> anyhow::Result<()> {
     else {
         return Ok(());
     };
+    // Auth-bearing header names that must never appear in `extra_headers` — the
+    // proxy injects ZDR auth from the `from_env` credential, so a header carrying
+    // auth in the config file is exactly the env-only channel being circumvented.
+    const AUTH_HEADERS: &[&str] = &[
+        "authorization",
+        "proxy-authorization",
+        "x-api-key",
+        "api-key",
+        "apikey",
+        "cookie",
+        "x-goog-api-key",
+        "x-amz-security-token",
+    ];
+    const FORBIDDEN: &[&str] = &["key", "api_key", "apikey", "auth", "token", "secret", "value"];
     for (i, item) in arr.iter().enumerate() {
         if let Some(tbl) = item.as_table() {
-            for forbidden in ["key", "api_key", "apikey", "auth", "token", "secret", "value"] {
-                if tbl.contains_key(forbidden) {
+            for (k, _) in tbl {
+                // Case-insensitive: TOML keys are case-sensitive, so `Key`/`API_KEY`
+                // would otherwise evade a literal lowercase match.
+                if FORBIDDEN.contains(&k.to_ascii_lowercase().as_str()) {
                     anyhow::bail!(
-                        "zlauder config: zdr.target[{i}] has a `{forbidden}` key — a ZDR \
-                         credential VALUE must never live in a config file. Use `from_env` to \
-                         reference an environment variable holding the key."
+                        "zlauder config: zdr.target[{i}] has a `{k}` key — a ZDR credential VALUE \
+                         must never live in a config file. Use `from_env` to reference an \
+                         environment variable holding the key."
                     );
+                }
+            }
+            // A credential smuggled through `extra_headers` (an auth-bearing header
+            // value) is the same invariant breach by another door — reject it.
+            if let Some(hdrs) = tbl.get("extra_headers").and_then(toml::Value::as_table) {
+                for hk in hdrs.keys() {
+                    if AUTH_HEADERS.contains(&hk.to_ascii_lowercase().as_str()) {
+                        anyhow::bail!(
+                            "zlauder config: zdr.target[{i}].extra_headers has an auth-bearing \
+                             header `{hk}` — a ZDR credential must never live in a config file. \
+                             The proxy injects ZDR auth from the `from_env` credential; remove it."
+                        );
+                    }
                 }
             }
         }
@@ -700,6 +735,31 @@ mod tests {
                 err.to_string().contains("never live in a config file"),
                 "got: {err}"
             ),
+        }
+
+        unsafe { std::env::remove_var("ZLAUDER_USER_CONFIG") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_auth_bearing_zdr_extra_header() {
+        let dir = std::env::temp_dir().join(format!("zlauder-zdrhdr-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let project = dir.join("zlauder.toml");
+        // A credential smuggled through extra_headers must be refused (the value
+        // would otherwise flow to egress, circumventing the env-only channel).
+        std::fs::write(
+            &project,
+            "[[zdr.target]]\nname = \"box\"\nbase_url = \"http://127.0.0.1:8080\"\n\
+             [zdr.target.extra_headers]\nAuthorization = \"Bearer sk-ant-api03-nope\"\n",
+        )
+        .unwrap();
+        // SAFETY: single-threaded unit test.
+        unsafe { std::env::set_var("ZLAUDER_USER_CONFIG", "/nonexistent/zlauder/config.toml") };
+
+        match load(Some(&project)) {
+            Ok(_) => panic!("auth-bearing extra_header must be rejected"),
+            Err(err) => assert!(err.to_string().contains("auth-bearing header"), "got: {err}"),
         }
 
         unsafe { std::env::remove_var("ZLAUDER_USER_CONFIG") };
