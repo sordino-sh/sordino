@@ -6,6 +6,7 @@
 //! be renamed or removed; additive fields are safe.
 
 use serde::{Deserialize, Serialize};
+use zlauder_engine::ManifestEntry;
 
 /// Monitor operating mode. Decides whether requests are held for approval.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize)]
@@ -66,14 +67,32 @@ impl RequestDecision {
 }
 
 /// One masked token occurrence, with its hidden plaintext (local UI only).
+///
+/// Carries the same `class` / `peekable` redaction seam as [`TokenLedgerEntry`]:
+/// this is the OTHER value-bearing surface (it rides every `RequestRecord` and the
+/// per-record SSE frame, and the UI's live ledger augmentation reads it), so it must
+/// honor the same gate or a future secret-class value would leak here even though the
+/// ledger withholds it. Today all tokens are [`TokenClass::AutoPii`] ⇒ peekable.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct TokenPreview {
     pub token: String,
+    /// Canonical plaintext, or empty when `!peekable`.
     pub value: String,
     pub entity_kind: String,
     pub surface: String,
     pub request_start: Option<usize>,
     pub request_end: Option<usize>,
+    #[serde(default = "default_token_class")]
+    pub class: TokenClass,
+    #[serde(default = "default_peekable")]
+    pub peekable: bool,
+}
+
+fn default_token_class() -> TokenClass {
+    TokenClass::AutoPii
+}
+fn default_peekable() -> bool {
+    true
 }
 
 /// A legacy byte-offset span over a preview string, used only for the raw
@@ -241,6 +260,16 @@ impl TokenClass {
     /// in the snapshot. Secret classes (guard/broker) are never peekable.
     pub fn is_peekable(self) -> bool {
         matches!(self, TokenClass::AutoPii | TokenClass::Custom)
+    }
+
+    /// THE single classification point for both value-bearing surfaces — the durable
+    /// ledger ([`TokenLedgerEntry`]) and per-record token previews ([`TokenPreview`]).
+    /// Today every masked token is detector/keyword PII ⇒ [`TokenClass::AutoPii`].
+    /// When the secrets engine tags manifest entries with a source, switch on it here
+    /// (and nowhere else) to return `Guard`/`Broker`; `is_peekable()` then suppresses
+    /// peek + plaintext transport on BOTH surfaces at once.
+    pub fn for_manifest_entry(_e: &ManifestEntry) -> TokenClass {
+        TokenClass::AutoPii
     }
 }
 

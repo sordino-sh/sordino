@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use zlauder_engine::UnmaskManifest;
 
-use super::model::{PreviewSpan, TokenPreview};
+use super::model::{PreviewSpan, TokenClass, TokenPreview};
 
 pub(crate) const PREVIEW_LIMIT: usize = 128 * 1024;
 
@@ -19,13 +19,26 @@ pub(crate) fn token_previews(manifest: &UnmaskManifest) -> Vec<TokenPreview> {
     manifest
         .entries
         .iter()
-        .map(|e| TokenPreview {
-            token: e.token_handle.clone(),
-            value: e.canonical_form.clone(),
-            entity_kind: e.entity_kind.clone(),
-            surface: format!("{:?}", e.arrow_origin),
-            request_start: e.exposed_at.as_ref().map(|r| r.start),
-            request_end: e.exposed_at.as_ref().map(|r| r.end),
+        .map(|e| {
+            // Mirror the ledger's structural redaction: withhold plaintext for a
+            // non-peekable (secret-class) token so it never rides a record/SSE frame.
+            // Today everything is AutoPii ⇒ peekable, so this is a no-op now.
+            let class = TokenClass::for_manifest_entry(e);
+            let peekable = class.is_peekable();
+            TokenPreview {
+                token: e.token_handle.clone(),
+                value: if peekable {
+                    e.canonical_form.clone()
+                } else {
+                    String::new()
+                },
+                entity_kind: e.entity_kind.clone(),
+                surface: format!("{:?}", e.arrow_origin),
+                request_start: e.exposed_at.as_ref().map(|r| r.start),
+                request_end: e.exposed_at.as_ref().map(|r| r.end),
+                class,
+                peekable,
+            }
         })
         .collect()
 }

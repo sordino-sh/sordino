@@ -345,6 +345,8 @@ mod tests {
             surface: "UserMessage".to_string(),
             request_start: None,
             request_end: None,
+            class: crate::monitor::model::TokenClass::AutoPii,
+            peekable: true,
         }
     }
 

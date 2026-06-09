@@ -1061,7 +1061,10 @@ es.onmessage = e => {
     // count_tokens still lands on the next snapshot (that path emits no SSE frame).
     for (const t of (rec.tokens || [])) {
       if (!sessionTokens.some(s => s.token === t.token)) {
-        sessionTokens.push({ token: t.token, value: t.value, entity_kind: t.entity_kind, class: 'auto_pii', peekable: true, count: 1 });
+        // Honor the server's redaction seam: a non-peekable (secret-class) token
+        // carries no plaintext and must not become peekable in the live ledger.
+        const peekable = t.peekable !== false;
+        sessionTokens.push({ token: t.token, value: peekable ? t.value : '', entity_kind: t.entity_kind, class: t.class || 'auto_pii', peekable, count: 1 });
       }
     }
     // Bound the client ledger like the server (oldest-first; live appends are newest).

@@ -537,7 +537,7 @@ fn ingest_tokens_into(inner: &mut Inner, manifest: &UnmaskManifest, now: u128) {
             existing.count = existing.count.saturating_add(1);
             continue;
         }
-        let class = TokenClass::AutoPii;
+        let class = TokenClass::for_manifest_entry(e);
         let peekable = class.is_peekable();
         let value = if peekable {
             e.canonical_form.clone()

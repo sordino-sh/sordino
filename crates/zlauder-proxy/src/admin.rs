@@ -417,6 +417,13 @@ fn set_enabled(st: &AppState, hdrs: &HeaderMap, on: bool) -> Response {
     if !st.authed(hdrs) {
         return forbidden();
     }
+    // The master switch is config state, so it must compose under `config_control`
+    // like every other control-plane writer. Without the lock, a concurrent
+    // `reload`/`put`/`profile` (which snapshot `enabled`, then `set_config` the whole
+    // config) can read the pre-toggle value and write it back AFTER this toggle —
+    // silently losing the operator's intent (e.g. re-disabling masking right after an
+    // explicit enable, leaking PII). Held only across the sync toggle + snapshot.
+    let _cfg_guard = st.config_control.lock().expect("config_control mutex poisoned");
     st.engine.set_enabled(on);
     json_ok(&snapshot(st))
 }
