@@ -297,18 +297,31 @@ fn validate_no_inline_zdr_creds(merged: &toml::Value) -> anyhow::Result<()> {
     else {
         return Ok(());
     };
-    // Auth-bearing header names that must never appear in `extra_headers` — the
-    // proxy injects ZDR auth from the `from_env` credential, so a header carrying
-    // auth in the config file is exactly the env-only channel being circumvented.
-    const AUTH_HEADERS: &[&str] = &[
-        "authorization",
-        "proxy-authorization",
-        "x-api-key",
+    // Credential-bearing header names that must never appear in `extra_headers` — the
+    // proxy injects ZDR auth from the `from_env` credential, so a header carrying a
+    // credential in the config file is exactly the env-only channel being
+    // circumvented. SUBSTRING keywords (not an exact denylist) so vendor variants
+    // (`x-auth-token`, `x-access-token`, `x-amz-security-token`, `x-goog-api-key`, …)
+    // are all caught without enumerating every one — and an arbitrary (non-OAuth-
+    // shaped) API key under such a name is refused here even though the value-shape
+    // guard wouldn't flag it. `api-key`/`apikey`/`api_key` (not a bare `key`) avoids
+    // false-positives on benign headers like `x-idempotency-key`.
+    const AUTH_KEYWORDS: &[&str] = &[
+        "auth",
+        "token",
+        "secret",
+        "credential",
+        "cookie",
+        "bearer",
+        "password",
+        "passwd",
+        "signature",
+        "hmac",
         "api-key",
         "apikey",
-        "cookie",
-        "x-goog-api-key",
-        "x-amz-security-token",
+        "api_key",
+        "access-key",
+        "x-amz-security",
     ];
     const FORBIDDEN: &[&str] = &["key", "api_key", "apikey", "auth", "token", "secret", "value"];
     for (i, item) in arr.iter().enumerate() {
@@ -328,9 +341,10 @@ fn validate_no_inline_zdr_creds(merged: &toml::Value) -> anyhow::Result<()> {
             // value) is the same invariant breach by another door — reject it.
             if let Some(hdrs) = tbl.get("extra_headers").and_then(toml::Value::as_table) {
                 for hk in hdrs.keys() {
-                    if AUTH_HEADERS.contains(&hk.to_ascii_lowercase().as_str()) {
+                    let lk = hk.to_ascii_lowercase();
+                    if AUTH_KEYWORDS.iter().any(|kw| lk.contains(kw)) {
                         anyhow::bail!(
-                            "zlauder config: zdr.target[{i}].extra_headers has an auth-bearing \
+                            "zlauder config: zdr.target[{i}].extra_headers has a credential-bearing \
                              header `{hk}` — a ZDR credential must never live in a config file. \
                              The proxy injects ZDR auth from the `from_env` credential; remove it."
                         );
@@ -759,7 +773,39 @@ mod tests {
 
         match load(Some(&project)) {
             Ok(_) => panic!("auth-bearing extra_header must be rejected"),
-            Err(err) => assert!(err.to_string().contains("auth-bearing header"), "got: {err}"),
+            Err(err) => assert!(
+                err.to_string().contains("credential-bearing header"),
+                "got: {err}"
+            ),
+        }
+
+        unsafe { std::env::remove_var("ZLAUDER_USER_CONFIG") };
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rejects_keyword_named_zdr_extra_header_even_with_plain_value() {
+        let dir = std::env::temp_dir().join(format!("zlauder-zdrkw-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let project = dir.join("zlauder.toml");
+        // `x-access-token` is in no exact denylist, and its value is NOT OAuth-shaped,
+        // so only the substring-keyword NAME match catches it. Without that, an
+        // arbitrary API key would slip both layers.
+        std::fs::write(
+            &project,
+            "[[zdr.target]]\nname = \"box\"\nbase_url = \"http://127.0.0.1:8080\"\n\
+             [zdr.target.extra_headers]\nx-access-token = \"opaque-api-key-not-oauth\"\n",
+        )
+        .unwrap();
+        // SAFETY: single-threaded unit test.
+        unsafe { std::env::set_var("ZLAUDER_USER_CONFIG", "/nonexistent/zlauder/config.toml") };
+
+        match load(Some(&project)) {
+            Ok(_) => panic!("keyword-named credential header must be rejected"),
+            Err(err) => assert!(
+                err.to_string().contains("credential-bearing header"),
+                "got: {err}"
+            ),
         }
 
         unsafe { std::env::remove_var("ZLAUDER_USER_CONFIG") };

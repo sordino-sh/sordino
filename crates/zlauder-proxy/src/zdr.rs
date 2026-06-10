@@ -322,30 +322,60 @@ fn reject_subscription_shaped(key: &str) -> Result<(), String> {
 /// trailing slash (so `base + "/v1/messages"` is well-formed).
 fn parse_base_url(base: &str) -> Result<(String, String), String> {
     let trimmed = base.trim();
+    // Redacted form for ANY error/log line — never echo a credential, even when we
+    // are rejecting the URL precisely BECAUSE it embeds one (these errors are logged
+    // by `main.rs`, so an unredacted `user:secret@host` would land in the logs).
+    let shown = redact_userinfo(trimmed);
     let u = url::Url::parse(trimmed)
-        .map_err(|e| format!("base_url '{base}' is not a valid URL: {e}"))?;
+        .map_err(|e| format!("base_url '{shown}' is not a valid URL: {e}"))?;
     match u.scheme() {
         "http" | "https" => {}
         other => {
             return Err(format!(
-                "base_url '{base}' must use http/https (got scheme '{other}')"
+                "base_url '{shown}' must use http/https (got scheme '{other}')"
             ));
         }
     }
     if !u.username().is_empty() || u.password().is_some() {
-        return Err(format!(
-            "base_url '{base}' must not embed userinfo (user:pass@host) — it would route to the \
-             host AFTER the '@', not the name before it. Refusing."
-        ));
+        // Emit NO URL here — it carries a credential by definition.
+        return Err("base_url must not embed userinfo (user:pass@host) — it would route to the \
+             host AFTER the '@', not the name before it. Refusing (URL withheld: it carries a \
+             credential)."
+            .to_string());
     }
-    let host = u
-        .host_str()
-        .ok_or_else(|| format!("base_url '{base}' has no host"))?;
+    // Host[:port], bracketing IPv6 literals so the Host header is well-formed
+    // (`[::1]:8080`, not `::1:8080`).
+    let host = match u.host().ok_or_else(|| format!("base_url '{shown}' has no host"))? {
+        url::Host::Domain(d) => d.to_string(),
+        url::Host::Ipv4(ip) => ip.to_string(),
+        url::Host::Ipv6(ip) => format!("[{ip}]"),
+    };
     let host_port = match u.port() {
         Some(p) => format!("{host}:{p}"),
-        None => host.to_string(),
+        None => host,
     };
     Ok((trimmed.trim_end_matches('/').to_string(), host_port))
+}
+
+/// Strip any `user:pass@` userinfo from a URL string before it is echoed in an
+/// error/log line — a credential must never reach the logs even when the URL is
+/// being rejected for containing one.
+fn redact_userinfo(url: &str) -> String {
+    if let Some(scheme_end) = url.find("://") {
+        let after = scheme_end + 3;
+        let authority_end = url[after..]
+            .find('/')
+            .map(|i| after + i)
+            .unwrap_or(url.len());
+        // The userinfo/host delimiter is the LAST `@` in the authority (a password
+        // may itself contain a literal `@`, as `url::Url` parses it) — redacting at
+        // the FIRST `@` would leave the password suffix exposed in the log line.
+        if let Some(at_rel) = url[after..authority_end].rfind('@') {
+            let at = after + at_rel;
+            return format!("{}***@{}", &url[..after], &url[at + 1..]);
+        }
+    }
+    url.to_string()
 }
 
 #[cfg(test)]
@@ -384,6 +414,36 @@ mod tests {
         // Userinfo spoofing is refused (would route to evil.example).
         assert!(parse_base_url("https://verified.example@evil.example").is_err());
         assert!(parse_base_url("https://u:p@host.example").is_err());
+        // IPv6 literals are bracketed for a well-formed Host header.
+        assert_eq!(
+            parse_base_url("http://[::1]:8080").unwrap().1,
+            "[::1]:8080"
+        );
+        assert_eq!(parse_base_url("http://[::1]").unwrap().1, "[::1]");
+    }
+
+    #[test]
+    fn userinfo_rejection_does_not_echo_credential() {
+        let err = parse_base_url("https://user:supersecret@evil.example").unwrap_err();
+        assert!(
+            !err.contains("supersecret"),
+            "rejection must not echo the credential: {err}"
+        );
+    }
+
+    #[test]
+    fn redact_userinfo_strips_creds() {
+        assert_eq!(redact_userinfo("https://u:p@host/x"), "https://***@host/x");
+        assert_eq!(redact_userinfo("https://host/x"), "https://host/x");
+        assert_eq!(redact_userinfo("http://a:b@h"), "http://***@h");
+        // A password containing a literal `@`: redact through the LAST authority `@`
+        // (the userinfo/host delimiter) so no password suffix survives.
+        assert_eq!(
+            redact_userinfo("ftp://user:p@ss@host/x"),
+            "ftp://***@host/x"
+        );
+        // `@` only in the path is not userinfo — left untouched.
+        assert_eq!(redact_userinfo("https://host/a@b"), "https://host/a@b");
     }
 
     #[test]
