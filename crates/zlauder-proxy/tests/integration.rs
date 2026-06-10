@@ -13,7 +13,11 @@ use axum::routing::post;
 use http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
 use zlauder_engine::{EngineConfig, MaskEngine, token_regex};
 use zlauder_proxy::{
-    config::ConfigLayers, monitor::Monitor, routes::router as proxy_router, state::AppState,
+    config::ConfigLayers,
+    monitor::Monitor,
+    routes::router as proxy_router,
+    state::AppState,
+    zdr::{TrustBasis, ZdrTarget},
 };
 
 /// Build an `AppState` for tests (no real config files; reload points at a
@@ -1601,4 +1605,312 @@ async fn reveal_then_remask_keyphrase_roundtrip() {
     assert_eq!(unauth.status(), reqwest::StatusCode::FORBIDDEN);
 
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---- ZDR (Trust switch) routing — chunk 2 ------------------------------------
+
+/// Build a test state with a single registered ZDR target as the `[zdr]` default.
+fn zdr_state(engine: MaskEngine, default_base: String, target: ZdrTarget) -> AppState {
+    let mut s = mk_state(engine, default_base, "test-key");
+    let name = target.name.clone();
+    let mut map = std::collections::HashMap::new();
+    map.insert(name.clone(), Arc::new(target));
+    s.zdr_targets = Arc::new(map);
+    s.zdr_default = Arc::new(Some(name));
+    s
+}
+
+// A ZDR-active conversation routes to the verified target bearing the injected ZDR
+// key — NOT the client's subscription token — and the default upstream is never hit.
+// Masking still fully applies (routing-only): the ZDR upstream sees only a token.
+#[tokio::test]
+async fn zdr_session_routes_to_target_with_zdr_key_not_subscription() {
+    let zdr_cap = Captured::default();
+    let zdr_up = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(zdr_cap.clone());
+    let zdr_addr = spawn(zdr_up).await;
+
+    let def_cap = Captured::default();
+    let def_up = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(def_cap.clone());
+    let def_addr = spawn(def_up).await;
+
+    let target = ZdrTarget::new(
+        "trusted".into(),
+        &format!("http://{zdr_addr}"),
+        TrustBasis::SelfHosted,
+        true,
+        vec![],
+        "zdr-key-xyz".into(),
+    )
+    .unwrap();
+
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = zdr_state(engine, format!("http://{def_addr}"), target);
+    state.set_zdr_selection("conv1", "trusted");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/zlauder/session/conv1/v1/messages"))
+        // The client's subscription credentials — both must be stripped.
+        .header("authorization", "Bearer sk-ant-oat01-SUBSCRIPTION")
+        .header("x-api-key", "sk-client-key")
+        .header("anthropic-version", "2023-06-01")
+        .json(&serde_json::json!({
+            "model":"claude-test","max_tokens":10,
+            "messages":[{"role":"user","content":[{"type":"text","text":"email dana@example.com"}]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let client_text = resp.text().await.unwrap();
+
+    let zdr_headers = zdr_cap.headers.lock().unwrap().clone();
+    assert_eq!(
+        zdr_headers.get("x-api-key").map(|v| v.to_str().unwrap()),
+        Some("zdr-key-xyz"),
+        "ZDR credential must be injected"
+    );
+    assert!(
+        zdr_headers.get("authorization").is_none(),
+        "subscription token must be stripped, never sent to the ZDR endpoint"
+    );
+    assert_eq!(
+        zdr_headers.get("host").map(|v| v.to_str().unwrap()),
+        Some(zdr_addr.to_string().as_str()),
+        "Host rewritten to the ZDR target"
+    );
+    // Routing-only: masking still applies — the ZDR upstream sees a token, not PII.
+    let zdr_body = zdr_cap.body.lock().unwrap().clone();
+    assert!(
+        !zdr_body.contains("dana@example.com"),
+        "plaintext leaked to ZDR upstream: {zdr_body}"
+    );
+    assert!(zdr_body.contains("[EMAIL_ADDRESS_"));
+    // The default upstream was never contacted.
+    assert!(
+        def_cap.body.lock().unwrap().is_empty(),
+        "default upstream must not be hit while ZDR-active"
+    );
+    // Client got the unmasked response.
+    assert!(client_text.contains("dana@example.com"));
+}
+
+// A selection naming an UNKNOWN target refuses (409) — fail-closed, never silently
+// routed to the default endpoint.
+#[tokio::test]
+async fn zdr_unknown_selection_refuses_fail_closed() {
+    let def_cap = Captured::default();
+    let def_up = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(def_cap.clone());
+    let def_addr = spawn(def_up).await;
+    let target = ZdrTarget::new(
+        "trusted".into(),
+        &format!("http://{def_addr}"),
+        TrustBasis::SelfHosted,
+        true,
+        vec![],
+        "k".into(),
+    )
+    .unwrap();
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = zdr_state(engine, format!("http://{def_addr}"), target);
+    state.set_zdr_selection("conv1", "ghost"); // not in the registry
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/zlauder/session/conv1/v1/messages"))
+        .json(&serde_json::json!({"model":"m","max_tokens":1,"messages":[]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(
+        def_cap.body.lock().unwrap().is_empty(),
+        "fail-closed: nothing dispatched on an unresolvable selection"
+    );
+}
+
+// A selection referencing a non-`user_verified` target refuses (403) — defense in
+// depth beyond the engage-time check.
+#[tokio::test]
+async fn zdr_unverified_target_refuses_fail_closed() {
+    let def_cap = Captured::default();
+    let def_up = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(def_cap.clone());
+    let def_addr = spawn(def_up).await;
+    let target = ZdrTarget::new(
+        "unverified".into(),
+        &format!("http://{def_addr}"),
+        TrustBasis::SelfHosted,
+        false, // not user_verified
+        vec![],
+        "k".into(),
+    )
+    .unwrap();
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = zdr_state(engine, format!("http://{def_addr}"), target);
+    state.set_zdr_selection("conv1", "unverified");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/zlauder/session/conv1/v1/messages"))
+        .json(&serde_json::json!({"model":"m","max_tokens":1,"messages":[]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::FORBIDDEN);
+    assert!(def_cap.body.lock().unwrap().is_empty());
+}
+
+// The OpenAI-compatible endpoints refuse a ZDR-active conversation (501) — the
+// foundation is Anthropic-wire only; never silently route it to Anthropic.
+#[tokio::test]
+async fn zdr_openai_path_refuses() {
+    let def_cap = Captured::default();
+    let def_up = Router::new()
+        .route("/v1/chat/completions", post(fake_openai_chat_upstream))
+        .with_state(def_cap.clone());
+    let def_addr = spawn(def_up).await;
+    let target = ZdrTarget::new(
+        "trusted".into(),
+        &format!("http://{def_addr}"),
+        TrustBasis::SelfHosted,
+        true,
+        vec![],
+        "k".into(),
+    )
+    .unwrap();
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = zdr_state(engine, format!("http://{def_addr}"), target);
+    state.set_zdr_selection("conv1", "trusted");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!(
+            "http://{proxy_addr}/zlauder/session/conv1/v1/chat/completions"
+        ))
+        .json(&serde_json::json!({"model":"gpt","messages":[{"role":"user","content":"hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_IMPLEMENTED);
+    assert!(
+        def_cap.body.lock().unwrap().is_empty(),
+        "must not dispatch when refusing"
+    );
+}
+
+// The control endpoint: engage (verified) warns about the cache break and sets
+// active; GET reflects it; unverified→400, unknown→404; DELETE disengages; all
+// key-gated.
+#[tokio::test]
+async fn zdr_control_endpoint_engage_status_and_refuse() {
+    let def_cap = Captured::default();
+    let def_up = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(def_cap.clone());
+    let def_addr = spawn(def_up).await;
+    let verified = ZdrTarget::new(
+        "trusted".into(),
+        &format!("http://{def_addr}"),
+        TrustBasis::SelfHosted,
+        true,
+        vec![],
+        "k".into(),
+    )
+    .unwrap();
+    let unverified = ZdrTarget::new(
+        "raw".into(),
+        &format!("http://{def_addr}"),
+        TrustBasis::SelfHosted,
+        false,
+        vec![],
+        "k".into(),
+    )
+    .unwrap();
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let mut state = mk_state(engine, format!("http://{def_addr}"), "test-key");
+    let mut map = std::collections::HashMap::new();
+    map.insert("trusted".to_string(), Arc::new(verified));
+    map.insert("raw".to_string(), Arc::new(unverified));
+    state.zdr_targets = Arc::new(map);
+    state.zdr_default = Arc::new(Some("trusted".into()));
+    let proxy_addr = spawn(proxy_router(state)).await;
+    let client = reqwest::Client::new();
+
+    // Key-gated.
+    let unauth = client
+        .post(format!("http://{proxy_addr}/zlauder/session/c/zdr"))
+        .json(&serde_json::json!({"config":"trusted"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // Engage a verified config.
+    let ok = client
+        .post(format!("http://{proxy_addr}/zlauder/session/c/zdr"))
+        .header("x-zlauder-key", "test-key")
+        .json(&serde_json::json!({"config":"trusted"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = ok.json().await.unwrap();
+    assert_eq!(body["active"], serde_json::json!("trusted"));
+    assert!(
+        body["warning"].as_str().unwrap_or("").contains("cache"),
+        "engage must warn about the cache break: {body}"
+    );
+
+    // GET status reflects the active selection.
+    let st = client
+        .get(format!("http://{proxy_addr}/zlauder/session/c/zdr"))
+        .header("x-zlauder-key", "test-key")
+        .send()
+        .await
+        .unwrap();
+    let stj: serde_json::Value = st.json().await.unwrap();
+    assert_eq!(stj["active"], serde_json::json!("trusted"));
+
+    // Engaging an unverified config → 400.
+    let unv = client
+        .post(format!("http://{proxy_addr}/zlauder/session/c2/zdr"))
+        .header("x-zlauder-key", "test-key")
+        .json(&serde_json::json!({"config":"raw"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unv.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    // Engaging an unknown config → 404.
+    let unk = client
+        .post(format!("http://{proxy_addr}/zlauder/session/c3/zdr"))
+        .header("x-zlauder-key", "test-key")
+        .json(&serde_json::json!({"config":"nope"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unk.status(), reqwest::StatusCode::NOT_FOUND);
+
+    // DELETE disengages.
+    let del = client
+        .delete(format!("http://{proxy_addr}/zlauder/session/c/zdr"))
+        .header("x-zlauder-key", "test-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(del.status(), reqwest::StatusCode::OK);
+    let delj: serde_json::Value = del.json().await.unwrap();
+    assert_eq!(delj["active"], serde_json::Value::Null);
+    assert_eq!(delj["disengaged"], serde_json::json!(true));
 }

@@ -27,6 +27,7 @@ pub mod secrets;
 pub mod sse;
 pub mod state;
 pub mod walk;
+pub mod wire_adapter;
 pub mod zdr;
 
 pub use routes::router;

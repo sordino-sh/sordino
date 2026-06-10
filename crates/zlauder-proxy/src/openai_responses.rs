@@ -22,6 +22,7 @@ use zlauder_engine::{
     EngineError, MAX_TOKEN_LEN, MaskEngine, MaskStats, Surface, UnmaskManifest, token_regex,
 };
 
+use crate::zdr::PinnedMode;
 use crate::{headers, monitor, routes, sse, state::AppState, walk};
 
 const MAX_BODY: usize = 64 * 1024 * 1024;
@@ -42,6 +43,20 @@ pub async fn responses_session(
 async fn responses_inner(st: AppState, req: Request, conversation: Option<String>) -> Response {
     if let Some(resp) = routes::secrets_gate(&st) {
         return resp;
+    }
+    // ZDR is Anthropic-wire only in the foundation: refuse a ZDR-active conversation
+    // on the OpenAI-compatible path rather than silently routing it to Anthropic with
+    // the subscription credential (fail-closed; never silent-downgrade).
+    match routes::resolve_pinned_mode(&st, conversation.as_deref()) {
+        Ok(PinnedMode::Normal) => {}
+        Ok(PinnedMode::Zdr(_)) => {
+            return routes::err(
+                StatusCode::NOT_IMPLEMENTED,
+                "ZDR routing is not supported on the OpenAI-compatible endpoints in this build; \
+                 route this conversation via the Anthropic /v1/messages path",
+            );
+        }
+        Err(resp) => return resp,
     }
     let (parts, body) = req.into_parts();
     let body_bytes = match to_bytes(body, MAX_BODY).await {
@@ -67,7 +82,9 @@ async fn responses_inner(st: AppState, req: Request, conversation: Option<String
     }
 
     st.monitor.record_dispatched(&record_id);
-    let resp = match routes::send_upstream(&st, &parts, masked, "/v1/responses").await {
+    let resp = match routes::send_upstream(&st, &parts, masked, "/v1/responses", &PinnedMode::Normal)
+        .await
+    {
         Ok(r) => r,
         Err(resp) => {
             st.monitor

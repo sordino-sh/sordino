@@ -10,6 +10,8 @@ use axum::routing::{get, post};
 use http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
 use zlauder_engine::{RevealAudit, UnmaskManifest};
 
+use crate::wire_adapter::{AnthropicNative, WireAdapter};
+use crate::zdr::PinnedMode;
 use crate::{admin, headers, monitor, openai_chat, openai_responses, sse, state::AppState, walk};
 
 const MAX_BODY: usize = 64 * 1024 * 1024;
@@ -69,6 +71,13 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/zlauder/session/{conversation}/v1/messages",
             post(messages_session),
+        )
+        // Session-scoped count_tokens: a ZDR-active conversation's token-count must
+        // route to the SAME (ZDR) target as its messages — and be masked — so it
+        // can't fall through to the verbatim relay or silently hit Anthropic.
+        .route(
+            "/zlauder/session/{conversation}/v1/messages/count_tokens",
+            post(count_tokens_session),
         )
         .route(
             "/zlauder/session/{conversation}/v1/chat/completions",
@@ -147,10 +156,48 @@ async fn messages_session(
     messages_inner(st, req, Some(conversation)).await
 }
 
+/// Resolve a request's trust posture ONCE at entry, from the **explicit
+/// session-route conversation id** (never the monitor's content-derived id).
+/// Fail-closed taxonomy:
+///   - no conversation / no selection → [`PinnedMode::Normal`] (today's masked path);
+///   - selection present but its target is unknown or not `user_verified` → **refuse**
+///     (never silently downgrade to the default endpoint, never silently engage).
+/// Returns the captured mode by value so a concurrent control-plane change can't
+/// strand an in-flight request — it dispatches against what it captured here.
+pub(crate) fn resolve_pinned_mode(
+    st: &AppState,
+    conversation: Option<&str>,
+) -> Result<PinnedMode, Response> {
+    let Some(conv) = conversation else {
+        return Ok(PinnedMode::Normal);
+    };
+    let Some(sel) = st.zdr_selection(conv) else {
+        return Ok(PinnedMode::Normal);
+    };
+    match st.zdr_target(&sel.target) {
+        Some(t) if t.user_verified => Ok(PinnedMode::Zdr(t)),
+        Some(_) => Err(err(
+            StatusCode::FORBIDDEN,
+            "ZDR selection references a target that is no longer user_verified — refusing \
+             (fail-closed; never silently route to it or to the default endpoint)",
+        )),
+        None => Err(err(
+            StatusCode::CONFLICT,
+            "ZDR selection references an unknown target — refusing rather than silently sending \
+             this conversation to the default endpoint",
+        )),
+    }
+}
+
 async fn messages_inner(st: AppState, req: Request, conversation: Option<String>) -> Response {
     if let Some(resp) = secrets_gate(&st) {
         return resp;
     }
+    // Pin the trust posture from the session-route id BEFORE masking, by value.
+    let pinned = match resolve_pinned_mode(&st, conversation.as_deref()) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
     let (parts, body) = req.into_parts();
     let body_bytes = match to_bytes(body, MAX_BODY).await {
         Ok(b) => b,
@@ -175,7 +222,7 @@ async fn messages_inner(st: AppState, req: Request, conversation: Option<String>
     }
 
     st.monitor.record_dispatched(&record_id);
-    let resp = match send_upstream(&st, &parts, masked, "/v1/messages").await {
+    let resp = match send_upstream(&st, &parts, masked, "/v1/messages", &pinned).await {
         Ok(r) => r,
         Err(resp) => {
             st.monitor
@@ -231,9 +278,26 @@ async fn messages_inner(st: AppState, req: Request, conversation: Option<String>
 /// `/v1/messages/count_tokens` — mask request so counts reflect masked text;
 /// response is `{"input_tokens":N}` (no PII), relayed verbatim.
 async fn count_tokens(State(st): State<AppState>, req: Request) -> Response {
+    count_tokens_inner(st, req, None).await
+}
+
+async fn count_tokens_session(
+    State(st): State<AppState>,
+    Path(conversation): Path<String>,
+    req: Request,
+) -> Response {
+    count_tokens_inner(st, req, Some(conversation)).await
+}
+
+async fn count_tokens_inner(st: AppState, req: Request, conversation: Option<String>) -> Response {
     if let Some(resp) = secrets_gate(&st) {
         return resp;
     }
+    // Count tokens against the SAME trust target as the conversation's messages.
+    let pinned = match resolve_pinned_mode(&st, conversation.as_deref()) {
+        Ok(p) => p,
+        Err(resp) => return resp,
+    };
     let (parts, body) = req.into_parts();
     let body_bytes = match to_bytes(body, MAX_BODY).await {
         Ok(b) => b,
@@ -247,7 +311,7 @@ async fn count_tokens(State(st): State<AppState>, req: Request) -> Response {
     // session-token ledger directly so values masked only for a token-count are not
     // missing from the secrets ledger.
     st.monitor.ingest_session_tokens(&manifest);
-    let resp = match send_upstream(&st, &parts, masked, "/v1/messages/count_tokens").await {
+    let resp = match send_upstream(&st, &parts, masked, "/v1/messages/count_tokens", &pinned).await {
         Ok(r) => r,
         Err(resp) => return resp,
     };
@@ -289,13 +353,17 @@ pub(crate) async fn relay_verbatim(st: &AppState, req: Request) -> Response {
         .path_and_query()
         .map(|p| p.as_str())
         .unwrap_or_else(|| parts.uri.path());
-    let url = format!("{}{}", st.upstream_base, path_q);
-    let up_headers = headers::upstream_request_headers(&parts.headers, st.upstream_host());
+    // The verbatim relay (the `passthrough` fallback) is non-session, so it is always
+    // Normal in the foundation — there is no conversation id to carry a ZDR selection.
+    // Routing through the adapter keeps the egress seam uniform (and byte-identical
+    // for the Normal path).
+    let adapter = AnthropicNative::for_mode(&st.upstream_base, st.upstream_host(), &PinnedMode::Normal);
+    let wire = adapter.build(&parts.headers, path_q, body_bytes.to_vec());
     let resp = match st
         .http
-        .request(parts.method.clone(), &url)
-        .headers(up_headers)
-        .body(body_bytes.to_vec())
+        .request(parts.method.clone(), &wire.url)
+        .headers(wire.headers)
+        .body(wire.body)
         .send()
         .await
     {
@@ -369,13 +437,17 @@ pub(crate) async fn send_upstream(
     parts: &http::request::Parts,
     body: Vec<u8>,
     path: &str,
+    pinned: &PinnedMode,
 ) -> Result<reqwest::Response, Response> {
-    let url = format!("{}{}", st.upstream_base, path);
-    let up_headers = headers::upstream_request_headers(&parts.headers, st.upstream_host());
+    // Dispatch through the egress seam. `Normal` is byte-identical to the prior flat
+    // function; `Zdr` swaps base URL + credential (the masked body is unchanged —
+    // masking always applies, ZDR is routing-only in the foundation).
+    let adapter = AnthropicNative::for_mode(&st.upstream_base, st.upstream_host(), pinned);
+    let wire = adapter.build(&parts.headers, path, body);
     st.http
-        .post(&url)
-        .headers(up_headers)
-        .body(body)
+        .post(&wire.url)
+        .headers(wire.headers)
+        .body(wire.body)
         .send()
         .await
         .map_err(|e| err(StatusCode::BAD_GATEWAY, &format!("upstream error: {e}")))

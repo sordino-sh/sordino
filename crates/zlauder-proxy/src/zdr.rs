@@ -140,6 +140,40 @@ pub struct ZdrTarget {
 }
 
 impl ZdrTarget {
+    /// Construct + validate a target from already-resolved parts (the credential is
+    /// the resolved VALUE, not an env-var name). [`resolve_targets`] reads the env
+    /// var then calls this; other callers construct directly. Enforces the same
+    /// guards as resolution: ToS subscription-shape rejection (on the credential and
+    /// every extra-header value) and `url::Url` base-url validation.
+    pub fn new(
+        name: String,
+        base_url: &str,
+        trust_basis: TrustBasis,
+        user_verified: bool,
+        extra_headers: Vec<(String, String)>,
+        key: String,
+    ) -> Result<ZdrTarget, String> {
+        if name.trim().is_empty() {
+            return Err("empty name".into());
+        }
+        reject_subscription_shaped(key.trim())?;
+        // Defense-in-depth: a credential pasted into a (benign-named) extra header is
+        // still a credential. (Auth-bearing header NAMES are rejected at config load.)
+        for (hk, hv) in &extra_headers {
+            reject_subscription_shaped(hv).map_err(|e| format!("extra_headers['{hk}'] {e}"))?;
+        }
+        let (base_url, host) = parse_base_url(base_url)?;
+        Ok(ZdrTarget {
+            name,
+            base_url,
+            host,
+            trust_basis,
+            user_verified,
+            extra_headers,
+            key: ZdrKey(key.trim().to_string()),
+        })
+    }
+
     pub fn key(&self) -> &ZdrKey {
         &self.key
     }
@@ -240,9 +274,6 @@ pub fn resolve_targets(section: &ZdrSection) -> ResolvedZdr {
 }
 
 fn resolve_one(spec: &ZdrTargetSpec) -> Result<ZdrTarget, String> {
-    if spec.name.trim().is_empty() {
-        return Err("empty name".into());
-    }
     let trust_basis = match spec.trust_basis.as_deref() {
         Some(s) => TrustBasis::parse(s)?,
         // Most conservative default: no declared basis ⇒ you are the anchor.
@@ -250,35 +281,24 @@ fn resolve_one(spec: &ZdrTargetSpec) -> Result<ZdrTarget, String> {
     };
     // Resolve the credential from its env var (refs-only; never inline — enforced by
     // the config scope invariant). Unset ⇒ no key (allowed for a no-auth self-hosted
-    // box); present-but-OAuth-shaped ⇒ a hard ToS rejection.
+    // box); present-but-OAuth-shaped ⇒ a hard ToS rejection (in `ZdrTarget::new`).
     let key = match spec.from_env.as_deref() {
-        Some(var) => match std::env::var(var) {
-            Ok(v) => ZdrKey(v.trim().to_string()),
-            Err(_) => ZdrKey(String::new()),
-        },
-        None => ZdrKey(String::new()),
+        Some(var) => std::env::var(var).unwrap_or_default(),
+        None => String::new(),
     };
-    reject_subscription_shaped(key.as_str())?;
-    // Defense-in-depth: a credential pasted into a (benign-named) extra header is
-    // still a credential. Refuse an OAuth/subscription-shaped value in ANY header.
-    // (Auth-bearing header NAMES are rejected earlier, at config validation.)
-    for (hk, hv) in &spec.extra_headers {
-        reject_subscription_shaped(hv).map_err(|e| format!("extra_headers['{hk}'] {e}"))?;
-    }
-    let (base_url, host) = parse_base_url(&spec.base_url)?;
-    Ok(ZdrTarget {
-        name: spec.name.clone(),
-        base_url,
-        host,
+    let extra_headers = spec
+        .extra_headers
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    ZdrTarget::new(
+        spec.name.clone(),
+        &spec.base_url,
         trust_basis,
-        user_verified: spec.user_verified,
-        extra_headers: spec
-            .extra_headers
-            .iter()
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect(),
+        spec.user_verified,
+        extra_headers,
         key,
-    })
+    )
 }
 
 /// ToS guard: a ZDR credential must not be a subscription / OAuth token. Anthropic
