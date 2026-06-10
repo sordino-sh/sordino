@@ -269,10 +269,10 @@ impl Monitor {
         // last-turn hashes so a resent transcript is not mislabeled. Only the
         // genuine first turn (turn_index == 1) is `is_first`; a non-first turn
         // with no prior data is `prev_unavailable`, not "all new".
-        let delta = if let Some((pt, surfaces)) =
+        let delta = if let Some((pt, prev_req, prev_resp)) =
             previous_turn_surfaces(&inner.records, &conversation_id, turn_index)
         {
-            compute_delta(&request_surfaces, Some((pt, &surfaces)))
+            compute_delta(&request_surfaces, Some((pt, &prev_req, &prev_resp)))
         } else if let Some((pt, hashes)) = inner
             .last_turn_hashes
             .get(&conversation_id)
@@ -643,6 +643,16 @@ impl CompletionGuard {
         }
     }
 
+    /// Record a streamed tool call's NAME (carried only on the content-block start) so the
+    /// captured surface renders as `name(args)` and folds out of the next turn's delta.
+    /// No-op once disarmed.
+    pub fn start_tool(&mut self, key: &str, name: &str) {
+        if !self.armed {
+            return;
+        }
+        self.capture.start_tool(key, name);
+    }
+
     /// Push the captured-so-far reply as a live progress frame (non-terminal).
     fn flush_progress(&mut self) {
         if !self.armed || self.capture.is_empty() {
@@ -862,12 +872,20 @@ fn previous_turn_surfaces(
     records: &VecDeque<RequestRecord>,
     conversation_id: &str,
     turn_index: u32,
-) -> Option<(u32, Vec<Surface>)> {
+) -> Option<(u32, Vec<Surface>, Vec<Surface>)> {
     records
         .iter()
         .filter(|r| r.conversation_id == conversation_id && r.turn_index < turn_index)
         .max_by_key(|r| r.turn_index)
-        .map(|r| (r.turn_index, r.request_surfaces.clone()))
+        .map(|r| {
+            (
+                r.turn_index,
+                r.request_surfaces.clone(),
+                // Fold the captured reply into the next turn's baseline so the
+                // echoed reply drops out of its delta (see `compute_delta`).
+                r.response_surfaces.clone(),
+            )
+        })
 }
 
 /// Bound every per-conversation map by evicting the least-recently-seen

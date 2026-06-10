@@ -20,7 +20,7 @@ use zlauder_engine::{
     EngineError, MAX_TOKEN_LEN, MaskEngine, MaskStats, Surface, UnmaskManifest, token_regex,
 };
 
-use crate::{headers, monitor, routes, state::AppState, walk};
+use crate::{headers, monitor, routes, sse, state::AppState, walk};
 
 const MAX_BODY: usize = 64 * 1024 * 1024;
 
@@ -665,8 +665,10 @@ fn flush_held(st: &mut StreamState) {
         if emitted.is_empty() {
             continue;
         }
+        // Monitor copy is cleaned (marker + ANSI peeled); the forwarded chunk keeps it.
+        let clean = sse::clean_capture(st.engine.as_ref(), &emitted);
         st.guard
-            .capture(&format!("c{index}"), monitor::CapKind::Text, "assistant", &emitted);
+            .capture(&format!("c{index}"), monitor::CapKind::Text, "assistant", &clean);
         let chunk = st.xform.envelope.content_chunk(index, emitted);
         if let Ok(data) = serde_json::to_string(&chunk) {
             st.queue.push_back(frame(None, &data));
@@ -707,7 +709,7 @@ fn enqueue(st: &mut StreamState, sse: SseEvent) {
                 .xform
                 .process(chunk, st.engine.as_ref(), st.manifest.as_ref());
             // Mirror the unmasked reply onto the monitor record as it streams.
-            capture_chunk(&mut st.guard, &out);
+            capture_chunk(&mut st.guard, st.engine.as_ref(), &out);
             // A finish_reason (or trailing usage) chunk is protocol-terminal for a client;
             // flush any held tail BEFORE it so a client that stops at finish_reason still
             // receives the final fragment, not only one that reads through to [DONE].
@@ -754,26 +756,33 @@ fn enqueue(st: &mut StreamState, sse: SseEvent) {
 }
 
 /// Capture the unmasked assistant content + tool-call args from one re-emitted chunk into
-/// the monitor's response accumulator (one block per choice / per tool call).
-fn capture_chunk(guard: &mut monitor::CompletionGuard, chunk: &OpenAIChunk) {
+/// the monitor's response accumulator (one block per choice / per tool call). Assistant
+/// content is cleaned of reveal-marker + ANSI for the monitor copy (the forwarded chunk
+/// keeps its decoration); the tool NAME (carried on the first delta of a tool call) is
+/// recorded so the captured surface renders `name(args)` and folds out of the next delta.
+fn capture_chunk(guard: &mut monitor::CompletionGuard, engine: &MaskEngine, chunk: &OpenAIChunk) {
     for choice in &chunk.choices {
         if let Some(content) = &choice.delta.content {
+            let clean = sse::clean_capture(engine, content);
             guard.capture(
                 &format!("c{}", choice.index),
                 monitor::CapKind::Text,
                 "assistant",
-                content,
+                &clean,
             );
         }
         if let Some(calls) = &choice.delta.tool_calls {
             for call in calls {
+                let key = format!("c{}t{}", choice.index, call.index);
+                // The function name rides only on the first delta of a tool call; record
+                // it under the args key so the capture renders `name(canonical_args)`.
+                if let Some(name) = call.function.as_ref().and_then(|f| f.name.as_deref())
+                    && !name.is_empty()
+                {
+                    guard.start_tool(&key, name);
+                }
                 if let Some(args) = call.function.as_ref().and_then(|f| f.arguments.as_ref()) {
-                    guard.capture(
-                        &format!("c{}t{}", choice.index, call.index),
-                        monitor::CapKind::ToolUse,
-                        "tool_call",
-                        args,
-                    );
+                    guard.capture(&key, monitor::CapKind::ToolUse, "tool_call", args);
                 }
             }
         }

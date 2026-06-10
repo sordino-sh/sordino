@@ -10,6 +10,7 @@ use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 
+use anthropic_wire::ApiContentBlock;
 use anthropic_wire::parser::{ContentBlockDelta, StreamEvent};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
@@ -357,7 +358,7 @@ pub fn unmask_sse_body(
                                 index,
                                 delta: kind.delta(flushed),
                             };
-                            capture_event(&mut st.guard, &ev);
+                            capture_event(&mut st.guard, st.engine.as_ref(), &ev);
                             st.queue.push_back(frame_for(&ev));
                         }
                     }
@@ -380,7 +381,7 @@ fn enqueue(st: &mut StreamState, sse: SseEvent) {
             // Mirror exactly what we forward downstream onto the monitor record (already
             // unmasked), so the operator sees the reply on THIS turn as it streams.
             for o in &out {
-                capture_event(&mut st.guard, o);
+                capture_event(&mut st.guard, st.engine.as_ref(), o);
             }
             for o in out {
                 st.queue.push_back(frame_for(&o));
@@ -393,16 +394,74 @@ fn enqueue(st: &mut StreamState, sse: SseEvent) {
     }
 }
 
+/// Clean an assistant-text fragment for the MONITOR copy: peel the configured reveal
+/// marker, then strip terminal/ANSI escapes. The forwarded stream keeps the decoration
+/// (the user's in-conversation unmask insight); the captured copy is the clean reply, so
+/// it matches the re-masked re-send and folds out of the next turn's delta. Shared by all
+/// three relay paths (Anthropic here + both OpenAI relays). Tool args are never decorated,
+/// so they are captured verbatim and do NOT go through this.
+pub(crate) fn clean_capture(engine: &MaskEngine, text: &str) -> String {
+    let demarked = engine.strip_reveal_marker(text);
+    strip_terminal_codes(&demarked).into_owned()
+}
+
+/// Strip ANSI/VT terminal escape sequences (a CSI `ESC [ … final-byte`, plus a lone
+/// `ESC`). The monitor capture holds the CLEAN reply — terminal control bytes are the
+/// client's display concern, never part of the stored reply, and they would stop a
+/// captured reply from matching the un-decorated re-send. Independent of the
+/// configurable reveal marker (ANSI is only its default). Borrow-free when no `ESC`.
+fn strip_terminal_codes(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('\u{1b}') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // ESC: for a CSI (`ESC [`) consume through the final byte (0x40..=0x7E);
+        // for any other escape just drop the ESC itself.
+        if chars.peek() == Some(&'[') {
+            chars.next(); // '['
+            for p in chars.by_ref() {
+                if ('@'..='~').contains(&p) {
+                    break;
+                }
+            }
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// Capture the unmasked assistant text / tool-call args from one re-emitted stream event
 /// into the monitor's response accumulator. Thinking/signature blocks stay opaque and are
 /// not captured; compaction deltas are machine context (re-sent upstream), not the reply.
-fn capture_event(guard: &mut CompletionGuard, ev: &StreamEvent) {
+fn capture_event(guard: &mut CompletionGuard, engine: &MaskEngine, ev: &StreamEvent) {
+    // A tool-call's NAME rides only on the block start (the InputJsonDelta fragments
+    // carry args only). Record it under the SAME key the args capture uses (`j{index}`)
+    // so the captured surface renders as `name(args)` and folds out of the next delta.
+    if let StreamEvent::ContentBlockStart { index, content_block } = ev
+        && let ApiContentBlock::ToolUse { name, .. } = content_block
+    {
+        guard.start_tool(&format!("j{index}"), name);
+    }
     if let StreamEvent::ContentBlockDelta { index, delta } = ev {
         match delta {
             ContentBlockDelta::TextDelta { text } => {
-                guard.capture(&format!("t{index}"), CapKind::Text, "assistant", text);
+                // The forwarded stream keeps the reveal decoration (the user's
+                // in-conversation unmask insight). The MONITOR copy is the CLEAN reply:
+                // peel the configured reveal marker (symmetric with the engine's
+                // strip-on-resend, so a custom marker is handled too) AND any terminal
+                // escape codes (symmetric with the client storing an un-decorated
+                // transcript). That clean form matches the re-masked re-send, so a
+                // captured reply folds out of the next turn's delta.
+                let clean = clean_capture(engine, text);
+                guard.capture(&format!("t{index}"), CapKind::Text, "assistant", &clean);
             }
             ContentBlockDelta::InputJsonDelta { partial_json } => {
+                // Tool args are never decorated and are consumed verbatim by tools.
                 guard.capture(
                     &format!("j{index}"),
                     CapKind::ToolUse,

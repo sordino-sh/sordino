@@ -996,6 +996,22 @@ impl MaskEngine {
         self.unmask_inner(text, manifest, marker.is_active().then_some(marker))
     }
 
+    /// Strip the terminal reveal-marker decoration from already-unmasked assistant
+    /// text. The DECORATED copy still reaches the user's client (their in-conversation
+    /// unmask insight); this yields the CLEAN reply for the monitor capture. That clean
+    /// form is also what lets a captured reply fold out of the next turn's delta — its
+    /// egress form then matches the re-masked re-send (the decorated bytes never would).
+    /// A no-op (borrow-free clone) when the marker is inactive or absent from `text`.
+    pub fn strip_reveal_marker(&self, text: &str) -> String {
+        let policy = Arc::clone(&self.policy.read().expect("policy rwlock poisoned"));
+        let marker = &policy.config.reveal_marker;
+        if marker.is_active() && marker.contained_in(text) {
+            marker.strip(text)
+        } else {
+            text.to_string()
+        }
+    }
+
     /// Shared unmask body. With `marker = Some`, each successfully-resolved value is
     /// wrapped for display; unknown tokens pass through untouched (so nothing fake is
     /// ever decorated).

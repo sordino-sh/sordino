@@ -22,7 +22,7 @@ use zlauder_engine::{
     EngineError, MAX_TOKEN_LEN, MaskEngine, MaskStats, Surface, UnmaskManifest, token_regex,
 };
 
-use crate::{headers, monitor, routes, state::AppState, walk};
+use crate::{headers, monitor, routes, sse, state::AppState, walk};
 
 const MAX_BODY: usize = 64 * 1024 * 1024;
 
@@ -713,8 +713,10 @@ fn flush_held(st: &mut StreamState) {
         }
         // Same key shape as capture_event so the tail concatenates onto the right block.
         let key = format!("t:{item_id:?}:{output_index:?}:{content_index:?}");
+        // Monitor copy is cleaned (marker + ANSI peeled); the forwarded event keeps it.
+        let clean = sse::clean_capture(st.engine.as_ref(), &emitted);
         st.guard
-            .capture(&key, monitor::CapKind::Text, "assistant", &emitted);
+            .capture(&key, monitor::CapKind::Text, "assistant", &clean);
         let ev = ResponseStreamEvent::ResponseOutputTextDelta(ResponseOutputTextDeltaEvent {
             item_id,
             output_index,
@@ -778,7 +780,7 @@ fn enqueue(st: &mut StreamState, sse: SseEvent) {
                 .process(ev, st.engine.as_ref(), st.manifest.as_ref());
             // Mirror the unmasked reply onto the monitor record as it streams.
             for o in &out {
-                capture_event(&mut st.guard, o);
+                capture_event(&mut st.guard, st.engine.as_ref(), o);
             }
             // A response.completed/failed/incomplete event is stream-terminal for a client;
             // flush any held tail BEFORE it so a delta-accumulating client that stops there
@@ -806,15 +808,35 @@ fn enqueue(st: &mut StreamState, sse: SseEvent) {
 
 /// Capture the unmasked output-text + function-call args from one re-emitted Responses
 /// event into the monitor's response accumulator (keyed per item / output index).
-fn capture_event(guard: &mut monitor::CompletionGuard, ev: &ResponseStreamEvent) {
+fn capture_event(
+    guard: &mut monitor::CompletionGuard,
+    engine: &MaskEngine,
+    ev: &ResponseStreamEvent,
+) {
     match ev {
         ResponseStreamEvent::ResponseOutputTextDelta(d) => {
             let key = format!("t:{:?}:{:?}:{:?}", d.item_id, d.output_index, d.content_index);
-            guard.capture(&key, monitor::CapKind::Text, "assistant", &d.delta);
+            // Monitor copy is the clean reply (marker + ANSI peeled); the forwarded event
+            // keeps its decoration. Args are never decorated and are captured verbatim.
+            let clean = sse::clean_capture(engine, &d.delta);
+            guard.capture(&key, monitor::CapKind::Text, "assistant", &clean);
         }
         ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(d) => {
             let key = format!("a:{:?}:{:?}", d.item_id, d.output_index);
             guard.capture(&key, monitor::CapKind::ToolUse, "tool_call", &d.delta);
+        }
+        // The function NAME rides on the item-done event (this Responses wire version has
+        // no typed `output_item.added`). Record it under the SAME key the args deltas use
+        // — `a:{item.id}:{output_index}`, since the args delta's `item_id` IS the item's
+        // `id` — so the captured surface renders `name(canonical_args)` and folds out of
+        // the next delta. A key mismatch just leaves it args-only (safe over-show).
+        ResponseStreamEvent::ResponseOutputItemDone(done) => {
+            if let Some(ResponseOutputItem::FunctionCall(call)) = done.item.as_ref()
+                && !call.name.is_empty()
+            {
+                let key = format!("a:{:?}:{:?}", call.id, done.output_index);
+                guard.start_tool(&key, &call.name);
+            }
         }
         _ => {}
     }

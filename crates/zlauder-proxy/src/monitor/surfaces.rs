@@ -9,12 +9,36 @@
 
 use serde_json::Value;
 
+use super::capture::canonical_args;
 use super::model::{Run, Surface, TokenPreview, TokenRef};
 
 /// Short blake3 hex digest of a surface's masked text (delta / dedupe key).
 pub(crate) fn block_hash(text: &str) -> String {
     let hex = blake3::hash(text.as_bytes()).to_hex();
     hex.as_str().chars().take(16).collect()
+}
+
+/// The surface's hash in its EGRESS (masked) form — the key under which it appears
+/// when re-sent to the provider. For a REQUEST surface this already equals
+/// [`block_hash`] (its text is masked and its token runs hold the handle verbatim).
+/// For a captured RESPONSE surface — segmented by plaintext VALUE, so its
+/// `block_hash` is over the unmasked reply — it reconstructs the masked text
+/// (each token run's `[ENTITY_xxxx]` handle, everything else verbatim) and hashes
+/// THAT, so a reply folds out of the next turn's delta exactly when Claude Code
+/// echoes it back re-masked. A surface with no token runs has identical masked and
+/// unmasked text, so its `block_hash` is already its egress hash (fast path).
+pub(crate) fn egress_hash(s: &Surface) -> String {
+    if s.runs.iter().all(|r| r.token.is_none()) {
+        return s.block_hash.clone();
+    }
+    let mut masked = String::new();
+    for run in &s.runs {
+        match &run.token {
+            Some(t) => masked.push_str(&t.token),
+            None => masked.push_str(&run.text),
+        }
+    }
+    block_hash(&masked)
 }
 
 /// Which substring of a [`TokenPreview`] to locate when segmenting a surface.
@@ -114,10 +138,14 @@ fn collect_message_list(out: &mut Vec<RawSurface>, base: &str, items: &[Value]) 
                     .and_then(|f| f.get("name"))
                     .and_then(Value::as_str)
                     .unwrap_or("tool");
-                let args = func
-                    .and_then(|f| f.get("arguments"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("");
+                // Canonicalize the verbatim `arguments` string so it matches the captured
+                // reply's canonical form (see `canonical_args`) and the call folds out of
+                // the next delta.
+                let args = canonical_args(
+                    func.and_then(|f| f.get("arguments"))
+                        .and_then(Value::as_str)
+                        .unwrap_or(""),
+                );
                 let text = if args.is_empty() {
                     format!("{name}()")
                 } else {
@@ -187,14 +215,12 @@ fn text_values_from_block(
     if matches!(block_type, Some("tool_use") | Some("function_call")) {
         let name = o.get("name").and_then(Value::as_str).unwrap_or("tool");
         let args = match o.get("input") {
-            // Anthropic: `input` is a JSON object (already masked in place).
+            // Anthropic: `input` is a JSON object (already masked in place). serde's
+            // compact serialization IS the canonical form the captured side reproduces.
             Some(v) if !v.is_null() => serde_json::to_string(v).unwrap_or_default(),
-            // OpenAI Responses: `arguments` is a JSON string.
-            _ => o
-                .get("arguments")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
+            // OpenAI Responses: `arguments` is a JSON string — canonicalize it so it
+            // matches the captured reply's canonical form and the call folds next turn.
+            _ => canonical_args(o.get("arguments").and_then(Value::as_str).unwrap_or("")),
         };
         let text = if args.is_empty() {
             format!("{name}()")
@@ -548,6 +574,27 @@ mod tests {
         let text: String = tu[0].runs.iter().map(|r| r.text.as_str()).collect();
         assert!(text.starts_with("send("), "got: {text}");
         assert!(tu[0].runs.iter().any(|r| r.token.is_some()));
+    }
+
+    #[test]
+    fn openai_arguments_string_is_canonicalized_for_the_fold() {
+        // The harness re-sends the model's `arguments` string verbatim; a whitespace-laden
+        // form must canonicalize to the SAME compact text the captured reply produces,
+        // otherwise the tool call never folds out of the next delta.
+        let body = serde_json::json!({
+            "messages": [
+                {"role": "assistant", "content": Value::Null, "tool_calls": [
+                    {"id": "call_1", "type": "function",
+                     "function": {"name": "send", "arguments": "{  \"to\" :  \"x@y.com\"  }"}}
+                ]}
+            ]
+        });
+        let bytes = serde_json::to_vec(&body).unwrap();
+        let surfaces = surfaces_from_body(&bytes, &[]);
+        let tu: Vec<&Surface> = surfaces.iter().filter(|s| s.kind == "tool_use").collect();
+        assert_eq!(tu.len(), 1);
+        let text: String = tu[0].runs.iter().map(|r| r.text.as_str()).collect();
+        assert_eq!(text, "send({\"to\":\"x@y.com\"})", "args must be compact-canonical");
     }
 
     #[test]

@@ -30,6 +30,26 @@ struct CapBlock {
     kind: CapKind,
     label: String,
     text: String,
+    /// Tool NAME for a `ToolUse` block (from the content-block start), so the captured
+    /// surface renders as `name(args)` — matching how the request extractor surfaces a
+    /// re-sent tool call — and therefore folds out of the next turn's delta. `None` for
+    /// prose, or a tool call whose name never arrived (then it falls back to args-only).
+    name: Option<String>,
+}
+
+/// Canonicalize a tool-args JSON blob (parse → re-serialize) so the captured form
+/// matches the request extractor's canonical form, regardless of the whitespace/key-order
+/// the model streamed. Falls back to the raw text on any parse failure (partial/non-JSON
+/// args) — a non-match there just means the tool call re-surfaces in the delta (safe
+/// over-show), never a wrong fold. Shared with the request-side surface extractor
+/// (`surfaces.rs`) so both sides of the fold canonicalize identically, which is what makes
+/// the OpenAI `arguments`-string fold deterministic (the harness re-sends the model's
+/// arguments string verbatim, so request and capture only match once both are canonical).
+pub(crate) fn canonical_args(raw: &str) -> String {
+    serde_json::from_str::<serde_json::Value>(raw)
+        .ok()
+        .and_then(|v| serde_json::to_string(&v).ok())
+        .unwrap_or_else(|| raw.to_string())
 }
 
 /// Accumulator for one streamed response. Append-only; renders to a preview string and
@@ -88,6 +108,7 @@ impl ResponseCapture {
                     kind,
                     label: label.to_string(),
                     text: String::new(),
+                    name: None,
                 });
                 self.slot.insert(key.to_string(), i);
                 i
@@ -97,13 +118,42 @@ impl ResponseCapture {
         self.total += text.len();
     }
 
+    /// Record the tool NAME for a tool-call block at `key`, creating the (empty) block in
+    /// first-seen order if its args have not streamed yet. Called when the content-block
+    /// start carries the name (which the per-fragment [`Self::push`] never sees). Idempotent
+    /// — a later push appends args to the same slot, and [`Self::render`] emits `name(args)`.
+    pub fn start_tool(&mut self, key: &str, name: &str) {
+        let idx = match self.slot.get(key) {
+            Some(&i) => i,
+            None => {
+                let i = self.blocks.len();
+                self.blocks.push(CapBlock {
+                    kind: CapKind::ToolUse,
+                    label: key.to_string(),
+                    text: String::new(),
+                    name: None,
+                });
+                self.slot.insert(key.to_string(), i);
+                i
+            }
+        };
+        if !name.is_empty() {
+            self.blocks[idx].name = Some(name.to_string());
+        }
+    }
+
     /// Total bytes captured so far (the progress-flush throttle key).
     pub fn total_len(&self) -> usize {
         self.total
     }
 
+    /// True when [`Self::render`] would emit nothing. Mirrors render's per-block skip
+    /// condition exactly (`text empty AND name none`) rather than testing `total == 0`, so
+    /// a name-only tool call (a tool that streamed a name but zero arg bytes → `total == 0`)
+    /// still counts as content: it is persisted and folds as `name()` instead of being
+    /// dropped at finalize (the completion path gates the response surfaces on this).
     pub fn is_empty(&self) -> bool {
-        self.total == 0
+        !self.blocks.iter().any(|b| !b.text.is_empty() || b.name.is_some())
     }
 
     /// Render `(preview, surfaces)` from the accumulated blocks. `preview` is the raw
@@ -113,24 +163,39 @@ impl ResponseCapture {
         let mut surfaces = Vec::with_capacity(self.blocks.len());
         let mut preview = String::new();
         for b in &self.blocks {
-            if b.text.is_empty() {
+            // Skip a truly empty block, but keep a named tool call with no args (`name()`).
+            if b.text.is_empty() && b.name.is_none() {
                 continue;
             }
             let (kind, role) = match b.kind {
                 CapKind::Text => ("message", Some("assistant".to_string())),
                 CapKind::ToolUse => ("tool_use", Some("assistant".to_string())),
             };
+            // A named tool call surfaces `name(canonical_args)` — the SAME form the request
+            // extractor produces for a re-sent tool call — so it folds out of the next
+            // turn's delta. Prose and unnamed tool calls surface their captured text as-is.
+            let surface_text = match (b.kind, &b.name) {
+                (CapKind::ToolUse, Some(name)) => {
+                    let args = canonical_args(&b.text);
+                    if args.is_empty() {
+                        format!("{name}()")
+                    } else {
+                        format!("{name}({args})")
+                    }
+                }
+                _ => b.text.clone(),
+            };
             surfaces.push(response_text_surface(
                 b.label.clone(),
                 role,
                 kind,
-                &b.text,
+                &surface_text,
                 tokens,
             ));
             if !preview.is_empty() {
                 preview.push_str("\n\n");
             }
-            preview.push_str(&b.text);
+            preview.push_str(&surface_text);
         }
         if self.truncated {
             preview.push_str("\n...[truncated]");
@@ -171,6 +236,56 @@ mod tests {
         assert_eq!(token_runs[0].text, "a@b.com");
         assert_eq!(surfaces[0].role.as_deref(), Some("assistant"));
         assert_eq!(surfaces[0].provenance, "assistant");
+    }
+
+    #[test]
+    fn named_tool_call_renders_name_and_canonical_args() {
+        // The name (from the block start) + canonicalized args (whitespace/order-normalized)
+        // reproduce the request extractor's `name(args)` form, so the call folds next turn.
+        let mut c = ResponseCapture::new();
+        c.start_tool("j0", "Bash");
+        c.push("j0", CapKind::ToolUse, "tool_use[0]", "{ \"command\" :  \"ls\" }");
+        let (preview, surfaces) = c.render(&[]);
+        assert_eq!(surfaces.len(), 1);
+        assert_eq!(surfaces[0].kind, "tool_use");
+        assert!(
+            preview.starts_with("Bash({\"command\":\"ls\"})"),
+            "expected name(canonical_args), got: {preview}"
+        );
+    }
+
+    #[test]
+    fn unnamed_tool_call_falls_back_to_args_only() {
+        // No start_tool (name never arrived) -> args-only, the prior behavior (safe over-show).
+        let mut c = ResponseCapture::new();
+        c.push("j0", CapKind::ToolUse, "tool_use[0]", "{\"x\":1}");
+        let (preview, _surfaces) = c.render(&[]);
+        assert_eq!(preview, "{\"x\":1}");
+    }
+
+    #[test]
+    fn name_only_tool_call_is_non_empty_and_renders_name_parens() {
+        // A tool call that streamed a name but zero arg bytes must NOT be treated as empty
+        // (else the completion path drops it instead of persisting/folding it as `name()`).
+        let mut c = ResponseCapture::new();
+        c.start_tool("j0", "Bash");
+        assert!(!c.is_empty(), "name-only capture must count as content");
+        let (preview, surfaces) = c.render(&[]);
+        assert_eq!(surfaces.len(), 1);
+        assert_eq!(surfaces[0].kind, "tool_use");
+        assert_eq!(preview, "Bash()");
+    }
+
+    #[test]
+    fn empty_name_start_tool_stays_empty() {
+        // start_tool with an empty name creates a phantom block with no name and no text;
+        // render skips it, so is_empty() must agree (no over-persist of a blank surface).
+        let mut c = ResponseCapture::new();
+        c.start_tool("j0", "");
+        assert!(c.is_empty());
+        let (preview, surfaces) = c.render(&[]);
+        assert!(preview.is_empty());
+        assert!(surfaces.is_empty());
     }
 
     #[test]
