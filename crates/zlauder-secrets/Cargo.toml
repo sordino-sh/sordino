@@ -10,7 +10,7 @@ description = "Host-side secret providers (pass/age/sops/dotenv/env) + registrat
 [dependencies]
 # Produces `zlauder_engine::SecretRule`s for `MaskEngine::set_secret_rules`. Never
 # touches engine internals.
-zlauder-engine = { path = "../zlauder-engine", version = "0.9.0", default-features = false }
+zlauder-engine = { path = "../zlauder-engine", version = "0.10.0", default-features = false }
 
 async-trait = "0.1"
 # `process` for the SecretBroker spawn choke-point; the rest inherit from the
