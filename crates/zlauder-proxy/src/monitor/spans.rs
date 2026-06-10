@@ -45,6 +45,69 @@ pub(crate) fn token_previews(manifest: &UnmaskManifest) -> Vec<TokenPreview> {
         .collect()
 }
 
+/// The `(plaintext → handle)` re-mask pairs for every NON-peekable (secret-class) token
+/// in `manifest` — CVV ([`TokenClass::Sad`]) and brokered secrets. A captured RESPONSE is
+/// the reply forwarded to the client UNMASKED (the client owns the data), so its monitor
+/// mirror would otherwise persist a secret plaintext the request side never exposes (the
+/// request stores the masked handle; `token_previews` only withholds the *peek* value, it
+/// cannot scrub already-unmasked text). Sorted longest-value-first so a value that is a
+/// substring of another is replaced first. Brokered values never reach the display unmask
+/// (it refuses them), so they cannot appear in a reply — included only as defense in depth.
+pub(crate) fn redaction_pairs(manifest: &UnmaskManifest) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = manifest
+        .entries
+        .iter()
+        .filter(|e| !TokenClass::for_manifest_entry(e).is_peekable())
+        .filter(|e| !e.canonical_form.is_empty())
+        .map(|e| (e.canonical_form.clone(), e.token_handle.clone()))
+        .collect();
+    pairs.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    pairs
+}
+
+/// Replace every non-peekable plaintext value in `text` with its `[ENTITY_xxxx]` handle
+/// (see [`redaction_pairs`]). A no-op (and allocation-cheap) when there are no secret-class
+/// tokens — the common path. A value the engine resolved is whole within a single forwarded
+/// fragment (display unmask never emits a partial value), so this can run per-fragment on a
+/// stream without splitting a value. Over-redacts a coincidental verbatim collision with a
+/// secret value — the SAFE direction for a monitor copy (the wire already carried the real
+/// value to the client); peekable PII is left intact for re-hydration.
+pub(crate) fn redact_secret_values(text: &str, pairs: &[(String, String)]) -> String {
+    if pairs.is_empty() {
+        return text.to_string();
+    }
+    let mut out = text.to_string();
+    for (value, handle) in pairs {
+        if out.contains(value.as_str()) {
+            out = out.replace(value.as_str(), handle);
+        }
+    }
+    out
+}
+
+/// [`redaction_pairs`] expanded with the JSON-string-escaped form of each value, for
+/// scrubbing a SERIALIZED JSON body (the non-streaming `record_response` path): a value
+/// containing a quote / backslash / control char appears in the body in its escaped form,
+/// not raw, so the raw needle would miss it. The streaming path scrubs unmasked PLAINTEXT
+/// fragments and so needs only [`redaction_pairs`]. Today's non-peekable classes are
+/// escape-free (CVV is digits; brokered secrets never egress on the display path), so this
+/// is defense-in-depth for any future escapable secret class. Longest-needle-first.
+pub(crate) fn json_body_redaction_pairs(manifest: &UnmaskManifest) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::new();
+    for (value, handle) in redaction_pairs(manifest) {
+        if let Ok(json) = serde_json::to_string(&value) {
+            // Strip the surrounding quotes serde adds, leaving the inner escaped form.
+            let escaped = json[1..json.len().saturating_sub(1)].to_string();
+            if escaped != value {
+                out.push((escaped, handle.clone()));
+            }
+        }
+        out.push((value, handle));
+    }
+    out.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+    out
+}
+
 /// Spans derived from the engine-reported byte offsets of each token handle.
 pub(crate) fn spans_from_manifest(manifest: &UnmaskManifest, preview: &str) -> Vec<PreviewSpan> {
     let mut spans: Vec<PreviewSpan> = manifest
@@ -129,4 +192,72 @@ pub(crate) fn now_ms() -> u128 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use zlauder_engine::{ENTITY_CVV, ManifestEntry, Surface};
+
+    fn entry(value: &str, handle: &str, entity_kind: &str, broker: bool) -> ManifestEntry {
+        ManifestEntry {
+            canonical_form: value.into(),
+            token_handle: handle.into(),
+            entity_kind: entity_kind.into(),
+            arrow_origin: Surface::UserMessage,
+            exposed_at: None,
+            broker,
+        }
+    }
+
+    #[test]
+    fn redaction_pairs_covers_secret_classes_only() {
+        let mut m = UnmaskManifest::new();
+        m.push(entry("joe@x.com", "[EMAIL_ADDRESS_aa]", "EMAIL_ADDRESS", false)); // peekable
+        m.push(entry("987", "[CVV_bb]", ENTITY_CVV, false)); // non-peekable (Sad)
+        m.push(entry("sk-secret", "[API_KEY_cc]", "API_KEY", true)); // non-peekable (Broker)
+        let values: Vec<String> = redaction_pairs(&m).into_iter().map(|(v, _)| v).collect();
+        assert!(values.contains(&"987".to_string()));
+        assert!(values.contains(&"sk-secret".to_string()));
+        assert!(
+            !values.contains(&"joe@x.com".to_string()),
+            "peekable PII must never be scrubbed (it is intentionally re-hydrated)"
+        );
+    }
+
+    #[test]
+    fn redact_scrubs_secret_value_keeps_peekable() {
+        let mut m = UnmaskManifest::new();
+        m.push(entry("joe@x.com", "[EMAIL_ADDRESS_aa]", "EMAIL_ADDRESS", false));
+        m.push(entry("987", "[CVV_bb]", ENTITY_CVV, false));
+        let pairs = redaction_pairs(&m);
+        let scrubbed = redact_secret_values("mail joe@x.com cvv 987 done", &pairs);
+        assert_eq!(scrubbed, "mail joe@x.com cvv [CVV_bb] done");
+    }
+
+    #[test]
+    fn json_body_pairs_cover_escaped_form() {
+        // Defense-in-depth: a (hypothetical future) non-peekable value with a quote appears
+        // in a SERIALIZED body in its escaped form, so the json-body needle set must carry it.
+        let mut m = UnmaskManifest::new();
+        m.push(entry("a\"b", "[CVV_zz]", ENTITY_CVV, false));
+        let pairs = json_body_redaction_pairs(&m);
+        let needles: Vec<&str> = pairs.iter().map(|(v, _)| v.as_str()).collect();
+        assert!(needles.contains(&"a\"b"), "raw form present");
+        assert!(needles.contains(&"a\\\"b"), "json-escaped form present");
+        // Scrubbing a serialized body redacts the ESCAPED occurrence the raw needle misses.
+        let body = serde_json::to_string(&serde_json::json!({ "x": "a\"b" })).unwrap();
+        let scrubbed = redact_secret_values(&body, &pairs);
+        assert!(!scrubbed.contains("a\\\"b"), "escaped secret must be scrubbed: {scrubbed}");
+        assert!(scrubbed.contains("[CVV_zz]"));
+    }
+
+    #[test]
+    fn redact_is_noop_without_secret_classes() {
+        let mut m = UnmaskManifest::new();
+        m.push(entry("joe@x.com", "[EMAIL_ADDRESS_aa]", "EMAIL_ADDRESS", false));
+        let pairs = redaction_pairs(&m);
+        assert!(pairs.is_empty(), "ordinary PII mints no redaction pair");
+        assert_eq!(redact_secret_values("anything 987", &pairs), "anything 987");
+    }
 }

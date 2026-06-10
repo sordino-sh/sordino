@@ -15,7 +15,10 @@ use super::model::{
     RequestDecision, RequestRecord, ResponseProgress, Surface, TokenClass, TokenLedgerEntry,
     TokenPreview, TurnDelta,
 };
-use super::spans::{now_ms, preview, spans_from_manifest, spans_from_values, token_previews};
+use super::spans::{
+    json_body_redaction_pairs, now_ms, preview, redact_secret_values, redaction_pairs,
+    spans_from_manifest, spans_from_values, token_previews,
+};
 use super::surfaces::{surfaces_from_body, surfaces_from_response_body};
 
 const MAX_RECORDS: usize = 500;
@@ -382,7 +385,23 @@ impl Monitor {
         }
     }
 
-    pub fn record_response(&self, id: &str, status: u16, body: Option<&[u8]>) {
+    pub fn record_response(
+        &self,
+        id: &str,
+        status: u16,
+        body: Option<&[u8]>,
+        manifest: &UnmaskManifest,
+    ) {
+        // The body is UNMASKED here (walk::unmask_response replaced every [ENTITY_xxxx]
+        // handle with its plaintext for the client). Scrub the MONITOR copy of any
+        // non-peekable secret value back to its handle so the record never persists a
+        // CVV/secret the request side withholds — peekable PII stays re-hydrated. Computed
+        // off the lock; the forwarded `out` buffer is untouched. The body is serialized
+        // JSON, so match both the raw and JSON-escaped forms of each secret value.
+        let pairs = json_body_redaction_pairs(manifest);
+        let scrubbed: Option<Vec<u8>> = body.map(|b| {
+            redact_secret_values(&String::from_utf8_lossy(b), &pairs).into_bytes()
+        });
         self.update_record(id, |r| {
             // Terminal-idempotent: a late drain or a drop-guard firing after the
             // record already reached a terminal verdict must NOT resurrect
@@ -391,16 +410,16 @@ impl Monitor {
                 return;
             }
             r.response_status = Some(status);
-            r.response_preview = body.map(preview);
+            r.response_preview = scrubbed.as_deref().map(preview);
             r.response_spans = r
                 .response_preview
                 .as_deref()
                 .map(|p| spans_from_values(&r.tokens, p))
                 .unwrap_or_default();
-            // The response body is UNMASKED here (walk::unmask_response has
-            // already replaced every [ENTITY_xxxx] handle with its plaintext),
-            // so segment by the canonical VALUE, not the handle.
-            r.response_surfaces = body
+            // Segment by the canonical VALUE, not the handle (the body is unmasked, modulo
+            // the secret-class scrub above which turns those back into plain handle text).
+            r.response_surfaces = scrubbed
+                .as_deref()
                 .map(|b| surfaces_from_response_body(b, &r.tokens))
                 .unwrap_or_default();
             r.decision = RequestDecision::Completed;
@@ -610,6 +629,11 @@ pub struct CompletionGuard {
     /// Token previews (handle → plaintext) for this request, so the captured reply can be
     /// segmented by VALUE (the stream is already unmasked). Built once from the manifest.
     tokens: Vec<TokenPreview>,
+    /// `(plaintext → handle)` pairs for non-peekable (secret-class) tokens, so a secret the
+    /// reply echoes — forwarded UNMASKED to the client — is scrubbed back to its handle
+    /// before it lands in the monitor capture. Held only on this in-flight guard, never on
+    /// the persisted record. Empty (and free) when the request minted no secret-class token.
+    redactions: Vec<(String, String)>,
     /// The unmasked assistant reply accumulated as it streams downstream.
     capture: ResponseCapture,
     /// `capture.total_len()` at the last live progress flush (the throttle baseline).
@@ -624,6 +648,7 @@ impl CompletionGuard {
             status,
             armed: true,
             tokens: token_previews(manifest),
+            redactions: redaction_pairs(manifest),
             capture: ResponseCapture::new(),
             flushed_len: 0,
         }
@@ -637,7 +662,12 @@ impl CompletionGuard {
         if !self.armed {
             return;
         }
-        self.capture.push(key, kind, label, text);
+        // Scrub any non-peekable (secret-class, e.g. CVV) plaintext back to its handle BEFORE
+        // it lands in the capture. The relay forwarded the reply UNMASKED to the client, but
+        // the monitor copy must mirror the request side and never persist a secret value.
+        // Peekable PII is left intact (it is intentionally re-hydrated for the operator).
+        let scrubbed = redact_secret_values(text, &self.redactions);
+        self.capture.push(key, kind, label, &scrubbed);
         if self.capture.total_len().saturating_sub(self.flushed_len) >= PROGRESS_FLUSH_BYTES {
             self.flush_progress();
         }
@@ -1360,7 +1390,7 @@ mod tests {
         let r = find(&m, &id);
         assert!(matches!(r.decision, RequestDecision::InFlight));
         assert!(r.dispatched_ms.is_some());
-        m.record_response(&id, 200, None);
+        m.record_response(&id, 200, None, &UnmaskManifest::new());
         assert!(matches!(find(&m, &id).decision, RequestDecision::Completed));
     }
 
@@ -1372,13 +1402,13 @@ mod tests {
         // Client disconnect → Aborted; a late drain must NOT flip it to Completed.
         m.record_aborted(&id);
         assert!(matches!(find(&m, &id).decision, RequestDecision::Aborted));
-        m.record_response(&id, 200, None);
+        m.record_response(&id, 200, None, &UnmaskManifest::new());
         assert!(matches!(find(&m, &id).decision, RequestDecision::Aborted));
         // Upstream error stays terminal under a stray completion too.
         let id2 = record(&m, &body(&[("user", json!("go2"))]));
         m.record_dispatched(&id2);
         m.record_upstream_error(&id2, "boom");
-        m.record_response(&id2, 200, None);
+        m.record_response(&id2, 200, None, &UnmaskManifest::new());
         assert!(matches!(
             find(&m, &id2).decision,
             RequestDecision::UpstreamError
@@ -1473,6 +1503,69 @@ mod tests {
             broker: false,
         });
         m
+    }
+
+    /// A non-peekable CVV (`TokenClass::Sad`) token alongside a peekable email — the
+    /// response-scrub fixture: the CVV must re-mask in the monitor copy, the email stays
+    /// re-hydrated.
+    fn manifest_cvv_and_email() -> UnmaskManifest {
+        let mut m = manifest_with("[EMAIL_0001]", "joe@example.com");
+        m.push(zlauder_engine::ManifestEntry {
+            canonical_form: "987".to_string(),
+            token_handle: "[CVV_0001]".to_string(),
+            entity_kind: zlauder_engine::ENTITY_CVV.to_string(),
+            arrow_origin: zlauder_engine::Surface::UserMessage,
+            exposed_at: None,
+            broker: false,
+        });
+        m
+    }
+
+    #[test]
+    fn streamed_capture_scrubs_secret_class_keeps_peekable() {
+        // A secret-class value (CVV) the reply echoes is forwarded UNMASKED to the client, but
+        // must NOT be persisted in the monitor capture: it re-masks to its handle, while a
+        // peekable email in the same reply stays re-hydrated for operator review. Without the
+        // scrub, `token_previews` emptying the CVV value left its plaintext un-redacted here.
+        let m = Monitor::new();
+        let manifest = manifest_cvv_and_email();
+        let id = m
+            .record_llm_request("/v1/messages", "POST", None, &body(&[("user", json!("go"))]), &manifest)
+            .id()
+            .to_string();
+        m.record_dispatched(&id);
+        let mut g = CompletionGuard::new(m.clone(), id.clone(), 200, &manifest);
+        g.capture("t0", CapKind::Text, "assistant", "your cvv 987 mailed to joe@example.com");
+        g.complete();
+        let r = find(&m, &id);
+        let preview = r.response_preview.as_deref().unwrap();
+        assert!(!preview.contains("987"), "secret-class CVV must not be persisted: {preview}");
+        assert!(preview.contains("[CVV_0001]"), "CVV re-masked to its handle: {preview}");
+        assert!(preview.contains("joe@example.com"), "peekable email stays re-hydrated: {preview}");
+    }
+
+    #[test]
+    fn non_streaming_response_scrubs_secret_class_keeps_peekable() {
+        // Same invariant on the NON-streaming path (`record_response`): the unmasked reply
+        // body is scrubbed of secret-class plaintext before it lands on the record.
+        let m = Monitor::new();
+        let manifest = manifest_cvv_and_email();
+        let id = m
+            .record_llm_request("/v1/messages", "POST", None, &body(&[("user", json!("go"))]), &manifest)
+            .id()
+            .to_string();
+        m.record_dispatched(&id);
+        let reply = serde_json::to_vec(&json!({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "your cvv 987 mailed to joe@example.com"}]
+        }))
+        .unwrap();
+        m.record_response(&id, 200, Some(&reply), &manifest);
+        let r = find(&m, &id);
+        let preview = r.response_preview.as_deref().unwrap();
+        assert!(!preview.contains("987"), "secret-class CVV must not be persisted: {preview}");
+        assert!(preview.contains("[CVV_0001]"), "CVV re-masked to its handle: {preview}");
+        assert!(preview.contains("joe@example.com"), "peekable email stays re-hydrated: {preview}");
     }
 
     #[test]

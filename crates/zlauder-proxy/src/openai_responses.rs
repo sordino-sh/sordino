@@ -115,7 +115,7 @@ async fn responses_inner(st: AppState, req: Request, conversation: Option<String
         let out = unmask_response(st.engine.as_ref(), &manifest, &bytes)
             .unwrap_or_else(|_| bytes.to_vec());
         st.monitor
-            .record_response(&record_id, status.as_u16(), Some(&out));
+            .record_response(&record_id, status.as_u16(), Some(&out), &manifest);
         routes::respond(status, out_headers, Body::from(out))
     }
 }
