@@ -152,8 +152,12 @@ async fn messages_inner(st: AppState, req: Request, conversation: Option<String>
     let manifest = Arc::new(manifest);
 
     if is_sse {
-        let guard =
-            monitor::CompletionGuard::new(st.monitor.clone(), record_id.clone(), status.as_u16());
+        let guard = monitor::CompletionGuard::new(
+            st.monitor.clone(),
+            record_id.clone(),
+            status.as_u16(),
+            manifest.as_ref(),
+        );
         let body = sse::unmask_sse_body(
             Box::pin(resp.bytes_stream()),
             st.engine.clone(),
@@ -176,7 +180,7 @@ async fn messages_inner(st: AppState, req: Request, conversation: Option<String>
         let out = walk::unmask_response(st.engine.as_ref(), &manifest, &bytes)
             .unwrap_or_else(|_| bytes.to_vec());
         st.monitor
-            .record_response(&record_id, status.as_u16(), Some(&out));
+            .record_response(&record_id, status.as_u16(), Some(&out), &manifest);
         respond(status, out_headers, Body::from(out))
     }
 }

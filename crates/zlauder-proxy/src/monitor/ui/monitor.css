@@ -510,6 +510,8 @@ select:focus { outline: none; border-color: var(--cyan-dim); box-shadow: 0 0 0 1
 .panel-title { font-family: var(--disp); letter-spacing: .2em; font-size: 12px; color: var(--ink); font-weight: 500; }
 .panel-count { font-size: 10px; color: var(--ink-dim); margin-left: auto; font-variant-numeric: tabular-nums; }
 .panel-body { padding: 4px 14px 14px; }
+/* live streamed-response indicator on the RESPONSE panel summary */
+.stream-live { color: var(--cyan); letter-spacing: .12em; font-weight: 600; animation: pulse 1.4s ease-in-out infinite; }
 
 /* surfaces */
 .surface { border-top: 1px solid var(--line-soft); padding: 12px 0; }
@@ -533,6 +535,22 @@ select:focus { outline: none; border-color: var(--cyan-dim); box-shadow: 0 0 0 1
 .surface.is-new:first-child { margin-top: 0; }
 @keyframes newSurface { 0% { background: var(--amber-glow); } 100% {} }
 .surface.is-new .new-flag { margin-left: 4px; }
+
+/* ---------- inbound (RESPONSE) direction cues ----------
+   A received reply reads in the calm INBOUND (cyan / "system, local") register, never the
+   red egress register: its values were re-hydrated locally for review and are not leaving. */
+.dir-tag {
+  font-size: 8.5px; letter-spacing: .14em; text-transform: uppercase; font-weight: 600;
+  padding: 2px 7px; border-radius: 3px; border: 1px solid var(--line); white-space: nowrap;
+}
+.dir-in { color: var(--cyan); border-color: var(--cyan-dim); background: var(--cyan-glow); }
+.surface-in { border-left: 2px solid var(--cyan-dim); padding-left: 10px; }
+.surface-in .kind-tool_use, .surface-in .kind-message { color: var(--cyan); }
+.surface-note {
+  font-size: 9.5px; color: var(--ink-faint); letter-spacing: .03em;
+  margin: -1px 0 7px; font-style: italic;
+}
+.panel-response > summary .dir-in { margin-left: 8px; }
 
 .payload {
   white-space: pre-wrap; word-break: break-word; margin: 0;
@@ -777,6 +795,12 @@ select:focus { outline: none; border-color: var(--cyan-dim); box-shadow: 0 0 0 1
   position: relative; isolation: isolate;
   background: #060809; box-shadow: inset 0 0 0 1px var(--line-soft);
 }
+/* The streaming/prose RESPONSE payload grows in the #detail flow (no inner cap) so the
+   stream-tail sentinel tracks the TRUE tail for sticky auto-follow; bordered cyan to match
+   the inbound register. Two-class selector (0-2-0) so it wins over BOTH single-class
+   .payload rules above regardless of source order. (Token-run response surfaces render as
+   per-surface .payload and keep the shared cap.) */
+.payload.payload-in { max-height: none; overflow-y: visible; border-color: var(--cyan-dim); }
 
 @media (prefers-reduced-motion: reduce) {
   .mesh, .grain, .scanlines { animation: none !important; }

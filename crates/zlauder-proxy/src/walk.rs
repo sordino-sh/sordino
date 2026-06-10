@@ -181,8 +181,28 @@ impl MaskWalker<'_> {
                 warn_unknown_map(&tool.extra, "tool");
             }
         }
+        // `metadata.user_id` is API-protocol TELEMETRY, not natural-language content:
+        // Anthropic populates it (Claude Code sets it to an opaque account/session
+        // identifier) and uses it to correlate traffic for abuse detection. Masking it
+        // CORRUPTS that telemetry on the wire — a session UUID trips `US_BANK_NUMBER`, so
+        // the field would egress as `[US_BANK_NUMBER_…]`, change every session, and read
+        // as deliberate evasion — for ZERO privacy benefit (the field is contractually
+        // opaque and must never carry PII). So pass `user_id` through VERBATIM (cf. the
+        // tool `input_schema` passthrough above), while still masking any other metadata
+        // leaf an unexpected client might set (defense-in-depth, unchanged). The same
+        // traversal serves COLLECT and MASK, so skipping `user_id` here skips it in both.
         if let Some(meta) = req.metadata.as_mut() {
-            self.value(meta, Surface::UserMessage)?;
+            match meta {
+                Value::Object(map) => {
+                    for (key, v) in map.iter_mut() {
+                        if key == "user_id" {
+                            continue;
+                        }
+                        self.value(v, Surface::UserMessage)?;
+                    }
+                }
+                other => self.value(other, Surface::UserMessage)?,
+            }
         }
         if let Some(ctx) = req.context_management.as_mut() {
             self.context_management(ctx)?;
@@ -812,6 +832,38 @@ mod tests {
         let s = String::from_utf8(out).unwrap();
         assert!(s.contains("bob@example.com"), "not unmasked: {s}");
         assert!(!s.contains(&token));
+    }
+
+    #[test]
+    fn metadata_user_id_is_telemetry_passthrough_other_metadata_still_masked() {
+        // Regression guard for the egress-correctness fix: Claude Code stuffs an opaque
+        // account/session id into `metadata.user_id` (Anthropic's abuse-correlation
+        // telemetry). That field must reach the provider VERBATIM — masking it mangles
+        // the telemetry (and is the root cause of the `cc-[US_BANK_NUMBER_…]` ids) — while
+        // any other metadata leaf an unexpected client sets still gets masked.
+        let e = engine();
+        let user_id = "user_acct_session contact bob@example.com 4111111111111111";
+        let body = serde_json::json!({
+            "model": "m", "max_tokens": 10,
+            "metadata": { "user_id": user_id, "note": "ping bob@example.com" },
+            "messages": [{"role":"user","content":[{"type":"text","text":"hi"}]}]
+        });
+        let (masked, _manifest) = mask_request(&e, body.to_string().as_bytes()).unwrap();
+        let v: Value = serde_json::from_slice(&masked).unwrap();
+        // Telemetry passthrough: user_id is byte-for-byte unchanged on the wire, even
+        // though it carries strings that WOULD otherwise mask (an email + a card number).
+        assert_eq!(
+            v["metadata"]["user_id"].as_str().unwrap(),
+            user_id,
+            "metadata.user_id must egress verbatim (telemetry), got: {}",
+            v["metadata"]["user_id"]
+        );
+        // Defense-in-depth preserved: a non-telemetry metadata leaf is still masked.
+        assert!(
+            !v["metadata"]["note"].as_str().unwrap().contains("bob@example.com"),
+            "other metadata leaves must still be masked: {}",
+            v["metadata"]["note"]
+        );
     }
 
     // With a model `Ready`, `mask_request` runs the COLLECT → prewarm → MASK two-phase

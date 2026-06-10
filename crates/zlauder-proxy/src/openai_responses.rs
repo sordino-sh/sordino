@@ -11,9 +11,10 @@ use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http::{StatusCode, header::CONTENT_TYPE};
 use openai_wire::{
-    ResponseCompletedEvent, ResponseContentPart, ResponseFunctionCallItem,
-    ResponseFunctionCallOutputItem, ResponseInputItem, ResponseMessageContent, ResponseMessageItem,
-    ResponseObject, ResponseOutputItem, ResponseStreamEvent, ResponsesInput, ResponsesRequest,
+    ResponseCompletedEvent, ResponseContentPart, ResponseFunctionCallArgumentsDeltaEvent,
+    ResponseFunctionCallItem, ResponseFunctionCallOutputItem, ResponseInputItem,
+    ResponseMessageContent, ResponseMessageItem, ResponseObject, ResponseOutputItem,
+    ResponseOutputTextDeltaEvent, ResponseStreamEvent, ResponsesInput, ResponsesRequest,
 };
 use serde_json::{Map, Value};
 use sse_core::{SseClient, SseEvent};
@@ -21,7 +22,7 @@ use zlauder_engine::{
     EngineError, MAX_TOKEN_LEN, MaskEngine, MaskStats, Surface, UnmaskManifest, token_regex,
 };
 
-use crate::{headers, monitor, routes, state::AppState, walk};
+use crate::{headers, monitor, routes, sse, state::AppState, walk};
 
 const MAX_BODY: usize = 64 * 1024 * 1024;
 
@@ -86,8 +87,12 @@ async fn responses_inner(st: AppState, req: Request, conversation: Option<String
     let manifest = Arc::new(manifest);
 
     if is_sse {
-        let guard =
-            monitor::CompletionGuard::new(st.monitor.clone(), record_id.clone(), status.as_u16());
+        let guard = monitor::CompletionGuard::new(
+            st.monitor.clone(),
+            record_id.clone(),
+            status.as_u16(),
+            manifest.as_ref(),
+        );
         let body = unmask_sse_body(
             Box::pin(resp.bytes_stream()),
             st.engine.clone(),
@@ -110,7 +115,7 @@ async fn responses_inner(st: AppState, req: Request, conversation: Option<String
         let out = unmask_response(st.engine.as_ref(), &manifest, &bytes)
             .unwrap_or_else(|_| bytes.to_vec());
         st.monitor
-            .record_response(&record_id, status.as_u16(), Some(&out));
+            .record_response(&record_id, status.as_u16(), Some(&out), &manifest);
         routes::respond(status, out_headers, Body::from(out))
     }
 }
@@ -237,12 +242,15 @@ impl MaskWalker<'_> {
         if let Some(instructions) = req.instructions.as_mut() {
             self.str(instructions, Surface::SystemPrompt)?;
         }
+        // `metadata` is developer free-form key-values (not telemetry) → still masked.
         if let Some(metadata) = req.metadata.as_mut() {
             self.value_safe(metadata, Surface::UserMessage)?;
         }
-        if let Some(user) = req.user.as_mut() {
-            self.str(user, Surface::UserMessage)?;
-        }
+        // The top-level `user` field is API-protocol TELEMETRY (OpenAI's abuse-correlation
+        // identifier), contractually opaque — the direct analog of Anthropic's
+        // `metadata.user_id` (see walk.rs). Pass it through VERBATIM; masking it corrupts
+        // the telemetry on the wire. (`metadata` above stays masked: it is developer
+        // free-form content, not the telemetry field.)
         self.map_safe(&mut req.extra, Surface::UserMessage)?;
         Ok(())
     }
@@ -560,6 +568,9 @@ pub fn unmask_sse_body(
                     st.done = true;
                 }
                 None => {
+                    // Upstream closed without a [DONE] sentinel: still flush held tails
+                    // (no-op if [DONE] already drained them) before finalizing.
+                    flush_held(&mut st);
                     st.guard.complete();
                     st.done = true;
                 }
@@ -674,6 +685,77 @@ impl ResponsesSseUnmasker {
             .unmask(safe, manifest)
             .unwrap_or_else(|_| safe.to_string())
     }
+
+    /// Drain any still-held partial-token tails at stream end: output-text tails per
+    /// (item_id, output_index, content_index), function-arg tails per (item_id,
+    /// output_index). Mirrors the Anthropic relay so a stream ending mid-incomplete-token
+    /// does not silently drop its final fragment.
+    fn drain(&mut self) -> (Vec<(TextCarryKey, String)>, Vec<(ArgsCarryKey, String)>) {
+        let text: Vec<(TextCarryKey, String)> =
+            self.text_carry.drain().filter(|(_, v)| !v.is_empty()).collect();
+        let args: Vec<(ArgsCarryKey, String)> =
+            self.args_carry.drain().filter(|(_, v)| !v.is_empty()).collect();
+        (text, args)
+    }
+}
+
+/// Flush held partial-token tails (output text + function args) BEFORE the stream's
+/// terminal sentinel — re-emitting each downstream as its true delta event and capturing
+/// it through the same keys as the streaming path, so neither the client nor the monitor
+/// loses a reply that ends mid-incomplete-token. Idempotent (a second call finds the
+/// carries already drained).
+fn flush_held(st: &mut StreamState) {
+    let (text, args) = st.xform.drain();
+    for ((item_id, output_index, content_index), held) in text {
+        let emitted = st
+            .engine
+            .unmask_assistant(&held, st.manifest.as_ref())
+            .unwrap_or(held);
+        if emitted.is_empty() {
+            continue;
+        }
+        // Same key shape as capture_event so the tail concatenates onto the right block.
+        let key = format!("t:{item_id:?}:{output_index:?}:{content_index:?}");
+        // Monitor copy is cleaned (marker + ANSI peeled); the forwarded event keeps it.
+        let clean = sse::clean_capture(st.engine.as_ref(), &emitted);
+        st.guard
+            .capture(&key, monitor::CapKind::Text, "assistant", &clean);
+        let ev = ResponseStreamEvent::ResponseOutputTextDelta(ResponseOutputTextDeltaEvent {
+            item_id,
+            output_index,
+            content_index,
+            delta: emitted,
+            ..Default::default()
+        });
+        if let Ok(data) = serde_json::to_string(&ev) {
+            st.queue
+                .push_back(frame(Some("response.output_text.delta"), &data));
+        }
+    }
+    for ((item_id, output_index), held) in args {
+        let emitted = st
+            .engine
+            .unmask(&held, st.manifest.as_ref())
+            .unwrap_or(held);
+        if emitted.is_empty() {
+            continue;
+        }
+        let key = format!("a:{item_id:?}:{output_index:?}");
+        st.guard
+            .capture(&key, monitor::CapKind::ToolUse, "tool_call", &emitted);
+        let ev = ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(
+            ResponseFunctionCallArgumentsDeltaEvent {
+                item_id,
+                output_index,
+                delta: emitted,
+                ..Default::default()
+            },
+        );
+        if let Ok(data) = serde_json::to_string(&ev) {
+            st.queue
+                .push_back(frame(Some("response.function_call_arguments.delta"), &data));
+        }
+    }
 }
 
 fn unmask_completed(
@@ -689,21 +771,77 @@ fn unmask_completed(
 
 fn enqueue(st: &mut StreamState, sse: SseEvent) {
     if sse.data.trim() == "[DONE]" {
+        // Flush held tails BEFORE the terminal sentinel (a client stops at [DONE]).
+        flush_held(st);
         st.queue.push_back(frame(sse.event.as_deref(), "[DONE]"));
         return;
     }
     match serde_json::from_str::<ResponseStreamEvent>(&sse.data) {
         Ok(ev) => {
-            for out in st
+            let out = st
                 .xform
-                .process(ev, st.engine.as_ref(), st.manifest.as_ref())
-            {
-                if let Ok(data) = serde_json::to_string(&out) {
+                .process(ev, st.engine.as_ref(), st.manifest.as_ref());
+            // Mirror the unmasked reply onto the monitor record as it streams.
+            for o in &out {
+                capture_event(&mut st.guard, st.engine.as_ref(), o);
+            }
+            // A response.completed/failed/incomplete event is stream-terminal for a client;
+            // flush any held tail BEFORE it so a delta-accumulating client that stops there
+            // still receives the final fragment, not only one that reads through to [DONE].
+            let terminal = out.iter().any(|o| {
+                matches!(
+                    o,
+                    ResponseStreamEvent::ResponseCompleted(_)
+                        | ResponseStreamEvent::ResponseFailed(_)
+                        | ResponseStreamEvent::ResponseIncomplete(_)
+                )
+            });
+            if terminal {
+                flush_held(st);
+            }
+            for o in out {
+                if let Ok(data) = serde_json::to_string(&o) {
                     st.queue.push_back(frame(sse.event.as_deref(), &data));
                 }
             }
         }
         Err(_) => st.queue.push_back(frame(sse.event.as_deref(), &sse.data)),
+    }
+}
+
+/// Capture the unmasked output-text + function-call args from one re-emitted Responses
+/// event into the monitor's response accumulator (keyed per item / output index).
+fn capture_event(
+    guard: &mut monitor::CompletionGuard,
+    engine: &MaskEngine,
+    ev: &ResponseStreamEvent,
+) {
+    match ev {
+        ResponseStreamEvent::ResponseOutputTextDelta(d) => {
+            let key = format!("t:{:?}:{:?}:{:?}", d.item_id, d.output_index, d.content_index);
+            // Monitor copy is the clean reply (marker + ANSI peeled); the forwarded event
+            // keeps its decoration. Args are never decorated and are captured verbatim.
+            let clean = sse::clean_capture(engine, &d.delta);
+            guard.capture(&key, monitor::CapKind::Text, "assistant", &clean);
+        }
+        ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(d) => {
+            let key = format!("a:{:?}:{:?}", d.item_id, d.output_index);
+            guard.capture(&key, monitor::CapKind::ToolUse, "tool_call", &d.delta);
+        }
+        // The function NAME rides on the item-done event (this Responses wire version has
+        // no typed `output_item.added`). Record it under the SAME key the args deltas use
+        // — `a:{item.id}:{output_index}`, since the args delta's `item_id` IS the item's
+        // `id` — so the captured surface renders `name(canonical_args)` and folds out of
+        // the next delta. A key mismatch just leaves it args-only (safe over-show).
+        ResponseStreamEvent::ResponseOutputItemDone(done) => {
+            if let Some(ResponseOutputItem::FunctionCall(call)) = done.item.as_ref()
+                && !call.name.is_empty()
+            {
+                let key = format!("a:{:?}:{:?}", call.id, done.output_index);
+                guard.start_tool(&key, &call.name);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -807,6 +945,31 @@ mod tests {
         assert!(s.contains("dXNlckBleGFtcGxlLmNvbQ=="));
         assert!(s.contains("[EMAIL_ADDRESS_"));
         assert_eq!(manifest.len(), 5);
+    }
+
+    #[test]
+    fn responses_user_is_telemetry_passthrough_metadata_still_masked() {
+        // Parity with the Anthropic metadata.user_id fix: the top-level `user` field is
+        // OpenAI's abuse-correlation telemetry (opaque, verbatim). The Responses `metadata`
+        // map is developer free-form content, NOT the telemetry field, so it stays masked.
+        let e = engine();
+        let body = serde_json::json!({
+            "model": "gpt-test",
+            "user": "acct contact bob@example.com 4111111111111111",
+            "metadata": {"ticket": "ref carol@example.com"},
+            "input": "hello"
+        });
+        let (masked, _m) = mask_request(&e, body.to_string().as_bytes()).unwrap();
+        let v: Value = serde_json::from_slice(&masked).unwrap();
+        assert_eq!(
+            v["user"].as_str().unwrap(),
+            "acct contact bob@example.com 4111111111111111",
+            "user must egress verbatim (telemetry), got: {}", v["user"]
+        );
+        assert!(
+            !v["metadata"]["ticket"].as_str().unwrap().contains("carol@example.com"),
+            "developer metadata must still be masked: {}", v["metadata"]["ticket"]
+        );
     }
 
     #[test]

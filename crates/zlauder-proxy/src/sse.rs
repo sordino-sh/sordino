@@ -10,13 +10,14 @@ use std::collections::{HashMap, VecDeque};
 use std::pin::Pin;
 use std::sync::Arc;
 
+use anthropic_wire::ApiContentBlock;
 use anthropic_wire::parser::{ContentBlockDelta, StreamEvent};
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use sse_core::{SseClient, SseEvent};
 use zlauder_engine::{MAX_TOKEN_LEN, MaskEngine, UnmaskManifest, token_regex};
 
-use crate::monitor::CompletionGuard;
+use crate::monitor::{CapKind, CompletionGuard};
 use crate::walk::unmask_value;
 
 // ---------------------------------------------------------------------------
@@ -77,11 +78,45 @@ enum Wrap {
     Plain,
 }
 
+/// The delta kind of a content block, remembered per block index so a HELD partial-token
+/// tail is flushed (at `ContentBlockStop` / stream drain) as the block's TRUE kind — not
+/// blindly as a `text_delta`. Without this, a held tool-args / compaction tail was
+/// re-emitted downstream as assistant text AND captured into the monitor as assistant
+/// prose, mis-attributing machine context to the reply.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HeldKind {
+    Text,
+    Compaction,
+    InputJson,
+}
+
+impl HeldKind {
+    /// Reveal-marker policy for the SAFE (resolvable) prefix of this block: assistant
+    /// prose is decorated; machine context (compaction / tool input) is left plain.
+    fn wrap(self) -> Wrap {
+        match self {
+            HeldKind::Text => Wrap::Reveal,
+            HeldKind::Compaction | HeldKind::InputJson => Wrap::Plain,
+        }
+    }
+
+    /// Rebuild a [`ContentBlockDelta`] of this kind around `text`.
+    fn delta(self, text: String) -> ContentBlockDelta {
+        match self {
+            HeldKind::Text => ContentBlockDelta::TextDelta { text },
+            HeldKind::Compaction => ContentBlockDelta::CompactionDelta { content: text },
+            HeldKind::InputJson => ContentBlockDelta::InputJsonDelta { partial_json: text },
+        }
+    }
+}
+
 /// Stateful per-response unmasker. One per streamed response.
 #[derive(Default)]
 pub struct SseUnmasker {
     /// Held partial-token tail per content-block index.
     carry: HashMap<u32, String>,
+    /// The delta kind of each content-block index, so a held tail flushes as its true kind.
+    held_kind: HashMap<u32, HeldKind>,
 }
 
 impl SseUnmasker {
@@ -108,9 +143,15 @@ impl SseUnmasker {
                 {
                     let flushed = engine.unmask(&held, manifest).unwrap_or(held);
                     if !flushed.is_empty() {
-                        out.push(text_delta(index, flushed));
+                        // Flush as the block's TRUE kind, not blindly as text.
+                        let kind = self.held_kind.get(&index).copied().unwrap_or(HeldKind::Text);
+                        out.push(StreamEvent::ContentBlockDelta {
+                            index,
+                            delta: kind.delta(flushed),
+                        });
                     }
                 }
+                self.held_kind.remove(&index);
                 out.push(StreamEvent::ContentBlockStop { index });
                 out
             }
@@ -132,23 +173,17 @@ impl SseUnmasker {
         match delta {
             // Assistant prose → display: the only delta the reveal marker decorates.
             ContentBlockDelta::TextDelta { text } => {
-                self.buffered(index, text, Wrap::Reveal, engine, manifest, |t| {
-                    ContentBlockDelta::TextDelta { text: t }
-                })
+                self.buffered(index, text, HeldKind::Text, engine, manifest)
             }
             // Machine context that is re-sent upstream: never decorate.
             ContentBlockDelta::CompactionDelta { content } => {
-                self.buffered(index, content, Wrap::Plain, engine, manifest, |t| {
-                    ContentBlockDelta::CompactionDelta { content: t }
-                })
+                self.buffered(index, content, HeldKind::Compaction, engine, manifest)
             }
             ContentBlockDelta::InputJsonDelta { partial_json } => {
                 // Token chars are all JSON-safe (never escaped), so a token can
                 // only be split by a chunk boundary, not a JSON-escape boundary.
                 // Tool input is consumed verbatim by a tool → never decorate.
-                self.buffered(index, partial_json, Wrap::Plain, engine, manifest, |t| {
-                    ContentBlockDelta::InputJsonDelta { partial_json: t }
-                })
+                self.buffered(index, partial_json, HeldKind::InputJson, engine, manifest)
             }
             ContentBlockDelta::CitationsDelta { mut citation } => {
                 unmask_value(engine, manifest, &mut citation);
@@ -169,11 +204,13 @@ impl SseUnmasker {
         &mut self,
         index: u32,
         incoming: String,
-        wrap: Wrap,
+        kind: HeldKind,
         engine: &MaskEngine,
         manifest: &UnmaskManifest,
-        make: impl Fn(String) -> ContentBlockDelta,
     ) -> Vec<StreamEvent> {
+        // Remember this block's kind so a later stop/drain flush re-emits its held tail
+        // as the same kind (not as text).
+        self.held_kind.insert(index, kind);
         let buf = {
             let c = self.carry.entry(index).or_default();
             c.push_str(&incoming);
@@ -183,7 +220,7 @@ impl SseUnmasker {
         // Only the `safe` prefix is unmasked here; `held` is at most one INCOMPLETE
         // token tail (never a resolvable token), so the reveal marker only ever needs
         // to apply on this path — the stop/drain flushes below stay plain.
-        let emitted = match wrap {
+        let emitted = match kind.wrap() {
             Wrap::Reveal => engine.unmask_assistant(safe, manifest),
             Wrap::Plain => engine.unmask(safe, manifest),
         }
@@ -194,17 +231,25 @@ impl SseUnmasker {
         } else {
             vec![StreamEvent::ContentBlockDelta {
                 index,
-                delta: make(emitted),
+                delta: kind.delta(emitted),
             }]
         }
     }
 
-    /// Drain any still-held carry buffers (call on upstream end).
-    fn drain(&mut self) -> Vec<(u32, String)> {
-        self.carry.drain().filter(|(_, v)| !v.is_empty()).collect()
+    /// Drain any still-held carry buffers (call on upstream end), each tagged with the
+    /// block's kind so the caller re-emits/captures it as text / compaction / tool input.
+    fn drain(&mut self) -> Vec<(u32, HeldKind, String)> {
+        let held: Vec<(u32, String)> = self.carry.drain().filter(|(_, v)| !v.is_empty()).collect();
+        held.into_iter()
+            .map(|(i, v)| {
+                let kind = self.held_kind.get(&i).copied().unwrap_or(HeldKind::Text);
+                (i, kind, v)
+            })
+            .collect()
     }
 }
 
+#[cfg(test)]
 fn text_delta(index: u32, text: String) -> StreamEvent {
     StreamEvent::ContentBlockDelta {
         index,
@@ -300,13 +345,21 @@ pub fn unmask_sse_body(
                     st.done = true;
                 }
                 None => {
-                    for (index, held) in st.xform.drain() {
+                    for (index, kind, held) in st.xform.drain() {
                         let flushed = st
                             .engine
                             .unmask(&held, st.manifest.as_ref())
                             .unwrap_or(held);
                         if !flushed.is_empty() {
-                            st.queue.push_back(frame_for(&text_delta(index, flushed)));
+                            // Re-emit the held tail as its TRUE kind and capture through the
+                            // same classifier as the streaming path (compaction → not
+                            // captured; tool input → tool_use; text → assistant prose).
+                            let ev = StreamEvent::ContentBlockDelta {
+                                index,
+                                delta: kind.delta(flushed),
+                            };
+                            capture_event(&mut st.guard, st.engine.as_ref(), &ev);
+                            st.queue.push_back(frame_for(&ev));
                         }
                     }
                     st.guard.complete();
@@ -322,17 +375,102 @@ pub fn unmask_sse_body(
 fn enqueue(st: &mut StreamState, sse: SseEvent) {
     match serde_json::from_str::<StreamEvent>(&sse.data) {
         Ok(ev) => {
-            for out in st
+            let out = st
                 .xform
-                .process(ev, st.engine.as_ref(), st.manifest.as_ref())
-            {
-                st.queue.push_back(frame_for(&out));
+                .process(ev, st.engine.as_ref(), st.manifest.as_ref());
+            // Mirror exactly what we forward downstream onto the monitor record (already
+            // unmasked), so the operator sees the reply on THIS turn as it streams.
+            for o in &out {
+                capture_event(&mut st.guard, st.engine.as_ref(), o);
+            }
+            for o in out {
+                st.queue.push_back(frame_for(&o));
             }
         }
         // Unparseable payload: relay verbatim rather than break the stream.
         Err(_) => st
             .queue
             .push_back(frame(sse.event.as_deref().unwrap_or("message"), &sse.data)),
+    }
+}
+
+/// Clean an assistant-text fragment for the MONITOR copy: peel the configured reveal
+/// marker, then strip terminal/ANSI escapes. The forwarded stream keeps the decoration
+/// (the user's in-conversation unmask insight); the captured copy is the clean reply, so
+/// it matches the re-masked re-send and folds out of the next turn's delta. Shared by all
+/// three relay paths (Anthropic here + both OpenAI relays). Tool args are never decorated,
+/// so they are captured verbatim and do NOT go through this.
+pub(crate) fn clean_capture(engine: &MaskEngine, text: &str) -> String {
+    let demarked = engine.strip_reveal_marker(text);
+    strip_terminal_codes(&demarked).into_owned()
+}
+
+/// Strip ANSI/VT terminal escape sequences (a CSI `ESC [ … final-byte`, plus a lone
+/// `ESC`). The monitor capture holds the CLEAN reply — terminal control bytes are the
+/// client's display concern, never part of the stored reply, and they would stop a
+/// captured reply from matching the un-decorated re-send. Independent of the
+/// configurable reveal marker (ANSI is only its default). Borrow-free when no `ESC`.
+fn strip_terminal_codes(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains('\u{1b}') {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '\u{1b}' {
+            out.push(c);
+            continue;
+        }
+        // ESC: for a CSI (`ESC [`) consume through the final byte (0x40..=0x7E);
+        // for any other escape just drop the ESC itself.
+        if chars.peek() == Some(&'[') {
+            chars.next(); // '['
+            for p in chars.by_ref() {
+                if ('@'..='~').contains(&p) {
+                    break;
+                }
+            }
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Capture the unmasked assistant text / tool-call args from one re-emitted stream event
+/// into the monitor's response accumulator. Thinking/signature blocks stay opaque and are
+/// not captured; compaction deltas are machine context (re-sent upstream), not the reply.
+fn capture_event(guard: &mut CompletionGuard, engine: &MaskEngine, ev: &StreamEvent) {
+    // A tool-call's NAME rides only on the block start (the InputJsonDelta fragments
+    // carry args only). Record it under the SAME key the args capture uses (`j{index}`)
+    // so the captured surface renders as `name(args)` and folds out of the next delta.
+    if let StreamEvent::ContentBlockStart { index, content_block } = ev
+        && let ApiContentBlock::ToolUse { name, .. } = content_block
+    {
+        guard.start_tool(&format!("j{index}"), name);
+    }
+    if let StreamEvent::ContentBlockDelta { index, delta } = ev {
+        match delta {
+            ContentBlockDelta::TextDelta { text } => {
+                // The forwarded stream keeps the reveal decoration (the user's
+                // in-conversation unmask insight). The MONITOR copy is the CLEAN reply:
+                // peel the configured reveal marker (symmetric with the engine's
+                // strip-on-resend, so a custom marker is handled too) AND any terminal
+                // escape codes (symmetric with the client storing an un-decorated
+                // transcript). That clean form matches the re-masked re-send, so a
+                // captured reply folds out of the next turn's delta.
+                let clean = clean_capture(engine, text);
+                guard.capture(&format!("t{index}"), CapKind::Text, "assistant", &clean);
+            }
+            ContentBlockDelta::InputJsonDelta { partial_json } => {
+                // Tool args are never decorated and are consumed verbatim by tools.
+                guard.capture(
+                    &format!("j{index}"),
+                    CapKind::ToolUse,
+                    &format!("tool_use[{index}]"),
+                    partial_json,
+                );
+            }
+            _ => {}
+        }
     }
 }
 
@@ -512,5 +650,65 @@ mod tests {
             &m,
         )));
         assert_eq!(got, "see [EMAIL_ab");
+    }
+
+    // A held partial-token tail must flush at ContentBlockStop as the block's TRUE delta
+    // kind — NOT blindly as a text_delta. Otherwise a tool-args / compaction tail is both
+    // mis-emitted downstream as assistant text and mis-captured into the monitor reply.
+    #[test]
+    fn held_tail_flushes_as_its_true_kind() {
+        let e = engine();
+        let m = UnmaskManifest::new();
+
+        let start = || StreamEvent::ContentBlockStart {
+            index: 0,
+            content_block: ApiContentBlock::Text {
+                text: String::new(),
+                cache_control: None,
+            },
+        };
+        let stop_kind = |out: &[StreamEvent]| -> Option<&'static str> {
+            out.iter().find_map(|ev| match ev {
+                StreamEvent::ContentBlockDelta { delta, .. } => Some(match delta {
+                    ContentBlockDelta::TextDelta { .. } => "text",
+                    ContentBlockDelta::CompactionDelta { .. } => "compaction",
+                    ContentBlockDelta::InputJsonDelta { .. } => "input_json",
+                    _ => "other",
+                }),
+                _ => None,
+            })
+        };
+
+        // Tool input ending mid-incomplete-token: held "[EMAIL_ab" must flush as InputJson.
+        let mut x = SseUnmasker::new();
+        x.process(start(), &e, &m);
+        x.process(
+            StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: ContentBlockDelta::InputJsonDelta {
+                    partial_json: "{\"x\":\"[EMAIL_ab".to_string(),
+                },
+            },
+            &e,
+            &m,
+        );
+        let out = x.process(StreamEvent::ContentBlockStop { index: 0 }, &e, &m);
+        assert_eq!(stop_kind(&out), Some("input_json"), "tool tail flushes as tool input, not text");
+
+        // Compaction ending mid-incomplete-token: held tail must flush as Compaction.
+        let mut x = SseUnmasker::new();
+        x.process(start(), &e, &m);
+        x.process(
+            StreamEvent::ContentBlockDelta {
+                index: 0,
+                delta: ContentBlockDelta::CompactionDelta {
+                    content: "ctx [EMAIL_ab".to_string(),
+                },
+            },
+            &e,
+            &m,
+        );
+        let out = x.process(StreamEvent::ContentBlockStop { index: 0 }, &e, &m);
+        assert_eq!(stop_kind(&out), Some("compaction"), "compaction tail flushes as compaction, not text");
     }
 }

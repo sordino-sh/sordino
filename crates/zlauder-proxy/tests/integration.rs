@@ -131,6 +131,43 @@ async fn fake_openai_chat_stream_upstream(
     (StatusCode::OK, [(CONTENT_TYPE, "text/event-stream")], body)
 }
 
+/// A chat stream whose reply ENDS on a viable-but-incomplete token prefix (no closing
+/// `]`), so the relay's carry buffer holds the trailing fragment — which the relay used to
+/// drop at stream end. Exercises the held-tail drain on the chat path.
+async fn fake_openai_chat_stream_held_tail_upstream(
+    State(cap): State<Captured>,
+    body: Bytes,
+) -> impl IntoResponse {
+    *cap.body.lock().unwrap() = String::from_utf8_lossy(&body).to_string();
+    let data1 = serde_json::json!({
+        "id": "chatcmpl_tail", "object": "chat.completion.chunk", "model": "gpt-test",
+        "choices": [{"index": 0, "delta": {"content": "tail [EMAIL_ADDRESS_a1b2c3"}, "finish_reason": null}]
+    });
+    // A dedicated finish_reason chunk before [DONE] — a client may stop here, so the held
+    // tail must be flushed BEFORE this chunk, not only before [DONE].
+    let data2 = serde_json::json!({
+        "id": "chatcmpl_tail", "object": "chat.completion.chunk", "model": "gpt-test",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]
+    });
+    let body = format!("data: {data1}\n\ndata: {data2}\n\ndata: [DONE]\n\n");
+    (StatusCode::OK, [(CONTENT_TYPE, "text/event-stream")], body)
+}
+
+/// A (non-standard but possible) chat stream where a SINGLE chunk carries both trailing
+/// content ending mid-token AND finish_reason — exercises the content→tail→terminal split.
+async fn fake_openai_chat_stream_content_and_finish_upstream(
+    State(cap): State<Captured>,
+    body: Bytes,
+) -> impl IntoResponse {
+    *cap.body.lock().unwrap() = String::from_utf8_lossy(&body).to_string();
+    let data1 = serde_json::json!({
+        "id": "chatcmpl_combo", "object": "chat.completion.chunk", "model": "gpt-test",
+        "choices": [{"index": 0, "delta": {"content": "abc [EMAIL_ab"}, "finish_reason": "stop"}]
+    });
+    let body = format!("data: {data1}\n\ndata: [DONE]\n\n");
+    (StatusCode::OK, [(CONTENT_TYPE, "text/event-stream")], body)
+}
+
 async fn fake_responses_upstream(
     State(cap): State<Captured>,
     body: Bytes,
@@ -365,6 +402,133 @@ async fn openai_chat_completions_streaming_unmasks_and_preserves_done() {
     );
 }
 
+// A chat stream that ends mid-incomplete-token must flush the held tail to BOTH the wire
+// (before [DONE]) and the monitor record — not silently drop it. Regression for the
+// cumulative-audit finding that the OpenAI relays never drained their carry buffer, and
+// the first integration coverage of the OpenAI chat capture→record path.
+#[tokio::test]
+async fn openai_chat_stream_held_tail_reaches_client_and_monitor() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(fake_openai_chat_stream_held_tail_upstream),
+        )
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, format!("http://{up_addr}"), "tail-key");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let client = reqwest::Client::new();
+    let text = client
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "gpt-test",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    // The held trailing fragment is flushed to the client BEFORE the finish_reason chunk
+    // (and thus before [DONE]) — a client that stops at finish_reason still receives it.
+    let tail_idx = text
+        .find("[EMAIL_ADDRESS_a1b2c3")
+        .unwrap_or_else(|| panic!("held tail dropped from the wire: {text}"));
+    let finish_idx = text.find("\"stop\"").expect("finish_reason chunk present");
+    let done_idx = text.find("[DONE]").expect("[DONE] present");
+    assert!(tail_idx < finish_idx, "held tail must precede the finish_reason chunk: {text}");
+    assert!(finish_idx < done_idx, "[DONE] is last: {text}");
+
+    // And it is captured onto the monitor record — the reply is not truncated.
+    let snap: serde_json::Value = client
+        .get(format!("http://{proxy_addr}/zlauder/monitor/snapshot"))
+        .header("x-zlauder-key", "tail-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rec = snap["records"]
+        .as_array()
+        .and_then(|rs| rs.first())
+        .expect("one recorded request");
+    assert_eq!(rec["decision"], "completed");
+    let preview = rec["response_preview"].as_str().unwrap_or_default();
+    assert!(
+        preview.contains("tail [EMAIL_ADDRESS_a1b2c3"),
+        "captured streamed reply was truncated: {preview}"
+    );
+}
+
+// A single chunk carrying BOTH content (ending mid-token) and finish_reason must not let
+// the flushed held tail jump ahead of that chunk's own content. Wire order must be
+// content → tail → terminal, and the captured reply must keep the same order.
+#[tokio::test]
+async fn openai_chat_stream_content_and_finish_in_one_chunk_orders_correctly() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route(
+            "/v1/chat/completions",
+            post(fake_openai_chat_stream_content_and_finish_upstream),
+        )
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, format!("http://{up_addr}"), "combo-key");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let client = reqwest::Client::new();
+    let text = client
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "gpt-test",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hi"}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    // Wire order: content "abc " → held tail → finish_reason — never reversed.
+    let abc = text.find("abc ").expect("content on the wire");
+    let tail = text.find("[EMAIL_ab").expect("held tail on the wire");
+    let stop = text.find("\"stop\"").expect("finish_reason present");
+    assert!(abc < tail, "content must precede the held tail: {text}");
+    assert!(tail < stop, "held tail must precede finish_reason: {text}");
+
+    // The captured reply preserves the correct order (wire == capture).
+    let snap: serde_json::Value = client
+        .get(format!("http://{proxy_addr}/zlauder/monitor/snapshot"))
+        .header("x-zlauder-key", "combo-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rec = snap["records"]
+        .as_array()
+        .and_then(|rs| rs.first())
+        .expect("one recorded request");
+    let preview = rec["response_preview"].as_str().unwrap_or_default();
+    assert!(
+        preview.contains("abc [EMAIL_ab"),
+        "captured reply order reversed: {preview}"
+    );
+}
+
 #[tokio::test]
 async fn openai_responses_mask_unmask_json_response() {
     let cap = Captured::default();
@@ -453,6 +617,39 @@ async fn openai_responses_streaming_unmasks_and_preserves_sse_events() {
     assert!(
         !text.contains("[EMAIL_ADDRESS_"),
         "token leaked to client: {text}"
+    );
+
+    // The STREAMED reply must also land on the monitor record (the headline fix): the
+    // operator sees the model's response on THIS turn, not only once the next request
+    // resends it as transcript. By the time `.text()` resolved the stream had drained, so
+    // CompletionGuard::complete() already finalized the record.
+    let snap: serde_json::Value = client
+        .get(format!("http://{proxy_addr}/zlauder/monitor/snapshot"))
+        .header("x-zlauder-key", "test-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let rec = snap["records"]
+        .as_array()
+        .and_then(|rs| rs.first())
+        .expect("one recorded request");
+    assert_eq!(rec["decision"], "completed", "streamed turn finalized");
+    let resp_blob = rec["response_surfaces"].to_string() + &rec["response_preview"].to_string();
+    assert!(
+        resp_blob.contains("response-stream@example.com"),
+        "streamed reply not captured onto the record: {}",
+        rec["response_preview"]
+    );
+    // The captured reply text is UNMASKED (the run text + raw preview carry plaintext, not
+    // handles). The handle still rides each token run's `TokenRef` metadata — that is the
+    // same local, key-gated handle→value mapping the request surfaces carry, by design.
+    let preview = rec["response_preview"].as_str().unwrap_or_default();
+    assert!(
+        !preview.contains("[EMAIL_ADDRESS_"),
+        "masked handle leaked into the captured response text: {preview}"
     );
 }
 

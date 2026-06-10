@@ -401,6 +401,25 @@ fn default_approval_timeout_secs() -> u64 {
     300
 }
 
+/// A live, in-flight update of a STREAMED response, carried on its own lightweight
+/// SSE frame rather than the whole [`RequestRecord`].
+///
+/// The three SSE relay paths unmask the upstream reply frame-by-frame and forward it
+/// downstream; this frame mirrors the same unmasked text onto the monitor as it streams,
+/// so the operator watches the model's reply paint in on the SAME turn — instead of only
+/// seeing it once the NEXT request resends it as transcript. Kept separate from the
+/// `Record` frame on purpose: re-broadcasting the entire (often 100KB+) request body on
+/// every text chunk would be wasteful, so only the growing response rides here. The UI
+/// merges these onto the matching record by `id`. The terminal `Completed` state still
+/// arrives on a full `Record` frame when the stream drains.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ResponseProgress {
+    pub id: String,
+    pub status: u16,
+    pub response_preview: String,
+    pub response_surfaces: Vec<Surface>,
+}
+
 /// SSE event envelope: `{ "event": ..., "data": ... }`.
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case", tag = "event", content = "data")]
@@ -413,6 +432,9 @@ pub(crate) enum MonitorEvent {
     /// open policy panel re-syncs the instant the policy moves — the panel is then
     /// a faithful live mirror, never a stale snapshot from when it was opened.
     Policy(Box<serde_json::Value>),
+    /// A streamed response grew. Lightweight live update of one record's `response_*`
+    /// fields (see [`ResponseProgress`]); emitted by the SSE relay as the model replies.
+    ResponseProgress(Box<ResponseProgress>),
 }
 
 // --- request DTOs (HTTP input bodies) ---

@@ -12,7 +12,7 @@ use futures::{Stream, StreamExt};
 use http::{StatusCode, header::CONTENT_TYPE};
 use openai_wire::{
     ChatCompletionsRequest, ChatCompletionsResponse, OpenAIChunk, OpenAIContent, OpenAIContentPart,
-    OpenAIMessage,
+    OpenAIDelta, OpenAIFunctionDelta, OpenAIMessage, OpenAIStreamChoice, OpenAIToolCallDelta,
 };
 use serde_json::{Map, Value};
 use sse_core::{SseClient, SseEvent};
@@ -20,7 +20,7 @@ use zlauder_engine::{
     EngineError, MAX_TOKEN_LEN, MaskEngine, MaskStats, Surface, UnmaskManifest, token_regex,
 };
 
-use crate::{headers, monitor, routes, state::AppState, walk};
+use crate::{headers, monitor, routes, sse, state::AppState, walk};
 
 const MAX_BODY: usize = 64 * 1024 * 1024;
 
@@ -89,8 +89,12 @@ async fn chat_completions_inner(
     let manifest = Arc::new(manifest);
 
     if is_sse {
-        let guard =
-            monitor::CompletionGuard::new(st.monitor.clone(), record_id.clone(), status.as_u16());
+        let guard = monitor::CompletionGuard::new(
+            st.monitor.clone(),
+            record_id.clone(),
+            status.as_u16(),
+            manifest.as_ref(),
+        );
         let body = unmask_sse_body(
             Box::pin(resp.bytes_stream()),
             st.engine.clone(),
@@ -113,7 +117,7 @@ async fn chat_completions_inner(
         let out = unmask_response(st.engine.as_ref(), &manifest, &bytes)
             .unwrap_or_else(|_| bytes.to_vec());
         st.monitor
-            .record_response(&record_id, status.as_u16(), Some(&out));
+            .record_response(&record_id, status.as_u16(), Some(&out), &manifest);
         routes::respond(status, out_headers, Body::from(out))
     }
 }
@@ -247,9 +251,12 @@ impl MaskWalker<'_> {
         for msg in req.messages.iter_mut() {
             self.message(msg)?;
         }
-        if let Some(user) = req.user.as_mut() {
-            self.str(user, Surface::UserMessage)?;
-        }
+        // The top-level `user` field is API-protocol TELEMETRY (OpenAI's abuse-correlation
+        // identifier), contractually opaque, not natural-language content — the direct
+        // analog of Anthropic's `metadata.user_id` (see walk.rs). Pass it through VERBATIM:
+        // masking it corrupts the telemetry on the wire (a value that trips a detector would
+        // egress as a token and change every session, reading as deliberate evasion). Other
+        // caller-set `extra` leaves are still masked below (defense-in-depth).
         self.map_safe(&mut req.extra, Surface::UserMessage)?;
         Ok(())
     }
@@ -474,6 +481,9 @@ pub fn unmask_sse_body(
                     st.done = true;
                 }
                 None => {
+                    // Upstream closed without a [DONE] sentinel: still flush held tails
+                    // (no-op if [DONE] already drained them) before finalizing.
+                    flush_held(&mut st);
                     st.guard.complete();
                     st.done = true;
                 }
@@ -484,10 +494,64 @@ pub fn unmask_sse_body(
     Body::from_stream(stream)
 }
 
+/// Envelope (id/model/created/…) of the most recent chunk, so a flushed held tail can be
+/// re-emitted as a valid chunk carrying the same stream identity, not a bare `{choices}`.
+#[derive(Default, Clone)]
+struct ChunkEnvelope {
+    id: Option<String>,
+    object: Option<String>,
+    created: Option<u64>,
+    model: Option<String>,
+    system_fingerprint: Option<String>,
+}
+
+impl ChunkEnvelope {
+    fn chunk(&self, choice: OpenAIStreamChoice) -> OpenAIChunk {
+        OpenAIChunk {
+            id: self.id.clone(),
+            object: self.object.clone(),
+            created: self.created,
+            model: self.model.clone(),
+            system_fingerprint: self.system_fingerprint.clone(),
+            choices: vec![choice],
+            ..Default::default()
+        }
+    }
+    fn content_chunk(&self, index: i64, content: String) -> OpenAIChunk {
+        self.chunk(OpenAIStreamChoice {
+            index,
+            delta: OpenAIDelta {
+                content: Some(content),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+    fn tool_chunk(&self, choice: i64, call: i64, arguments: String) -> OpenAIChunk {
+        self.chunk(OpenAIStreamChoice {
+            index: choice,
+            delta: OpenAIDelta {
+                tool_calls: Some(vec![OpenAIToolCallDelta {
+                    index: call,
+                    function: Some(OpenAIFunctionDelta {
+                        arguments: Some(arguments),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                }]),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+    }
+}
+
 #[derive(Default)]
 struct OpenAISseUnmasker {
     content_carry: HashMap<i64, String>,
     tool_carry: HashMap<(i64, i64), String>,
+    /// Envelope of the latest chunk, used to mint a valid flushed-tail chunk at stream end.
+    envelope: ChunkEnvelope,
 }
 
 impl OpenAISseUnmasker {
@@ -497,6 +561,14 @@ impl OpenAISseUnmasker {
         engine: &MaskEngine,
         manifest: &UnmaskManifest,
     ) -> OpenAIChunk {
+        // Remember this chunk's envelope so a held-tail flush can reuse its identity.
+        self.envelope = ChunkEnvelope {
+            id: chunk.id.clone(),
+            object: chunk.object.clone(),
+            created: chunk.created,
+            model: chunk.model.clone(),
+            system_fingerprint: chunk.system_fingerprint.clone(),
+        };
         for choice in chunk.choices.iter_mut() {
             if let Some(content) = choice.delta.content.take() {
                 choice.delta.content =
@@ -568,10 +640,69 @@ impl OpenAISseUnmasker {
             Some(emitted)
         }
     }
+
+    /// Drain any still-held partial-token tails at stream end: content tails per choice
+    /// index, tool-arg tails per (choice, call). Mirrors the Anthropic relay's drain so a
+    /// stream ending mid-incomplete-token does not silently drop its final fragment.
+    fn drain(&mut self) -> (Vec<(i64, String)>, Vec<((i64, i64), String)>) {
+        let content: Vec<(i64, String)> =
+            self.content_carry.drain().filter(|(_, v)| !v.is_empty()).collect();
+        let tool: Vec<((i64, i64), String)> =
+            self.tool_carry.drain().filter(|(_, v)| !v.is_empty()).collect();
+        (content, tool)
+    }
+}
+
+/// Flush held partial-token tails (content + tool args) BEFORE the stream's terminal
+/// sentinel — re-emitting each downstream as a valid chunk (reusing the last envelope) and
+/// capturing it into the monitor through the same keys as the streaming path, so neither
+/// the client nor the monitor loses a reply that ends mid-incomplete-token. Idempotent: a
+/// second call after `drain()` emptied the carries is a no-op.
+fn flush_held(st: &mut StreamState) {
+    let (content, tool) = st.xform.drain();
+    for (index, held) in content {
+        let emitted = st
+            .engine
+            .unmask_assistant(&held, st.manifest.as_ref())
+            .unwrap_or(held);
+        if emitted.is_empty() {
+            continue;
+        }
+        // Monitor copy is cleaned (marker + ANSI peeled); the forwarded chunk keeps it.
+        let clean = sse::clean_capture(st.engine.as_ref(), &emitted);
+        st.guard
+            .capture(&format!("c{index}"), monitor::CapKind::Text, "assistant", &clean);
+        let chunk = st.xform.envelope.content_chunk(index, emitted);
+        if let Ok(data) = serde_json::to_string(&chunk) {
+            st.queue.push_back(frame(None, &data));
+        }
+    }
+    for ((choice, call), held) in tool {
+        let emitted = st
+            .engine
+            .unmask(&held, st.manifest.as_ref())
+            .unwrap_or(held);
+        if emitted.is_empty() {
+            continue;
+        }
+        st.guard.capture(
+            &format!("c{choice}t{call}"),
+            monitor::CapKind::ToolUse,
+            "tool_call",
+            &emitted,
+        );
+        let chunk = st.xform.envelope.tool_chunk(choice, call, emitted);
+        if let Ok(data) = serde_json::to_string(&chunk) {
+            st.queue.push_back(frame(None, &data));
+        }
+    }
 }
 
 fn enqueue(st: &mut StreamState, sse: SseEvent) {
     if sse.data.trim() == "[DONE]" {
+        // Flush any held tail BEFORE the terminal sentinel — a client stops reading at
+        // [DONE], so a tail emitted after it would be lost.
+        flush_held(st);
         st.queue.push_back(frame(sse.event.as_deref(), "[DONE]"));
         return;
     }
@@ -580,11 +711,84 @@ fn enqueue(st: &mut StreamState, sse: SseEvent) {
             let out = st
                 .xform
                 .process(chunk, st.engine.as_ref(), st.manifest.as_ref());
-            if let Ok(data) = serde_json::to_string(&out) {
-                st.queue.push_back(frame(sse.event.as_deref(), &data));
+            // Mirror the unmasked reply onto the monitor record as it streams.
+            capture_chunk(&mut st.guard, st.engine.as_ref(), &out);
+            // A finish_reason (or trailing usage) chunk is protocol-terminal for a client;
+            // flush any held tail BEFORE it so a client that stops at finish_reason still
+            // receives the final fragment, not only one that reads through to [DONE].
+            let terminal =
+                out.usage.is_some() || out.choices.iter().any(|c| c.finish_reason.is_some());
+            let has_content = out
+                .choices
+                .iter()
+                .any(|c| c.delta.content.is_some() || c.delta.tool_calls.is_some());
+            let event = sse.event.as_deref();
+            if terminal && has_content {
+                // One chunk carrying BOTH content and a terminal marker (non-standard, but
+                // some OpenAI-compatible backends do it): emit its content FIRST, then the
+                // held tail, then a terminal-only chunk — otherwise the flushed tail jumps
+                // ahead of the very content it trails, reversing the wire and diverging it
+                // from the captured order.
+                let mut content_part = out.clone();
+                content_part.usage = None;
+                for c in content_part.choices.iter_mut() {
+                    c.finish_reason = None;
+                }
+                if let Ok(data) = serde_json::to_string(&content_part) {
+                    st.queue.push_back(frame(event, &data));
+                }
+                flush_held(st);
+                let mut term_part = out;
+                for c in term_part.choices.iter_mut() {
+                    c.delta = OpenAIDelta::default();
+                }
+                if let Ok(data) = serde_json::to_string(&term_part) {
+                    st.queue.push_back(frame(event, &data));
+                }
+            } else {
+                if terminal {
+                    flush_held(st);
+                }
+                if let Ok(data) = serde_json::to_string(&out) {
+                    st.queue.push_back(frame(event, &data));
+                }
             }
         }
         Err(_) => st.queue.push_back(frame(sse.event.as_deref(), &sse.data)),
+    }
+}
+
+/// Capture the unmasked assistant content + tool-call args from one re-emitted chunk into
+/// the monitor's response accumulator (one block per choice / per tool call). Assistant
+/// content is cleaned of reveal-marker + ANSI for the monitor copy (the forwarded chunk
+/// keeps its decoration); the tool NAME (carried on the first delta of a tool call) is
+/// recorded so the captured surface renders `name(args)` and folds out of the next delta.
+fn capture_chunk(guard: &mut monitor::CompletionGuard, engine: &MaskEngine, chunk: &OpenAIChunk) {
+    for choice in &chunk.choices {
+        if let Some(content) = &choice.delta.content {
+            let clean = sse::clean_capture(engine, content);
+            guard.capture(
+                &format!("c{}", choice.index),
+                monitor::CapKind::Text,
+                "assistant",
+                &clean,
+            );
+        }
+        if let Some(calls) = &choice.delta.tool_calls {
+            for call in calls {
+                let key = format!("c{}t{}", choice.index, call.index);
+                // The function name rides only on the first delta of a tool call; record
+                // it under the args key so the capture renders `name(canonical_args)`.
+                if let Some(name) = call.function.as_ref().and_then(|f| f.name.as_deref())
+                    && !name.is_empty()
+                {
+                    guard.start_tool(&key, name);
+                }
+                if let Some(args) = call.function.as_ref().and_then(|f| f.arguments.as_ref()) {
+                    guard.capture(&key, monitor::CapKind::ToolUse, "tool_call", args);
+                }
+            }
+        }
     }
 }
 
@@ -680,8 +884,9 @@ mod tests {
         let (masked, manifest) = mask_request(&e, body.to_string().as_bytes()).unwrap();
         let s = String::from_utf8(masked).unwrap();
 
+        // Message/tool content is masked; the top-level `user` field is telemetry and
+        // passes VERBATIM (asserted just below), so alice@example.com is NOT in this list.
         for plain in [
-            "alice@example.com",
             "sys@example.com",
             "bob@example.com",
             "carol@example.com",
@@ -692,7 +897,33 @@ mod tests {
             assert!(!s.contains(plain), "leaked {plain}: {s}");
         }
         assert!(s.contains("[EMAIL_ADDRESS_"));
-        assert_eq!(manifest.len(), 7);
+        // Telemetry passthrough: the `user` field egresses verbatim even though its value is
+        // email-shaped (it appears nowhere else in the body, so this proves it's unmasked).
+        assert!(s.contains("alice@example.com"), "user field must pass verbatim (telemetry): {s}");
+        assert_eq!(manifest.len(), 6);
+    }
+
+    #[test]
+    fn openai_chat_user_field_is_telemetry_passthrough_other_content_still_masked() {
+        // Parity with the Anthropic metadata.user_id fix: the `user` field is OpenAI's
+        // abuse-correlation telemetry — contractually opaque, passed verbatim — while the
+        // message content beside it is still masked.
+        let e = engine();
+        let body = serde_json::json!({
+            "model": "gpt-test",
+            "user": "acct contact bob@example.com 4111111111111111",
+            "messages": [{"role": "user", "content": "mail bob@example.com"}]
+        });
+        let (masked, _m) = mask_request(&e, body.to_string().as_bytes()).unwrap();
+        let v: Value = serde_json::from_slice(&masked).unwrap();
+        assert_eq!(
+            v["user"].as_str().unwrap(),
+            "acct contact bob@example.com 4111111111111111",
+            "user must egress verbatim (telemetry), got: {}", v["user"]
+        );
+        // The message content email is still masked (telemetry passthrough is scoped to `user`).
+        let msg = v["messages"][0]["content"].as_str().unwrap();
+        assert!(!msg.contains("bob@example.com"), "message content must still mask: {msg}");
     }
 
     #[test]
