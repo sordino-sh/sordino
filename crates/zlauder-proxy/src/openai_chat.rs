@@ -710,15 +710,43 @@ fn enqueue(st: &mut StreamState, sse: SseEvent) {
             capture_chunk(&mut st.guard, &out);
             // A finish_reason (or trailing usage) chunk is protocol-terminal for a client;
             // flush any held tail BEFORE it so a client that stops at finish_reason still
-            // receives the final fragment, not only one that reads through to [DONE]. Real
-            // OpenAI streams carry finish_reason / usage in their own empty-delta chunk, so
-            // the flushed tail lands after the last content and before the terminal chunk.
-            let terminal = out.usage.is_some() || out.choices.iter().any(|c| c.finish_reason.is_some());
-            if terminal {
+            // receives the final fragment, not only one that reads through to [DONE].
+            let terminal =
+                out.usage.is_some() || out.choices.iter().any(|c| c.finish_reason.is_some());
+            let has_content = out
+                .choices
+                .iter()
+                .any(|c| c.delta.content.is_some() || c.delta.tool_calls.is_some());
+            let event = sse.event.as_deref();
+            if terminal && has_content {
+                // One chunk carrying BOTH content and a terminal marker (non-standard, but
+                // some OpenAI-compatible backends do it): emit its content FIRST, then the
+                // held tail, then a terminal-only chunk — otherwise the flushed tail jumps
+                // ahead of the very content it trails, reversing the wire and diverging it
+                // from the captured order.
+                let mut content_part = out.clone();
+                content_part.usage = None;
+                for c in content_part.choices.iter_mut() {
+                    c.finish_reason = None;
+                }
+                if let Ok(data) = serde_json::to_string(&content_part) {
+                    st.queue.push_back(frame(event, &data));
+                }
                 flush_held(st);
-            }
-            if let Ok(data) = serde_json::to_string(&out) {
-                st.queue.push_back(frame(sse.event.as_deref(), &data));
+                let mut term_part = out;
+                for c in term_part.choices.iter_mut() {
+                    c.delta = OpenAIDelta::default();
+                }
+                if let Ok(data) = serde_json::to_string(&term_part) {
+                    st.queue.push_back(frame(event, &data));
+                }
+            } else {
+                if terminal {
+                    flush_held(st);
+                }
+                if let Ok(data) = serde_json::to_string(&out) {
+                    st.queue.push_back(frame(event, &data));
+                }
             }
         }
         Err(_) => st.queue.push_back(frame(sse.event.as_deref(), &sse.data)),
