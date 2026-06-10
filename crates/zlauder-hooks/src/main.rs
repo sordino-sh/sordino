@@ -152,6 +152,28 @@ enum Cmd {
         #[command(subcommand)]
         action: SettingsAction,
     },
+    /// View or change the ZDR (trusted-routing) posture for THIS session (backs
+    /// `/zlauder:zdr`). Optional; off unless the user configures `[zdr]` targets.
+    Zdr {
+        #[command(subcommand)]
+        action: Option<ZdrAction>,
+    },
+}
+
+#[derive(Subcommand)]
+enum ZdrAction {
+    /// Show this session's ZDR status + configured targets (default).
+    Status,
+    /// Engage ZDR for this session (uses the `[zdr]` default if no config named).
+    /// BREAKS the prompt cache — never automatic.
+    On {
+        /// The `[zdr]` target name (omit to use the configured default).
+        config: Option<String>,
+    },
+    /// Disengage ZDR (back to the masked Anthropic path). Also breaks the cache.
+    Off,
+    /// List the configured ZDR targets (names + trust basis + verified flag).
+    Config,
 }
 
 #[derive(Subcommand)]
@@ -339,6 +361,7 @@ fn main() -> Result<()> {
         Cmd::Reveal { token } => reveal(token),
         Cmd::Monitor => monitor_cmd(),
         Cmd::Secrets { action } => secrets_cmd(action),
+        Cmd::Zdr { action } => zdr_cmd(action),
         Cmd::Scrub {
             transcript,
             values,
@@ -3289,6 +3312,8 @@ fn unverified(port: u16, mode: SlMode) -> String {
 /// this session — i.e. unique PII values caught — so it doubles as the "N PII" count.
 fn render_on(s: &Snapshot, port: u16, mode: SlMode) -> String {
     let ml = ml_indicator(s.ml.as_ref());
+    // Per-session ZDR segment: shown only when THIS conversation is ZDR-routed.
+    let zdr = zdr_suffix(&s.zdr, conversation_from_base_url().as_deref());
     match mode {
         SlMode::Off => String::new(),
         // ShieldOnly's whole purpose: the bare 🛡, and ONLY here (confirmed-masking). Every
@@ -3296,21 +3321,35 @@ fn render_on(s: &Snapshot, port: u16, mode: SlMode) -> String {
         SlMode::ShieldOnly => "\u{1f6e1}".to_string(),
         SlMode::Min => "\u{1f6e1}".to_string(), // 🛡 only
         SlMode::Compact => format!(
-            "\u{1f6e1} :{port} {}{}{}{}",
+            "\u{1f6e1} :{port} {}{}{}{}{}",
             s.config.profile,
             ml,
             pii_suffix(s.token_count),
-            key_suffix(s.secrets.as_ref())
+            key_suffix(s.secrets.as_ref()),
+            zdr,
         ),
         SlMode::Verbose => format!(
-            "\u{1f6e1} ON :{port} {} t={:.2}{} {} PII [{}]{}",
+            "\u{1f6e1} ON :{port} {} t={:.2}{} {} PII [{}]{}{}",
             s.config.profile,
             s.config.score_threshold,
             ml,
             s.token_count,
             s.config.enabled_categories.join(","),
-            key_suffix(s.secrets.as_ref())
+            key_suffix(s.secrets.as_ref()),
+            zdr,
         ),
+    }
+}
+
+/// ` 🔒ZDR·<config>` when THIS session's conversation is in the proxy's active ZDR
+/// set; empty otherwise (absent when off — no visual noise for the common case).
+fn zdr_suffix(zdr: &ZdrSummary, conversation: Option<&str>) -> String {
+    let Some(conv) = conversation else {
+        return String::new();
+    };
+    match zdr.active.iter().find(|a| a.conversation == conv) {
+        Some(a) => format!(" \u{1f512}ZDR\u{b7}{}", a.config), // 🔒ZDR·name
+        None => String::new(),
     }
 }
 
@@ -4212,6 +4251,130 @@ mod prompt_spoof_tests {
     }
 }
 
+// ---------------------------------------------------------------------------
+// zdr (Trust switch)
+// ---------------------------------------------------------------------------
+
+/// Backs `/zlauder:zdr`. Targets THIS session's conversation — the SessionStart hook
+/// baked the id into `ANTHROPIC_BASE_URL` as `.../zlauder/session/<id>`, which this
+/// process inherits, so the CLI keys the same id the proxy sees on the wire.
+fn zdr_cmd(port: Option<u16>, action: Option<ZdrAction>) -> Result<()> {
+    let root = canonical(&project_root());
+    let port = port.unwrap_or_else(|| pick_port(&root));
+    let key = key_for(port).context("reading session state (is the proxy running?)")?;
+    let conv = conversation_from_base_url().context(
+        "this session is not ZDR-routable: ANTHROPIC_BASE_URL has no /zlauder/session/<id> \
+         segment. Run /zlauder:enable and restart Claude Code so the proxy sees a session id.",
+    )?;
+    let url = format!(
+        "http://127.0.0.1:{port}/zlauder/session/{}/zdr",
+        percent_encode(&conv)
+    );
+    let client = blocking_client();
+    match action.unwrap_or(ZdrAction::Status) {
+        ZdrAction::Status => {
+            let snap = json_or_err(client.get(&url).header("x-zlauder-key", &key).send()?)?;
+            print_zdr_status(&snap);
+        }
+        ZdrAction::Config => {
+            let snap = json_or_err(client.get(&url).header("x-zlauder-key", &key).send()?)?;
+            print_zdr_configs(&snap);
+        }
+        ZdrAction::On { config } => {
+            let body = serde_json::json!({ "config": config });
+            let resp = json_or_err(
+                client
+                    .post(&url)
+                    .header("x-zlauder-key", &key)
+                    .json(&body)
+                    .send()?,
+            )
+            .context("engaging ZDR")?;
+            if let Some(w) = resp.get("warning").and_then(|v| v.as_str()) {
+                println!("{w}\n");
+            }
+            print_zdr_status(&resp);
+        }
+        ZdrAction::Off => {
+            let resp = json_or_err(client.delete(&url).header("x-zlauder-key", &key).send()?)?;
+            println!("ZDR disengaged — this session is back on the masked Anthropic path.");
+            println!("(The prompt cache breaks once on the next turn.)\n");
+            print_zdr_status(&resp);
+        }
+    }
+    Ok(())
+}
+
+/// Print the per-session ZDR status from a `{active, default, configured}` payload.
+/// The chrome ALWAYS frames ZDR as the USER's assertion — never as verified.
+fn print_zdr_status(snap: &Value) {
+    match snap.get("active").and_then(|v| v.as_str()) {
+        Some(name) => println!(
+            "ZDR: ON — this session routes to '{name}' (your assertion; zlauder cannot verify a \
+             provider is zero-retention). Masking still applies — values are NOT revealed."
+        ),
+        None => println!("ZDR: OFF — this session uses the normal masked Anthropic path."),
+    }
+    if let Some(def) = snap.get("default").and_then(|v| v.as_str()) {
+        println!("  default config: {def}");
+    }
+    let n = snap
+        .get("configured")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    println!("  {n} configured target(s) — `/zlauder:zdr config` to list.");
+}
+
+/// Print the configured ZDR targets (value-free view: never a credential).
+fn print_zdr_configs(snap: &Value) {
+    let configured = snap.get("configured").and_then(|v| v.as_array());
+    match configured {
+        Some(arr) if !arr.is_empty() => {
+            println!("Configured ZDR targets (asserted by you — zlauder cannot verify ZDR):");
+            for t in arr {
+                let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let basis = t.get("trust_basis").and_then(|v| v.as_str()).unwrap_or("?");
+                let verified = t
+                    .get("user_verified")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let has_key = t.get("has_key").and_then(|v| v.as_bool()).unwrap_or(false);
+                let vflag = if verified {
+                    "verified"
+                } else {
+                    "UNVERIFIED — cannot engage"
+                };
+                let kflag = if has_key { "key" } else { "no-auth" };
+                println!("  - {name}  [{basis}; {vflag}; {kflag}]");
+            }
+        }
+        _ => println!(
+            "No ZDR targets configured (this is optional). Add a `[[zdr.target]]` to zlauder.toml \
+             to enable trusted routing."
+        ),
+    }
+}
+
+/// Extract the conversation id the proxy will see, from the inherited
+/// `ANTHROPIC_BASE_URL` (the SessionStart hook baked it in as
+/// `.../zlauder/session/<id>`). `None` when this session isn't session-routed.
+fn conversation_from_base_url() -> Option<String> {
+    conversation_from_url(&std::env::var("ANTHROPIC_BASE_URL").ok()?)
+}
+
+/// Pure parser for the conversation id embedded in a base URL (testable without env).
+fn conversation_from_url(url: &str) -> Option<String> {
+    const MARKER: &str = "/zlauder/session/";
+    let idx = url.find(MARKER)? + MARKER.len();
+    let id = url[idx..].split('/').next().unwrap_or("").trim();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
+}
+
 /// PreToolUse broker resolver (T2). Reads the hook payload from stdin, asks the proxy
 /// to resolve allow-listed broker tokens into `tool_input`, and emits `updatedInput`.
 /// Every failure path is silent (emit nothing, exit 0) so the tool runs with the
@@ -4630,6 +4793,26 @@ struct Snapshot {
     /// never values.
     #[serde(default)]
     secrets: Option<SecretsSummary>,
+    /// Optional ZDR (Trust switch) summary (absent on older proxies). Active sessions
+    /// + value-free target views — never a credential.
+    #[serde(default)]
+    zdr: ZdrSummary,
+}
+
+/// The proxy's `zdr` block. `active` lists the currently ZDR-routed conversations
+/// (so the statusline can show a per-session segment); no credential ever appears.
+#[derive(serde::Deserialize, Default)]
+struct ZdrSummary {
+    #[serde(default)]
+    active: Vec<ZdrActive>,
+}
+
+#[derive(serde::Deserialize)]
+struct ZdrActive {
+    #[serde(default)]
+    conversation: String,
+    #[serde(default)]
+    config: String,
 }
 
 /// The proxy's `secrets` block, counts only.
@@ -5540,7 +5723,25 @@ mod statusline_tests {
 
 #[cfg(test)]
 mod route_tests {
-    use super::base_url_matches;
+    use super::{base_url_matches, conversation_from_url};
+
+    #[test]
+    fn conversation_id_extracted_from_session_base_url() {
+        assert_eq!(
+            conversation_from_url("http://127.0.0.1:8787/zlauder/session/abc123"),
+            Some("abc123".to_string())
+        );
+        // Trailing path segments after the id are ignored.
+        assert_eq!(
+            conversation_from_url("http://127.0.0.1:8787/zlauder/session/abc123/v1/messages"),
+            Some("abc123".to_string())
+        );
+        // A non-session (plain) base URL has no conversation id.
+        assert_eq!(conversation_from_url("http://127.0.0.1:8787"), None);
+        assert_eq!(conversation_from_url("https://api.anthropic.com"), None);
+        // An empty id segment is not a valid conversation.
+        assert_eq!(conversation_from_url("http://x/zlauder/session/"), None);
+    }
 
     #[test]
     fn matches_exact_and_trailing_slash() {
