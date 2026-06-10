@@ -157,9 +157,17 @@ impl ZdrTarget {
             return Err("empty name".into());
         }
         reject_subscription_shaped(key.trim())?;
-        // Defense-in-depth: a credential pasted into a (benign-named) extra header is
-        // still a credential. (Auth-bearing header NAMES are rejected at config load.)
+        // Enforce the extra-header invariant at the TYPE BOUNDARY (not only at config
+        // load): a credential-bearing header NAME is refused — ZDR auth must come from
+        // the env-sourced credential, never an extra header — and a credential pasted
+        // as a header VALUE under a benign name is refused too.
         for (hk, hv) in &extra_headers {
+            if header_name_is_auth_bearing(hk) {
+                return Err(format!(
+                    "extra header '{hk}' is credential-bearing — ZDR auth comes from the \
+                     env-sourced credential, not an extra header"
+                ));
+            }
             reject_subscription_shaped(hv).map_err(|e| format!("extra_headers['{hk}'] {e}"))?;
         }
         let (base_url, host) = parse_base_url(base_url)?;
@@ -299,6 +307,36 @@ fn resolve_one(spec: &ZdrTargetSpec) -> Result<ZdrTarget, String> {
         extra_headers,
         key,
     )
+}
+
+/// Whether a header NAME (case-insensitive) looks like it carries a credential.
+/// Single source of truth for BOTH the config scope-invariant check
+/// ([`crate::config`]) and the [`ZdrTarget::new`] type-boundary check, so a
+/// constructor-built target can never violate the invariant config-loaded targets
+/// are held to. Substring keywords (not an exact list) catch vendor variants
+/// (`x-auth-token`, `x-access-token`, `x-amz-security-token`, `x-goog-api-key`, …);
+/// `api-key`/`apikey`/`api_key` (not a bare `key`) avoids false-positives on benign
+/// headers like `x-idempotency-key`.
+pub(crate) fn header_name_is_auth_bearing(name: &str) -> bool {
+    const AUTH_KEYWORDS: &[&str] = &[
+        "auth",
+        "token",
+        "secret",
+        "credential",
+        "cookie",
+        "bearer",
+        "password",
+        "passwd",
+        "signature",
+        "hmac",
+        "api-key",
+        "apikey",
+        "api_key",
+        "access-key",
+        "x-amz-security",
+    ];
+    let lk = name.to_ascii_lowercase();
+    AUTH_KEYWORDS.iter().any(|kw| lk.contains(kw))
 }
 
 /// ToS guard: a ZDR credential must not be a subscription / OAuth token. Anthropic
@@ -539,6 +577,34 @@ mod tests {
         let resolved = resolve_targets(&section);
         assert!(!resolved.targets.contains_key("box"));
         assert!(resolved.errors.iter().any(|e| e.contains("extra_headers")));
+    }
+
+    #[test]
+    fn constructor_rejects_auth_bearing_extra_header_name() {
+        // The type-boundary check: a constructor caller (not config) cannot create a
+        // target whose extra header could override the injected credential.
+        let err = ZdrTarget::new(
+            "box".into(),
+            "http://127.0.0.1:8080",
+            TrustBasis::SelfHosted,
+            true,
+            vec![("X-Api-Key".into(), "anything".into())],
+            String::new(),
+        )
+        .unwrap_err();
+        assert!(err.contains("credential-bearing"), "got: {err}");
+        // A benign extra header is accepted.
+        assert!(
+            ZdrTarget::new(
+                "box".into(),
+                "http://127.0.0.1:8080",
+                TrustBasis::SelfHosted,
+                true,
+                vec![("anthropic-beta".into(), "x".into())],
+                String::new(),
+            )
+            .is_ok()
+        );
     }
 
     #[test]

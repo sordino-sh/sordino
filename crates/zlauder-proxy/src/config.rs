@@ -297,32 +297,6 @@ fn validate_no_inline_zdr_creds(merged: &toml::Value) -> anyhow::Result<()> {
     else {
         return Ok(());
     };
-    // Credential-bearing header names that must never appear in `extra_headers` — the
-    // proxy injects ZDR auth from the `from_env` credential, so a header carrying a
-    // credential in the config file is exactly the env-only channel being
-    // circumvented. SUBSTRING keywords (not an exact denylist) so vendor variants
-    // (`x-auth-token`, `x-access-token`, `x-amz-security-token`, `x-goog-api-key`, …)
-    // are all caught without enumerating every one — and an arbitrary (non-OAuth-
-    // shaped) API key under such a name is refused here even though the value-shape
-    // guard wouldn't flag it. `api-key`/`apikey`/`api_key` (not a bare `key`) avoids
-    // false-positives on benign headers like `x-idempotency-key`.
-    const AUTH_KEYWORDS: &[&str] = &[
-        "auth",
-        "token",
-        "secret",
-        "credential",
-        "cookie",
-        "bearer",
-        "password",
-        "passwd",
-        "signature",
-        "hmac",
-        "api-key",
-        "apikey",
-        "api_key",
-        "access-key",
-        "x-amz-security",
-    ];
     const FORBIDDEN: &[&str] = &["key", "api_key", "apikey", "auth", "token", "secret", "value"];
     for (i, item) in arr.iter().enumerate() {
         if let Some(tbl) = item.as_table() {
@@ -341,8 +315,9 @@ fn validate_no_inline_zdr_creds(merged: &toml::Value) -> anyhow::Result<()> {
             // value) is the same invariant breach by another door — reject it.
             if let Some(hdrs) = tbl.get("extra_headers").and_then(toml::Value::as_table) {
                 for hk in hdrs.keys() {
-                    let lk = hk.to_ascii_lowercase();
-                    if AUTH_KEYWORDS.iter().any(|kw| lk.contains(kw)) {
+                    // Shared predicate with `ZdrTarget::new` — one source of truth so a
+                    // constructor-built target is held to the same invariant.
+                    if crate::zdr::header_name_is_auth_bearing(hk) {
                         anyhow::bail!(
                             "zlauder config: zdr.target[{i}].extra_headers has a credential-bearing \
                              header `{hk}` — a ZDR credential must never live in a config file. \

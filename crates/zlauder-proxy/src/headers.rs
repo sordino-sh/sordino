@@ -64,20 +64,23 @@ pub fn upstream_request_headers_zdr(
         }
         out.append(name.clone(), value.clone());
     }
+    // Target-specific extra headers (non-secret; auth-bearing names are rejected both
+    // at config load AND in `ZdrTarget::new`). Applied FIRST so the proxy-controlled
+    // credential and Host below always win — an extra header can never override the
+    // injected `x-api-key` or the rewritten `Host`, regardless of how the target was
+    // constructed (defense in depth beyond the name rejection).
+    for (k, v) in &target.extra_headers {
+        if let (Ok(name), Ok(val)) = (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v))
+        {
+            out.insert(name, val);
+        }
+    }
     // Inject the ZDR credential (env-sourced, in-process only). Empty ⇒ no-auth.
     let key = target.key();
     if !key.is_empty()
         && let Ok(v) = HeaderValue::from_str(key.as_str())
     {
         out.insert("x-api-key", v);
-    }
-    // Target-specific extra headers (non-secret; auth-bearing names are rejected at
-    // config load). These OVERRIDE any forwarded value of the same name.
-    for (k, v) in &target.extra_headers {
-        if let (Ok(name), Ok(val)) = (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v))
-        {
-            out.insert(name, val);
-        }
     }
     if let Ok(h) = HeaderValue::from_str(upstream_host) {
         out.insert(HOST, h);
