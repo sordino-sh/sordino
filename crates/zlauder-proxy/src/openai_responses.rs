@@ -242,12 +242,15 @@ impl MaskWalker<'_> {
         if let Some(instructions) = req.instructions.as_mut() {
             self.str(instructions, Surface::SystemPrompt)?;
         }
+        // `metadata` is developer free-form key-values (not telemetry) → still masked.
         if let Some(metadata) = req.metadata.as_mut() {
             self.value_safe(metadata, Surface::UserMessage)?;
         }
-        if let Some(user) = req.user.as_mut() {
-            self.str(user, Surface::UserMessage)?;
-        }
+        // The top-level `user` field is API-protocol TELEMETRY (OpenAI's abuse-correlation
+        // identifier), contractually opaque — the direct analog of Anthropic's
+        // `metadata.user_id` (see walk.rs). Pass it through VERBATIM; masking it corrupts
+        // the telemetry on the wire. (`metadata` above stays masked: it is developer
+        // free-form content, not the telemetry field.)
         self.map_safe(&mut req.extra, Surface::UserMessage)?;
         Ok(())
     }
@@ -942,6 +945,31 @@ mod tests {
         assert!(s.contains("dXNlckBleGFtcGxlLmNvbQ=="));
         assert!(s.contains("[EMAIL_ADDRESS_"));
         assert_eq!(manifest.len(), 5);
+    }
+
+    #[test]
+    fn responses_user_is_telemetry_passthrough_metadata_still_masked() {
+        // Parity with the Anthropic metadata.user_id fix: the top-level `user` field is
+        // OpenAI's abuse-correlation telemetry (opaque, verbatim). The Responses `metadata`
+        // map is developer free-form content, NOT the telemetry field, so it stays masked.
+        let e = engine();
+        let body = serde_json::json!({
+            "model": "gpt-test",
+            "user": "acct contact bob@example.com 4111111111111111",
+            "metadata": {"ticket": "ref carol@example.com"},
+            "input": "hello"
+        });
+        let (masked, _m) = mask_request(&e, body.to_string().as_bytes()).unwrap();
+        let v: Value = serde_json::from_slice(&masked).unwrap();
+        assert_eq!(
+            v["user"].as_str().unwrap(),
+            "acct contact bob@example.com 4111111111111111",
+            "user must egress verbatim (telemetry), got: {}", v["user"]
+        );
+        assert!(
+            !v["metadata"]["ticket"].as_str().unwrap().contains("carol@example.com"),
+            "developer metadata must still be masked: {}", v["metadata"]["ticket"]
+        );
     }
 
     #[test]

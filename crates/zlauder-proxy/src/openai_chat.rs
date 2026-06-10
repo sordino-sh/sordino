@@ -251,9 +251,12 @@ impl MaskWalker<'_> {
         for msg in req.messages.iter_mut() {
             self.message(msg)?;
         }
-        if let Some(user) = req.user.as_mut() {
-            self.str(user, Surface::UserMessage)?;
-        }
+        // The top-level `user` field is API-protocol TELEMETRY (OpenAI's abuse-correlation
+        // identifier), contractually opaque, not natural-language content — the direct
+        // analog of Anthropic's `metadata.user_id` (see walk.rs). Pass it through VERBATIM:
+        // masking it corrupts the telemetry on the wire (a value that trips a detector would
+        // egress as a token and change every session, reading as deliberate evasion). Other
+        // caller-set `extra` leaves are still masked below (defense-in-depth).
         self.map_safe(&mut req.extra, Surface::UserMessage)?;
         Ok(())
     }
@@ -881,8 +884,9 @@ mod tests {
         let (masked, manifest) = mask_request(&e, body.to_string().as_bytes()).unwrap();
         let s = String::from_utf8(masked).unwrap();
 
+        // Message/tool content is masked; the top-level `user` field is telemetry and
+        // passes VERBATIM (asserted just below), so alice@example.com is NOT in this list.
         for plain in [
-            "alice@example.com",
             "sys@example.com",
             "bob@example.com",
             "carol@example.com",
@@ -893,7 +897,33 @@ mod tests {
             assert!(!s.contains(plain), "leaked {plain}: {s}");
         }
         assert!(s.contains("[EMAIL_ADDRESS_"));
-        assert_eq!(manifest.len(), 7);
+        // Telemetry passthrough: the `user` field egresses verbatim even though its value is
+        // email-shaped (it appears nowhere else in the body, so this proves it's unmasked).
+        assert!(s.contains("alice@example.com"), "user field must pass verbatim (telemetry): {s}");
+        assert_eq!(manifest.len(), 6);
+    }
+
+    #[test]
+    fn openai_chat_user_field_is_telemetry_passthrough_other_content_still_masked() {
+        // Parity with the Anthropic metadata.user_id fix: the `user` field is OpenAI's
+        // abuse-correlation telemetry — contractually opaque, passed verbatim — while the
+        // message content beside it is still masked.
+        let e = engine();
+        let body = serde_json::json!({
+            "model": "gpt-test",
+            "user": "acct contact bob@example.com 4111111111111111",
+            "messages": [{"role": "user", "content": "mail bob@example.com"}]
+        });
+        let (masked, _m) = mask_request(&e, body.to_string().as_bytes()).unwrap();
+        let v: Value = serde_json::from_slice(&masked).unwrap();
+        assert_eq!(
+            v["user"].as_str().unwrap(),
+            "acct contact bob@example.com 4111111111111111",
+            "user must egress verbatim (telemetry), got: {}", v["user"]
+        );
+        // The message content email is still masked (telemetry passthrough is scoped to `user`).
+        let msg = v["messages"][0]["content"].as_str().unwrap();
+        assert!(!msg.contains("bob@example.com"), "message content must still mask: {msg}");
     }
 
     #[test]
