@@ -4366,8 +4366,12 @@ fn conversation_from_base_url() -> Option<String> {
 /// Pure parser for the conversation id embedded in a base URL (testable without env).
 fn conversation_from_url(url: &str) -> Option<String> {
     const MARKER: &str = "/zlauder/session/";
-    let idx = url.find(MARKER)? + MARKER.len();
-    let id = url[idx..].split('/').next().unwrap_or("").trim();
+    // Consider only the PATH: drop any query/fragment first so the marker can't be
+    // matched inside a `?redirect=/zlauder/session/…`-style query, and the host can't
+    // contain it (a host has no `/`). Then the marker only ever matches the real path.
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let idx = path.find(MARKER)? + MARKER.len();
+    let id = path[idx..].split('/').next().unwrap_or("").trim();
     if id.is_empty() {
         None
     } else {
@@ -5741,6 +5745,26 @@ mod route_tests {
         assert_eq!(conversation_from_url("https://api.anthropic.com"), None);
         // An empty id segment is not a valid conversation.
         assert_eq!(conversation_from_url("http://x/zlauder/session/"), None);
+        // The marker in a query/fragment is NOT the path — must not mis-key.
+        assert_eq!(
+            conversation_from_url("https://api.anthropic.com/?redirect=/zlauder/session/evil"),
+            None
+        );
+        // A real path id with a trailing query is still extracted.
+        assert_eq!(
+            conversation_from_url("http://x/zlauder/session/abc?foo=bar"),
+            Some("abc".to_string())
+        );
+        // Same for a fragment: marker in a fragment is not the path; a trailing
+        // fragment after a real id is stripped.
+        assert_eq!(
+            conversation_from_url("https://api.anthropic.com/#/zlauder/session/evil"),
+            None
+        );
+        assert_eq!(
+            conversation_from_url("http://x/zlauder/session/abc#frag"),
+            Some("abc".to_string())
+        );
     }
 
     #[test]

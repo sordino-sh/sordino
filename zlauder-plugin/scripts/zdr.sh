@@ -15,7 +15,9 @@ if ! zlauder_resolve_bins --no-build; then
 fi
 
 # Re-split the single argument string into positionals (status / on <config> / off /
-# config) under `set -f` so a config name lands as its own arg.
+# config) under `set -f` so a config name lands as its own arg. (Like the other
+# zlauder scripts, this word-splits on whitespace — ZDR config names are TOML target
+# identifiers, so keep them shell-simple / single-word.)
 # shellcheck disable=SC2086
 set -- ${1:-}
 
