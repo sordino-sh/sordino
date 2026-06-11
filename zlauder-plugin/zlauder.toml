@@ -1,36 +1,28 @@
-# ZlauDeR project config.
+# ZlauDeR project config — the concise default seeded by /zlauder:enable.
 #
-# This is the practical default seeded by /zlauder:enable. For the full annotated
-# config surface, see zlauder.toml.example in the plugin or main repo.
-
-[proxy]
-# No static port: each project's proxy binds an OS-assigned ephemeral port, published
-# to a per-project rendezvous file. (Set `port = N` to pin a static port instead.)
-bind = "127.0.0.1"
-upstream_base_url = "https://api.anthropic.com"
+# One knob: pick a profile. Register your secrets when the LLM offers the command.
+# The full annotated surface (every advanced lever) lives in zlauder.toml.example.
 
 [engine]
-enabled = true
+# Presets: "strict" | "balanced" | "minimal" | "secrets_only". Balanced masks
+# secrets + financial + identity + contact at threshold 0.5 with reversible tokens
+# (CVV is redacted and credit-card numbers are last-4 masked — both irreversible,
+# built in, no config needed).
 profile = "balanced"
-score_threshold = 0.5
-language = "en"
-enabled_categories = ["secrets", "financial", "identity", "contact"]
-default_operator = { kind = "token" }
-fail_closed = true
 
-[engine.ml]
-enabled = false
-model = "openai/privacy-filter"
-
-[engine.reveal_marker]
-enabled = true
-prefix = "\u001b[97;44m"
-suffix = "\u001b[0m"
-
-[engine.entity_operators]
-CREDIT_CARD = { kind = "mask", char = "*", from_end = 4 }
-
+# Don't tokenize bare 4-digit numbers (years, ports, small counts).
 [engine.allow_list]
-exact = ["Anthropic", "Claude", "127.0.0.1"]
-exact_ci = ["localhost"]
 patterns = ['^\d{4}$']
+
+# Register a credential / DSN so it masks as ONE token instead of being half-detected
+# and structurally mangled. The LLM prints the exact command when it spots a secret:
+#   /zlauder:secrets register database_url env:DATABASE_URL --operator broker
+# [[secrets]]
+# name = "database_url"
+# from_env = "DATABASE_URL"
+# operator = "broker"       # broker = resolved only at the tool boundary, never to the model
+
+# Pin a static proxy port (default: an OS-assigned ephemeral port, published to a
+# per-project rendezvous file so projects never collide):
+# [proxy]
+# port = 8787

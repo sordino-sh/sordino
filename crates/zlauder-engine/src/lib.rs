@@ -1913,26 +1913,22 @@ mod tests {
             .mask("card 4111111111111111", Surface::UserMessage)
             .unwrap();
         assert!(
-            before.masked_text.contains("[CREDIT_CARD_"),
-            "default tokenizes CC"
+            before.masked_text.contains("************1111"),
+            "default masks CC last-4 (compiled built-in): {}",
+            before.masked_text
         );
 
-        // Swap to a config that masks CC with stars instead of a token.
+        // Swap to a config that tokenizes CC (reversible) instead of the built-in mask.
         let mut cfg = e.config_snapshot();
-        cfg.entity_operators.insert(
-            "CREDIT_CARD".into(),
-            Operator::Mask {
-                char: '*',
-                from_end: 4,
-            },
-        );
+        cfg.entity_operators
+            .insert("CREDIT_CARD".into(), Operator::Token);
         e.set_config(cfg).unwrap();
 
         let after = e
             .mask("card 4111111111111111", Surface::UserMessage)
             .unwrap();
         assert!(
-            after.masked_text.contains("************1111"),
+            after.masked_text.contains("[CREDIT_CARD_"),
             "got: {}",
             after.masked_text
         );
@@ -2214,7 +2210,16 @@ mod tests {
     // why every pre-existing default-config test stays green).
     #[test]
     fn reveal_marker_disabled_is_plain_unmask() {
-        let e = engine(); // default: marker off
+        // Marker explicitly OFF (it is ON by default); with no marker, the assistant
+        // and plain un-mask paths must produce identical bytes.
+        let e = MaskEngine::new(EngineConfig {
+            reveal_marker: RevealMarker {
+                enabled: false,
+                ..Default::default()
+            },
+            ..EngineConfig::default()
+        })
+        .unwrap();
         let m = e
             .mask("mail bob@example.com", Surface::UserMessage)
             .unwrap();
@@ -2666,13 +2671,11 @@ mod tests {
             m.contains("[CREDIT_CARD_EXPIRATION_"),
             "expiry survived: {m}"
         );
-        // CREDIT_CARD (the PAN) is a distinct `[CREDIT_CARD_<hex>]` token, NOT the
-        // `[CREDIT_CARD_EXPIRATION_...]` one — strip the expiry token form first so the
-        // substring check can't be satisfied by the expiration prefix.
-        let without_expiry = m.replace("[CREDIT_CARD_EXPIRATION_", "[__EXP_");
+        // CREDIT_CARD (the PAN) masks to its last 4 via the compiled built-in (irreversible
+        // Mask), distinct from the still-tokenized `[CREDIT_CARD_EXPIRATION_...]` expiry.
         assert!(
-            without_expiry.contains("[CREDIT_CARD_"),
-            "CREDIT_CARD (PAN) survived as its own token: {m}"
+            m.contains("************1111"),
+            "CREDIT_CARD (PAN) masked last-4 by the built-in: {m}"
         );
         assert!(m.contains("[REDACTED]"), "CVV (redacted) survived: {m}");
         // None of the raw values leak.

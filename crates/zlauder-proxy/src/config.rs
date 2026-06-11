@@ -447,16 +447,16 @@ mod tests {
         assert_eq!(cfg.upstream_base_url, "https://api.anthropic.com");
         assert!(cfg.engine.enabled, "enabled defaults true");
 
-        // Tagged `Operator` enum parsed from `{ kind = "mask", char = "*", from_end = 4 }`.
+        // CREDIT_CARD masks last-4 via the compiled built-in (no seed entity_operators needed).
         assert!(matches!(
-            cfg.engine.entity_operators.get("CREDIT_CARD"),
-            Some(Operator::Mask { from_end: 4, .. })
+            cfg.engine.operator_for("CREDIT_CARD"),
+            Operator::Mask { from_end: 4, .. }
         ));
-        // Categories parsed (snake_case).
+        // Categories seeded from the `balanced` profile (snake_case).
         assert!(cfg.engine.enabled_categories.contains(&Category::Secrets));
-        // Reveal marker seeded on with the ANSI escape (basic-string \u001b).
+        // Reveal marker on by default with the printable bracket (no ANSI junk).
         assert!(cfg.engine.reveal_marker.enabled);
-        assert!(cfg.engine.reveal_marker.prefix.starts_with('\u{1b}'));
+        assert_eq!(cfg.engine.reveal_marker.prefix, "\u{27e6}");
         // Allow-list compiled: common-word default + the `^\d{4}$` pattern.
         assert!(cfg.engine.allow_list.is_allowed("Anthropic"));
         assert!(cfg.engine.allow_list.is_allowed("1234"));
@@ -488,8 +488,8 @@ mod tests {
         assert!(cfg.engine.enabled);
         assert!(cfg.engine.reveal_marker.enabled);
         assert!(matches!(
-            cfg.engine.entity_operators.get("CREDIT_CARD"),
-            Some(Operator::Mask { from_end: 4, .. })
+            cfg.engine.operator_for("CREDIT_CARD"),
+            Operator::Mask { from_end: 4, .. }
         ));
     }
 
@@ -560,12 +560,10 @@ mod tests {
         assert!(cfg.engine.reveal_marker.enabled);
         assert_eq!(cfg.engine.reveal_marker.prefix, "\u{1b}[97;44m");
         assert_eq!(cfg.engine.reveal_marker.suffix, "\u{1b}[0m");
-        // A config without the section defaults cleanly (off).
-        assert!(
-            !zlauder_engine::EngineConfig::default()
-                .reveal_marker
-                .enabled
-        );
+        // A config without the section defaults cleanly: ON, with the printable `⟦` marker.
+        let d = zlauder_engine::EngineConfig::default();
+        assert!(d.reveal_marker.enabled);
+        assert_eq!(d.reveal_marker.prefix, "\u{27e6}");
 
         unsafe { std::env::remove_var("ZLAUDER_USER_CONFIG") };
         let _ = std::fs::remove_dir_all(&dir);

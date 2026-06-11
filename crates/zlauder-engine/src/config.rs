@@ -392,18 +392,18 @@ impl AllowList {
 ///   so upstream receives the bare token — byte-identical to a no-marker
 ///   round-trip, with zero added noise and a stable prompt-cache prefix.
 ///
-/// The default `prefix`/`suffix` are ANSI escapes (a colored background + reset).
-/// ANSI is out-of-band — the model cannot accidentally emit or override it the way
-/// it can with markdown (`**bold**`) — at the cost of only rendering if the
-/// surrounding harness passes raw escapes through (Claude Code renders model text
-/// as markdown, so this is best confirmed empirically). Any prefix/suffix pair
-/// works; pick markers that do NOT occur in ordinary prose, since the strip removes
-/// the exact literals from re-sent assistant history (the default escapes never
-/// collide; printable markers like a backtick would over-strip code spans).
+/// The default `prefix`/`suffix` are the printable brackets `⟦`/`⟧` (U+27E6/U+27E7):
+/// they render everywhere — terminal, file, and the Claude Code web UI alike — unlike
+/// raw ANSI escapes, which show as literal `␛[…m` bytes anywhere that doesn't interpret
+/// them. Any prefix/suffix pair works; pick markers that do NOT occur in ordinary prose
+/// or code, since the strip removes the exact literals from re-sent assistant history
+/// (the `⟦`/`⟧` brackets are chosen precisely because they don't appear in code/prose;
+/// a backtick would over-strip code spans, and ANSI renders as junk out-of-terminal).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RevealMarker {
-    /// Master switch for the decoration. Off by default (no behavior change).
-    #[serde(default)]
+    /// Master switch for the decoration. On by default — the printable `⟦`/`⟧` markers
+    /// (see the type doc) make un-masked spans visible locally with no out-of-band junk.
+    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Inserted immediately before each un-masked value.
     #[serde(default = "default_marker_prefix")]
@@ -413,19 +413,20 @@ pub struct RevealMarker {
     pub suffix: String,
 }
 
-/// `ESC[97;44m` — bright-white foreground on a blue background.
+/// `⟦` (U+27E6) — a printable left bracket that renders in every sink (terminal, file,
+/// web UI) and never occurs in ordinary code or prose, so the strip can't over-remove.
 fn default_marker_prefix() -> String {
-    "\u{1b}[97;44m".to_string()
+    "\u{27e6}".to_string()
 }
-/// `ESC[0m` — reset all attributes.
+/// `⟧` (U+27E7) — the matching right bracket.
 fn default_marker_suffix() -> String {
-    "\u{1b}[0m".to_string()
+    "\u{27e7}".to_string()
 }
 
 impl Default for RevealMarker {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             prefix: default_marker_prefix(),
             suffix: default_marker_suffix(),
         }
@@ -749,8 +750,8 @@ pub struct EngineConfig {
     pub ml: MlConfig,
 
     /// Display-time decoration for un-masked assistant text (see [`RevealMarker`]).
-    /// Off by default; a display/apply-time concern, so it is NOT part of
-    /// `detection_fingerprint` (changing it does not invalidate the detection cache).
+    /// On by default (printable `⟦`/`⟧` markers); a display/apply-time concern, so it is NOT
+    /// part of `detection_fingerprint` (changing it does not invalidate the detection cache).
     #[serde(default)]
     pub reveal_marker: RevealMarker,
 
@@ -1028,7 +1029,8 @@ impl EngineConfig {
 
     /// Resolve the operator for an entity type. Precedence (highest first):
     /// 1. an explicit per-type `entity_operators` override (user/project/local config);
-    /// 2. a built-in per-type SAD default ([`ENTITY_CVV`] → [`Operator::Redact`]);
+    /// 2. a built-in per-type irreversible default ([`ENTITY_CVV`] → [`Operator::Redact`];
+    ///    `CREDIT_CARD` → [`Operator::Mask`] keeping the last 4);
     /// 3. the profile/config `default_operator`.
     ///
     /// CVV is PCI Sensitive Authentication Data ("never store"). The reversible
@@ -1043,6 +1045,16 @@ impl EngineConfig {
         }
         if entity_type == ENTITY_CVV {
             return Operator::Redact;
+        }
+        // CREDIT_CARD masks irreversibly OUT OF THE BOX (last-4 preserved). The reversible
+        // `Token` default would round-trip the full PAN through the SessionStore and the local
+        // monitor ledger; `Mask` is lossy, so the full number never persists. Same lowest-
+        // precedence built-in shape as CVV — an explicit `entity_operators.CREDIT_CARD` wins.
+        if entity_type == "CREDIT_CARD" {
+            return Operator::Mask {
+                char: '*',
+                from_end: 4,
+            };
         }
         self.default_operator
     }
@@ -1652,9 +1664,16 @@ mod tests {
             Operator::Redact,
             "CVV masks irreversibly by default (PCI SAD), not the Token default"
         );
-        // Other entities still follow the profile default_operator. CVV is the ONLY
-        // built-in Redact; the neutral date labels (EXPIRATION_DATE / PRIVATE_DATE) are
-        // reversible tokens, NOT SAD — assert by name so the no-SAD fall-through is locked.
+        // CREDIT_CARD masks the last 4 irreversibly OUT OF THE BOX (built-in Mask), so the
+        // full PAN never round-trips reversibly through the store / monitor ledger.
+        assert!(
+            matches!(cfg.operator_for("CREDIT_CARD"), Operator::Mask { from_end: 4, .. }),
+            "CREDIT_CARD masks last-4 by default (built-in), not the reversible Token default"
+        );
+        // The two built-in irreversible defaults are CVV (Redact) and CREDIT_CARD (Mask). The
+        // neutral date labels (CREDIT_CARD_EXPIRATION / EXPIRATION_DATE / DATE_OF_BIRTH /
+        // PRIVATE_DATE) are reversible tokens, NOT SAD — assert by name so the no-SAD
+        // fall-through is locked.
         assert_eq!(cfg.operator_for(ENTITY_CREDIT_CARD_EXPIRATION), Operator::Token);
         assert_eq!(cfg.operator_for(ENTITY_DATE_OF_BIRTH), Operator::Token);
         assert_eq!(cfg.operator_for(ENTITY_EXPIRATION_DATE), Operator::Token);

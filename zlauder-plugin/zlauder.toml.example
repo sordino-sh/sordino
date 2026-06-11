@@ -53,10 +53,6 @@ enabled_categories = ["secrets", "financial", "identity", "contact"]
 #   { kind = "keep" }                          detect but leave plaintext
 default_operator = { kind = "token" }
 
-# Deprecated compatibility field. Detection failures always reject the request
-# instead of forwarding plaintext; `false` is ignored.
-fail_closed = true
-
 # Disable masking/unmasking on selected traffic surfaces. Usually leave empty.
 # Values: "user_message", "system_prompt", "tool_result", "assistant_text",
 # "tool_use_input".
@@ -64,15 +60,6 @@ disabled_surfaces = []
 
 # In-memory detection cache. 0 disables and clears it live.
 detection_cache_cap = 50000
-
-# Reserved/inert fields parsed for forward compatibility. They currently do not
-# change runtime behavior.
-detection_cache_persist = false
-# detection_cache_path = "/path/to/zlauder-detection-cache"
-redact_exposed_on_ml = false
-exposure_redaction_scope = "leaf"     # "leaf" | "value"
-salt_scope = "project"                # "project" | "conversation"
-drop_contaminated_thinking = false
 
 [engine.ml]
 # Optional openai/privacy-filter recognizer for free-text PII such as names,
@@ -91,17 +78,22 @@ prefer_gpu = false         # GPU backends are not compiled in by default
 # Wrap unmasked values in assistant prose so restored spans are visible locally.
 # Applies only to displayed assistant text, never tool inputs/results. Markers are
 # stripped before that assistant history is sent upstream on the next turn.
+# ON by default with the printable brackets below — they render everywhere (terminal,
+# file, web UI), unlike raw ANSI (which shows as literal escape bytes out of terminal).
+# Override prefix/suffix for a different style, or set enabled = false to turn it off.
 enabled = true
-prefix = "\u001b[97;44m"   # ANSI: bright-white foreground on blue background
-suffix = "\u001b[0m"       # ANSI reset
-# Printable fallback if your terminal displays literal escape bytes:
-# prefix = "$"
-# suffix = "$"
+prefix = "⟦"
+suffix = "⟧"
+# Prefer ANSI color in a terminal?
+# prefix = "\u001b[97;44m"   # bright-white on blue
+# suffix = "\u001b[0m"
 
 [engine.entity_operators]
 # Per-entity overrides. Presence also opts an entity type into masking even if its
 # category is not listed in enabled_categories.
-CREDIT_CARD = { kind = "mask", char = "*", from_end = 4 }
+# CREDIT_CARD masks the last 4 irreversibly by DEFAULT (compiled built-in, like CVV);
+# list it here only to OVERRIDE that (e.g. a reversible token round-trips the full PAN):
+# CREDIT_CARD = { kind = "token" }
 # EMAIL_ADDRESS = { kind = "token" }
 # PASSWORD = { kind = "redact" }
 # DATE_TIME = { kind = "keep" }

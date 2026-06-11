@@ -310,17 +310,18 @@ but **off by default** and runs only after you download the model:
 > Note: because the Candle stack is always compiled in, the build is heavier and
 > the binaries are larger than a regex-only build — a deliberate trade-off.
 
-### Optional: highlight un-masked values (`[engine.reveal_marker]`)
+### Highlighting un-masked values (`[engine.reveal_marker]`)
 
-Normally an un-masked value is restored silently into the assistant's reply, so
-you can't tell which spans came back from a token. Turn on `reveal_marker` to wrap
-each restored value with a configurable `prefix`/`suffix` for display:
+When an un-masked value is restored into the assistant's reply, ZlauDeR wraps it with
+a marker so you can see locally which spans came back from a token. It is **on by
+default** with the printable brackets `⟦`/`⟧`; tune or disable it via
+`[engine.reveal_marker]`:
 
 ```toml
 [engine.reveal_marker]
-enabled = true
-prefix = "$"   # or any string — the repo default is an ANSI colour escape
-suffix = "$"   #   (see zlauder.toml; written with the TOML \uXXXX escape)
+enabled = true       # on by default; set false to restore silently
+prefix = "⟦"         # the default printable brackets — render in terminal, file, and web UI
+suffix = "⟧"
 ```
 
 - **Assistant prose only.** The decoration is applied **only** to `Surface::AssistantText`
@@ -332,13 +333,13 @@ suffix = "$"   #   (see zlauder.toml; written with the TOML \uXXXX escape)
   marker literals **before** detection, so upstream receives the bare token —
   byte-identical to a no-marker round-trip, with a stable prompt-cache prefix. The
   marker is purely a local display aid; it never reaches the model.
-- **ANSI vs. printable.** The default `prefix`/`suffix` are ANSI escapes — out-of-band,
-  so the model can't emit or override them (unlike `**bold**`). Whether they render
-  as color depends on the harness (Claude Code renders model text as markdown, so
-  confirm empirically); if you see literal escape junk, switch to a printable pair
-  like `prefix = suffix = "$"`. Pick markers that don't occur in ordinary prose —
-  the strip removes the **exact** literal from re-sent history (the ANSI escapes
-  never collide; a backtick or `*` would over-strip code/emphasis).
+- **Printable by default; ANSI optional.** The default `prefix`/`suffix` are the printable
+  brackets `⟦`/`⟧` (U+27E6/U+27E7): they render in every sink (terminal, file, Claude Code
+  web UI) and never occur in ordinary code or prose. Prefer terminal colour? Set them to
+  ANSI escapes (out-of-band, so the model can't emit or override them) — but they show as
+  literal escape bytes anywhere that doesn't interpret them. Whatever you pick, choose
+  markers that don't occur in ordinary prose: the strip removes the **exact** literal from
+  re-sent history (a backtick or `*` would over-strip code/emphasis).
 
 ## Threat model & limitations
 

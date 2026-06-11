@@ -898,7 +898,16 @@ mod tests {
     use zlauder_engine::{EngineConfig, RevealMarker};
 
     fn engine() -> MaskEngine {
-        MaskEngine::new(EngineConfig::default()).unwrap()
+        // Neutral test engine: reveal marker OFF (it is ON by default) so unmask-mechanics
+        // assertions see bare values; marker behavior is exercised by dedicated marker tests.
+        let cfg = EngineConfig {
+            reveal_marker: zlauder_engine::RevealMarker {
+                enabled: false,
+                ..Default::default()
+            },
+            ..EngineConfig::default()
+        };
+        MaskEngine::new(cfg).unwrap()
     }
 
     fn engine_marked() -> MaskEngine {

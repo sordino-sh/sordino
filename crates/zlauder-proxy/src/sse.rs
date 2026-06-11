@@ -409,7 +409,8 @@ pub(crate) fn clean_capture(engine: &MaskEngine, text: &str) -> String {
 /// `ESC`). The monitor capture holds the CLEAN reply — terminal control bytes are the
 /// client's display concern, never part of the stored reply, and they would stop a
 /// captured reply from matching the un-decorated re-send. Independent of the
-/// configurable reveal marker (ANSI is only its default). Borrow-free when no `ESC`.
+/// configurable reveal marker (default `⟦`/`⟧`; ANSI is a user option this still strips).
+/// Borrow-free when no `ESC`.
 fn strip_terminal_codes(text: &str) -> std::borrow::Cow<'_, str> {
     if !text.contains('\u{1b}') {
         return std::borrow::Cow::Borrowed(text);
@@ -481,7 +482,16 @@ mod tests {
     use zlauder_engine::{EngineConfig, Surface};
 
     fn engine() -> MaskEngine {
-        MaskEngine::new(EngineConfig::default()).unwrap()
+        // Neutral test engine: reveal marker OFF (it is ON by default) so unmask-mechanics
+        // assertions see bare values; marker behavior is exercised by dedicated marker tests.
+        let cfg = EngineConfig {
+            reveal_marker: zlauder_engine::RevealMarker {
+                enabled: false,
+                ..Default::default()
+            },
+            ..EngineConfig::default()
+        };
+        MaskEngine::new(cfg).unwrap()
     }
 
     fn collect_text(evs: Vec<StreamEvent>) -> String {
