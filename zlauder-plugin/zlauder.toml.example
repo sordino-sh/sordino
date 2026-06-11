@@ -22,7 +22,7 @@ upstream_base_url = "https://api.anthropic.com"
 enabled = true
 
 # Presets: "strict", "balanced", "minimal", "secrets_only".
-#   strict       threshold 0.4, all 5 categories, Token operator
+#   strict       threshold 0.4, all 6 categories, Token operator
 #   balanced     threshold 0.5, secrets+financial+identity+contact (default)
 #   minimal      threshold 0.6, secrets+financial
 #   secrets_only threshold 0.6, secrets only   (was "development_safe"; alias kept)
@@ -37,7 +37,7 @@ language = "en"
 
 # Categories:
 #   secrets   API_KEY, AWS_ACCESS_KEY, AWS_SECRET_KEY, AZURE_KEY, GCP_API_KEY,
-#             PRIVATE_KEY, JWT
+#             PRIVATE_KEY, JWT, URL_CREDENTIAL
 #   financial CREDIT_CARD, IBAN_CODE, CRYPTO, US_BANK_NUMBER, ABA_ROUTING_NUMBER
 #   identity  SSN/ITIN, national IDs, passports, driver's licenses, medical IDs
 #   contact   EMAIL_ADDRESS, PHONE_NUMBER
