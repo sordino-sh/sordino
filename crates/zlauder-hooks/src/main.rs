@@ -436,6 +436,105 @@ fn ensure_object<'a>(v: &'a mut Value, key: &str) -> &'a mut serde_json::Map<Str
         .expect("just inserted an object")
 }
 
+// --- model-gating permission rules (F0: the Approval Kernel seal) -------------------
+//
+// ZlauDeR writes these into the project's settings.local.json on enable and removes them on
+// disable. They constrain ONLY the model's own tool calls — the Claude Code harness runs
+// hooks and `!`-prefixed slash-command bash OUTSIDE the permission system, so the plugin's
+// own CLI keeps working while the model is denied the loosen path:
+//   - deny the model's Bash on our CLIs (it must drive privacy via the slash commands);
+//   - force an `ask` prompt on a model Edit/Write of zlauder.toml / zlauder.local.toml
+//     (mode-independent — `ask` overrides acceptEdits AND bypassPermissions).
+// Both the bare-name form (CLI on PATH) and an absolute/relative `*/zlauder-hooks` form, since
+// the binary commonly lives off-PATH (`target/release/`, the plugin bin dir) and CC's Bash
+// matcher keys on the command as written. This is best-effort defense-in-depth: a shell-capable
+// model can still reach the proxy another way (e.g. read the 0600 key + curl), and CC prompts on
+// shell redirection by default — the seal blocks the casual + prompt-injection paths, it is not
+// a sandbox. The proxy only re-reads config on a key-gated reload or a restart, and the status
+// line shows `⚠ OFF` if masking is ever disabled.
+const DENY_RULES: &[&str] = &[
+    "Bash(zlauder-hooks:*)",
+    "Bash(zlauder-proxy:*)",
+    "Bash(*/zlauder-hooks:*)",
+    "Bash(*/zlauder-proxy:*)",
+];
+const ASK_RULES: &[&str] = &["Edit(/zlauder.toml)", "Edit(/zlauder.local.toml)"];
+
+/// The `(permissions.<key>, our-rules)` pairs we own.
+fn permission_rule_sets() -> [(&'static str, &'static [&'static str]); 2] {
+    [("deny", DENY_RULES), ("ask", ASK_RULES)]
+}
+
+/// Merge our rules into `v["permissions"]`, appending only entries not already present
+/// (dedup by exact string) so a user's own permissions are preserved. `v` must be an object.
+/// Refuses (rather than clobbers) a malformed non-array `deny`/`ask` value — that is invalid
+/// per Claude Code's schema, and overwriting it would destroy the user's content.
+fn merge_permission_rules(v: &mut Value) -> Result<()> {
+    let perms = ensure_object(v, "permissions");
+    for (key, wanted) in permission_rule_sets() {
+        let arr = perms.entry(key.to_string()).or_insert_with(|| json!([]));
+        let a = arr.as_array_mut().ok_or_else(|| {
+            anyhow::anyhow!(
+                "settings.local.json permissions.{key} is not a JSON array; refusing to \
+                 overwrite it. Fix it and re-run /zlauder:enable."
+            )
+        })?;
+        for w in wanted {
+            if !a.iter().any(|x| x.as_str() == Some(*w)) {
+                a.push(Value::String((*w).to_string()));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Every one of our rules is already present (so a re-enable is a true NoOp).
+fn permission_rules_present(v: &Value) -> bool {
+    permission_rule_sets().iter().all(|(key, wanted)| {
+        v.pointer(&format!("/permissions/{key}"))
+            .and_then(Value::as_array)
+            .map(|a| wanted.iter().all(|w| a.iter().any(|x| x.as_str() == Some(*w))))
+            .unwrap_or(false)
+    })
+}
+
+/// ANY of our rules is present (so disable still cleans a file carrying only our rules,
+/// after the env/statusLine takeover was already removed by hand).
+fn any_permission_rule_present(v: &Value) -> bool {
+    permission_rule_sets().iter().any(|(key, wanted)| {
+        v.pointer(&format!("/permissions/{key}"))
+            .and_then(Value::as_array)
+            .map(|a| wanted.iter().any(|w| a.iter().any(|x| x.as_str() == Some(*w))))
+            .unwrap_or(false)
+    })
+}
+
+/// Remove ONLY our rules from `v["permissions"]`, preserving any user entries; drop an array
+/// that empties and the `permissions` object if it empties. Returns whether anything changed.
+fn remove_permission_rules(v: &mut Value) -> bool {
+    let mut changed = false;
+    let mut perms_empty = false;
+    if let Some(perms) = v.get_mut("permissions").and_then(Value::as_object_mut) {
+        for (key, ours) in permission_rule_sets() {
+            if let Some(arr) = perms.get_mut(key).and_then(Value::as_array_mut) {
+                let before = arr.len();
+                arr.retain(|x| !ours.iter().any(|o| x.as_str() == Some(*o)));
+                changed |= arr.len() != before;
+                if arr.is_empty() {
+                    perms.remove(key);
+                }
+            }
+        }
+        perms_empty = perms.is_empty();
+    }
+    if perms_empty
+        && let Some(root) = v.as_object_mut()
+    {
+        root.remove("permissions");
+    }
+    changed
+}
+
 /// Atomically write `value` as pretty JSON (2-space, trailing newline — like jq): write a
 /// same-dir temp, then rename over the target. `std::fs::rename` is atomic and replaces an
 /// existing file on both Unix and Windows (MoveFileEx w/ REPLACE_EXISTING).
@@ -512,7 +611,10 @@ fn settings_enable(url: &str, zport: &str, statusline: &str) -> Result<SettingsO
         .pointer("/env/ZLAUDER_PORT")
         .and_then(Value::as_str)
         .unwrap_or("");
-    let already = base_url_matches(cur_url, url) && cur_port == zport;
+    // NoOp only when the route AND the model-gating permission rules are already present;
+    // a route-present-but-rules-missing install (e.g. pre-F0) is an upgrade → Changed.
+    let already =
+        base_url_matches(cur_url, url) && cur_port == zport && permission_rules_present(&local_v);
 
     // Status-line takeover: snapshot the user's original line to the sidecar that
     // /zlauder:disable restores from. NEVER delete the sidecar here — an OLD install routed
@@ -556,6 +658,9 @@ fn settings_enable(url: &str, zport: &str, statusline: &str) -> Result<SettingsO
     );
     env.insert("ZLAUDER_PORT".to_string(), Value::String(zport.to_string()));
     v["statusLine"] = json!({ "type": "command", "command": statusline });
+    // Seal the Approval Kernel: deny the model's Bash on our CLIs + force an `ask` on its
+    // edits of zlauder.toml/zlauder.local.toml. Merge (never clobber) the user's own rules.
+    merge_permission_rules(&mut v)?;
 
     atomic_write_json(&local_file, &v)?;
     Ok(if already {
@@ -672,6 +777,105 @@ mod gitignore_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod permission_rule_tests {
+    use super::{
+        ASK_RULES, DENY_RULES, any_permission_rule_present, merge_permission_rules,
+        permission_rules_present, remove_permission_rules,
+    };
+    use serde_json::{Value, json};
+
+    fn arr(v: &Value, key: &str) -> Vec<String> {
+        v.pointer(&format!("/permissions/{key}"))
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+            .unwrap_or_default()
+    }
+    fn want(rules: &[&str]) -> Vec<String> {
+        rules.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn merge_writes_both_rule_sets_into_empty_object() {
+        let mut v = json!({});
+        merge_permission_rules(&mut v).unwrap();
+        assert_eq!(arr(&v, "deny"), want(DENY_RULES));
+        assert_eq!(arr(&v, "ask"), want(ASK_RULES));
+        assert!(permission_rules_present(&v));
+        assert!(any_permission_rule_present(&v));
+    }
+
+    #[test]
+    fn merge_preserves_user_entries_and_is_idempotent() {
+        let mut v = json!({ "permissions": { "deny": ["Bash(rm:*)"], "allow": ["Read(*)"] } });
+        merge_permission_rules(&mut v).unwrap();
+        merge_permission_rules(&mut v).unwrap(); // re-run must not duplicate
+        let deny = arr(&v, "deny");
+        assert!(deny.contains(&"Bash(rm:*)".to_string()), "user entry kept: {deny:?}");
+        for r in DENY_RULES {
+            assert_eq!(
+                deny.iter().filter(|x| x.as_str() == *r).count(),
+                1,
+                "no dup of {r}: {deny:?}"
+            );
+        }
+        assert_eq!(arr(&v, "ask"), want(ASK_RULES));
+        // An unrelated permissions key is untouched.
+        assert_eq!(arr(&v, "allow"), want(&["Read(*)"]));
+    }
+
+    #[test]
+    fn remove_strips_only_ours_and_drops_emptied_containers() {
+        let mut v = json!({});
+        merge_permission_rules(&mut v).unwrap();
+        assert!(remove_permission_rules(&mut v));
+        // Both arrays were exactly ours → emptied → dropped → permissions object dropped.
+        assert!(v.get("permissions").is_none(), "empty permissions dropped: {v}");
+        assert!(!any_permission_rule_present(&v));
+    }
+
+    #[test]
+    fn remove_preserves_user_entries() {
+        let mut v = json!({ "permissions": { "deny": ["Bash(rm:*)"], "allow": ["Read(*)"] } });
+        merge_permission_rules(&mut v).unwrap();
+        remove_permission_rules(&mut v);
+        assert_eq!(arr(&v, "deny"), want(&["Bash(rm:*)"]), "our deny gone, user's kept");
+        assert_eq!(arr(&v, "allow"), want(&["Read(*)"]));
+        assert!(v.pointer("/permissions/ask").is_none(), "ask was all ours → dropped: {v}");
+    }
+
+    #[test]
+    fn enable_then_disable_round_trips() {
+        let original = json!({ "permissions": { "deny": ["Bash(rm:*)"] }, "env": { "FOO": "bar" } });
+        let mut v = original.clone();
+        merge_permission_rules(&mut v).unwrap();
+        remove_permission_rules(&mut v);
+        assert_eq!(v, original, "merge + remove must restore the original exactly");
+    }
+
+    #[test]
+    fn partial_rules_are_not_present_the_upgrade_signal() {
+        // A pre-F0 install: route present but only some/zero of our rules.
+        let mut v = json!({ "permissions": { "deny": DENY_RULES } }); // ask missing
+        assert!(!permission_rules_present(&v), "missing ask ⇒ not fully present (⇒ Changed)");
+        assert!(any_permission_rule_present(&v));
+        merge_permission_rules(&mut v).unwrap();
+        assert!(permission_rules_present(&v));
+    }
+
+    #[test]
+    fn merge_refuses_a_non_array_permission_field() {
+        // A malformed (schema-invalid) permissions.deny must be REFUSED, never clobbered.
+        let mut v = json!({ "permissions": { "deny": "oops-not-an-array" } });
+        assert!(merge_permission_rules(&mut v).is_err(), "must refuse: {v}");
+        assert_eq!(
+            v.pointer("/permissions/deny").and_then(Value::as_str),
+            Some("oops-not-an-array"),
+            "the user's value must be left intact"
+        );
     }
 }
 
@@ -824,7 +1028,10 @@ fn strip_routing_from(settings_file: &Path, restore: Option<&Value>) -> Result<(
             .and_then(Value::as_str)
             .unwrap_or(""),
     );
-    if !has_env_wiring && !sl_is_ours {
+    // Also trigger when only our permission rules remain (env/statusLine hand-removed) so
+    // disable stays a true inverse and never leaves the model-gating rules orphaned.
+    let has_perms_wiring = any_permission_rule_present(&v);
+    if !has_env_wiring && !sl_is_ours && !has_perms_wiring {
         return Ok((false, false));
     }
 
@@ -857,6 +1064,10 @@ fn strip_routing_from(settings_file: &Path, restore: Option<&Value>) -> Result<(
             }
         }
     }
+
+    // Strip our model-gating permission rules too (preserving any user permissions), so
+    // disable is a true inverse of enable's merge.
+    remove_permission_rules(&mut v);
 
     atomic_write_json(settings_file, &v)?;
     Ok((true, restored))
@@ -2978,22 +3189,49 @@ fn pre_tool_use() -> Result<()> {
         Ok(v) => v,
         Err(_) => return Ok(()),
     };
-    // Nothing resolved ⇒ don't rewrite the input (no-op hook).
-    if out.get("resolved").and_then(Value::as_u64).unwrap_or(0) == 0 {
-        return Ok(());
-    }
+    let resolved = out.get("resolved").and_then(Value::as_u64).unwrap_or(0);
+    let denials = out.get("denied").and_then(Value::as_array);
     let updated = out.get("tool_input").cloned().unwrap_or(Value::Null);
-    if updated.is_null() {
-        return Ok(());
+
+    let mut hook = serde_json::Map::new();
+    hook.insert("hookEventName".into(), json!("PreToolUse"));
+    if resolved > 0 && !updated.is_null() {
+        hook.insert("updatedInput".into(), updated);
     }
-    let emit = json!({
-        "hookSpecificOutput": {
-            "hookEventName": "PreToolUse",
-            "updatedInput": updated,
-        }
-    });
-    println!("{emit}");
+    // Surface (value-free) WHY any allow-listed broker token stayed masked, so the model can
+    // tell the user which [[broker.allow]] rule to add. The token is left UNRESOLVED either
+    // way (fail-closed) — this only explains; it never reveals the secret's value.
+    if let Some(d) = denials.filter(|d| !d.is_empty()) {
+        hook.insert("additionalContext".into(), json!(broker_denial_note(d)));
+    }
+    if hook.len() == 1 {
+        return Ok(()); // nothing resolved and nothing denied → no-op
+    }
+    println!("{}", json!({ "hookSpecificOutput": Value::Object(hook) }));
     Ok(())
+}
+
+/// A value-free note (never the resolved secret) explaining which registered broker tokens
+/// stayed masked for a tool call and why, for the model to relay to the user. Inputs are the
+/// `denied` entries from /zlauder/broker/resolve (pointer + reason category only).
+fn broker_denial_note(denials: &[Value]) -> String {
+    let mut lines = vec![
+        "ZlauDeR kept one or more registered broker secrets MASKED for this tool call (the \
+         tool ran with the [TOKEN] in place, not the real value):"
+            .to_string(),
+    ];
+    for d in denials {
+        let ptr = d.get("pointer").and_then(Value::as_str).unwrap_or("?");
+        let reason = d.get("reason").and_then(Value::as_str).unwrap_or("denied");
+        lines.push(format!("  - {ptr}: {reason}"));
+    }
+    lines.push(
+        "To allow it, the USER adds a matching [[broker.allow]] rule (secret + tool + param + \
+         dest host) to zlauder.toml and restarts. You can suggest the exact rule, but only the \
+         user can apply it — and you never see the secret's value."
+            .to_string(),
+    );
+    lines.join("\n")
 }
 
 /// `/zlauder:secrets` — read-only view of the registered-secret gate + status. Pulls

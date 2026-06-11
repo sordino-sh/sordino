@@ -2,6 +2,10 @@
 description: View or change ZlauDeR PII-masking for this project — status, on/off, profile, category, threshold, ML model, token reveal, and transcript scrub
 argument-hint: "[status | on | off | profile <name> | category <name> on|off | threshold <0-1> | model <download|on|off|status> | reveal <token> | scrub --transcript <jsonl> (--value <text> | --values-file <file>)] [--scope session|project|user|local]"
 allowed-tools: Bash(bash:*)
+# User-only: this panel can LOOSEN masking (off / category off / profile minimal / model off /
+# reveal / scrub), so the model must not invoke it via the SlashCommand tool. The model
+# surfaces the exact command and the USER runs it. Read-only status moved to /zlauder:status.
+disable-model-invocation: true
 ---
 
 Privacy control output:

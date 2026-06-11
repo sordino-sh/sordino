@@ -2,6 +2,8 @@
 description: Stop routing this project through the ZlauDeR proxy (reverts .claude/settings.local.json; a one-time Claude Code restart reliably applies it). `--all` sweeps every project — run it before uninstalling.
 argument-hint: "[--all]"
 allowed-tools: Bash(bash:*)
+# User-only: tearing down routing is a loosen action; the model surfaces it, the user runs it.
+disable-model-invocation: true
 ---
 
 Reverting the ZlauDeR routing for this project. The script below removes the

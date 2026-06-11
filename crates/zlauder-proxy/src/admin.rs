@@ -560,11 +560,35 @@ pub async fn broker_resolve(State(st): State<AppState>, hdrs: HeaderMap, body: B
     };
     let mut input = req.tool_input;
     let report = st.engine.broker_resolve_pointers(&req.tool_name, &mut input);
+    // Surface the per-pointer denials so the PreToolUse hook can tell the model WHY an
+    // allow-listed broker token stayed masked (blocker #4). VALUE-FREE: only the RFC-6901
+    // pointer (already in the tool input the model sent) and a reason CATEGORY — never the
+    // resolved secret, and never the host parsed from it (HostNotAllowed drops the host).
+    let denied: Vec<_> = report
+        .denied
+        .iter()
+        .map(|(pointer, reason)| json!({ "pointer": pointer, "reason": deny_reason_label(reason) }))
+        .collect();
     json_ok(&json!({
         "tool_input": input,
         "resolved": report.resolved,
-        "denied": report.denied.len(),
+        "denied": denied,
+        "denied_count": report.denied.len(),
     }))
+}
+
+/// A stable, VALUE-FREE label for a broker denial — safe to surface to the model (so it can
+/// guide the user to a fix) without ever revealing the resolved secret, or, for a host
+/// denial, the host parsed out of it.
+fn deny_reason_label(reason: &zlauder_engine::DenyReason) -> &'static str {
+    use zlauder_engine::DenyReason::*;
+    match reason {
+        NoRule => "no matching [[broker.allow]] rule for this secret + tool + param",
+        EgressBoundary => "tool is an egress boundary (MCP / sub-agent) — never brokered",
+        OpaqueCommand => "tool runs a free-form shell command — use a structured tool instead",
+        HostNotAllowed(_) => "the destination host is not on the rule's allow-list",
+        HostUnparsed => "the rule requires a host allow-list but no host could be parsed",
+    }
 }
 
 // --- small response helpers (mirrors routes.rs style) -----------------------

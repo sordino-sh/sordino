@@ -129,17 +129,40 @@ text) is policy: the everyday on/off, controlled live by `/zlauder:privacy`. Mas
 *on top of* routing, so turning it off is transparent pass-through and never strands a
 session.
 
+**Who can run what.** The model can drive only the read-and-tighten commands —
+`/zlauder:status`, `/zlauder:secrets`, `/zlauder:doctor`, `/zlauder:enable` — through its
+SlashCommand tool. The commands that can *loosen* masking or open a browser
+(`/zlauder:privacy`, `/zlauder:disable`, `/zlauder:monitor`) are **user-only**: the model
+surfaces the exact command and you run it. This is enforced by `disable-model-invocation` on
+those commands plus the `permissions.deny`/`ask` rules the plugin writes into
+`.claude/settings.local.json` (deny the model's Bash on the `zlauder-*` CLIs; force an `ask`
+prompt on its edits of `zlauder.toml` / `zlauder.local.toml`).
+
+> **Defense-in-depth, not a sandbox.** These rules block the casual and prompt-injection
+> paths (the model running `/zlauder:privacy off`, the `zlauder-*` CLIs, or editing the config
+> via the Edit tool all hit a deny/ask; Claude Code also prompts on shell redirection by
+> default). A model with full shell access could still reach the proxy another way — but that
+> is bounded: the proxy re-reads config only on a key-gated reload or a restart (the model
+> can't trigger a reload), and the status line shows `⚠ OFF` the moment masking is off, so a
+> silent disable isn't possible.
+
 | Command | What it does |
 |---|---|
 | `/zlauder:enable` | Explicit per-project routing setup (usually automatic — the `SessionStart` hook does this on first sight). Writes this project's gitignored `.claude/settings.local.json` to set `ANTHROPIC_BASE_URL` (and `ZLAUDER_PORT`) at the proxy's OS-assigned ephemeral port (published per-project via a rendezvous record), takes over the status-line slot (wrapping any existing line as `🛡 … │ {your line}`, original saved for restore), and seeds a practical starter `zlauder.toml`. **A one-time Claude Code restart reliably activates it.** |
 | `/zlauder:disable` | Revert the routing change for this project and restore your original status line (saved at enable time; if you had none, the zlauder line is just removed) so traffic goes straight to Anthropic again — effective after a one-time restart, and it opts the project out of auto-routing. **`/zlauder:disable --all`** sweeps every plumbed project; run it **before uninstalling** so no project strands on a dead proxy. |
-| `/zlauder:privacy [args]` | Unified masking control. With no args (or `status`): show proxy health, whether this session is routed, and the masking state (on/off, profile, categories, ML model). Also: `on` / `off`, `profile <name>`, `category <name> on\|off`, `threshold <0-1>` (each takes `--scope session\|project\|user\|local`), and `reveal <token>` to decode one masked token (e.g. `[EMAIL_ADDRESS_a47n1d8s9c0f]`) via the key-gated proxy. |
+| `/zlauder:status` | **Read-only** (model-invocable): proxy health, whether this session is routed, and the masking state (on/off, profile, categories, ML model). Changes nothing — the model uses this to report status; to *change* anything it surfaces the `/zlauder:privacy` command for you to run. |
+| `/zlauder:privacy [args]` | **User-only.** Unified masking control. With no args (or `status`): show proxy health, whether this session is routed, and the masking state. Also: `on` / `off`, `profile <name>`, `category <name> on\|off`, `threshold <0-1>` (each takes `--scope session\|project\|user\|local`), and `reveal <token>` to decode one masked token (e.g. `[EMAIL_ADDRESS_a47n1d8s9c0f]`) via the key-gated proxy. |
 | `/zlauder:privacy model …` | The optional `openai/privacy-filter` ML recognizer (CPU) for free-text PII (names, locations). `model download [<repo>]` caches the weights (large/slow first run); `model on`/`off` toggles it (on **loads in the background** — text is not filtered through the model until `model status` shows `ready`, so masking stays regex-only meanwhile); `model status` reports `disabled\|loading\|ready\|failed`. Pair with `category personal on`. |
 
 > **Changed in 0.2.0:** `/zlauder:status` and `/zlauder:reveal` were folded into
 > `/zlauder:privacy` (`/zlauder:privacy status` and `/zlauder:privacy reveal <token>`).
 > The standalone `zlauder-hooks init` CLI setup path was removed — the plugin is now
 > the sole install interface.
+>
+> **Changed in 1.0:** `/zlauder:status` is back as a standalone **read-only** command so the
+> model can check masking state without being able to change it; `/zlauder:privacy` (which
+> can *loosen* masking) is now user-only. `reveal` / `scrub` stay inside the user-only
+> `/zlauder:privacy`.
 
 ## Updating the plugin
 
