@@ -111,9 +111,17 @@ pub(crate) fn snapshot(st: &AppState) -> serde_json::Value {
         "config": wire,
         "ml": {
             "enabled": cfg.ml.enabled,
+            "required": cfg.ml.required,
+            "backend": cfg.ml.backend,
             "model": cfg.ml.model,
+            "endpoint": cfg.ml.endpoint,
             "status": ml.status,
             "error": ml.error,
+            // Post-`Ready` recognizer failures (http endpoint flaps): requests are
+            // refused fail-closed while status stays `ready` — this is the
+            // operator's signal for WHY. See MlRuntime::last_runtime_error.
+            "last_runtime_error": ml.last_runtime_error,
+            "runtime_failures": ml.runtime_failures,
         },
         "secrets": {
             "ready": st.secrets_ready(),

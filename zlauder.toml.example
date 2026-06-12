@@ -79,6 +79,27 @@ detection_cache_cap = 50000
 #   /zlauder:privacy category personal on
 enabled = false
 model = "openai/privacy-filter"
+# Where inference runs: "local" (in-process Candle, the default) or "http" (a
+# remote endpoint speaking the HF token-classification schema — HF Inference
+# Providers, or a self-hosted privacy-filter server).
+# ⚠ PRIVACY: with "http", every un-cached piece of text is sent to `endpoint`.
+# Point it only at infrastructure you trust with the PII this plugin protects;
+# a cloud endpoint sees your prompts in the clear. Once ready, an unreachable
+# endpoint ⇒ the request is REFUSED (fail-closed), never passed through
+# unscanned. A FAILED LOAD degrades to regex-only (visible in `model status`,
+# same as a failed local load) — set `required = true` to refuse instead
+# whenever ML is enabled but not ready (recommended with backend = "http").
+# Toggling `required` applies live (refusal policy, not recognizer identity) —
+# no reload/re-probe. While loading+required, every maskable request is refused:
+# vs a responsive/refusing endpoint that's sub-second, but a BLACKHOLED endpoint
+# can hold the refusal up to http_timeout_secs × 3 attempts (~90s) — lower
+# http_timeout_secs for a LAN endpoint if that matters.
+# backend = "local"
+# required = true
+# endpoint = "http://10.0.0.5:3007/detect"                  # self-hosted, or:
+# endpoint = "https://router.huggingface.co/hf-inference/models/openai/privacy-filter"
+# auth_token_env = "HF_TOKEN"  # NAME of the env var holding a bearer token
+# http_timeout_secs = 30       # per-attempt timeout for backend = "http" (also bounds the load probe)
 # revision = "main"        # branch, tag, or commit
 # min_score = 0.5          # ML recognizer score floor
 prefer_gpu = false         # GPU backends are not compiled in by default

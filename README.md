@@ -89,7 +89,13 @@ are kept tokenized end-to-end (never unmasked), so signatures stay valid.
 ```sh
 cargo build --release --workspace
 # binaries: target/release/zlauder-proxy, target/release/zlauder-hooks
+
+# HTTP-only ML (thin client; skips the local Candle backend entirely):
+cargo build --release -p zlauder-proxy -p zlauder-hooks --no-default-features --features ml-http
 ```
+
+The thin-client build compiles no Candle stack and downloads no model weights —
+it only ever calls a remote endpoint (pair it with `backend = "http"` below).
 
 Requires Rust ≥ 1.91 (the `anthropic-wire` dependency is edition 2024).
 
@@ -321,6 +327,65 @@ but **off by default** and runs only after you download the model:
 
 > Note: because the Candle stack is always compiled in, the build is heavier and
 > the binaries are larger than a regex-only build — a deliberate trade-off.
+
+#### Remote inference (`backend = "http"`)
+
+Instead of loading the model in-process on every machine, the ML pass can call a
+**remote token-classification endpoint** — any server speaking the standard HF
+Inference-API token-classification schema. Use cases: thin clients (laptops,
+containers, VMs) sharing one model host on your LAN, or zero-setup via HF
+Inference Providers.
+
+```toml
+[engine.ml]
+enabled = true
+backend = "http"
+required = true   # strict: refuse requests whenever the endpoint isn't ready
+# a self-hosted privacy-filter wrapper on your own infrastructure…
+endpoint = "http://10.0.0.5:3007/detect"
+# …or Hugging Face Inference Providers (zero infra, cloud):
+# endpoint = "https://router.huggingface.co/hf-inference/models/openai/privacy-filter"
+# auth_token_env = "HF_TOKEN"     # name of the env var holding the bearer token
+```
+
+- **Same detections.** Spans come back with the same labels the local backend
+  emits and flow through the identical category gates / operators; the only
+  difference is where the forward pass runs.
+- **Fail-closed at request time.** Once the recognizer is `ready`, an endpoint
+  failure mid-session (after retries; 503 cold loads are waited out) **refuses**
+  the request — never passes it through with free-text PII unscanned — and
+  `model status` reports the runtime failure while staying `ready` (recovers on
+  the next successful call). On this detection path, only the HTTP status code is
+  kept — response **bodies** from the endpoint are never copied into local logs,
+  status, or errors, so an endpoint that echoes rejected input back can't leak
+  that PII into your local state (probe-time errors may include the body, since
+  the probe input is the literal `"probe"`, never user text).
+- **Load failures follow the standard hot-load semantics by default**: a dead
+  endpoint at enable time shows `failed` (the load probes the URL) and masking
+  continues **regex-only** — exactly like a failed local model load. If you want
+  strictness from the first byte, set `required = true`: ML enabled but not
+  `ready` (loading *or* failed) then refuses every maskable request.
+  **Recommended for `backend = "http"`** — the load is a short endpoint probe.
+  Against a responsive (or actively refusing) endpoint it settles in well under a
+  second; against a *blackholed* one (firewall drop, dead route) the refusal
+  window is bounded by `http_timeout_secs` (default 30s) × up to 3 probe attempts
+  — roughly 90s worst case before status turns `failed`. Tune `http_timeout_secs`
+  down for a LAN endpoint if that matters. (With the local backend, strictness
+  instead refuses for the full duration of a model load.)
+- **Flipping `required` applies live.** It's refusal policy, not recognizer
+  identity, so toggling it takes effect immediately without dropping or
+  re-probing a `ready` recognizer.
+- ⚠ **Privacy trade-off.** Every un-cached piece of text is sent to that
+  endpoint — point it only at infrastructure you trust with exactly the PII this
+  plugin exists to protect. A cloud endpoint (e.g. HF) sees your prompts in the
+  clear; a self-hosted LAN endpoint keeps them home. The local backend remains
+  the most private option.
+- `model download` with `backend = "http"` just validates + probes the endpoint
+  (there is nothing to download).
+- **Slim thin-client build.** Because this path never loads a local model, you can
+  compile the proxy + hooks with `--no-default-features --features ml-http` (see
+  [Build](#build)) — no model weights, no Candle compile — and point `endpoint` at
+  a shared model host.
 
 ### Highlighting un-masked values (`[engine.reveal_marker]`)
 

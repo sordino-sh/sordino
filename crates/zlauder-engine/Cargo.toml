@@ -14,6 +14,10 @@ presidio-analyzer = { workspace = true }
 # default (the `ml` feature is in `default`) so normal builds are "ML-capable".
 # `zlauder-hooks` opts OUT with `default-features = false` to stay lean.
 presidio-classifier = { workspace = true, features = ["backend-candle"], optional = true }
+# HTTP ML recognizer (remote HF-token-classification endpoint). Optional, ON by
+# default (the `ml-http` feature is in `default`). Sync client on purpose — see
+# the workspace manifest note.
+ureq = { workspace = true, optional = true }
 
 blake3   = { workspace = true }
 aes-gcm  = { workspace = true }
@@ -39,8 +43,12 @@ tracing   = { workspace = true }
 # the rest of the engine (the MlRuntime slot, detection wiring) is candle-free, so
 # a `--no-default-features` build is a lean regex-only engine that still parses the
 # `[engine.ml]` config (it just never loads a model).
-default = ["ml"]
+default = ["ml", "ml-http"]
 ml = ["dep:presidio-classifier"]
+# Remote-inference backend (`[engine.ml] backend = "http"`): no Candle, no
+# weights — just a small sync HTTP client. Independent of `ml`, so a slim
+# regex+http build (`--no-default-features --features ml-http`) is possible.
+ml-http = ["dep:ureq"]
 # NOTE (R1, gemm-vs-MKL lever): an opt-in `mkl` passthrough feature was attempted
 # here (`mkl = ["ml", "presidio-classifier/mkl"]`) but it CANNOT be wired without
 # breaking the default build. presidio-classifier is consumed as a git dependency

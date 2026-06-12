@@ -69,6 +69,13 @@ pub fn reconcile_ml(st: &AppState, new_ml: &MlConfig, retry_failed: bool) {
         MlStatus::Loading | MlStatus::Ready => params_changed,
     };
     if needs_load {
+        // A spawned (re)load installs the WHOLE desired config (incl. `required`)
+        // via `ml_begin_load`, so no separate `required` update is needed here.
         spawn_ml_load(st.engine.clone(), new_ml.clone());
+    } else {
+        // No reload: `required` is the one param `same_model_params` excludes (it is
+        // refusal policy, not recognizer identity), so a strict-mode flip would
+        // otherwise be lost. Apply it live — `ml_for_mask` reads it on every request.
+        st.engine.ml_update_required(new_ml.required);
     }
 }

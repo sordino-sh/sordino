@@ -502,9 +502,58 @@ pub struct MlConfig {
     /// background; until the model is `Ready`, masking is regex-only.
     #[serde(default)]
     pub enabled: bool,
+    /// Strict fail-closed mode. When `true`, masking REFUSES every maskable
+    /// request while ML is enabled but not `Ready` (still `Loading`, or
+    /// `Failed`) — no text leaves with only regex coverage. When `false` (the
+    /// default — today's behavior), masking degrades to regex-only with a
+    /// visible non-ready status, per the documented hot-load design.
+    ///
+    /// Recommended `true` for `backend = "http"`, where the load is a short
+    /// endpoint probe and an endpoint outage at session start would otherwise
+    /// silently skip the ML pass. A responsive or actively-refusing endpoint
+    /// settles sub-second; a *blackholed* one bounds the refusal window by
+    /// `http_timeout_secs` × up to 3 attempts (~90s worst case) — lower the
+    /// timeout for a LAN endpoint. With the local backend it instead refuses
+    /// for the duration of a (possibly minutes-long) model load — opt in
+    /// knowingly. Toggling this flag applies live: it's refusal policy, not
+    /// recognizer identity, so it never drops or re-probes a `Ready` recognizer.
+    #[serde(default)]
+    pub required: bool,
+    /// Where inference runs: [`MlBackend::Local`] (default — the in-process
+    /// Candle backend, today's behavior) or [`MlBackend::Http`] (a remote
+    /// HF-token-classification endpoint; see `endpoint`). Parsed even by builds
+    /// that lack one of the backends — selecting a missing backend fails the
+    /// load with a clear error, never silently falls through.
+    #[serde(default)]
+    pub backend: MlBackend,
     /// HuggingFace repo id of a privacy-filter–compatible checkpoint.
     #[serde(default = "default_ml_model")]
     pub model: String,
+    /// `backend = "http"` only: the URL POSTed for detection, speaking the HF
+    /// Inference-API token-classification schema
+    /// (`{"inputs": …, "parameters": {"aggregation_strategy": "simple"}}` →
+    /// `[{entity_group, score, start, end, …}]`). Works against HF Inference
+    /// Providers (`https://router.huggingface.co/hf-inference/models/openai/privacy-filter`)
+    /// or any self-hosted endpoint serving the same schema (e.g. a LAN
+    /// privacy-filter `/detect`). Required when `backend = "http"`; must be
+    /// `http://` or `https://`.
+    ///
+    /// ⚠ PRIVACY: every un-cached leaf's raw text is sent to this endpoint —
+    /// point it only at infrastructure you trust with the very PII this plugin
+    /// exists to protect. A cloud endpoint (HF) sees your prompts in the clear.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// `backend = "http"` only: the NAME of an environment variable holding a
+    /// bearer token for the endpoint (e.g. `"HF_TOKEN"`). The token itself never
+    /// lives in config files. `None` ⇒ no Authorization header (typical for
+    /// LAN/self-hosted endpoints).
+    #[serde(default)]
+    pub auth_token_env: Option<String>,
+    /// `backend = "http"` only: per-request timeout in seconds. Default 30 —
+    /// generous enough for HF cold loads behind the retry loop, small enough
+    /// that a hung endpoint fails (closed) rather than wedging a session.
+    #[serde(default = "default_ml_http_timeout_secs")]
+    pub http_timeout_secs: u64,
     /// Optional pinned revision (branch/tag/commit); `None` ⇒ `main`.
     #[serde(default)]
     pub revision: Option<String>,
@@ -562,6 +611,34 @@ pub struct MlConfig {
     /// `ml` backend is loaded.
     #[serde(default = "default_ml_banded")]
     pub banded_attention: bool,
+}
+
+/// Where ML inference runs. Serde wire form is lowercase (`"local"`, `"http"`).
+///
+/// `Local` (default) is today's in-process Candle path. `Http` sends each
+/// un-cached leaf to [`MlConfig::endpoint`] speaking the HF token-classification
+/// schema — for thin clients (multiple machines, containers/VMs) sharing one
+/// model host instead of each downloading + loading ~2.8 GB of weights.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MlBackend {
+    /// In-process Candle inference (the `ml` feature).
+    #[default]
+    Local,
+    /// Remote HF-token-classification endpoint (the `ml-http` feature).
+    Http,
+}
+
+impl MlBackend {
+    /// Per-variant byte for the recognizer-identity fingerprint
+    /// ([`crate::compute_ml_fp`]). Exhaustive on purpose — see
+    /// [`Quantization::fp_tag`].
+    pub(crate) fn fp_tag(self) -> u8 {
+        match self {
+            MlBackend::Local => 0,
+            MlBackend::Http => 1,
+        }
+    }
 }
 
 /// MoE expert-weight storage precision selector for the ML backend.
@@ -644,6 +721,13 @@ fn default_ml_model() -> String {
     AUTHORIZED_ML_MODELS[0].to_string()
 }
 
+/// Serde default for [`MlConfig::http_timeout_secs`]: 30s. Generous enough to
+/// ride out an HF cold load behind the retry loop; small enough that a hung
+/// endpoint fails closed instead of wedging a session indefinitely.
+fn default_ml_http_timeout_secs() -> u64 {
+    30
+}
+
 /// The HuggingFace repo ids ZlauDeR is authorized to fetch + load — an allowlist,
 /// NOT an open `--model`. A model checkpoint is an executable-grade artifact (a
 /// loader/tokenizer + tensor deserialization surface), so "download any repo" is a
@@ -685,7 +769,12 @@ impl Default for MlConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            required: false,
+            backend: MlBackend::Local,
             model: default_ml_model(),
+            endpoint: None,
+            auth_token_env: None,
+            http_timeout_secs: default_ml_http_timeout_secs(),
             revision: None,
             min_score: None,
             prefer_gpu: false,
@@ -709,6 +798,16 @@ impl MlConfig {
     /// rebuilding the recognizer vs. a no-op.
     pub fn same_model_params(&self, other: &Self) -> bool {
         self.model == other.model
+            // `required` is DELIBERATELY excluded: it is refusal POLICY (whether a
+            // not-`Ready` slot fails closed), not recognizer identity. A flip is
+            // applied live via `MaskEngine::ml_update_required` — no reload — so
+            // including it here would needlessly drop a `Ready` recognizer and
+            // re-probe on a strict-mode toggle. Excluded from `ml_fp` too (spans
+            // unchanged).
+            && self.backend == other.backend
+            && self.endpoint == other.endpoint
+            && self.auth_token_env == other.auth_token_env
+            && self.http_timeout_secs == other.http_timeout_secs
             && self.revision == other.revision
             && self.min_score == other.min_score
             && self.prefer_gpu == other.prefer_gpu
@@ -1202,6 +1301,35 @@ mod tests {
         assert!(!is_authorized_model(""));
         // The default is, by construction, the first authorized entry.
         assert_eq!(default_ml_model(), AUTHORIZED_ML_MODELS[0]);
+    }
+
+    #[test]
+    fn same_model_params_ignores_required() {
+        // `required` is refusal policy, not recognizer identity: two configs that
+        // differ ONLY in `required` ARE the same model params, so a strict-mode flip
+        // applies live (`ml_update_required`) instead of forcing a recognizer reload.
+        let lax = MlConfig {
+            enabled: true,
+            required: false,
+            ..Default::default()
+        };
+        let strict = MlConfig {
+            required: true,
+            ..lax.clone()
+        };
+        assert!(
+            lax.same_model_params(&strict),
+            "a `required` flip must NOT count as a different recognizer"
+        );
+        // A genuine identity change (the backend) still counts as different.
+        let other_backend = MlConfig {
+            backend: MlBackend::Http,
+            ..lax.clone()
+        };
+        assert!(
+            !lax.same_model_params(&other_backend),
+            "a backend change IS a different recognizer"
+        );
     }
 
     #[test]

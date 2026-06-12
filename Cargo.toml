@@ -74,6 +74,9 @@ tokio   = { version = "1", features = ["rt-multi-thread", "macros", "net", "sign
 axum    = "0.8"
 tower-http = { version = "0.6", features = ["trace", "limit"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+# sync http (engine `ml-http` backend — sync by design: `Recognizer::analyze` is a
+# sync trait method called off the async executor; ureq never spins a runtime)
+ureq    = { version = "2", default-features = false, features = ["tls"] }
 http    = "1.1"
 bytes   = "1.9"
 futures = "0.3"

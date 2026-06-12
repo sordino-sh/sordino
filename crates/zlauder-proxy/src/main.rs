@@ -276,12 +276,20 @@ async fn download_model(mut ml: MlConfig, model_override: Option<String>) -> any
     if let Some(m) = model_override {
         ml.model = m;
     }
-    println!(
-        "ZlauDeR: downloading ML model '{}' for CPU inference. The first run can be \
-         large and slow; it caches under the HuggingFace cache (HF_HOME / \
-         ~/.cache/huggingface).",
-        ml.model
-    );
+    if ml.backend == zlauder_engine::MlBackend::Http {
+        println!(
+            "ZlauDeR: [engine.ml] backend = \"http\" — nothing to download; probing \
+             the endpoint {} instead.",
+            ml.endpoint.as_deref().unwrap_or("(unset)")
+        );
+    } else {
+        println!(
+            "ZlauDeR: downloading ML model '{}' for CPU inference. The first run can be \
+             large and slow; it caches under the HuggingFace cache (HF_HOME / \
+             ~/.cache/huggingface).",
+            ml.model
+        );
+    }
     let model = ml.model.clone();
     let res = tokio::task::spawn_blocking(move || zlauder_engine::ml::download(&ml))
         .await
@@ -289,8 +297,8 @@ async fn download_model(mut ml: MlConfig, model_override: Option<String>) -> any
     match res {
         Ok(()) => {
             println!(
-                "ZlauDeR: model '{model}' downloaded and cached. Enable it with \
-                 `/zlauder:privacy model on`."
+                "ZlauDeR: model '{model}' ready (cached / endpoint probed). Enable it \
+                 with `/zlauder:privacy model on`."
             );
             Ok(())
         }
