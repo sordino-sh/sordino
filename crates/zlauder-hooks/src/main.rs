@@ -2795,11 +2795,7 @@ fn pii_suffix(n: u64) -> String {
     }
 }
 
-/// Compact ML indicator appended to the status line when masking is on: a brain
-/// when the model is filtering, an hourglass while it loads (the user's cue that
-/// their text is NOT yet filtered through it), a warning if a load failed — or
-/// if the recognizer is `ready` but its endpoint is failing at request time
-/// (http backend; those requests are refused fail-closed, see `print_ml_line`).
+/// Compact ML indicator appended to the status line when masking is on.
 fn ml_indicator(ml: Option<&MlSnap>) -> &'static str {
     match ml.map(|m| (m.status.as_str(), m.last_runtime_error.is_some())) {
         Some(("ready", false)) => " \u{1f9e0}",   // 🧠 filtering
@@ -3153,10 +3149,8 @@ fn print_ml_line(s: &Snapshot, port: u16) {
     if ml.status == "ready"
         && let Some(e) = ml.last_runtime_error.as_deref()
     {
-        // The recognizer is loaded but its endpoint is failing AT REQUEST TIME:
-        // those requests are refused (fail-closed), not leaked. The status
-        // deliberately stays `ready` (dropping the recognizer would fail open);
-        // this line is the operator's signal.
+        // Loaded recognizer failed at request time; requests are refused while
+        // status stays `ready` so the operator sees the runtime failure.
         println!(
             "  \u{26a0} endpoint failing at request time ({} failure(s); requests refused): {e}",
             ml.runtime_failures
@@ -4027,8 +4021,7 @@ struct MlSnap {
     status: String,
     #[serde(default)]
     error: Option<String>,
-    /// Post-`Ready` recognizer failure (http endpoint flaps): requests refused
-    /// fail-closed while status still reads `ready`.
+    /// Post-`Ready` recognizer failure; requests are refused while status stays `ready`.
     #[serde(default)]
     last_runtime_error: Option<String>,
     #[serde(default)]

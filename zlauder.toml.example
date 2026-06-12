@@ -79,21 +79,13 @@ detection_cache_cap = 50000
 #   /zlauder:privacy category personal on
 enabled = false
 model = "openai/privacy-filter"
-# Where inference runs: "local" (in-process Candle, the default) or "http" (a
-# remote endpoint speaking the HF token-classification schema — HF Inference
-# Providers, or a self-hosted privacy-filter server).
-# ⚠ PRIVACY: with "http", every un-cached piece of text is sent to `endpoint`.
-# Point it only at infrastructure you trust with the PII this plugin protects;
-# a cloud endpoint sees your prompts in the clear. Once ready, an unreachable
-# endpoint ⇒ the request is REFUSED (fail-closed), never passed through
-# unscanned. A FAILED LOAD degrades to regex-only (visible in `model status`,
-# same as a failed local load) — set `required = true` to refuse instead
-# whenever ML is enabled but not ready (recommended with backend = "http").
-# Toggling `required` applies live (refusal policy, not recognizer identity) —
-# no reload/re-probe. While loading+required, every maskable request is refused:
-# vs a responsive/refusing endpoint that's sub-second, but a BLACKHOLED endpoint
-# can hold the refusal up to http_timeout_secs × 3 attempts (~90s) — lower
-# http_timeout_secs for a LAN endpoint if that matters.
+# Where inference runs: "local" (in-process Candle, default) or "http"
+# (HF-compatible remote endpoint).
+# Privacy: with "http", every un-cached text leaf is sent to `endpoint`.
+# Once ready, endpoint failures refuse the request instead of sending regex-only
+# text. Load failures normally degrade to regex-only; set `required = true`
+# (recommended for http) to refuse whenever enabled ML is not ready.
+# `required` applies live because it is policy, not recognizer identity.
 # backend = "local"
 # required = true
 # endpoint = "http://10.0.0.5:3007/detect"                  # self-hosted, or:

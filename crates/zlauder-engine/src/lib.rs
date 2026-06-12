@@ -141,18 +141,10 @@ struct MlRuntime {
     status: MlStatus,
     recognizer: Option<Arc<dyn ml_api::MlRecognizer>>,
     error: Option<String>,
-    /// Most recent RUNTIME (post-`Ready`) recognizer failure — e.g. the http
-    /// backend's endpoint went unreachable mid-session, so requests are being
-    /// refused (fail-closed) while the status is still `Ready`. Surfaced in
-    /// [`MlSnapshot`] so the operator can see WHY masking is refusing. The
-    /// status is deliberately NOT demoted to `Failed` on runtime errors:
-    /// `Failed` drops the recognizer, which would flip masking to regex-only —
-    /// i.e. fail OPEN — on the first transient blip. Cleared by the next
-    /// successful ML detection (and by any reload).
+    /// Most recent post-`Ready` recognizer failure. Status stays `Ready` so a
+    /// transient backend error cannot drop ML coverage to regex-only.
     last_runtime_error: Option<String>,
-    /// Count of runtime recognizer failures since the recognizer became
-    /// `Ready` (resets on reload). A growing number with `Ready` status =
-    /// "loaded but the endpoint is flapping/down".
+    /// Runtime recognizer failures since this recognizer became `Ready`.
     runtime_failures: u64,
     /// Params of the load that is desired / in-flight / loaded, so a reconcile can
     /// tell whether a config change requires rebuilding the recognizer.
@@ -198,17 +190,7 @@ fn compute_ml_fp(rt: &MlRuntime) -> u64 {
     if rt.status == MlStatus::Ready && rt.recognizer.is_some() {
         h.update(&[1]);
         if let Some(d) = &rt.desired {
-            h.update(d.model.as_bytes());
-            h.update(&[0]);
-            match &d.revision {
-                Some(r) => {
-                    h.update(&[1]);
-                    h.update(r.as_bytes());
-                }
-                None => {
-                    h.update(&[0]);
-                }
-            };
+            h.update(&[d.backend.fp_tag()]);
             match d.min_score {
                 Some(s) => {
                     h.update(&[1]);
@@ -218,66 +200,40 @@ fn compute_ml_fp(rt: &MlRuntime) -> u64 {
                     h.update(&[0]);
                 }
             };
-            // `prefer_gpu` is a recognizer-identity param: `MlConfig::same_model_params`
-            // (the single source of truth for "this is a DIFFERENT recognizer") includes
-            // it, so a `prefer_gpu` flip rebuilds the recognizer — `ml_fp` MUST move with
-            // it or a byte-identical leaf would be served stale cross-backend detections
-            // (inert today since the GPU backends aren't compiled in, but the fingerprint
-            // must stay complete). Keep this set in sync with `same_model_params`.
-            h.update(&[d.prefer_gpu as u8]);
-            // `compute_precision` is likewise a recognizer-identity param: f16 vs
-            // f32 produce DIFFERENT detection output, so `same_model_params`
-            // includes it and the fingerprint must move with it or an f16 flip
-            // would serve stale f32-derived detections from a byte-identical leaf.
-            // `fp_tag` is an EXHAUSTIVE match at the enum def, so a new precision
-            // variant compile-forces a distinct tag here (keep `same_model_params`
-            // in sync too — that one is still a hand-listed field set).
-            h.update(&[d.compute_precision.fp_tag()]);
-            // `quant` is likewise a recognizer-identity param: Q8_0/Bf16/Bf16Vnni vs
-            // None produce DIFFERENT detection output. `Quantization::fp_tag` is
-            // exhaustive, so adding a quant variant without a distinct fingerprint
-            // byte is a compile error (no silent stale-cache collision).
-            h.update(&[d.quant.fp_tag()]);
-            // `banded_attention` is likewise a recognizer-identity param: the
-            // banded path is DESIGNED to be bit-equivalent to dense, but it is
-            // an unproven recall-risk opt-in, so `same_model_params` includes it
-            // and the fingerprint must move with it — a flip must never serve
-            // stale dense-derived detections from a byte-identical leaf. Keep in
-            // sync with `same_model_params`.
-            h.update(&[d.banded_attention as u8]);
-            // `backend`/`endpoint`/`auth_token_env` are recognizer-identity
-            // params: a different backend (in-process Candle vs a remote HTTP
-            // server) or a different endpoint can produce DIFFERENT detection
-            // output (server model version, aggregation, scoring), so
-            // `same_model_params` includes them and the fingerprint must move
-            // with them — switching endpoints must never serve stale detections
-            // computed by the previous one. Length-prefix-free framing is safe
-            // here because each Option is tagged and endpoint/env-name bytes are
-            // separated by an explicit 0 byte. `http_timeout_secs` is
-            // deliberately EXCLUDED: it changes failure behavior, never spans,
-            // so cached detections stay valid across a timeout tweak
-            // (`same_model_params` still includes it, so the rebuild applies the
-            // new timeout).
-            h.update(&[d.backend.fp_tag()]);
-            match &d.endpoint {
-                Some(e) => {
-                    h.update(&[1]);
-                    h.update(e.as_bytes());
-                }
-                None => {
+            match d.backend {
+                crate::config::MlBackend::Local => {
+                    h.update(d.model.as_bytes());
                     h.update(&[0]);
+                    match &d.revision {
+                        Some(r) => {
+                            h.update(&[1]);
+                            h.update(r.as_bytes());
+                        }
+                        None => h.update(&[0]),
+                    };
+                    h.update(&[d.prefer_gpu as u8]);
+                    h.update(&[d.compute_precision.fp_tag()]);
+                    h.update(&[d.quant.fp_tag()]);
+                    h.update(&[d.banded_attention as u8]);
                 }
-            }
-            h.update(&[0]);
-            match &d.auth_token_env {
-                Some(v) => {
-                    h.update(&[1]);
-                    h.update(v.as_bytes());
-                }
-                None => {
+                crate::config::MlBackend::Http => {
+                    match &d.endpoint {
+                        Some(e) => {
+                            h.update(&[1]);
+                            h.update(e.as_bytes());
+                        }
+                        None => h.update(&[0]),
+                    }
                     h.update(&[0]);
+                    match &d.auth_token_env {
+                        Some(v) => {
+                            h.update(&[1]);
+                            h.update(v.as_bytes());
+                        }
+                        None => h.update(&[0]),
+                    }
                 }
-            }
+            };
         }
     } else {
         h.update(&[0]);
@@ -294,9 +250,7 @@ fn compute_ml_fp(rt: &MlRuntime) -> u64 {
 pub struct MlSnapshot {
     pub status: MlStatus,
     pub error: Option<String>,
-    /// Most recent RUNTIME (post-`Ready`) recognizer failure, if any — requests
-    /// are being refused fail-closed while status still reads `Ready`. See
-    /// `MlRuntime::last_runtime_error` for why this never demotes the status.
+    /// Most recent post-`Ready` recognizer failure, if any.
     pub last_runtime_error: Option<String>,
     /// Runtime recognizer failures since this recognizer became `Ready`.
     pub runtime_failures: u64,
@@ -609,14 +563,8 @@ impl MaskEngine {
         ml.ml_fp = compute_ml_fp(&ml);
     }
 
-    /// Apply a strict-mode (`required`) flip LIVE, without reloading the
-    /// recognizer. Updates only `desired.required` under the write lock — NO
-    /// generation bump, NO status change, the recognizer is untouched. This is
-    /// safe and immediate because `ml_for_mask` reads `desired.required` afresh on
-    /// every request, so the new policy governs the very next mask call; reloading
-    /// for a policy flip would drop a `Ready` recognizer (and re-probe the endpoint)
-    /// for nothing — `required` is refusal POLICY, not recognizer identity (see
-    /// `MlConfig::same_model_params`).
+    /// Apply a `required` policy flip live without reloading the recognizer.
+    /// `ml_for_mask` reads it on every request.
     pub fn ml_update_required(&self, required: bool) {
         let mut ml = self.ml.write().expect("ml rwlock poisoned");
         if let Some(d) = &mut ml.desired {
@@ -655,24 +603,9 @@ impl MaskEngine {
         )
     }
 
-    /// The active recognizer (if `Ready`) together with the matching `ml_fp`, the
-    /// slot's `generation`, and the strict-mode refusal verdict, read under ONE
-    /// `ml.read()` so none of the four can tear across an ML transition (audit #1).
-    ///
-    /// The `generation` is returned so a runtime success/failure derived from THIS
-    /// recognizer can be attributed back to it (via
-    /// [`Self::ml_clear_runtime_failure`] / [`Self::ml_note_runtime_failure`]):
-    /// a slow request that started on an old recognizer must not mark a freshly
-    /// reloaded/disabled slot, and a stale success must not clear a new slot's real
-    /// failure. Reading it here keeps the attribution token consistent with the
-    /// recognizer/`ml_fp` it pairs with — no second `ml.read()`.
-    ///
-    /// `refusal` is `Some(reason)` when the desired config says ML is `enabled`
-    /// AND `required` but the recognizer is not `Ready` (still loading, or load
-    /// failed). The mask path must refuse BEFORE its cache lookup: the
-    /// not-Ready `ml_fp` keys the regex-only cache space, so proceeding would
-    /// serve regex-only detections — exactly the fail-open `required` exists to
-    /// prevent.
+    /// Snapshot the recognizer, cache fingerprint, generation, and required-mode
+    /// refusal under one read lock so transitions cannot tear. Required-mode
+    /// refusal is returned before cache lookup to avoid serving regex-only results.
     fn ml_for_mask(
         &self,
     ) -> (
@@ -702,18 +635,8 @@ impl MaskEngine {
         (rec, ml.ml_fp, ml.generation, refusal)
     }
 
-    /// Record a RUNTIME recognizer failure (a `Ready` recognizer's analyze call
-    /// errored — e.g. http endpoint unreachable; the request was refused). Kept
-    /// out of `status` on purpose: demoting to `Failed` would drop the
-    /// recognizer and flip masking to regex-only — fail OPEN — on a transient
-    /// blip. Surfaced via [`MlSnapshot`] instead.
-    ///
-    /// `generation` is the slot generation that produced the failure (from
-    /// [`Self::ml_for_mask`]). We silently drop the note if it no longer matches
-    /// the live `ml.generation`: the failing call belongs to a recognizer that has
-    /// since been reloaded/disabled (begin_load/disable bump the generation), and a
-    /// slow straggler must NOT mark the new slot as failing. The check and the
-    /// mutation both happen under the one write lock, so there is no read→write gap.
+    /// Record a post-`Ready` recognizer failure without demoting status; demotion
+    /// would drop ML coverage to regex-only. Stale generations are ignored.
     fn ml_note_runtime_failure(&self, generation: u64, msg: &str) {
         let mut ml = self.ml.write().expect("ml rwlock poisoned");
         if ml.generation != generation {
@@ -723,16 +646,7 @@ impl MaskEngine {
         ml.last_runtime_error = Some(msg.to_string());
     }
 
-    /// Clear the runtime-failure note after a successful ML detection (cheap
-    /// read-first so the happy path takes no write lock).
-    ///
-    /// `generation` is the slot generation that produced the success (from
-    /// [`Self::ml_for_mask`]). A stale success from an OLD recognizer must not
-    /// clear a NEWLY reloaded recognizer's real failure, so we only clear when the
-    /// generation still matches. The cheap read-first guard therefore checks BOTH
-    /// `last_runtime_error.is_some()` AND the generation; because read→write is not
-    /// atomic, the generation (and the error presence) is RE-VERIFIED under the
-    /// write lock before clearing.
+    /// Clear the runtime-failure note after a successful same-generation ML call.
     fn ml_clear_runtime_failure(&self, generation: u64) {
         {
             let ml = self.ml.read().expect("ml rwlock poisoned");

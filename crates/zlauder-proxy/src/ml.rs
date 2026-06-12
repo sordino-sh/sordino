@@ -41,14 +41,8 @@ pub fn spawn_ml_load(engine: Arc<MaskEngine>, ml: MlConfig) {
     });
 }
 
-/// Reconcile the live ML runtime to a desired config: start a (re)load when newly
-/// enabled / the model params changed, drop it when disabled. Idempotent — safe to
-/// call on every config change.
-///
-/// `retry_failed` controls whether a `Failed` status should re-attempt the load:
-/// `true` for an explicit `/zlauder/ml/enable` (the user is asking for it), `false`
-/// for a `reload`/`put` triggered by some *other* edit — so an unrelated
-/// `category`/`threshold` change doesn't silently re-stall on a broken model.
+/// Reconcile the live ML runtime to a desired config. `retry_failed` is true
+/// only for an explicit enable, so unrelated edits do not retry a broken model.
 pub fn reconcile_ml(st: &AppState, new_ml: &MlConfig, retry_failed: bool) {
     let snap = st.engine.ml_snapshot();
     if !new_ml.enabled {
@@ -73,9 +67,7 @@ pub fn reconcile_ml(st: &AppState, new_ml: &MlConfig, retry_failed: bool) {
         // via `ml_begin_load`, so no separate `required` update is needed here.
         spawn_ml_load(st.engine.clone(), new_ml.clone());
     } else {
-        // No reload: `required` is the one param `same_model_params` excludes (it is
-        // refusal policy, not recognizer identity), so a strict-mode flip would
-        // otherwise be lost. Apply it live — `ml_for_mask` reads it on every request.
+        // `required` is refusal policy, not recognizer identity; apply it live.
         st.engine.ml_update_required(new_ml.required);
     }
 }

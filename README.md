@@ -331,10 +331,8 @@ but **off by default** and runs only after you download the model:
 #### Remote inference (`backend = "http"`)
 
 Instead of loading the model in-process on every machine, the ML pass can call a
-**remote token-classification endpoint** — any server speaking the standard HF
-Inference-API token-classification schema. Use cases: thin clients (laptops,
-containers, VMs) sharing one model host on your LAN, or zero-setup via HF
-Inference Providers.
+remote HF-compatible token-classification endpoint. This is useful for thin
+clients sharing one model host or for HF Inference Providers.
 
 ```toml
 [engine.ml]
@@ -351,35 +349,18 @@ endpoint = "http://10.0.0.5:3007/detect"
 - **Same detections.** Spans come back with the same labels the local backend
   emits and flow through the identical category gates / operators; the only
   difference is where the forward pass runs.
-- **Fail-closed at request time.** Once the recognizer is `ready`, an endpoint
-  failure mid-session (after retries; 503 cold loads are waited out) **refuses**
-  the request — never passes it through with free-text PII unscanned — and
-  `model status` reports the runtime failure while staying `ready` (recovers on
-  the next successful call). On this detection path, only the HTTP status code is
-  kept — response **bodies** from the endpoint are never copied into local logs,
-  status, or errors, so an endpoint that echoes rejected input back can't leak
-  that PII into your local state (probe-time errors may include the body, since
-  the probe input is the literal `"probe"`, never user text).
-- **Load failures follow the standard hot-load semantics by default**: a dead
-  endpoint at enable time shows `failed` (the load probes the URL) and masking
-  continues **regex-only** — exactly like a failed local model load. If you want
-  strictness from the first byte, set `required = true`: ML enabled but not
-  `ready` (loading *or* failed) then refuses every maskable request.
-  **Recommended for `backend = "http"`** — the load is a short endpoint probe.
-  Against a responsive (or actively refusing) endpoint it settles in well under a
-  second; against a *blackholed* one (firewall drop, dead route) the refusal
-  window is bounded by `http_timeout_secs` (default 30s) × up to 3 probe attempts
-  — roughly 90s worst case before status turns `failed`. Tune `http_timeout_secs`
-  down for a LAN endpoint if that matters. (With the local backend, strictness
-  instead refuses for the full duration of a model load.)
-- **Flipping `required` applies live.** It's refusal policy, not recognizer
-  identity, so toggling it takes effect immediately without dropping or
-  re-probing a `ready` recognizer.
-- ⚠ **Privacy trade-off.** Every un-cached piece of text is sent to that
-  endpoint — point it only at infrastructure you trust with exactly the PII this
-  plugin exists to protect. A cloud endpoint (e.g. HF) sees your prompts in the
-  clear; a self-hosted LAN endpoint keeps them home. The local backend remains
-  the most private option.
+- **Fail-closed at request time.** Once `ready`, endpoint failures refuse the
+  request instead of sending text with only regex coverage. User-text response
+  bodies from the endpoint are not copied into logs, status, or errors.
+- **Load failures follow hot-load semantics by default**: a dead endpoint at
+  enable time shows `failed` and masking continues regex-only. Set
+  `required = true` to refuse maskable requests whenever enabled ML is not
+  `ready`; this is recommended for `backend = "http"`.
+- **Flipping `required` applies live.** It is refusal policy, not recognizer
+  identity.
+- **Privacy trade-off.** Every un-cached piece of text is sent to that endpoint.
+  Use only infrastructure you trust with that plaintext; the local backend
+  remains the most private option.
 - `model download` with `backend = "http"` just validates + probes the endpoint
   (there is nothing to download).
 - **Slim thin-client build.** Because this path never loads a local model, you can

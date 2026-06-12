@@ -1,37 +1,16 @@
 //! HTTP ML recognizer: token-classification over a remote endpoint instead of
 //! the in-process Candle backend (`backend = "http"` in `[engine.ml]`).
 //!
-//! Speaks the de-facto standard **HF Inference-API token-classification schema**
-//! — `POST {"inputs": <text>, "parameters": {"aggregation_strategy": "simple"}}`
-//! → `[{entity_group, score, word, start, end}, …]` — so ONE wire format covers
-//! HF Inference Providers (`router.huggingface.co/hf-inference/models/...`), HF
-//! Inference Endpoints, and any self-hosted wrapper serving the same shape
-//! (e.g. a LAN `openai/privacy-filter` `/detect` service). Use case: thin
-//! clients — many machines / containers sharing one model host instead of each
-//! downloading + loading ~2.8 GB of weights.
+//! Speaks the HF token-classification schema, so HF-hosted and self-hosted
+//! endpoints can share the same client.
 //!
-//! Three impedance mismatches between the wire schema and the engine are
-//! absorbed here:
-//!   1. **Offsets** — HF-style servers report `start`/`end` as Unicode
-//!      *codepoint* indices (Python-string semantics); the engine works in
-//!      *byte* offsets. Converted per text via a `char_indices` table.
-//!   2. **Score** — some servers expose no confidence (`score: null`; the
-//!      official `opf` runtime is one). Missing/null is treated as 1.0, then the
-//!      `min_score` floor applies as usual.
-//!   3. **Labels** — spans arrive as raw model labels (`private_person`, …);
-//!      mapped to the same `EntityType`s as the local backend's
-//!      `privacy_filter_mapping` (incl. `private_date` → `Custom("PRIVATE_DATE")`,
-//!      see `ml.rs` for the audit-trail rationale) so detections are
-//!      indistinguishable downstream from local-backend ones.
+//! This module adapts remote responses to engine semantics: codepoint offsets
+//! become byte offsets, missing scores become 1.0 before thresholding, and raw
+//! model labels map to the same `EntityType`s as the local backend.
 //!
-//! **Fail-closed.** This type implements the engine's fallible
-//! [`MlRecognizer`] slot: an endpoint failure (after the retry loop) returns a
-//! real `Err`, which the detection layer treats as a detection failure and the
-//! engine fail-safes into REFUSING the request. Returning an empty span list
-//! instead would FAIL OPEN — the leaf would be masked regex-only and free-text
-//! PII (names, addresses) would ride upstream unscanned. Load-time strictness
-//! (refusing while the endpoint is down at enable time) is the separate
-//! `[engine.ml] required` switch — see `MlConfig::required`.
+//! Endpoint failures return `Err`, so the engine refuses the request instead of
+//! falling back to regex-only scanning. Load-time strictness is controlled by
+//! `[engine.ml] required`.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,29 +26,17 @@ use crate::ml_api::MlRecognizer;
 /// Total attempts per request (1 initial + 2 retries). 503 (HF cold load) waits
 /// longer between attempts than transport errors do.
 const ATTEMPTS: u32 = 3;
+const PROBE_TEXT: &str = "Probe contact: Sarah Probe <sarah.probe@example.com>";
+const PROBE_EMAIL: &str = "sarah.probe@example.com";
 
-/// A failed HTTP exchange, structured so callers can branch on WHAT failed:
-/// `status: None` = transport-level (connect/timeout/body), `Some(code)` = the
-/// server answered with a non-2xx. `analyze_batch` uses the code to tell "this
-/// server doesn't accept batched inputs" (4xx → per-text fallback) from "the
-/// endpoint is down" (propagate, fail closed).
-///
-/// **PII-sanitization contract.** `msg` is always safe to log/surface: for a
-/// status error it is `HTTP {code} from {endpoint}` — NEVER the response body.
-/// Many token-classification servers echo the rejected input in their error
-/// body, so embedding it here would copy the user's PII into local logs →
-/// runtime status → admin JSON → `model status`. The truncated body lives ONLY
-/// in `body_snippet`, which `Display`, `fail_closed()`, and every analyze/detect
-/// path deliberately ignore. The single exception is `probe()`: its request body
-/// is the literal `"probe"`, so an echoed body can't contain user text — it may
-/// surface `body_snippet` for diagnosability.
+/// A failed HTTP exchange. `msg` is log-safe and never includes a response body;
+/// `body_snippet` is only for the synthetic probe, where echoed input cannot
+/// contain user text.
 #[derive(Debug)]
 struct HttpError {
     status: Option<u16>,
     msg: String,
-    /// Truncated (≤200 char) response body for a status error. SANITIZED OUT of
-    /// every analyze/detect surface (see the type doc) — only `probe()` may read
-    /// it, because the probe input is a fixed non-PII string.
+    /// Truncated response body, intentionally ignored by analyze/detect paths.
     body_snippet: Option<String>,
 }
 
@@ -89,8 +56,7 @@ impl HttpError {
         )
     }
 
-    /// A "this server rejected the REQUEST SHAPE" status — how a
-    /// single-input-only endpoint answers `inputs: [...]`.
+    /// Statuses commonly used when a single-input endpoint rejects `inputs: [...]`.
     fn rejects_request_shape(&self) -> bool {
         matches!(
             self.status,
@@ -98,8 +64,7 @@ impl HttpError {
         )
     }
 
-    /// Wrap as the engine error, with the fail-closed framing the operator will
-    /// see in logs/status.
+    /// Wrap as the fail-closed engine error surfaced in logs/status.
     fn fail_closed(&self) -> EngineError {
         EngineError::Ml(format!(
             "http ML endpoint unavailable (failing CLOSED — request refused, not \
@@ -165,13 +130,8 @@ struct ResolvedSpan {
     end_cp: usize,
 }
 
-/// Map a raw model label to the engine's `EntityType`, mirroring the local
-/// backend's `privacy_filter_mapping` (see `ml.rs`): spec defaults for the 8
-/// privacy-filter categories, with `private_date` routed to the neutral
-/// `Custom("PRIVATE_DATE")` (NOT `DateTime`/`DATE_OF_BIRTH` — audit-trail
-/// rationale in `ml.rs`). Unknown labels (a future server-side category) map to
-/// `Custom(UPPERCASED)` so they surface honestly instead of being dropped; they
-/// only mask if the user enables that entity, same as any custom type.
+/// Map a raw model label to the engine's `EntityType`, matching the local
+/// backend. Unknown labels become custom entities instead of being dropped.
 fn label_to_entity(label: &str) -> EntityType {
     match label {
         "private_person" => EntityType::Person,
@@ -192,14 +152,12 @@ const ENTITY_PRIVATE_DATE_LABEL: &str = "private_date";
 pub struct HttpRecognizer {
     agent: ureq::Agent,
     endpoint: String,
-    /// Pre-rendered `Bearer <token>` value, resolved ONCE from the env var named
-    /// by `auth_token_env` (the token itself never lives in config).
+    /// Pre-rendered `Bearer <token>` from `auth_token_env`; the token stays out
+    /// of config.
     auth_header: Option<String>,
     /// Score floor (spec default 0.5 when unset, matching the local backend).
     min_score: f32,
-    /// Flipped when a batched POST is rejected (4xx) or comes back in a
-    /// non-batch shape — from then on `analyze_batch` goes straight to the
-    /// per-text loop instead of re-sending whole batches every prewarm.
+    /// Set after a rejected/non-batch response so future batches go per-text.
     batch_unsupported: AtomicBool,
 }
 
@@ -214,9 +172,7 @@ impl std::fmt::Debug for HttpRecognizer {
 }
 
 impl HttpRecognizer {
-    /// Validate config + resolve the auth token. Fails fast (at load, visible in
-    /// `model status`) on a missing endpoint, a non-http(s) scheme, or a named
-    /// auth env var that is unset/empty — never at first masked request.
+    /// Validate config and resolve the auth token at load time.
     pub fn from_config(cfg: &MlConfig) -> Result<Self, EngineError> {
         let endpoint = cfg.endpoint.clone().ok_or_else(|| {
             EngineError::Ml(
@@ -327,19 +283,14 @@ impl HttpRecognizer {
         Err(last)
     }
 
-    /// One-shot connectivity probe — used at load (`build_recognizer`) and by
-    /// `--download-model` for the http backend, so a bad endpoint/token fails
-    /// visibly at enable-time instead of on the first masked request.
+    /// One-shot connectivity probe used at load and by `--download-model`.
     pub fn probe(&self) -> Result<(), EngineError> {
         let body = serde_json::json!({
-            "inputs": "probe",
+            "inputs": PROBE_TEXT,
             "parameters": {"aggregation_strategy": "simple"},
         });
-        // Unlike the analyze/detect paths, probe MAY surface the response body:
-        // the request body is the literal "probe", so an echoed error body cannot
-        // contain user PII — and the snippet aids diagnosing a misconfigured
-        // endpoint at enable-time. (Analyze errors are sanitized to status-code
-        // only precisely because their request body is user text.)
+        // Probe may surface the response body because it sends fixed synthetic
+        // text, never user input.
         let v = self.post(&body).map_err(|e| {
             let detail = match &e.body_snippet {
                 Some(s) => format!("{}: {s}", e.msg),
@@ -347,19 +298,50 @@ impl HttpRecognizer {
             };
             EngineError::Ml(detail)
         })?;
-        // Strengthen the shape check: a bare `v.is_array()` accepted ANY array
-        // (e.g. `[1,2,3]`), masking an endpoint that answers JSON but not the
-        // token-classification schema. Require a clean `WireResponse` parse —
-        // only that proves the wire contract the detect path depends on. The
-        // truncated body is safe to echo here for the same probe-input reason.
-        match serde_json::from_value::<WireResponse>(v.clone()) {
-            Ok(_) => Ok(()),
-            Err(_) => Err(EngineError::Ml(format!(
-                "endpoint {} answered, but not with a token-classification array \
+        let entities = match serde_json::from_value::<WireResponse>(v.clone()) {
+            Ok(wire) => self.single_input_entities(wire).map_err(|msg| {
+                EngineError::Ml(format!("endpoint {} answered, but {msg}", self.endpoint))
+            })?,
+            Err(_) => {
+                return Err(EngineError::Ml(format!(
+                    "endpoint {} answered, but not with a token-classification array \
                  (got: {})",
-                self.endpoint,
-                truncate_for_log(&v.to_string()),
-            ))),
+                    self.endpoint,
+                    truncate_for_log(&v.to_string()),
+                )));
+            }
+        };
+        let spans = self.convert(PROBE_TEXT, entities);
+        let saw_email = spans.iter().any(|r| {
+            r.entity_type == EntityType::EmailAddress
+                && PROBE_TEXT.get(r.start..r.end) == Some(PROBE_EMAIL)
+        });
+        if saw_email {
+            Ok(())
+        } else {
+            Err(EngineError::Ml(format!(
+                "endpoint {} answered, but the probe did not return the expected \
+                 EMAIL_ADDRESS span",
+                self.endpoint
+            )))
+        }
+    }
+
+    fn single_input_entities(&self, response: WireResponse) -> Result<Vec<WireEntity>, String> {
+        match response {
+            WireResponse::Nested(mut nested) => {
+                if nested.is_empty() {
+                    Ok(Vec::new())
+                } else if nested.len() == 1 {
+                    Ok(nested.swap_remove(0))
+                } else {
+                    Err(format!(
+                        "ambiguous nested response with {} outer arrays for a single input",
+                        nested.len()
+                    ))
+                }
+            }
+            WireResponse::Flat(flat) => Ok(flat),
         }
     }
 
@@ -475,31 +457,13 @@ impl HttpRecognizer {
         });
         let v = self.post(&body).map_err(|e| e.fail_closed())?;
         let entities = match serde_json::from_value::<WireResponse>(v) {
-            // Some servers wrap a single input's entities in a one-element outer
-            // array (batch semantics); unwrap that shape transparently. But ONLY
-            // for len 0 (empty) or 1 (the wrapped single result). A response with
-            // >1 outer array is ambiguous for a single input: the old
-            // `swap_remove(0)` silently dropped the rest, so a buggy endpoint
-            // returning e.g. `[[], [..spans..]]` would read as the empty first
-            // array → "no PII found" → FAIL OPEN, riding the PII upstream
-            // unmasked. Refuse instead (fail closed).
-            Ok(WireResponse::Nested(mut nested)) => {
-                if nested.is_empty() {
-                    Vec::new()
-                } else if nested.len() == 1 {
-                    nested.swap_remove(0)
-                } else {
-                    return Err(EngineError::Ml(format!(
-                        "http ML endpoint unavailable (failing CLOSED — request \
-                         refused, not passed through unmasked): ambiguous \
-                         nested response with {} outer arrays for a single input \
-                         from {}",
-                        nested.len(),
-                        self.endpoint,
-                    )));
-                }
-            }
-            Ok(WireResponse::Flat(flat)) => flat,
+            Ok(wire) => self.single_input_entities(wire).map_err(|msg| {
+                EngineError::Ml(format!(
+                    "http ML endpoint unavailable (failing CLOSED — request \
+                     refused, not passed through unmasked): {msg} from {}",
+                    self.endpoint
+                ))
+            })?,
             Err(e) => {
                 return Err(EngineError::Ml(format!(
                     "unexpected response shape from {}: {e}",
@@ -510,12 +474,8 @@ impl HttpRecognizer {
         Ok(self.convert(text, entities))
     }
 
-    /// Batched detection: one POST with `inputs: [..]`, expecting one entity
-    /// array per input. Servers that don't batch — whether they REJECT the
-    /// array (4xx) or answer with a non-batch shape — flip `batch_unsupported`
-    /// and we fall back to per-text requests (correct, just N round-trips).
-    /// `Err` = endpoint unusable (the prewarm caller skips the batch; per-leaf
-    /// masking re-runs and fail-safes on its own).
+    /// Batched detection. Single-input endpoints are remembered and handled by
+    /// the per-text path; other endpoint failures propagate fail-closed.
     fn detect_batch(&self, texts: &[&str]) -> Result<Vec<Vec<RecognizerResult>>, EngineError> {
         if self.batch_unsupported.load(Ordering::Relaxed) {
             return texts.iter().map(|t| self.detect(t)).collect();
@@ -527,9 +487,7 @@ impl HttpRecognizer {
         let v = match self.post(&body) {
             Ok(v) => v,
             Err(e) if e.rejects_request_shape() => {
-                // A single-input-only server (HF router included) answers the
-                // array with a 4xx. Remember and go per-text — without this, the
-                // prewarm path would re-send (and re-fail) the batch every turn.
+                // Single-input endpoint: remember and go per-text from now on.
                 self.batch_unsupported.store(true, Ordering::Relaxed);
                 return texts.iter().map(|t| self.detect(t)).collect();
             }
@@ -551,9 +509,7 @@ impl HttpRecognizer {
 }
 
 impl MlRecognizer for HttpRecognizer {
-    /// FAIL-CLOSED by construction: an endpoint failure is a real `Err`, which
-    /// the detection layer surfaces as a detection error ⇒ the request is
-    /// refused. An empty `Ok` is only ever a genuine "no PII found".
+    /// Endpoint failures are real errors; empty `Ok` means "no PII found".
     fn analyze(&self, text: &str) -> Result<Vec<RecognizerResult>, EngineError> {
         self.detect(text)
     }
@@ -567,9 +523,7 @@ fn truncate_for_log(s: &str) -> String {
     s.chars().take(200).collect()
 }
 
-/// Build the HTTP-backed recognizer and PROBE the endpoint, so a dead URL or a
-/// bad token fails the (background) load — visible in `model status` — rather
-/// than the first masked request.
+/// Build the HTTP recognizer and probe the endpoint at load time.
 pub fn build_recognizer(cfg: &MlConfig) -> Result<Arc<dyn MlRecognizer>, EngineError> {
     let rec = HttpRecognizer::from_config(cfg)?;
     rec.probe()?;
@@ -906,9 +860,7 @@ mod tests {
         assert!(!s.contains(marker), "response body leaked PII: {s}");
     }
 
-    /// The deliberate asymmetry: `probe()` MAY surface the body, because its
-    /// request is the fixed literal "probe" (no user PII can be echoed). Locks
-    /// in that probe diagnostics include the body while analyze errors don't.
+    /// Probe errors may surface the body because probe sends fixed synthetic text.
     #[test]
     fn probe_error_may_include_body() {
         let marker = "currently loading details here";
@@ -938,11 +890,9 @@ mod tests {
         assert!(err.to_string().contains("failing CLOSED"), "got: {err}");
     }
 
-    /// `probe()` requires a real token-classification shape, not just any JSON
-    /// array: a bare `[1,2,3]` is valid JSON but not a `WireResponse`, so probe
-    /// must reject it — while a nested-empty `[[]]` (valid wire shape) passes.
+    /// `probe()` requires a real expected detection, not just array-shaped JSON.
     #[test]
-    fn probe_rejects_non_token_classification_shape() {
+    fn probe_requires_expected_email_span() {
         let bad = serve(vec![r#"[1,2,3]"#.to_string()]);
         let rec = rec_for(&bad);
         assert!(
@@ -950,10 +900,19 @@ mod tests {
             "[1,2,3] is an array but not a WireResponse — probe must reject"
         );
 
-        let ok = serve(vec![r#"[[]]"#.to_string()]);
+        let empty = serve(vec![r#"[[]]"#.to_string()]);
+        let rec = rec_for(&empty);
+        assert!(
+            rec.probe().is_err(),
+            "empty token-classification shape proves JSON compatibility, not detection"
+        );
+
+        let ok = serve(vec![
+            r#"[{"entity_group":"private_email","score":0.99,"start":29,"end":52}]"#.to_string(),
+        ]);
         let rec = rec_for(&ok);
         rec.probe()
-            .expect("nested-empty [[]] is a valid token-classification shape");
+            .expect("synthetic email span proves token-classification detection");
     }
 
     /// Live conformance against the real HF Inference Providers router. Ignored

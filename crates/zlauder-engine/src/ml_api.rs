@@ -1,16 +1,9 @@
 //! The engine-internal ML recognizer abstraction.
 //!
-//! The presidio `Recognizer` trait is infallible (`analyze -> Vec<_>`), which is
-//! the wrong boundary for backends that can FAIL — most obviously the http
-//! backend, where "endpoint unreachable" must refuse the request (fail-closed),
-//! never return an empty "no PII" result (fail-open). So the ML slot stores this
-//! fallible trait instead, and each backend adapts to it:
-//!   - the http backend ([`crate::ml_http::HttpRecognizer`]) implements it
-//!     directly, returning real errors;
-//!   - the local Candle backend (and the test mocks) are wrapped in
-//!     [`InfallibleMl`], whose `catch_unwind` also contains any unexpected panic
-//!     inside the model code and surfaces it as an error instead of letting it
-//!     tear through the proxy's request task.
+//! The presidio `Recognizer` trait is infallible, but remote backends can fail.
+//! The engine stores this fallible trait so failures refuse the request instead
+//! of looking like "no PII found". Local recognizers are wrapped by
+//! [`InfallibleMl`], which also converts panics into ML errors.
 //!
 //! Always compiled (no feature gate): the ML slot exists even in a regex-only
 //! build; only the backends behind it are feature-gated.
@@ -21,10 +14,8 @@ use presidio_core::RecognizerResult;
 
 use crate::error::EngineError;
 
-/// A fallible "text in → PII spans out" backend for the engine's ML slot.
-/// `Err` means the backend could not be consulted — the detection layer treats
-/// that as a detection failure, which the engine fail-safes into refusing the
-/// request. `Ok(vec![])` is a genuine "no PII found".
+/// A fallible "text in -> PII spans out" backend for the engine's ML slot.
+/// `Err` means the backend could not be consulted; `Ok(vec![])` means no PII.
 pub trait MlRecognizer: Send + Sync {
     fn analyze(&self, text: &str) -> Result<Vec<RecognizerResult>, EngineError>;
 
@@ -35,10 +26,8 @@ pub trait MlRecognizer: Send + Sync {
     }
 }
 
-/// Adapter from an infallible presidio [`presidio_core::Recognizer`] (the local
-/// Candle recognizer, test mocks) onto the fallible [`MlRecognizer`] slot. The
-/// `catch_unwind` is deliberate hardening: a panic inside model code becomes an
-/// [`EngineError::Ml`] (request refused) instead of unwinding through the proxy.
+/// Adapter from an infallible presidio recognizer onto the fallible ML slot.
+/// Panics become [`EngineError::Ml`] so the request is refused.
 pub struct InfallibleMl(pub Arc<dyn presidio_core::Recognizer>);
 
 impl MlRecognizer for InfallibleMl {
@@ -51,16 +40,28 @@ impl MlRecognizer for InfallibleMl {
     }
 }
 
-/// Run a recognizer call with panic containment, mapping an unwind to
-/// [`EngineError::Ml`] so the caller's existing fail-safe (refuse the request)
-/// takes over instead of the panic tearing through the proxy's request task.
+/// Run a recognizer call with panic containment.
 fn catch_recognizer_panic<T>(f: impl FnOnce() -> T) -> Result<T, EngineError> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|payload| {
-        let msg = payload
-            .downcast_ref::<String>()
-            .map(String::as_str)
-            .or_else(|| payload.downcast_ref::<&str>().copied())
-            .unwrap_or("recognizer panicked (non-string payload)");
-        EngineError::Ml(msg.to_string())
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)).map_err(|_| {
+        // Do not surface panic payloads. They are arbitrary strings from backend
+        // code and could include text being analyzed.
+        EngineError::Ml("local ML recognizer panicked".to_string())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn panic_payload_is_not_surfaced() {
+        let err = catch_recognizer_panic(|| panic!("secret@example.com")).unwrap_err();
+        match err {
+            EngineError::Ml(msg) => {
+                assert_eq!(msg, "local ML recognizer panicked");
+                assert!(!msg.contains("secret@example.com"));
+            }
+            other => panic!("unexpected error variant: {other:?}"),
+        }
+    }
 }

@@ -1,22 +1,8 @@
-//! ML recognizer construction — the single entry point the proxy calls, now a
-//! dispatcher over two backends selected by `[engine.ml] backend`:
-//!   - **local** (feature `ml`): `openai/privacy-filter` on the native-Rust
-//!     Candle CPU backend. This module is the ONLY place that touches
-//!     `presidio-classifier`/Candle.
-//!   - **http** (feature `ml-http`): a remote HF-token-classification endpoint
-//!     (`crate::ml_http`) — no weights, no Candle; for thin clients sharing one
-//!     model host.
-//! The rest of the engine wires the recognizer in purely as an
-//! `Arc<dyn MlRecognizer>` (the engine's fallible ML abstraction — see
-//! `ml_api.rs`) either way. A build lacking the selected
-//! backend's feature fails the load with a clear error (never a silent
-//! fall-through to the other backend).
+//! ML recognizer construction. `[engine.ml] backend` selects local Candle
+//! inference (`ml`) or a remote token-classification endpoint (`ml-http`).
+//! Missing backend features fail explicitly instead of falling through.
 //!
-//! Both entry points are synchronous and heavy/blocking (model download + load,
-//! or a network probe). The proxy calls them from a `spawn_blocking` task so the
-//! request executor is never blocked, and `CandleBackend`'s loader drives
-//! `hf-hub` on its own scoped-thread runtime, so it is safe to call from inside
-//! a Tokio context.
+//! Entry points are synchronous; the proxy calls them from `spawn_blocking`.
 
 use std::sync::Arc;
 
@@ -98,12 +84,8 @@ fn candle_config(cfg: &MlConfig) -> CandleConfig {
     }
 }
 
-/// Refuse to fetch or load any model repo that is not on the authorized allowlist
-/// ([`crate::config::AUTHORIZED_ML_MODELS`]). This is the SINGLE chokepoint covering
-/// every override source — `--download-model --model <repo>`, `model on --model
-/// <repo> --scope <file>`, and a raw `[engine.ml] model = "…"` edit all resolve here
-/// before any network/loader work, so an arbitrary (model-supplied, injected, or
-/// typo'd) checkpoint can never be pulled. Runs FIRST, before `CandleBackend::new`.
+/// Refuse to fetch or load model repos outside the authorized allowlist.
+/// Runs before any network or loader work.
 #[cfg(feature = "ml")]
 fn ensure_authorized(cfg: &MlConfig) -> Result<(), EngineError> {
     if !crate::config::is_authorized_model(&cfg.model) {
@@ -126,9 +108,7 @@ pub fn build_recognizer(cfg: &MlConfig) -> Result<Arc<dyn MlRecognizer>, EngineE
     }
 }
 
-/// `--download-model` pre-warm: the local backend fetches + caches the weights
-/// without keeping them loaded; the http backend has nothing to download, so it
-/// validates config and probes the endpoint instead.
+/// `--download-model` pre-warm: local caches weights; http probes the endpoint.
 pub fn download(cfg: &MlConfig) -> Result<(), EngineError> {
     match cfg.backend {
         MlBackend::Local => download_local(cfg),
@@ -152,8 +132,7 @@ fn build_local(cfg: &MlConfig) -> Result<Arc<dyn MlRecognizer>, EngineError> {
     if let Some(s) = cfg.min_score {
         builder = builder.with_min_score(s);
     }
-    // Adapt the infallible presidio recognizer onto the engine's fallible ML
-    // slot; the adapter also contains panics (see `ml_api::InfallibleMl`).
+    // Adapt the infallible local recognizer onto the engine's fallible ML slot.
     Ok(Arc::new(InfallibleMl(Arc::new(builder.build()))))
 }
 
@@ -216,9 +195,7 @@ fn no_http_backend() -> EngineError {
 mod tests {
     use super::*;
 
-    /// An unauthorized model id is refused by `download`/`build_recognizer` BEFORE
-    /// any network or loader work — `ensure_authorized` short-circuits, so this test
-    /// needs no model files and asserts the supply-chain gate, not the backend.
+    /// Unauthorized model ids are refused before network or loader work.
     #[test]
     fn unauthorized_model_is_refused_without_loading() {
         let mut cfg = MlConfig {
@@ -269,7 +246,10 @@ mod tests {
             map.translate("private_email"),
             Some(EntityType::EmailAddress)
         );
-        assert_eq!(map.translate("private_phone"), Some(EntityType::PhoneNumber));
+        assert_eq!(
+            map.translate("private_phone"),
+            Some(EntityType::PhoneNumber)
+        );
         assert_eq!(map.translate("private_url"), Some(EntityType::Url));
         assert_eq!(map.translate("private_address"), Some(EntityType::Location));
         assert_eq!(map.translate("private_person"), Some(EntityType::Person));
