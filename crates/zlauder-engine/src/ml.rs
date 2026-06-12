@@ -10,7 +10,9 @@
 
 use std::sync::Arc;
 
-use presidio_classifier::backends::{CandleBackend, CandleConfig, CpuPrecision, Quant};
+use presidio_classifier::backends::{
+    CandleBackend, CandleConfig, CpuPrecision, DeviceHint, PrecisionHint, Quant,
+};
 use presidio_classifier::{Chunker, LabelMap, OPENAI_PRIVACY_FILTER, TokenClassifierRecognizer};
 use presidio_core::{EntityType, Recognizer};
 
@@ -68,7 +70,20 @@ fn candle_config(cfg: &MlConfig) -> CandleConfig {
     CandleConfig {
         repo_id: cfg.model.clone(),
         revision: cfg.revision.clone(),
-        prefer_gpu: cfg.prefer_gpu,
+        // presidio-classifier's GPU foundation replaced `prefer_gpu: bool` with a
+        // `device: DeviceHint` + `gpu_precision: PrecisionHint` pair. Preserve the
+        // prior semantics exactly: `prefer_gpu` => `Auto` (try cuda > metal > cpu),
+        // otherwise pin to `Cpu`. `PrecisionHint::Auto` resolves to BF16 on
+        // sm80+/Metal and degrades to F16 below (both gate-proven recall-safe;
+        // router/experts/score-head stay F32). `MlConfig.prefer_gpu` stays the
+        // engine-facing knob; richer device selection (index/explicit Cuda/Metal)
+        // is a future MlConfig extension.
+        device: if cfg.prefer_gpu {
+            DeviceHint::Auto
+        } else {
+            DeviceHint::Cpu
+        },
+        gpu_precision: PrecisionHint::Auto,
         cpu_precision: cpu_precision(cfg.compute_precision),
         quant: quant(cfg.quant),
         banded_attention: cfg.banded_attention,
