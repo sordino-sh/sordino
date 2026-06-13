@@ -10,10 +10,14 @@ description = "PII masking/unmasking engine: deterministic blake3 session tokens
 [dependencies]
 presidio-core     = { workspace = true }
 presidio-analyzer = { workspace = true }
-# ML recognizer (openai/privacy-filter, Candle CPU backend). Optional, but ON by
-# default (the `ml` feature is in `default`) so normal builds are "ML-capable".
-# `zlauder-hooks` opts OUT with `default-features = false` to stay lean.
-presidio-classifier = { workspace = true, features = ["backend-candle"], optional = true }
+# ML recognizer (openai/privacy-filter). Optional, but ON by default (the `ml` /
+# `ml-http` features are in `default`) so normal builds are "ML-capable". The
+# concrete backend is selected by feature: `ml` -> `backend-candle` (in-process
+# Candle), `ml-http` -> `backend-http` (remote HF-token-classification endpoint,
+# a small reqwest::blocking client living UPSTREAM — zlauder carries no bespoke
+# HTTP client). `zlauder-hooks` opts OUT with `default-features = false` to stay
+# lean (neither backend, so presidio-classifier is not compiled at all).
+presidio-classifier = { workspace = true, optional = true }
 
 blake3   = { workspace = true }
 aes-gcm  = { workspace = true }
@@ -27,6 +31,8 @@ zeroize  = { workspace = true }
 globset  = { workspace = true }
 url      = { workspace = true }
 shlex    = { workspace = true }
+# Only the http backend (`ml-http`) needs it — wraps the resolved bearer token.
+secrecy  = { workspace = true, optional = true }
 
 serde     = { workspace = true }
 serde_json = { workspace = true }
@@ -39,8 +45,14 @@ tracing   = { workspace = true }
 # the rest of the engine (the MlRuntime slot, detection wiring) is candle-free, so
 # a `--no-default-features` build is a lean regex-only engine that still parses the
 # `[engine.ml]` config (it just never loads a model).
-default = ["ml"]
-ml = ["dep:presidio-classifier"]
+default = ["ml", "ml-http"]
+ml = ["dep:presidio-classifier", "presidio-classifier/backend-candle"]
+# Remote-inference backend (`[engine.ml] backend = "http"`): no Candle, no
+# weights — the upstream `presidio-classifier/backend-http` recognizer backend
+# (a reqwest::blocking client + HF/TEI/custom wire decode, all reviewed upstream).
+# Independent of `ml`, so a slim regex+http build
+# (`--no-default-features --features ml-http`) skips the whole Candle stack.
+ml-http = ["dep:presidio-classifier", "presidio-classifier/backend-http", "dep:secrecy"]
 # NOTE (R1, gemm-vs-MKL lever): an opt-in `mkl` passthrough feature was attempted
 # here (`mkl = ["ml", "presidio-classifier/mkl"]`) but it CANNOT be wired without
 # breaking the default build. presidio-classifier is consumed as a git dependency

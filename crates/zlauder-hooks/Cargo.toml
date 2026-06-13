@@ -13,7 +13,10 @@ path = "src/main.rs"
 
 [dependencies]
 zlauder-state  = { path = "../zlauder-state" }
-zlauder-engine = { path = "../zlauder-engine" }
+# Hooks only touches the engine's ungated config/category types (EngineConfig,
+# Profile, Category, MlStatus) — no ML backend, no Candle. Opt out of the engine's
+# default features so this binary stays lean (a regex-only engine build).
+zlauder-engine = { path = "../zlauder-engine", default-features = false }
 
 clap       = { workspace = true }
 serde      = { workspace = true }

@@ -111,9 +111,18 @@ pub(crate) fn snapshot(st: &AppState) -> serde_json::Value {
         "config": wire,
         "ml": {
             "enabled": cfg.ml.enabled,
+            // Effective policy (resolves the http default), so the status line and
+            // any client see the TRUE refusal behavior, not the unset three-state.
+            "required": cfg.ml.required_effective(),
+            "backend": cfg.ml.backend,
             "model": cfg.ml.model,
+            "endpoint": cfg.ml.endpoint,
             "status": ml.status,
             "error": ml.error,
+            // Post-`Ready` recognizer failures: requests are refused while status
+            // stays `ready`, so operators can see endpoint flaps.
+            "last_runtime_error": ml.last_runtime_error,
+            "runtime_failures": ml.runtime_failures,
         },
         "secrets": {
             "ready": st.secrets_ready(),
@@ -263,10 +272,8 @@ pub async fn put_config(State(st): State<AppState>, hdrs: HeaderMap, body: Bytes
             ),
         );
     }
-    // `ml.enabled` is live-owned: ONLY `/zlauder/ml/{enable,disable}` flip it. A
-    // generic PUT (even a stale/older client's) must not — so we override the posted
-    // value with the live one and reconcile model-param changes only. Serialized
-    // against the ml/enable|disable handlers.
+    // `ml.enabled` is live-owned by the dedicated enable/disable endpoints; PUT
+    // may change only model params.
     let _ml_guard = st.ml_control.lock().expect("ml_control mutex poisoned");
     let mut engine_cfg = engine_cfg;
     engine_cfg.ml.enabled = st.engine.ml_snapshot().status != MlStatus::Disabled;

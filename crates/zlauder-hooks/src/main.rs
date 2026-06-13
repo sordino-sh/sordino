@@ -2795,14 +2795,13 @@ fn pii_suffix(n: u64) -> String {
     }
 }
 
-/// Compact ML indicator appended to the status line when masking is on: a brain
-/// when the model is filtering, an hourglass while it loads (the user's cue that
-/// their text is NOT yet filtered through it), a warning if a load failed.
+/// Compact ML indicator appended to the status line when masking is on.
 fn ml_indicator(ml: Option<&MlSnap>) -> &'static str {
-    match ml.map(|m| m.status.as_str()) {
-        Some("ready") => " \u{1f9e0}",    // 🧠 filtering
-        Some("loading") => " \u{23f3}ml", // ⏳ml loading — not filtered yet
-        Some("failed") => " \u{26a0}ml",  // ⚠ml load failed
+    match ml.map(|m| (m.status.as_str(), m.last_runtime_error.is_some())) {
+        Some(("ready", false)) => " \u{1f9e0}",   // 🧠 filtering
+        Some(("ready", true)) => " \u{26a0}\u{1f9e0}", // ⚠🧠 loaded but endpoint failing
+        Some(("loading", _)) => " \u{23f3}ml",    // ⏳ml loading — not filtered yet
+        Some(("failed", _)) => " \u{26a0}ml",     // ⚠ml load failed
         _ => "",
     }
 }
@@ -3108,15 +3107,36 @@ fn print_ml_line(s: &Snapshot, port: u16) {
         println!("openai-privacy: not reported by this proxy (older build?).");
         return;
     };
+    let http = ml.backend.as_deref() == Some("http");
     println!("openai-privacy (port {port}):");
     println!("  model   : {}", ml.model);
-    println!("  desired : {}", if ml.enabled { "on" } else { "off" });
+    if http {
+        println!(
+            "  backend : http -> {}",
+            ml.endpoint.as_deref().unwrap_or("(endpoint unset!)")
+        );
+    }
+    println!(
+        "  desired : {}{}",
+        if ml.enabled { "on" } else { "off" },
+        if ml.enabled && ml.required {
+            " (required — refuses requests while not ready)"
+        } else {
+            ""
+        }
+    );
+    let not_ready_consequence = if ml.required {
+        "requests are being REFUSED (required = true)"
+    } else {
+        "masking is regex-only"
+    };
     let status = match ml.status.as_str() {
         "ready" => "ready — filtering active".to_string(),
-        "loading" => "loading — NOT filtering through the model yet; wait, or continue regex-only"
-            .to_string(),
+        "loading" => {
+            format!("loading — NOT filtering through the model yet; {not_ready_consequence}")
+        }
         "failed" => format!(
-            "failed{}",
+            "failed — {not_ready_consequence}{}",
             ml.error
                 .as_deref()
                 .map(|e| format!(": {e}"))
@@ -3126,10 +3146,33 @@ fn print_ml_line(s: &Snapshot, port: u16) {
         other => other.to_string(),
     };
     println!("  status  : {status}");
+    if ml.status == "ready"
+        && let Some(e) = ml.last_runtime_error.as_deref()
+    {
+        // Loaded recognizer failed at request time; requests are refused while
+        // status stays `ready` so the operator sees the runtime failure.
+        println!(
+            "  \u{26a0} endpoint failing at request time ({} failure(s); requests refused): {e}",
+            ml.runtime_failures
+        );
+    }
     if ml.status == "disabled" {
         println!(
             "  tip: run `/zlauder:privacy model download` once, then `/zlauder:privacy model on`."
         );
+    }
+    if ml.status == "failed" {
+        if http {
+            println!(
+                "  tip: check the endpoint URL / that the server is up / auth_token_env — \
+                 the load probes the endpoint; then retry `/zlauder:privacy model on`."
+            );
+        } else {
+            println!(
+                "  tip: check disk space / network, re-run `/zlauder:privacy model download`, \
+                 then `/zlauder:privacy model on`."
+            );
+        }
     }
 }
 
@@ -3964,11 +4007,25 @@ struct MlSnap {
     enabled: bool,
     #[serde(default)]
     model: String,
+    /// `local` | `http` (absent on older proxies ⇒ local).
+    #[serde(default)]
+    backend: Option<String>,
+    /// The remote endpoint when `backend = "http"`.
+    #[serde(default)]
+    endpoint: Option<String>,
+    /// Strict fail-closed mode: not-Ready ML refuses requests.
+    #[serde(default)]
+    required: bool,
     /// `disabled` | `loading` | `ready` | `failed` (see `zlauder_engine::MlStatus`).
     #[serde(default)]
     status: String,
     #[serde(default)]
     error: Option<String>,
+    /// Post-`Ready` recognizer failure; requests are refused while status stays `ready`.
+    #[serde(default)]
+    last_runtime_error: Option<String>,
+    #[serde(default)]
+    runtime_failures: u64,
 }
 
 fn parse_snapshot(snap: &Value) -> Result<Snapshot> {

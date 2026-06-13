@@ -502,9 +502,40 @@ pub struct MlConfig {
     /// background; until the model is `Ready`, masking is regex-only.
     #[serde(default)]
     pub enabled: bool,
+    /// Strict fail-closed mode. When effectively true, enabled-but-not-Ready ML
+    /// REFUSES maskable requests instead of degrading to regex-only. Applies live
+    /// because it is refusal policy, not recognizer identity.
+    ///
+    /// Three-state so the default is backend-specific (see
+    /// [`MlConfig::required_effective`]): `None` (unset) ⇒ `true` for
+    /// `backend = "http"`, `false` for `backend = "local"`. A remote endpoint
+    /// going unreachable is an unbounded, easy-to-miss outage — silently
+    /// downgrading the filter the operator explicitly chose is the wrong default —
+    /// whereas local "not ready" is a bounded, self-healing startup window. Set
+    /// `required = false` explicitly to opt a http backend back into regex-only
+    /// degradation.
+    #[serde(default)]
+    pub required: Option<bool>,
+    /// Where inference runs: local Candle backend or remote HTTP endpoint.
+    /// Selecting a backend not compiled into this build fails explicitly.
+    #[serde(default)]
+    pub backend: MlBackend,
     /// HuggingFace repo id of a privacy-filter–compatible checkpoint.
     #[serde(default = "default_ml_model")]
     pub model: String,
+    /// `backend = "http"` only: HF token-classification endpoint URL.
+    /// Required for HTTP backend; must be `http://` or `https://`.
+    ///
+    /// Privacy: every un-cached leaf's raw text is sent to this endpoint.
+    #[serde(default)]
+    pub endpoint: Option<String>,
+    /// `backend = "http"` only: env var name for the bearer token. The token
+    /// itself never lives in config files.
+    #[serde(default)]
+    pub auth_token_env: Option<String>,
+    /// `backend = "http"` only: per-request timeout in seconds.
+    #[serde(default = "default_ml_http_timeout_secs")]
+    pub http_timeout_secs: u64,
     /// Optional pinned revision (branch/tag/commit); `None` ⇒ `main`.
     #[serde(default)]
     pub revision: Option<String>,
@@ -562,6 +593,31 @@ pub struct MlConfig {
     /// `ml` backend is loaded.
     #[serde(default = "default_ml_banded")]
     pub banded_attention: bool,
+}
+
+/// Where ML inference runs. Serde wire form is lowercase (`"local"`, `"http"`).
+///
+/// `Http` sends un-cached text leaves to [`MlConfig::endpoint`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MlBackend {
+    /// In-process Candle inference (the `ml` feature).
+    #[default]
+    Local,
+    /// Remote HF-token-classification endpoint (the `ml-http` feature).
+    Http,
+}
+
+impl MlBackend {
+    /// Per-variant byte for the recognizer-identity fingerprint
+    /// ([`crate::compute_ml_fp`]). Exhaustive on purpose — see
+    /// [`Quantization::fp_tag`].
+    pub(crate) fn fp_tag(self) -> u8 {
+        match self {
+            MlBackend::Local => 0,
+            MlBackend::Http => 1,
+        }
+    }
 }
 
 /// MoE expert-weight storage precision selector for the ML backend.
@@ -644,6 +700,11 @@ fn default_ml_model() -> String {
     AUTHORIZED_ML_MODELS[0].to_string()
 }
 
+/// Serde default for [`MlConfig::http_timeout_secs`].
+fn default_ml_http_timeout_secs() -> u64 {
+    30
+}
+
 /// The HuggingFace repo ids ZlauDeR is authorized to fetch + load — an allowlist,
 /// NOT an open `--model`. A model checkpoint is an executable-grade artifact (a
 /// loader/tokenizer + tensor deserialization surface), so "download any repo" is a
@@ -657,7 +718,9 @@ pub const AUTHORIZED_ML_MODELS: &[&str] = &["openai/privacy-filter"];
 
 /// Whether `repo` is on the [`AUTHORIZED_ML_MODELS`] allowlist. The single predicate
 /// the ML loader and the `--download-model` pre-warm both gate on, so no override path
-/// can fetch an unlisted checkpoint.
+/// can fetch an unlisted checkpoint. Only the local (`ml`) backend fetches weights, so
+/// in an http-only/regex-only build its sole caller is cfg'd out — allow the unused.
+#[cfg_attr(not(feature = "ml"), allow(dead_code))]
 pub fn is_authorized_model(repo: &str) -> bool {
     AUTHORIZED_ML_MODELS.contains(&repo)
 }
@@ -685,7 +748,12 @@ impl Default for MlConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            required: None,
+            backend: MlBackend::Local,
             model: default_ml_model(),
+            endpoint: None,
+            auth_token_env: None,
+            http_timeout_secs: default_ml_http_timeout_secs(),
             revision: None,
             min_score: None,
             prefer_gpu: false,
@@ -704,17 +772,41 @@ impl Default for MlConfig {
 }
 
 impl MlConfig {
+    /// Resolve the three-state [`required`](Self::required) to a concrete policy:
+    /// an explicit setting wins; otherwise the default is backend-specific —
+    /// `true` for `Http` (a dead remote endpoint must refuse, not silently
+    /// degrade), `false` for `Local` (bounded, self-healing startup window).
+    pub fn required_effective(&self) -> bool {
+        self.required
+            .unwrap_or(matches!(self.backend, MlBackend::Http))
+    }
+
     /// Do the *model-affecting* params match `other` (ignoring `enabled`)? The
     /// proxy's reconcile uses this to decide whether a config change requires
-    /// rebuilding the recognizer vs. a no-op.
+    /// rebuilding the recognizer vs. a no-op. `required` is excluded — it is
+    /// refusal policy applied live, not recognizer identity.
     pub fn same_model_params(&self, other: &Self) -> bool {
-        self.model == other.model
-            && self.revision == other.revision
-            && self.min_score == other.min_score
-            && self.prefer_gpu == other.prefer_gpu
-            && self.compute_precision == other.compute_precision
-            && self.quant == other.quant
-            && self.banded_attention == other.banded_attention
+        if self.backend != other.backend {
+            return false;
+        }
+        let common = self.min_score == other.min_score;
+        match self.backend {
+            MlBackend::Local => {
+                common
+                    && self.model == other.model
+                    && self.revision == other.revision
+                    && self.prefer_gpu == other.prefer_gpu
+                    && self.compute_precision == other.compute_precision
+                    && self.quant == other.quant
+                    && self.banded_attention == other.banded_attention
+            }
+            MlBackend::Http => {
+                common
+                    && self.endpoint == other.endpoint
+                    && self.auth_token_env == other.auth_token_env
+                    && self.http_timeout_secs == other.http_timeout_secs
+            }
+        }
     }
 }
 
@@ -1202,6 +1294,102 @@ mod tests {
         assert!(!is_authorized_model(""));
         // The default is, by construction, the first authorized entry.
         assert_eq!(default_ml_model(), AUTHORIZED_ML_MODELS[0]);
+    }
+
+    #[test]
+    fn same_model_params_uses_backend_specific_identity() {
+        let lax = MlConfig {
+            enabled: true,
+            required: Some(false),
+            ..Default::default()
+        };
+        let strict = MlConfig {
+            required: Some(true),
+            ..lax.clone()
+        };
+        assert!(
+            lax.same_model_params(&strict),
+            "a `required` flip must NOT count as a different recognizer"
+        );
+
+        let other_backend = MlConfig {
+            backend: MlBackend::Http,
+            ..lax.clone()
+        };
+        assert!(
+            !lax.same_model_params(&other_backend),
+            "a backend change IS a different recognizer"
+        );
+
+        let http = MlConfig {
+            backend: MlBackend::Http,
+            endpoint: Some("http://127.0.0.1:3007/detect".into()),
+            ..lax.clone()
+        };
+        let http_local_knob_changed = MlConfig {
+            model: "ignored/for-http".into(),
+            revision: Some("ignored".into()),
+            prefer_gpu: true,
+            compute_precision: ComputePrecision::F16,
+            quant: Quantization::Q8_0,
+            banded_attention: false,
+            ..http.clone()
+        };
+        assert!(
+            http.same_model_params(&http_local_knob_changed),
+            "http identity should ignore local-only Candle knobs"
+        );
+
+        let http_other_endpoint = MlConfig {
+            endpoint: Some("http://127.0.0.1:3008/detect".into()),
+            ..http
+        };
+        assert!(
+            !http_local_knob_changed.same_model_params(&http_other_endpoint),
+            "http endpoint changes require a new recognizer"
+        );
+    }
+
+    // The `required` default is backend-specific: a remote endpoint refuses by
+    // default (a dead endpoint must not silently degrade), local degrades by
+    // default (bounded startup window); an explicit setting always wins.
+    #[test]
+    fn required_effective_defaults_per_backend() {
+        let http = MlConfig {
+            backend: MlBackend::Http,
+            ..Default::default()
+        };
+        assert!(
+            http.required_effective(),
+            "unset http must default to required=true (fail-closed)"
+        );
+        let local = MlConfig {
+            backend: MlBackend::Local,
+            ..Default::default()
+        };
+        assert!(
+            !local.required_effective(),
+            "unset local must default to required=false (hot-load degrade)"
+        );
+        // Explicit settings win for both backends.
+        assert!(
+            !MlConfig {
+                backend: MlBackend::Http,
+                required: Some(false),
+                ..Default::default()
+            }
+            .required_effective(),
+            "explicit required=false must opt a http backend back into degrade"
+        );
+        assert!(
+            MlConfig {
+                backend: MlBackend::Local,
+                required: Some(true),
+                ..Default::default()
+            }
+            .required_effective(),
+            "explicit required=true must apply to local"
+        );
     }
 
     #[test]

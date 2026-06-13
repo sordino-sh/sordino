@@ -11,10 +11,25 @@ description = "Local reverse proxy: masks PII in Anthropic Messages API requests
 name = "zlauder-proxy"
 path = "src/main.rs"
 
+[features]
+# Default = both backends, so a plain `cargo build` is byte-for-byte
+# behavior-identical to before the backend split (local Candle ML + remote
+# http). Thin clients that only ever point `[engine.ml] backend` at a remote
+# endpoint can skip the whole Candle stack:
+#   cargo build --release -p zlauder-proxy --no-default-features --features ml-http
+# At least one backend must be on — a backend-less proxy is rejected in main.rs
+# (it could never honor `[engine.ml] enabled = true`).
+default = ["ml", "ml-http"]
+ml = ["zlauder-engine/ml"]
+ml-http = ["zlauder-engine/ml-http"]
+
 [dependencies]
-# `features = ["ml"]` is explicit (not just relying on engine's default) so the
-# proxy always carries the openai/privacy-filter download + recognizer paths.
-zlauder-engine = { path = "../zlauder-engine", features = ["ml"] }
+# Backend selection now flows through THIS crate's own `ml` / `ml-http` features
+# (above) into the engine's matching features — so a `--no-default-features
+# --features ml-http` proxy pulls a Candle-free engine. We take the engine with
+# `default-features = false` and re-enable backends explicitly via the passthrough
+# features; the default build still ends up with both, exactly as before.
+zlauder-engine = { path = "../zlauder-engine", default-features = false }
 zlauder-state  = { path = "../zlauder-state" }
 zlauder-secrets = { path = "../zlauder-secrets" }
 

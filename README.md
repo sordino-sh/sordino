@@ -89,7 +89,13 @@ are kept tokenized end-to-end (never unmasked), so signatures stay valid.
 ```sh
 cargo build --release --workspace
 # binaries: target/release/zlauder-proxy, target/release/zlauder-hooks
+
+# HTTP-only ML (thin client; skips the local Candle backend entirely):
+cargo build --release -p zlauder-proxy -p zlauder-hooks --no-default-features --features ml-http
 ```
+
+The thin-client build compiles no Candle stack and downloads no model weights —
+it only ever calls a remote endpoint (pair it with `backend = "http"` below).
 
 Requires Rust ≥ 1.91 (the `anthropic-wire` dependency is edition 2024).
 
@@ -321,6 +327,51 @@ but **off by default** and runs only after you download the model:
 
 > Note: because the Candle stack is always compiled in, the build is heavier and
 > the binaries are larger than a regex-only build — a deliberate trade-off.
+
+#### Remote inference (`backend = "http"`)
+
+Instead of loading the model in-process on every machine, the ML pass can call a
+remote HF-compatible token-classification endpoint. This is useful for thin
+clients sharing one model host or for HF Inference Providers.
+
+```toml
+[engine.ml]
+enabled = true
+backend = "http"
+# required defaults to true for http (refuse while the endpoint isn't ready);
+# set `required = false` to opt into regex-only degradation instead.
+# a self-hosted privacy-filter wrapper on your own infrastructure…
+endpoint = "http://10.0.0.5:3007/detect"
+# …or Hugging Face Inference Providers (zero infra, cloud):
+# endpoint = "https://router.huggingface.co/hf-inference/models/openai/privacy-filter"
+# auth_token_env = "HF_TOKEN"     # name of the env var holding the bearer token
+```
+
+- **Same detections.** Spans come back with the same labels the local backend
+  emits and flow through the identical category gates / operators; the only
+  difference is where the forward pass runs.
+- **Fail-closed at request time.** Once `ready`, endpoint failures refuse the
+  request instead of sending text with only regex coverage. User-text response
+  bodies from the endpoint are not copied into logs, status, or errors.
+- **Fail-closed at load by default (http).** `required` governs the not-yet-ready
+  window and defaults per backend: **`http` defaults to `required = true`** — a
+  dead endpoint at enable time shows `failed` and *refuses* maskable requests
+  (a remote outage is unbounded and easy to miss, so it must not silently
+  downgrade the filter you chose). `local` defaults to `required = false` —
+  masking continues regex-only while the model loads (a bounded, self-healing
+  startup window). Set `required = false` explicitly to opt a http backend into
+  regex-only degradation; the refusal message names that escape hatch.
+- **Flipping `required` applies live.** It is refusal policy, not recognizer
+  identity.
+- **Privacy trade-off.** Every un-cached piece of text is sent to that endpoint.
+  Use only infrastructure you trust with that plaintext; the local backend
+  remains the most private option.
+- `model download` with `backend = "http"` just validates + probes the endpoint
+  (there is nothing to download).
+- **Slim thin-client build.** Because this path never loads a local model, you can
+  compile the proxy + hooks with `--no-default-features --features ml-http` (see
+  [Build](#build)) — no model weights, no Candle compile — and point `endpoint` at
+  a shared model host.
 
 ### Highlighting un-masked values (`[engine.reveal_marker]`)
 

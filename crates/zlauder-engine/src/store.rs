@@ -311,6 +311,9 @@ impl SessionStore {
 
     /// Delete (tombstone) a token: removes the entry and records the handle so it can
     /// never resolve or be re-interned again. Returns whether it was present.
+    // Pre-existing store API exercised only by store.rs tests today (the live
+    // deletion path seeds tombstones via DeletionLog replay); retained as API.
+    #[allow(dead_code)]
     pub fn delete(&mut self, token: &str) -> bool {
         let removed = self.token_map.remove(token).is_some();
         self.tombstoned.insert(token.to_string());
@@ -319,6 +322,7 @@ impl SessionStore {
 
     /// Seed a tombstone (DeletionLog replay on restart) without requiring the entry
     /// to be present.
+    #[allow(dead_code)] // see `delete` — store API, currently test-only callers.
     pub fn tombstone(&mut self, token: String) {
         self.token_map.remove(&token);
         self.tombstoned.insert(token);

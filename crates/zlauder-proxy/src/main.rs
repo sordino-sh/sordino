@@ -185,8 +185,7 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("zlauder-proxy listening on http://{addr} -> {upstream}");
 
-    // We're serving (bound above). Kick off the ML model load in the background if
-    // it's enabled in config — masking runs regex-only until it reports `Ready`.
+    // Kick off ML in the background; masking is regex-only until `Ready`.
     if ml_cfg.enabled {
         ml::spawn_ml_load(engine_for_ml, ml_cfg);
     }
@@ -269,19 +268,25 @@ fn build_engine(cfg: EngineConfig) -> anyhow::Result<MaskEngine> {
     }
 }
 
-/// `--download-model`: fetch + cache the model weights, then exit. Heavy +
-/// blocking, so it runs on a blocking thread (the loader drives hf-hub on its own
-/// runtime). Independent of `[engine.ml].enabled` — it only pre-warms the cache.
+/// `--download-model`: cache local weights or probe an HTTP endpoint, then exit.
 async fn download_model(mut ml: MlConfig, model_override: Option<String>) -> anyhow::Result<()> {
     if let Some(m) = model_override {
         ml.model = m;
     }
-    println!(
-        "ZlauDeR: downloading ML model '{}' for CPU inference. The first run can be \
-         large and slow; it caches under the HuggingFace cache (HF_HOME / \
-         ~/.cache/huggingface).",
-        ml.model
-    );
+    if ml.backend == zlauder_engine::MlBackend::Http {
+        println!(
+            "ZlauDeR: [engine.ml] backend = \"http\" — nothing to download; probing \
+             the endpoint {} instead.",
+            ml.endpoint.as_deref().unwrap_or("(unset)")
+        );
+    } else {
+        println!(
+            "ZlauDeR: downloading ML model '{}' for CPU inference. The first run can be \
+             large and slow; it caches under the HuggingFace cache (HF_HOME / \
+             ~/.cache/huggingface).",
+            ml.model
+        );
+    }
     let model = ml.model.clone();
     let res = tokio::task::spawn_blocking(move || zlauder_engine::ml::download(&ml))
         .await
@@ -289,8 +294,8 @@ async fn download_model(mut ml: MlConfig, model_override: Option<String>) -> any
     match res {
         Ok(()) => {
             println!(
-                "ZlauDeR: model '{model}' downloaded and cached. Enable it with \
-                 `/zlauder:privacy model on`."
+                "ZlauDeR: model '{model}' ready (cached / endpoint probed). Enable it \
+                 with `/zlauder:privacy model on`."
             );
             Ok(())
         }

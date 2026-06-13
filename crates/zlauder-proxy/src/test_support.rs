@@ -12,7 +12,7 @@
 use std::sync::Arc;
 
 use presidio_core::{EntityType, NlpArtifacts, Recognizer, RecognizerResult};
-use zlauder_engine::{EngineConfig, MaskEngine, MlConfig};
+use zlauder_engine::{EngineConfig, InfallibleMl, MaskEngine, MlConfig};
 
 /// A deterministic stand-in for the ML recognizer. `analyze_batch` is left at the
 /// trait default (loops `analyze`), exactly what the per-leaf `mask` path calls, so
@@ -73,7 +73,10 @@ pub fn engine_with_mock_ml(marker: &'static str) -> MaskEngine {
     let engine = MaskEngine::with_session(EngineConfig::default(), [3u8; 32], [5u8; 16])
         .expect("engine init");
     let generation = engine.ml_begin_load(MlConfig::default());
-    engine.ml_set_ready(generation, Arc::new(MarkerRecognizer::new(marker)));
+    engine.ml_set_ready(
+        generation,
+        Arc::new(InfallibleMl(Arc::new(MarkerRecognizer::new(marker)))),
+    );
     assert!(engine.ml_active(), "mock ML should be Ready");
     engine
 }

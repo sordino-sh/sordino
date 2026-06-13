@@ -79,6 +79,22 @@ detection_cache_cap = 50000
 #   /zlauder:privacy category personal on
 enabled = false
 model = "openai/privacy-filter"
+# Where inference runs: "local" (in-process Candle, default) or "http"
+# (HF-compatible remote endpoint).
+# Privacy: with "http", every un-cached text leaf is sent to `endpoint`.
+# Once ready, endpoint failures refuse the request instead of sending regex-only
+# text. `required` controls the not-yet-ready window and DEFAULTS PER BACKEND:
+# "http" defaults to required=true (a dead remote endpoint refuses, never silently
+# degrades); "local" defaults to required=false (bounded, self-healing startup —
+# degrade to regex-only while the model loads). Set it explicitly to override:
+# `required = false` opts a http backend back into regex-only degradation.
+# `required` applies live because it is policy, not recognizer identity.
+# backend = "local"
+# required = false   # http only: opt out of the fail-closed default
+# endpoint = "http://10.0.0.5:3007/detect"                  # self-hosted, or:
+# endpoint = "https://router.huggingface.co/hf-inference/models/openai/privacy-filter"
+# auth_token_env = "HF_TOKEN"  # NAME of the env var holding a bearer token
+# http_timeout_secs = 30       # per-attempt timeout for backend = "http" (also bounds the load probe)
 # revision = "main"        # branch, tag, or commit
 # min_score = 0.5          # ML recognizer score floor
 prefer_gpu = false         # GPU backends are not compiled in by default

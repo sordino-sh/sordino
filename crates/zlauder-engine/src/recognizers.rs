@@ -1681,12 +1681,34 @@ mod tests {
     // faithful end-to-end test of the gate + value-only span (the registration wiring
     // itself is proven in lib.rs).
 
+    // The ML slot is now the fallible `MlRecognizer`; these test recognizers are
+    // infallible `presidio_core::Recognizer`s, so adapt by borrow (the call below
+    // is one-shot, so a borrow adapter avoids cloning each mock into an `Arc`).
+    struct SlotRef<'a>(&'a dyn Recognizer);
+    impl crate::ml_api::MlRecognizer for SlotRef<'_> {
+        fn analyze(
+            &self,
+            text: &str,
+        ) -> Result<Vec<presidio_core::RecognizerResult>, crate::error::EngineError> {
+            Ok(self.0.analyze(text, None, None))
+        }
+    }
+
     fn detect_via_slot(
         cfg: &EngineConfig,
         rec: &dyn Recognizer,
         text: &str,
     ) -> Vec<(String, String)> {
-        run_detection(&analyzer(), cfg, &[], &[], Some(rec), text, Surface::UserMessage)
+        let slot = SlotRef(rec);
+        run_detection(
+            &analyzer(),
+            cfg,
+            &[],
+            &[],
+            Some(&slot),
+            text,
+            Surface::UserMessage,
+        )
             .unwrap()
             .into_iter()
             .filter_map(|d| {

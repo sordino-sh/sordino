@@ -3,13 +3,14 @@
 
 use presidio_analyzer::recognizers::GENERIC_ENTROPY_PATTERN;
 use presidio_analyzer::{AnalyzeRequest, AnalyzerEngine};
-use presidio_core::{NlpArtifacts, Recognizer, RecognizerResult, Token};
+use presidio_core::{NlpArtifacts, RecognizerResult, Token};
 use regex::{Regex, RegexBuilder};
 use std::collections::HashSet;
 
 use crate::cache::{CachedDetection, Source};
 use crate::config::{CustomReplacement, EngineConfig, Operator};
 use crate::error::EngineError;
+use crate::ml_api::MlRecognizer;
 use crate::secrets::{CompiledSecret, detect_secrets};
 use crate::surface::Surface;
 
@@ -134,7 +135,7 @@ pub fn run_detection(
     cfg: &EngineConfig,
     customs: &[CompiledCustom],
     secrets: &[CompiledSecret],
-    ml: Option<&dyn Recognizer>,
+    ml: Option<&dyn MlRecognizer>,
     text: &str,
     surface: Surface,
 ) -> Result<Vec<CachedDetection>, EngineError> {
@@ -146,7 +147,13 @@ pub fn run_detection(
     // spans only mask when the `personal` category is on. Tagged `Source::Ml` so the
     // deferred Component-3 burn can single it out.
     if let Some(rec) = ml {
-        let ml_results = rec.analyze(text, None, None);
+        // `MlRecognizer` is fallible BY DESIGN: an empty result would FAIL OPEN —
+        // the leaf would ride upstream with free-text PII unscanned. Both backends
+        // are a `TokenClassifierRecognizer` whose impl drives the fail-CLOSED
+        // `try_analyze` (a backend error — e.g. an unreachable http endpoint —
+        // becomes `Err`) under a panic guard (catch_unwind, which `try_analyze`
+        // does not cover). The `?` flows into the caller's fail-safe: refuse.
+        let ml_results = rec.analyze(text)?;
         ingest_results(
             ml_results,
             cfg,
@@ -162,7 +169,7 @@ pub fn run_detection(
 
 /// Batched sibling of [`run_detection`]: detect across MANY leaves with a SINGLE
 /// ML forward. The expensive ML token-classification runs once over all texts via
-/// [`Recognizer::analyze_batch`] (which the candle recognizer overrides to a padded
+/// [`MlRecognizer::analyze_batch`] (which the candle recognizer overrides to a padded
 /// batched forward — span-equivalent to looping `analyze` within a tight score
 /// tolerance); the cheap per-leaf regex/custom passes still run per leaf via the
 /// shared [`detect_base`]. Result `[i]` is the detection list for `leaves[i]`,
@@ -179,11 +186,14 @@ pub fn run_detection_batch(
     cfg: &EngineConfig,
     customs: &[CompiledCustom],
     secrets: &[CompiledSecret],
-    ml: &dyn Recognizer,
+    ml: &dyn MlRecognizer,
     leaves: &[(&str, Surface)],
 ) -> Result<Vec<Vec<CachedDetection>>, EngineError> {
     let texts: Vec<&str> = leaves.iter().map(|(t, _)| *t).collect();
-    let ml_batch = ml.analyze_batch(&texts, None, None);
+    // Fallible by design — a batched endpoint failure aborts the whole batch
+    // (the prewarm caller skips it and lets the per-leaf path re-run and
+    // fail-safe on its own).
+    let ml_batch = ml.analyze_batch(&texts)?;
     // The trait contract is one result vector per input, index-aligned. Guard it:
     // a wrong-length response would mis-route ML spans to the wrong leaf (a silent
     // cross-leaf leak), so refuse the batch instead and fall back to per-leaf.

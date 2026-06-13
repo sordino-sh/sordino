@@ -28,6 +28,10 @@
 //!
 //! Exits nonzero on FAIL so a CI/loop caller can detect a regression.
 
+// The module doc's nested signal list is intentionally indented for readability;
+// the (cosmetic) overindented-list lint doesn't earn a prose reflow here.
+#![allow(clippy::doc_overindented_list_items)]
+
 // The harness is meaningless without the ML backend; under a regex-only build it
 // compiles to a clear stub so `cargo build --examples` (no `ml`) still succeeds.
 #[cfg(not(feature = "ml"))]
@@ -50,7 +54,7 @@ mod ml_gate_impl {
     use std::process::ExitCode;
     use std::time::Instant;
 
-    use presidio_core::Recognizer;
+    use zlauder_engine::MlRecognizer;
     use serde_json::{Value, json};
 
     use zlauder_engine::{EngineConfig, MaskEngine, MlConfig, Profile, Surface};
@@ -89,11 +93,11 @@ operating territories and partner facilities for the remainder of the calendar y
         // Interleave needles into the prose so they are not all clustered at the front.
         for i in 0..32 {
             s.push_str(FILLER);
-            if let Some((_, sentence)) = needles.get(i % needles.len().max(1)) {
-                if i % 4 == 0 {
-                    s.push_str(sentence);
-                    s.push(' ');
-                }
+            if i % 4 == 0
+                && let Some((_, sentence)) = needles.get(i % needles.len().max(1))
+            {
+                s.push_str(sentence);
+                s.push(' ');
             }
         }
         s
@@ -388,7 +392,7 @@ operating territories and partner facilities for the remainder of the calendar y
     ///   `ZLAUDER_ML_PRECISION` = f32|f16                   (default: f32)
     fn build_engine_with_ml(
         baseline: bool,
-    ) -> Result<(MaskEngine, std::sync::Arc<dyn Recognizer>), String> {
+    ) -> Result<(MaskEngine, std::sync::Arc<dyn MlRecognizer>), String> {
         let mut cfg = EngineConfig::for_profile(Profile::Strict);
         let (precision, quant, banded) = if baseline {
             // The golden oracle: always F32 / None / dense, independent of env.
@@ -496,10 +500,10 @@ operating territories and partner facilities for the remainder of the calendar y
     /// in `text` and whose entity kind matches `kind`. `None` if the ML recognizer
     /// produced no overlapping match (the regex-only spans legitimately have no ML
     /// score — recorded as null and excluded from score-drift checks).
-    fn ml_score_for(rec: &dyn Recognizer, text: &str, kind: &str, needle: &str) -> Option<f32> {
+    fn ml_score_for(rec: &dyn MlRecognizer, text: &str, kind: &str, needle: &str) -> Option<f32> {
         let nstart = text.find(needle)?;
         let nend = nstart + needle.len();
-        let results = rec.analyze(text, None, None);
+        let results = rec.analyze(text).unwrap_or_default();
         let mut best: Option<f32> = None;
         for r in &results {
             let overlaps = r.start < nend && r.end > nstart;
@@ -522,7 +526,7 @@ operating territories and partner facilities for the remainder of the calendar y
     /// Run the corpus once; collect per-fixture observations and total mask() wall time.
     fn run_once(
         engine: &MaskEngine,
-        rec: &dyn Recognizer,
+        rec: &dyn MlRecognizer,
         fixtures: &[Fixture],
     ) -> (BTreeMap<String, Vec<Obs>>, u128) {
         let mut per_fixture: BTreeMap<String, Vec<Obs>> = BTreeMap::new();
@@ -641,12 +645,12 @@ operating territories and partner facilities for the remainder of the calendar y
     /// optimization work (f16/Q8/P1, attention/MoE kernels) lives entirely inside
     /// the recognizer's inference path, so timing `analyze()` is both cache-immune
     /// and the faithful measure of exactly what those levers change.
-    fn timed_total_ms(rec: &dyn Recognizer, fixtures: &[Fixture], reps: usize) -> f64 {
+    fn timed_total_ms(rec: &dyn MlRecognizer, fixtures: &[Fixture], reps: usize) -> f64 {
         let mut samples: Vec<f64> = Vec::with_capacity(reps);
         for _ in 0..reps.max(3) {
             let t0 = Instant::now();
             for f in fixtures {
-                let _ = rec.analyze(&f.text, None, None);
+                let _ = rec.analyze(&f.text);
             }
             samples.push(t0.elapsed().as_nanos() as f64 / 1.0e6);
         }
