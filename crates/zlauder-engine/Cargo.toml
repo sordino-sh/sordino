@@ -45,6 +45,23 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing   = { workspace = true }
 
+# Apple-Silicon Metal acceleration. presidio-classifier already pulls candle-*/metal
+# on macOS (its own `cfg(target_os = "macos")` table); the one missing switch is its
+# own `metal` feature, which gates the `select_device` Metal arm. Turning it on lets
+# a `prefer_gpu = true` proxy resolve the integrated GPU on Apple Silicon (Metal > CPU);
+# `prefer_gpu = false` still pins CPU (no silent GPU). macOS-ARM ONLY by necessity: the
+# `metal` feature compiles a candle `Device::new_metal` call that does not exist without
+# candle/metal, so it would fail to build on Linux/Windows — but `resolver = 2` ignores
+# this table off-target, keeping Linux/Windows/`--all-features` objc2-free. We ship
+# per-platform binaries, so the macOS-ARM artifact compiles Metal in while the others
+# don't. Precision note: Metal's `Auto` dtype resolves to F16 (not the bf16/F32 the
+# recall gate proved) — acceptable as an explicit `prefer_gpu` opt-in; a recall pass on
+# F16-on-Metal is a tracked follow-up. Side effect: `metal = ["backend-candle"]`, so on
+# macOS-ARM even a slim `--features ml-http`-only build pulls Candle here (Cargo has no
+# target-conditional *feature*); the shipped binary carries `ml` anyway, so it's moot.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+presidio-classifier = { workspace = true, optional = true, features = ["metal"] }
+
 [features]
 # `ml` is ON by default so a normal `cargo build` is ML-capable ("always compiled
 # in"). The candle-touching code lives behind `cfg(feature = "ml")` in `ml.rs`;

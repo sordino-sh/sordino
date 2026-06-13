@@ -149,11 +149,14 @@ fn quant(q: Quantization) -> Quant {
 
 /// Translate an `MlConfig` into a [`CandleConfig`]. `prefer_gpu` => `DeviceHint::Auto`
 /// (candle resolves cuda > metal > cpu — all freely re-buildable, so this survives
-/// zlauder's ML reload lifecycle), else pin `Cpu`. `PrecisionHint::Auto` resolves to
-/// BF16 on sm80+/Metal and degrades to F16 below (both gate-proven recall-safe;
-/// router/experts/score-head stay F32). When `force_cpu` is set (cache pre-warm), the
-/// device is pinned `Cpu` regardless of `prefer_gpu`. `MlConfig.prefer_gpu` stays the
-/// engine-facing knob; richer device selection is a future `MlConfig` extension.
+/// zlauder's ML reload lifecycle), else pin `Cpu`. `PrecisionHint::Auto` resolves
+/// per device: BF16 on CUDA sm80+ (degrading to F16 below), F16 on Metal, F32 on CPU;
+/// router/experts/score-head stay F32. The CPU-F32 and CUDA-BF16 paths are the ones
+/// the recall gate proved; F16-on-Metal (reachable on the Apple-Silicon build when
+/// `prefer_gpu` is set) is not yet separately gated — a tracked follow-up. When
+/// `force_cpu` is set (cache pre-warm), the device is pinned `Cpu` regardless of
+/// `prefer_gpu`. `MlConfig.prefer_gpu` stays the engine-facing knob; richer device
+/// selection is a future `MlConfig` extension.
 #[cfg(feature = "ml")]
 fn candle_config(cfg: &MlConfig, force_cpu: bool) -> CandleConfig {
     CandleConfig {

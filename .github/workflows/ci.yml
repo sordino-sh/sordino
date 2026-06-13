@@ -1,8 +1,11 @@
 name: ci
 
 # Build + test on every push to main and every PR, so a tag never publishes
-# binaries from a broken tree. Mirrors the release build (default features,
-# --locked) on the cheapest single target.
+# binaries from a broken tree. The Linux job mirrors the release build (default
+# features, --locked) on the cheapest target; a macOS-ARM job (push-to-main only,
+# to bound the 10x macOS minutes) compiles the aarch64-apple-darwin binary so the
+# macOS-only Metal code path (candle-metal-kernels -> objc2) can't slip a break
+# past CI and into the release build.
 
 on:
   push:
@@ -49,3 +52,23 @@ jobs:
           bash -n codex-zlauder-plugin/scripts/session-start.sh
           test -f codex-zlauder-plugin/zlauder.toml
           test -f codex-zlauder-plugin/skills/zlauder-openai/SKILL.md
+
+  # The macOS-ARM Metal code path (presidio-classifier `metal` feature ->
+  # candle-core/metal -> candle-metal-kernels -> objc2) is compiled on NO other
+  # target, so the Linux job above can't catch a break in it. This leg compiles
+  # the aarch64-apple-darwin release binary (default features => Metal in) exactly
+  # as release.yml does, so a wiring break surfaces here instead of mid-release.
+  # Push-to-main only: macOS runners bill ~10x, and fork PRs can't build anyway
+  # (no DEPS_TOKEN — see build-test).
+  build-macos:
+    name: build macOS (aarch64, Metal)
+    if: github.event_name == 'push'
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-rust
+        with:
+          target: aarch64-apple-darwin
+          deps-token: ${{ secrets.DEPS_TOKEN }}
+      - name: Build aarch64-apple-darwin (default features -> Metal compiled in)
+        run: cargo build --release --locked --target aarch64-apple-darwin --bin zlauder-proxy --bin zlauder-hooks

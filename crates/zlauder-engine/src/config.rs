@@ -543,8 +543,11 @@ pub struct MlConfig {
     /// engine-wide `score_threshold`, which is *also* applied to ML detections.
     #[serde(default)]
     pub min_score: Option<f32>,
-    /// Try CUDA/Metal before CPU. Default `false` (CPU); the GPU backends are not
-    /// compiled in by default, so this falls through to CPU regardless.
+    /// Try GPU (CUDA/Metal) before CPU. Default `false` (CPU). Whether `true`
+    /// actually reaches a GPU depends on the binary: the macOS-ARM (Apple Silicon)
+    /// build compiles Metal in, so `true` ⇒ Metal there; an `ml-cuda` build compiles
+    /// CUDA in; every other build (the default Linux/Windows artifact) has no GPU
+    /// backend, so `true` falls through to CPU. `false` always pins CPU.
     #[serde(default)]
     pub prefer_gpu: bool,
     /// CPU activation-compute precision. **Default [`ComputePrecision::F32`]**
