@@ -345,6 +345,7 @@ endpoint = "http://10.0.0.5:3007/detect"
 # …or Hugging Face Inference Providers (zero infra, cloud):
 # endpoint = "https://router.huggingface.co/hf-inference/models/openai/privacy-filter"
 # auth_token_env = "HF_TOKEN"     # name of the env var holding the bearer token
+# http_timeout_secs = 30          # per-attempt timeout; also bounds the load probe (default 30, min 1)
 ```
 
 - **Same detections.** Spans come back with the same labels the local backend
@@ -353,6 +354,10 @@ endpoint = "http://10.0.0.5:3007/detect"
 - **Fail-closed at request time.** Once `ready`, endpoint failures refuse the
   request instead of sending text with only regex coverage. User-text response
   bodies from the endpoint are not copied into logs, status, or errors.
+- **Timeout.** `http_timeout_secs` bounds each call to the endpoint, and also
+  caps the load-time healthcheck/probe. Defaults to `30`; values below `1` are
+  clamped to `1`. A request that exceeds it counts as an endpoint failure (so the
+  fail-closed rules above apply).
 - **Fail-closed at load by default (http).** `required` governs the not-yet-ready
   window and defaults per backend: **`http` defaults to `required = true`** — a
   dead endpoint at enable time shows `failed` and *refuses* maskable requests
