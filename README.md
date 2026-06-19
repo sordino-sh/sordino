@@ -132,7 +132,7 @@ After install, masking activates with a **one-time restart**:
 
 1. **Restart Claude Code once** in this project. The first session writes the route into
    `settings.local.json` and launches the proxy eagerly, but Claude Code applies a route
-   written *during* SessionStart to the current session only unreliably (~1 in 5) — every
+   written *during* SessionStart to the current session only unreliably — every
    session *after* the first reads it at startup, which always works. The statusline shows
    `⟳ ZlauDeR: restart to mask` until it's live, then `🛡`. Until this session is
    routed, ZlauDeR's intake gate **blocks** its messages so nothing sends unmasked

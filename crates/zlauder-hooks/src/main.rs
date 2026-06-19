@@ -393,7 +393,8 @@ fn settings_cmd(action: SettingsAction) -> Result<()> {
         SettingsAction::Disable { all } => {
             if all {
                 // Multi-project sweep: no exit-3 contract, no per-project opt-out (entries are
-                // removed). Returns Ok regardless of how many projects were swept.
+                // removed). Exits 0 on a full or empty sweep; exits NON-ZERO when some projects
+                // could not be cleaned, so a scripted pre-uninstall can gate on success.
                 settings_disable_all()?;
                 return Ok(());
             }
@@ -1118,6 +1119,11 @@ fn settings_disable_all() -> Result<()> {
              routing by hand) so no project is left pointing at a dead proxy.",
             roots.len()
         );
+        // Exit NON-ZERO so a scripted pre-uninstall sweep can gate on success. The full per-project
+        // summary is already on stdout; exit 1 = "ran, but some projects could not be cleaned"
+        // (mirrors verify/doctor's ran-but-failed=1), distinct from the exit 0 of a full sweep or an
+        // empty no-op. disable.sh forwards this via `exit $?`.
+        std::process::exit(1);
     }
     Ok(())
 }
@@ -1969,8 +1975,13 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
         let configured = project_baked_route(&root).is_some();
         let opted_out =
             zlauder_state::registry_get(&root) == Some(zlauder_state::PlumbState::Optout);
-        // Global escape hatch: ZLAUDER_NO_AUTO_ENABLE disables auto-plumb everywhere.
-        let auto_enable = std::env::var_os("ZLAUDER_NO_AUTO_ENABLE").is_none();
+        // Global escape hatch: ZLAUDER_NO_AUTO_ENABLE disables auto-plumb everywhere. VALUE-aware
+        // (mirrors the intake-gate hatch via `is_truthy_flag`): only an explicitly truthy value
+        // disables auto-plumb, so a `=0`/`=false` a user meant as "leave auto-enable ON" does NOT
+        // silently turn it off. A wrongly-disabled auto-plumb is fail-safe (no masking, no claim).
+        let auto_enable = !std::env::var("ZLAUDER_NO_AUTO_ENABLE")
+            .map(|v| is_truthy_flag(&v))
+            .unwrap_or(false);
 
         if !configured && !opted_out && auto_enable {
             // AUTO-PLUMB (first sight of this project): launch the proxy NOW to learn its
@@ -1978,8 +1989,11 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
             // (gitignored) and record it Plumbed. We launch EAGERLY — so a one-time restart
             // activates masking instantly with no first-message ConnectionRefused hang — but
             // make NO claim of masking THIS session: Claude Code applies a route written during
-            // SessionStart only unreliably (~1/5), so the SURE activation is a restart, which
-            // the statusline surfaces as "⟳ ZlauDeR: restart to mask".
+            // SessionStart only unreliably, so the SURE activation is a restart, which the
+            // statusline surfaces as "⟳ ZlauDeR: restart to mask".
+            // UNCERTAIN: the mid-session route-application rate is UNMEASURED; the intake gate is
+            // fail-closed regardless (it blocks until the route resolves to our verified live proxy),
+            // so the exact probability is a tunable, never a load-bearing correctness claim.
             let bake_port = match ensure_up(&root, config.clone(), &proxy_bin) {
                 Ok(EnsureOutcome::Ours { port }) => port,
                 Ok(EnsureOutcome::Failed { diag }) => {
@@ -2232,9 +2246,9 @@ fn user_prompt_submit() -> Result<()> {
     // (`intake_identity_ok`); this string match only distinguishes the two block REASONS.
     let env_routed = baked_port
         .is_some_and(|p| session_routed_through(&format!("http://127.0.0.1:{p}")));
-    // VALUE-aware, unlike the presence-based ZLAUDER_NO_AUTO_ENABLE: this disables a fail-CLOSED
-    // SECURITY control, so a user who sets `=0` meaning "off" must NOT accidentally turn the gate
-    // off — only an explicitly truthy value opens the hatch.
+    // VALUE-aware (like ZLAUDER_NO_AUTO_ENABLE): this disables a fail-CLOSED SECURITY control, so a
+    // user who sets `=0` meaning "off" must NOT accidentally turn the gate off — only an explicitly
+    // truthy value opens the hatch.
     let escape_hatch = std::env::var("ZLAUDER_NO_INTAKE_GATE")
         .map(|v| is_truthy_flag(&v))
         .unwrap_or(false);

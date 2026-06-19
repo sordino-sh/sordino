@@ -35,7 +35,9 @@ fi
 # Exit code is a contract: 0 = removed wiring, 3 = already disabled (no wiring / no file),
 # non-zero = error (reason on stderr).
 # `/zlauder:disable --all` sweeps EVERY plumbed project (run this BEFORE uninstalling the
-# plugin so no project is left pointing at a dead proxy). It always exits 0.
+# plugin so no project is left pointing at a dead proxy). Exits 0 on a full or empty sweep,
+# non-zero if any project could not be cleaned (forwarded via `exit $?` below) — so a scripted
+# pre-uninstall can gate on success.
 if [ "${1:-}" = "--all" ]; then
   "$ZLAUDER_HOOKS_BIN" settings disable --all
   exit $?
