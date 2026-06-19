@@ -46,9 +46,66 @@ config_path() {
   fi
 }
 
+# Pure-shell detection of OUR baked route (jq-free; jq is a hard Windows blocker). Mirrors
+# `project_baked_route`: a route is OURS only when a .claude/settings*.json carries BOTH a loopback
+# env.ANTHROPIC_BASE_URL (http://127.0.0.1:<port> or http://localhost:<port>, no path) AND a
+# co-keyed env.ZLAUDER_PORT whose value EQUALS that URL's <port>. A URL-only match is NOT enough —
+# it would false-warn on a user's OWN 127.0.0.1 base URL. Bias to FALSE-NEGATIVE: any parse
+# ambiguity -> treat as NOT ours -> stay silent (a missed warning just leaves today's behavior; a
+# false warning nags an innocent project). Prints nothing; returns 0 iff ours.
+zlauder_has_baked_route() {
+  local proj="${CLAUDE_PROJECT_DIR:-$PWD}"
+  local f block url port zport
+  for f in "$proj/.claude/settings.local.json" "$proj/.claude/settings.json"; do
+    [ -f "$f" ] || continue
+    # SCOPE to the TOP-LEVEL "env" object — the only env Claude Code applies as routing, matching
+    # Rust project_baked_route's v.get("env"). zlauder writes settings via serde pretty-print
+    # (2-space indent), so the top-level env spans the lines from `  "env": {` to its `  }`; a nested
+    # *.env (e.g. mcpServers.*.env) is indented DEEPER and is excluded, so a co-keyed URL/port outside
+    # the top-level env cannot trigger a false warning. Biased to FALSE-NEGATIVE: a compact or
+    # hand-reformatted (non-2-space) file yields an EMPTY block -> stay silent (a missed warning just
+    # leaves today's behavior; we must never nag an innocent project).
+    block="$(sed -n '/^[[:space:]][[:space:]]"env"[[:space:]]*:[[:space:]]*{/,/^[[:space:]][[:space:]]}/p' "$f" 2>/dev/null)" || true
+    [ -n "$block" ] || continue
+    # First string value of each key WITHIN that env block; tolerant of whitespace around the colon.
+    # ZLAUDER_PORT may be a JSON string ("41234") or a number (41234) — accept both, keep the digits.
+    # `|| true`: under `set -euo pipefail` a no-match grep exits 1 and pipefail would abort the hook.
+    url="$(printf '%s\n' "$block" | grep -oE '"ANTHROPIC_BASE_URL"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | sed -E 's/.*"([^"]*)"$/\1/')" || true
+    zport="$(printf '%s\n' "$block" | grep -oE '"ZLAUDER_PORT"[[:space:]]*:[[:space:]]*"?[0-9]+"?' | head -n1 | grep -oE '[0-9]+' | head -n1)" || true
+    [ -n "$url" ] && [ -n "$zport" ] || continue
+    url="${url%/}"
+    case "$url" in
+      http://127.0.0.1:*|http://localhost:*) ;;
+      *) continue ;;
+    esac
+    port="${url##*:}"
+    case "$port" in
+      ''|*[!0-9]*) continue ;;   # empty, or a path/query after the port -> not our bare host:port
+    esac
+    # Match Rust's parse::<u16>(): a port > 65535 is not a real port (NOT ours). `test -le` is decimal.
+    [ "$port" -le 65535 ] 2>/dev/null || continue
+    [ "$port" = "$zport" ] && return 0
+  done
+  return 1
+}
+
 # Resolve (and, on first run, build) the binaries; this also prepends their dir
 # to PATH so the hooks call below and session-start's default --proxy-bin resolve.
 if ! zlauder_resolve_bins; then
+  # Binaries unresolved. If THIS repo nonetheless carries OUR baked route (a cloned repo that
+  # committed .claude/settings*.json, or a leftover route on a machine where zlauder was removed),
+  # Claude Code already applied that route at startup and this session is pointed at a loopback
+  # port that will NEVER come up — a silent multi-minute ConnectionRefused hang with no signal that
+  # a MISSING BINARY is the cause. Emit a valid SessionStart note (model + human-on-stderr) and
+  # exit 0 so CC consumes it instead of logging a hook failure. We do NOT launch/build here — there
+  # is no binary to launch.
+  if zlauder_has_baked_route; then
+    warn "ZlauDeR: this repo is configured to route through ZlauDeR, but the zlauder binaries are not installed on this machine. Install the plugin (or put zlauder-proxy/zlauder-hooks on PATH) and restart; until then this session routes to a local proxy port that will not answer, so requests will hang and nothing is masked."
+    printf '%s\n' '{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"This repository is configured to route Claude Code through the ZlauDeR PII-masking proxy (a baked ANTHROPIC_BASE_URL + matching ZLAUDER_PORT in .claude/settings*.json), but the zlauder binaries are NOT installed on this machine, so the proxy cannot start. Until the user installs the ZlauDeR plugin (or puts zlauder-proxy/zlauder-hooks on PATH) and restarts Claude Code, this session is routed to a dead local port: requests will hang with ConnectionRefused and NO masking is active. Tell the user to install ZlauDeR, or to remove the ANTHROPIC_BASE_URL and ZLAUDER_PORT keys from .claude/settings.local.json to stop routing. Do not claim masking is active in this session."}}'
+    exit 0
+  fi
+  # No zlauder route here -> an unconfigured project without the binaries is simply not a zlauder
+  # project; nothing to warn about. Keep the silent no-op.
   warn "ZlauDeR: proxy not started this session."
   exit 1
 fi
