@@ -7,10 +7,11 @@
 // honor `[engine.ml] enabled = true` — refuse at compile time instead. Lives in
 // the lib root (not `main.rs`) so the clear message fires before `ml.rs`'s
 // unresolved-`zlauder_engine::ml` errors would drown it.
-#[cfg(not(any(feature = "ml", feature = "ml-http")))]
+#[cfg(not(any(feature = "ml", feature = "ml-http", feature = "ml-sidecar")))]
 compile_error!(
     "zlauder-proxy needs at least one ML backend feature: build with `--features ml` \
-     (local Candle), `--features ml-http` (remote endpoint), or the default (both)."
+     (local Candle), `--features ml-http` (remote endpoint), `--features ml-sidecar` \
+     (burn-wgpu GPU child), or the default (ml + ml-http)."
 );
 
 pub mod admin;

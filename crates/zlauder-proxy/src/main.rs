@@ -268,24 +268,31 @@ fn build_engine(cfg: EngineConfig) -> anyhow::Result<MaskEngine> {
     }
 }
 
-/// `--download-model`: cache local weights or probe an HTTP endpoint, then exit.
+/// `--download-model`: cache local weights, probe an HTTP endpoint, or spawn the
+/// burn sidecar to fetch weights + verify the GPU path, then exit.
 async fn download_model(mut ml: MlConfig, model_override: Option<String>) -> anyhow::Result<()> {
     if let Some(m) = model_override {
         ml.model = m;
     }
-    if ml.backend == zlauder_engine::MlBackend::Http {
-        println!(
+    match ml.backend {
+        zlauder_engine::MlBackend::Http => println!(
             "ZlauDeR: [engine.ml] backend = \"http\" — nothing to download; probing \
              the endpoint {} instead.",
             ml.endpoint.as_deref().unwrap_or("(unset)")
-        );
-    } else {
-        println!(
+        ),
+        zlauder_engine::MlBackend::Sidecar => println!(
+            "ZlauDeR: [engine.ml] backend = \"sidecar\" — spawning the burn-wgpu child \
+             to fetch model '{}' and verify the GPU path. The first run can be large \
+             and slow; weights cache under the HuggingFace cache (HF_HOME / \
+             ~/.cache/huggingface), shared with the local backend.",
+            ml.model
+        ),
+        zlauder_engine::MlBackend::Local => println!(
             "ZlauDeR: downloading ML model '{}' for CPU inference. The first run can be \
              large and slow; it caches under the HuggingFace cache (HF_HOME / \
              ~/.cache/huggingface).",
             ml.model
-        );
+        ),
     }
     let model = ml.model.clone();
     let res = tokio::task::spawn_blocking(move || zlauder_engine::ml::download(&ml))

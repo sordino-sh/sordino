@@ -508,12 +508,13 @@ pub struct MlConfig {
     ///
     /// Three-state so the default is backend-specific (see
     /// [`MlConfig::required_effective`]): `None` (unset) ⇒ `true` for
-    /// `backend = "http"`, `false` for `backend = "local"`. A remote endpoint
-    /// going unreachable is an unbounded, easy-to-miss outage — silently
-    /// downgrading the filter the operator explicitly chose is the wrong default —
-    /// whereas local "not ready" is a bounded, self-healing startup window. Set
-    /// `required = false` explicitly to opt a http backend back into regex-only
-    /// degradation.
+    /// `backend = "http"` and `backend = "sidecar"`, `false` for
+    /// `backend = "local"`. A remote endpoint going unreachable — or a sidecar
+    /// child that fails to spawn / init its GPU — is an unbounded, easy-to-miss
+    /// outage the proxy will not silently retry; downgrading the filter the
+    /// operator explicitly chose is the wrong default — whereas local "not ready"
+    /// is a bounded, self-healing startup window. Set `required = false` explicitly
+    /// to opt a http/sidecar backend back into regex-only degradation.
     #[serde(default)]
     pub required: Option<bool>,
     /// Where inference runs: local Candle backend or remote HTTP endpoint.
@@ -536,6 +537,17 @@ pub struct MlConfig {
     /// `backend = "http"` only: per-request timeout in seconds.
     #[serde(default = "default_ml_http_timeout_secs")]
     pub http_timeout_secs: u64,
+    /// `backend = "sidecar"` only: path to the `presidio-classifier-burn-server`
+    /// child binary. `None` ⇒ resolve from the `ZLAUDER_BURN_SERVER` env override,
+    /// else a binary co-located with the running proxy executable. There is NO
+    /// `PATH` fallback — the child is spawned with unmasked text, so an ambient
+    /// `PATH` lookup would be a hijack surface; loading fails closed if the binary
+    /// can't be located explicitly. The burn-wgpu child ships as a SEPARATE release
+    /// asset (not in the lean plugin payload), so it is located by path at spawn
+    /// time. Part of recognizer identity ([`MlConfig::same_model_params`]):
+    /// pointing at a different binary is a different recognizer.
+    #[serde(default)]
+    pub sidecar_path: Option<String>,
     /// Optional pinned revision (branch/tag/commit); `None` ⇒ `main`.
     #[serde(default)]
     pub revision: Option<String>,
@@ -598,9 +610,11 @@ pub struct MlConfig {
     pub banded_attention: bool,
 }
 
-/// Where ML inference runs. Serde wire form is lowercase (`"local"`, `"http"`).
+/// Where ML inference runs. Serde wire form is lowercase (`"local"`, `"http"`,
+/// `"sidecar"`).
 ///
-/// `Http` sends un-cached text leaves to [`MlConfig::endpoint`].
+/// `Http` sends un-cached text leaves to [`MlConfig::endpoint`]. `Sidecar` sends
+/// them over a private parent→child pipe to a co-located GPU child process.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum MlBackend {
@@ -609,6 +623,15 @@ pub enum MlBackend {
     Local,
     /// Remote HF-token-classification endpoint (the `ml-http` feature).
     Http,
+    /// Out-of-process burn-wgpu GPU sidecar (the `ml-sidecar` feature). A
+    /// supervised child binary (`presidio-classifier-burn-server`) speaks the
+    /// newline-delimited JSON-RPC protocol over a private parent→child pipe — no
+    /// port, no socket. The child owns its own cubecl/wgpu device, so zlauder's
+    /// reload (drop the recognizer → kill the child → respawn a fresh one) resets
+    /// the GPU cleanly; the in-process candle GPU path cannot, because cubecl's
+    /// process-global single-init bricks a second device build. Broad GPU reach
+    /// with no hard `libcuda` link: Vulkan / Metal / DX12 / OpenGL via wgpu.
+    Sidecar,
 }
 
 impl MlBackend {
@@ -619,6 +642,7 @@ impl MlBackend {
         match self {
             MlBackend::Local => 0,
             MlBackend::Http => 1,
+            MlBackend::Sidecar => 2,
         }
     }
 }
@@ -721,9 +745,11 @@ pub const AUTHORIZED_ML_MODELS: &[&str] = &["openai/privacy-filter"];
 
 /// Whether `repo` is on the [`AUTHORIZED_ML_MODELS`] allowlist. The single predicate
 /// the ML loader and the `--download-model` pre-warm both gate on, so no override path
-/// can fetch an unlisted checkpoint. Only the local (`ml`) backend fetches weights, so
-/// in an http-only/regex-only build its sole caller is cfg'd out — allow the unused.
-#[cfg_attr(not(feature = "ml"), allow(dead_code))]
+/// can fetch an unlisted checkpoint. Only the weight-fetching backends call it — local
+/// (`ml`) Candle and the `ml-sidecar` burn child (both via `ml::ensure_authorized`); the
+/// http backend pulls no weights. In an http-only/regex-only build (neither `ml` nor
+/// `ml-sidecar`) the sole caller is cfg'd out, so allow the unused.
+#[cfg_attr(not(any(feature = "ml", feature = "ml-sidecar")), allow(dead_code))]
 pub fn is_authorized_model(repo: &str) -> bool {
     AUTHORIZED_ML_MODELS.contains(&repo)
 }
@@ -757,6 +783,7 @@ impl Default for MlConfig {
             endpoint: None,
             auth_token_env: None,
             http_timeout_secs: default_ml_http_timeout_secs(),
+            sidecar_path: None,
             revision: None,
             min_score: None,
             prefer_gpu: false,
@@ -777,11 +804,22 @@ impl Default for MlConfig {
 impl MlConfig {
     /// Resolve the three-state [`required`](Self::required) to a concrete policy:
     /// an explicit setting wins; otherwise the default is backend-specific —
-    /// `true` for `Http` (a dead remote endpoint must refuse, not silently
-    /// degrade), `false` for `Local` (bounded, self-healing startup window).
+    /// `true` for `Http` and `Sidecar`, `false` for `Local`.
+    ///
+    /// `Local` defaults to degrade because its only failure window is a bounded,
+    /// self-healing model load. `Http` and `Sidecar` default to refuse because
+    /// their dominant failure modes are *unbounded, easy-to-miss, and not
+    /// self-healing*: a dead remote endpoint, or — for the sidecar — a missing
+    /// child binary / GPU-init failure that the proxy's reconcile does NOT retry
+    /// on an ordinary reload (only on an explicit re-enable or a model-param
+    /// change). Silently downgrading the filter the operator explicitly chose to a
+    /// GPU/remote backend is the wrong default; `required = false` opts back into
+    /// degrade. (The upstream `RestartPolicy` recovers a *live* child's runtime
+    /// crashes, but a load that never succeeded never installs a recognizer, so it
+    /// is not self-healing — hence the fail-closed default.)
     pub fn required_effective(&self) -> bool {
         self.required
-            .unwrap_or(matches!(self.backend, MlBackend::Http))
+            .unwrap_or(matches!(self.backend, MlBackend::Http | MlBackend::Sidecar))
     }
 
     /// Do the *model-affecting* params match `other` (ignoring `enabled`)? The
@@ -808,6 +846,24 @@ impl MlConfig {
                     && self.endpoint == other.endpoint
                     && self.auth_token_env == other.auth_token_env
                     && self.http_timeout_secs == other.http_timeout_secs
+            }
+            MlBackend::Sidecar => {
+                // The burn child receives model/revision/banded-attention as argv
+                // and fetches its own weights; `min_score` is applied at the
+                // recognizer level (shared with every backend, via `common`).
+                // `sidecar_path` selects the child binary — a different binary is a
+                // different recognizer. `prefer_gpu`/`compute_precision`/`quant` are
+                // candle-CPU levers with no effect on the wgpu child, so they are
+                // (deliberately) NOT part of sidecar identity. dtype/adapter are
+                // likewise excluded: the child exposes no dtype/adapter knob (always
+                // wgpu-auto at its built-in precision), so they are constant, not
+                // config; the child *version* is a spawn-time handshake concern
+                // (the doctor's job), not a static field.
+                common
+                    && self.model == other.model
+                    && self.revision == other.revision
+                    && self.sidecar_path == other.sidecar_path
+                    && self.banded_attention == other.banded_attention
             }
         }
     }
@@ -1351,6 +1407,66 @@ mod tests {
             !http_local_knob_changed.same_model_params(&http_other_endpoint),
             "http endpoint changes require a new recognizer"
         );
+
+        // Sidecar identity: model/revision/sidecar_path/banded_attention matter;
+        // candle-only CPU knobs (prefer_gpu/compute_precision/quant) and http-only
+        // knobs (endpoint/auth/timeout) do NOT — they have no effect on the wgpu
+        // child.
+        let sidecar = MlConfig {
+            backend: MlBackend::Sidecar,
+            sidecar_path: Some("/opt/zlauder/burn-server".into()),
+            ..lax.clone()
+        };
+        let sidecar_irrelevant_knobs = MlConfig {
+            prefer_gpu: true,
+            compute_precision: ComputePrecision::F16,
+            quant: Quantization::Q8_0,
+            endpoint: Some("http://ignored/for-sidecar".into()),
+            auth_token_env: Some("IGNORED".into()),
+            http_timeout_secs: 999,
+            ..sidecar.clone()
+        };
+        assert!(
+            sidecar.same_model_params(&sidecar_irrelevant_knobs),
+            "sidecar identity must ignore candle-CPU and http-only knobs"
+        );
+        let sidecar_other_binary = MlConfig {
+            sidecar_path: Some("/opt/zlauder/burn-server-v2".into()),
+            ..sidecar.clone()
+        };
+        assert!(
+            !sidecar.same_model_params(&sidecar_other_binary),
+            "a different sidecar binary IS a different recognizer"
+        );
+        let sidecar_other_banded = MlConfig {
+            banded_attention: !sidecar.banded_attention,
+            ..sidecar.clone()
+        };
+        assert!(
+            !sidecar.same_model_params(&sidecar_other_banded),
+            "banded_attention is forwarded to the child, so it is sidecar identity"
+        );
+        assert!(
+            !sidecar.same_model_params(&http_local_knob_changed),
+            "sidecar vs http is a backend change = different recognizer"
+        );
+    }
+
+    /// The serde wire form for the GPU sidecar backend is the lowercase
+    /// `"sidecar"` token, parsed even by a build without the `ml-sidecar` feature
+    /// (config parsing is backend-agnostic; selection fails later if uncompiled).
+    #[test]
+    fn sidecar_backend_wire_form_round_trips() {
+        let cfg = from_toml("[ml]\nenabled = true\nbackend = \"sidecar\"\n");
+        assert_eq!(cfg.ml.backend, MlBackend::Sidecar);
+        // Default required for an unset sidecar is REFUSE (true), like http: a
+        // failed spawn / GPU init is unbounded, easy-to-miss, and not retried by
+        // the proxy reconcile, so silent regex-only degradation is the wrong default.
+        assert!(
+            cfg.ml.required_effective(),
+            "unset sidecar must default to required=true (fail-closed)"
+        );
+        assert_eq!(MlBackend::Sidecar.fp_tag(), 2, "sidecar fp tag is stable");
     }
 
     // The `required` default is backend-specific: a remote endpoint refuses by
@@ -1373,6 +1489,15 @@ mod tests {
         assert!(
             !local.required_effective(),
             "unset local must default to required=false (hot-load degrade)"
+        );
+        let sidecar = MlConfig {
+            backend: MlBackend::Sidecar,
+            ..Default::default()
+        };
+        assert!(
+            sidecar.required_effective(),
+            "unset sidecar must default to required=true (fail-closed; failed spawn/GPU \
+             init is unbounded + not retried, like http)"
         );
         // Explicit settings win for both backends.
         assert!(

@@ -1,13 +1,18 @@
 //! ML recognizer construction. `[engine.ml] backend` selects local Candle
-//! inference (`ml`) or a remote token-classification endpoint (`ml-http`).
-//! Missing backend features fail explicitly instead of falling through.
+//! inference (`ml`), a remote token-classification endpoint (`ml-http`), or an
+//! out-of-process burn-wgpu GPU sidecar child (`ml-sidecar`). Missing backend
+//! features fail explicitly instead of falling through.
 //!
-//! Both backends build the SAME `presidio_classifier::TokenClassifierRecognizer`
+//! All three backends build the SAME `presidio_classifier::TokenClassifierRecognizer`
 //! through one helper ([`build_token_recognizer`]); they differ ONLY in the
 //! `InferenceBackend` passed in. The spec, chunker, label-map override, and
-//! score floor are set once, in that helper, so local and http can never drift
+//! score floor are set once, in that helper, so local/http/sidecar can never drift
 //! into different detections for the same model output (the #1 silent-corruption
-//! trap of a hand-rolled second path).
+//! trap of a hand-rolled second path). The http and sidecar paths additionally
+//! share the two load-time checks (connectivity + synthetic-PII positive control)
+//! via [`validate_opaque_backend`], because both wrap an opaque backend whose
+//! liveness and identity must be proven at load (candle is trusted by in-process
+//! construction).
 //!
 //! Fail-closed by construction: the engine slot stores the recognizer as a
 //! [`MlRecognizer`], whose impl drives the recognizer's inherent fail-CLOSED
@@ -26,16 +31,16 @@ use crate::config::{MlBackend, MlConfig};
 use crate::error::EngineError;
 use crate::ml_api::MlRecognizer;
 
-#[cfg(any(feature = "ml", feature = "ml-http"))]
+#[cfg(any(feature = "ml", feature = "ml-http", feature = "ml-sidecar"))]
 use presidio_classifier::{
     Chunker, InferenceBackend, LabelMap, OPENAI_PRIVACY_FILTER, TokenClassifierRecognizer,
 };
-#[cfg(any(feature = "ml", feature = "ml-http"))]
+#[cfg(any(feature = "ml", feature = "ml-http", feature = "ml-sidecar"))]
 use presidio_core::{EntityType, RecognizerResult};
 
-#[cfg(any(feature = "ml", feature = "ml-http"))]
+#[cfg(any(feature = "ml", feature = "ml-http", feature = "ml-sidecar"))]
 use crate::config::ENTITY_PRIVATE_DATE;
-#[cfg(any(feature = "ml", feature = "ml-http"))]
+#[cfg(any(feature = "ml", feature = "ml-http", feature = "ml-sidecar"))]
 use crate::ml_api::catch_recognizer_panic;
 
 #[cfg(feature = "ml")]
@@ -48,8 +53,21 @@ use crate::config::{ComputePrecision, Quantization};
 #[cfg(feature = "ml-http")]
 use presidio_classifier::backends::{HttpAuth, HttpBackend, HttpConfig, HttpSchema, RetryPolicy};
 
+#[cfg(feature = "ml-sidecar")]
+use std::ffi::OsString;
+#[cfg(feature = "ml-sidecar")]
+use std::path::PathBuf;
+#[cfg(feature = "ml-sidecar")]
+use std::time::Duration;
+#[cfg(feature = "ml-sidecar")]
+use presidio_classifier::BackendCapabilities;
+#[cfg(feature = "ml-sidecar")]
+use presidio_classifier::backends::{
+    SidecarRestartPolicy, SubprocessConfig, SubprocessSidecarBackend,
+};
+
 /// The `openai/privacy-filter` model's native label for any private date.
-#[cfg(any(feature = "ml", feature = "ml-http"))]
+#[cfg(any(feature = "ml", feature = "ml-http", feature = "ml-sidecar"))]
 const ML_LABEL_PRIVATE_DATE: &str = "private_date";
 
 /// Build the label map for the privacy-filter recognizer, remapping the model's
@@ -69,7 +87,7 @@ const ML_LABEL_PRIVATE_DATE: &str = "private_date";
 /// native model labels (`private_date`, `private_email`, …) and routes them
 /// through this exact map, so a date can never resolve to a different entity
 /// type local-vs-http.
-#[cfg(any(feature = "ml", feature = "ml-http"))]
+#[cfg(any(feature = "ml", feature = "ml-http", feature = "ml-sidecar"))]
 fn privacy_filter_mapping() -> LabelMap {
     LabelMap::from_spec(&OPENAI_PRIVACY_FILTER).with_overrides([(
         ML_LABEL_PRIVATE_DATE.into(),
@@ -82,7 +100,7 @@ fn privacy_filter_mapping() -> LabelMap {
 /// backend produces a span-comparable recognizer (see the module-level note on
 /// drift). Returns the concrete type so callers can reach the recognizer's
 /// inherent `try_analyze` / `healthcheck`.
-#[cfg(any(feature = "ml", feature = "ml-http"))]
+#[cfg(any(feature = "ml", feature = "ml-http", feature = "ml-sidecar"))]
 fn build_token_recognizer(
     backend: Arc<dyn InferenceBackend>,
     cfg: &MlConfig,
@@ -104,7 +122,7 @@ fn build_token_recognizer(
 /// Drive the recognizer's inherent fail-CLOSED seam onto the engine's fallible
 /// ML slot. Both backends are the same concrete type, so this one impl serves
 /// local AND http.
-#[cfg(any(feature = "ml", feature = "ml-http"))]
+#[cfg(any(feature = "ml", feature = "ml-http", feature = "ml-sidecar"))]
 impl MlRecognizer for TokenClassifierRecognizer {
     fn analyze(&self, text: &str) -> Result<Vec<RecognizerResult>, EngineError> {
         // `try_analyze` is fail-CLOSED (Err on backend failure); the engine maps
@@ -188,9 +206,11 @@ fn backend_choice(cfg: &MlConfig) -> BackendChoice {
 /// every override source — `--download-model --model <repo>`, `model on --model
 /// <repo> --scope <file>`, and a raw `[engine.ml] model = "…"` edit all resolve here
 /// before any network/loader work, so an arbitrary (model-supplied, injected, or
-/// typo'd) checkpoint can never be pulled. Local-only: the http backend pulls no
-/// weights, so there is no checkpoint supply-chain surface to gate.
-#[cfg(feature = "ml")]
+/// typo'd) checkpoint can never be pulled. Applies to the weight-fetching backends
+/// — local Candle AND the burn-wgpu sidecar child (which fetches its own weights
+/// from the model id we forward as argv). The http backend pulls no weights, so it
+/// has no checkpoint supply-chain surface and does not gate here.
+#[cfg(any(feature = "ml", feature = "ml-sidecar"))]
 fn ensure_authorized(cfg: &MlConfig) -> Result<(), EngineError> {
     if !crate::config::is_authorized_model(&cfg.model) {
         return Err(EngineError::Ml(format!(
@@ -210,14 +230,19 @@ pub fn build_recognizer(cfg: &MlConfig) -> Result<Arc<dyn MlRecognizer>, EngineE
     match cfg.backend {
         MlBackend::Local => build_local(cfg),
         MlBackend::Http => build_http(cfg),
+        MlBackend::Sidecar => build_sidecar(cfg),
     }
 }
 
-/// `--download-model` pre-warm: local caches weights; http probes the endpoint.
+/// `--download-model` pre-warm: local caches weights; http probes the endpoint;
+/// sidecar spawns the burn child (which fetches weights + inits the GPU) and runs
+/// the same load-time checks — a strictly stronger pre-warm that also proves the
+/// GPU path works before the operator relies on it.
 pub fn download(cfg: &MlConfig) -> Result<(), EngineError> {
     match cfg.backend {
         MlBackend::Local => download_local(cfg),
         MlBackend::Http => probe_http(cfg),
+        MlBackend::Sidecar => probe_sidecar(cfg),
     }
 }
 
@@ -244,12 +269,13 @@ fn download_local(cfg: &MlConfig) -> Result<(), EngineError> {
     Ok(())
 }
 
-/// Synthetic text whose round-trip through a privacy-filter endpoint must yield
-/// an `EMAIL_ADDRESS` span. Fixed and PII-free (`example.com`), so it can be
-/// sent to an unproven endpoint and may safely appear in error surfaces.
-#[cfg(feature = "ml-http")]
+/// Synthetic text whose round-trip through a privacy-filter backend must yield an
+/// `EMAIL_ADDRESS` span. Fixed and PII-free (`example.com`), so it can be sent to
+/// an unproven endpoint/child and may safely appear in error surfaces. Shared by
+/// the http and sidecar load-time positive control.
+#[cfg(any(feature = "ml-http", feature = "ml-sidecar"))]
 const PROBE_TEXT: &str = "Probe contact: Sarah Probe <sarah.probe@example.com>";
-#[cfg(feature = "ml-http")]
+#[cfg(any(feature = "ml-http", feature = "ml-sidecar"))]
 const PROBE_EMAIL: &str = "sarah.probe@example.com";
 
 /// Translate the engine's http config knobs into the upstream `HttpConfig`.
@@ -301,35 +327,44 @@ fn http_config(cfg: &MlConfig) -> Result<HttpConfig, EngineError> {
     })
 }
 
-/// Build the http recognizer and run both load-time checks. A failure here is a
-/// load failure (status `failed`): hot-load semantics keep masking regex-only
-/// unless `[engine.ml] required = true`.
+/// Run the two load-time checks shared by every opaque (out-of-process / remote)
+/// backend — http and sidecar. `what` names the backend in error messages
+/// ("http ML endpoint" / "burn sidecar"). A failure here is a load failure
+/// (status `failed`): hot-load semantics keep masking regex-only unless
+/// `[engine.ml] required = true`. Candle does NOT use this — an in-process build
+/// is trusted by construction.
+#[cfg(any(feature = "ml-http", feature = "ml-sidecar"))]
+fn validate_opaque_backend(rec: &TokenClassifierRecognizer, what: &str) -> Result<(), EngineError> {
+    // Check 1: connectivity / liveness — the backend answers warmup (upstream
+    // `healthcheck` posts a synthetic `warmup` and asserts success; for the
+    // sidecar this is also what waits out the child's eager GPU build).
+    rec.healthcheck()
+        .map_err(|e| EngineError::Ml(format!("{what} healthcheck failed: {}", e.redacted())))?;
+    // Check 2: positive control — synthetic PII actually round-trips to an
+    // EMAIL_ADDRESS span. A bare liveness reply proves reachability, not that this
+    // is a privacy-filter token-classifier; upstream deliberately bakes no PII
+    // fixture / expected label into the library, so this assertion is zlauder's.
+    positive_control(rec, what)
+}
+
+/// Build the http recognizer and run both load-time checks.
 #[cfg(feature = "ml-http")]
 fn build_http_checked(cfg: &MlConfig) -> Result<Arc<TokenClassifierRecognizer>, EngineError> {
     let backend = HttpBackend::new(http_config(cfg)?)
         .map_err(|e| EngineError::Ml(format!("http ML backend init failed: {}", e.redacted())))?;
     let rec = build_token_recognizer(Arc::new(backend), cfg);
-    // Check 1: connectivity — the endpoint answers a 2xx (upstream `healthcheck`
-    // posts a synthetic `warmup` input and asserts success).
-    rec.healthcheck().map_err(|e| {
-        EngineError::Ml(format!("http ML endpoint healthcheck failed: {}", e.redacted()))
-    })?;
-    // Check 2: positive control — synthetic PII actually round-trips to an
-    // EMAIL_ADDRESS span. A bare 2xx proves reachability, not that this is a
-    // privacy-filter token-classifier; upstream deliberately bakes no PII
-    // fixture / expected label into the library, so this assertion is zlauder's.
-    positive_control(rec.as_ref())?;
+    validate_opaque_backend(rec.as_ref(), "http ML endpoint")?;
     Ok(rec)
 }
 
 /// Send [`PROBE_TEXT`] through the recognizer and assert the expected email span
 /// comes back. Fail-closed via `try_analyze`: a backend error surfaces (redacted)
 /// rather than an empty result that would falsely pass the control.
-#[cfg(feature = "ml-http")]
-fn positive_control(rec: &TokenClassifierRecognizer) -> Result<(), EngineError> {
-    let spans = rec.try_analyze(PROBE_TEXT, None).map_err(|e| {
-        EngineError::Ml(format!("http ML endpoint probe failed: {}", e.redacted()))
-    })?;
+#[cfg(any(feature = "ml-http", feature = "ml-sidecar"))]
+fn positive_control(rec: &TokenClassifierRecognizer, what: &str) -> Result<(), EngineError> {
+    let spans = rec
+        .try_analyze(PROBE_TEXT, None)
+        .map_err(|e| EngineError::Ml(format!("{what} probe failed: {}", e.redacted())))?;
     let saw_email = spans.iter().any(|r| {
         r.entity_type == EntityType::EmailAddress
             && PROBE_TEXT.get(r.start..r.end) == Some(PROBE_EMAIL)
@@ -337,12 +372,10 @@ fn positive_control(rec: &TokenClassifierRecognizer) -> Result<(), EngineError> 
     if saw_email {
         Ok(())
     } else {
-        Err(EngineError::Ml(
-            "http ML endpoint answered, but the synthetic-PII probe did not return \
-             the expected EMAIL_ADDRESS span (is it an openai/privacy-filter \
-             token-classification endpoint?)"
-                .into(),
-        ))
+        Err(EngineError::Ml(format!(
+            "{what} answered, but the synthetic-PII probe did not return the expected \
+             EMAIL_ADDRESS span (is it an openai/privacy-filter token-classifier?)"
+        )))
     }
 }
 
@@ -355,6 +388,195 @@ fn build_http(cfg: &MlConfig) -> Result<Arc<dyn MlRecognizer>, EngineError> {
 #[cfg(feature = "ml-http")]
 fn probe_http(cfg: &MlConfig) -> Result<(), EngineError> {
     build_http_checked(cfg).map(|_| ())
+}
+
+/// Default basename of the burn-wgpu sidecar child binary (shipped as a separate
+/// release asset; located by path at spawn time).
+#[cfg(feature = "ml-sidecar")]
+const BURN_SERVER_BIN: &str = "presidio-classifier-burn-server";
+
+/// Resolve the burn-server child binary. Order: explicit `[engine.ml] sidecar_path`,
+/// then the `ZLAUDER_BURN_SERVER` env override, then a binary co-located with the
+/// running proxy executable (where packaging puts it). The explicit path / env are
+/// validated to exist (a clear load error, not an opaque spawn failure); if none
+/// resolve, loading fails closed with an actionable message.
+///
+/// There is intentionally NO bare-name `$PATH` fallback: the child is spawned with
+/// UNMASKED leaf text on its stdin, so resolving it through an ambient/writable
+/// `PATH` entry would be a PII-exfil / code-exec hijack surface. The binary must be
+/// named explicitly, via the env override, or co-located with the proxy.
+#[cfg(feature = "ml-sidecar")]
+fn resolve_sidecar_program(cfg: &MlConfig) -> Result<PathBuf, EngineError> {
+    if let Some(p) = cfg.sidecar_path.as_deref() {
+        return require_executable(PathBuf::from(p), "[engine.ml] sidecar_path");
+    }
+    if let Some(p) = std::env::var_os("ZLAUDER_BURN_SERVER") {
+        return require_executable(PathBuf::from(p), "ZLAUDER_BURN_SERVER");
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let candidate = dir.join(BURN_SERVER_BIN);
+        if candidate.is_file() {
+            return require_executable(candidate, "the proxy executable directory");
+        }
+    }
+    Err(EngineError::Ml(format!(
+        "could not locate the burn-wgpu sidecar binary '{BURN_SERVER_BIN}': set \
+         [engine.ml] sidecar_path to an absolute path, set $ZLAUDER_BURN_SERVER, or \
+         co-locate it next to the proxy executable. (No $PATH lookup is performed — \
+         the child receives unmasked text, so an ambient PATH entry would be a hijack \
+         surface.)"
+    )))
+}
+
+/// Resolve `path` to an existing, CANONICAL absolute file, with an actionable build
+/// hint. `source` names where the path came from (config key / env var / co-located).
+///
+/// An ABSOLUTE input is load-bearing security, not cosmetics, so it is enforced
+/// explicitly BEFORE canonicalize: `Path::canonicalize` resolves a *relative* input
+/// against the proxy's CWD (a bare `"presidio-classifier-burn-server"` becomes
+/// `$CWD/presidio-classifier-burn-server`), which would silently accept a binary from
+/// an ambient, possibly-writable working directory — a code-exec / PII-exfil hijack
+/// for a child that receives UNMASKED text. Rejecting non-absolute paths up front also
+/// forecloses the upstream `Command::new` ambient-`$PATH` fallback (which only consults
+/// `$PATH` for bare names). Canonicalize then merely resolves symlinks and confirms
+/// existence; `is_file` rejects a dir / symlink-to-dir.
+#[cfg(feature = "ml-sidecar")]
+fn require_executable(path: PathBuf, source: &str) -> Result<PathBuf, EngineError> {
+    // Absolute-path invariant (see fn doc): reject a relative input before canonicalize,
+    // which would otherwise silently re-anchor it on the proxy's CWD.
+    if !path.is_absolute() {
+        return Err(EngineError::Ml(format!(
+            "{source} points at '{}', which is not an absolute path; the burn-wgpu \
+             sidecar binary must be named by ABSOLUTE path (a relative path resolves \
+             against the proxy's working directory — a hijack surface for a child that \
+             receives unmasked text). build it (cargo build -p presidio-classifier \
+             --no-default-features --features backend-burn --bin {BURN_SERVER_BIN}) and \
+             point at the absolute path to the resulting binary",
+            path.display()
+        )));
+    }
+    let resolved = path.canonicalize().map_err(|e| {
+        EngineError::Ml(format!(
+            "{source} points at '{}', which could not be resolved to an existing file \
+             ({e}); build the burn-wgpu sidecar (cargo build -p presidio-classifier \
+             --no-default-features --features backend-burn --bin {BURN_SERVER_BIN}) and \
+             point at an absolute path to the resulting binary",
+            path.display()
+        ))
+    })?;
+    if resolved.is_file() {
+        Ok(resolved)
+    } else {
+        Err(EngineError::Ml(format!(
+            "{source} resolves to '{}', which is not a file",
+            resolved.display()
+        )))
+    }
+}
+
+/// Capabilities the burn sidecar reports via `InferenceBackend::capabilities`.
+/// Mirrors the model's native label set; `local = true` (same-host private pipe),
+/// `deterministic = false` (GPU float reductions are not bit-reproducible across
+/// drivers). Informational — detection routing uses the spec's [`LabelMap`], not
+/// these caps.
+#[cfg(feature = "ml-sidecar")]
+fn sidecar_caps(cfg: &MlConfig) -> BackendCapabilities {
+    BackendCapabilities {
+        model_id: cfg.model.as_str().into(),
+        supported_labels: [
+            "account_number",
+            "private_address",
+            "private_date",
+            "private_email",
+            "private_person",
+            "private_phone",
+            "private_url",
+            "secret",
+        ]
+        .iter()
+        .map(|s| (*s).into())
+        .collect(),
+        max_input_chars: 8192,
+        languages: vec!["en".into()],
+        local: true,
+        deterministic: false,
+    }
+}
+
+/// Construct the supervised burn-wgpu sidecar backend and run the load-time checks.
+///
+/// The backend is lazy-spawn (upstream): the first call — our `healthcheck` warmup
+/// — spawns the child, which eagerly builds the wgpu device and loads the model,
+/// then answers. `spawn_timeout` therefore covers the full cold start (cubecl init
+/// and model fetch/load); `call_timeout` covers a single classify. Reload safety
+/// rides zlauder's EXISTING drop+rebuild path: dropping this recognizer drops the
+/// backend, whose `Drop` shuts the child down (then `kill`s it), and a rebuild
+/// spawns a fresh child with a fresh, uncontended cubecl global — the whole reason
+/// the GPU path lives out-of-process.
+#[cfg(feature = "ml-sidecar")]
+fn build_sidecar_checked(cfg: &MlConfig) -> Result<Arc<TokenClassifierRecognizer>, EngineError> {
+    // The child fetches its own weights from the model id we forward; gate the
+    // allowlist here, before any spawn/network, exactly as the local loader does.
+    ensure_authorized(cfg)?;
+    let program = resolve_sidecar_program(cfg)?;
+
+    // Forward only the knobs the child honors: model id, optional revision, and
+    // banded-attention. `min_score` is applied at the recognizer level (the shared
+    // `build_token_recognizer`), not as argv; device/dtype are not wireable through
+    // the child (always wgpu-auto at its built-in precision).
+    let mut args: Vec<OsString> = Vec::new();
+    args.push("--model-id".into());
+    args.push(cfg.model.as_str().into());
+    if let Some(rev) = &cfg.revision {
+        args.push("--model-revision".into());
+        args.push(rev.as_str().into());
+    }
+    args.push("--banded-attention".into());
+    args.push(if cfg.banded_attention { "true" } else { "false" }.into());
+
+    let sub = SubprocessConfig {
+        program,
+        args,
+        envs: Vec::new(),
+        path_prepend: None,
+        id: format!("{}@sidecar:burn-wgpu", cfg.model),
+        caps: sidecar_caps(cfg),
+        // Forward child stderr to ours: the child writes ALL diagnostics there by
+        // discipline (stdout is JSON-RPC frames only), so this is the only window
+        // into a failing GPU init.
+        log_to_stderr: true,
+        // Cold start can be slow: a first-ever model download happens inside the
+        // child during the eager build, and the warmup reply waits on it. Generous
+        // so a legitimate cold download is not mistaken for a hang — this gates only
+        // load-time/pre-warm, never the steady-state request path. Pre-warm with
+        // `--download-model` to keep steady-state spawns fast (warm hf-hub cache).
+        spawn_timeout: Duration::from_secs(600),
+        // One classify on the GPU; generous for a large document. Fail-closed on
+        // timeout (the recognizer turns a Timeout into a refusal, never an empty Ok).
+        call_timeout: Duration::from_secs(120),
+        // Keep the GPU child warm; zlauder's reload owns the lifecycle, not idle.
+        idle_shutdown: None,
+        restart_policy: SidecarRestartPolicy::default(),
+    };
+
+    let backend = SubprocessSidecarBackend::new(sub)
+        .map_err(|e| EngineError::Ml(format!("burn sidecar init failed: {}", e.redacted())))?;
+    let rec = build_token_recognizer(Arc::new(backend), cfg);
+    validate_opaque_backend(rec.as_ref(), "burn sidecar")?;
+    Ok(rec)
+}
+
+#[cfg(feature = "ml-sidecar")]
+fn build_sidecar(cfg: &MlConfig) -> Result<Arc<dyn MlRecognizer>, EngineError> {
+    let rec: Arc<dyn MlRecognizer> = build_sidecar_checked(cfg)?;
+    Ok(rec)
+}
+
+#[cfg(feature = "ml-sidecar")]
+fn probe_sidecar(cfg: &MlConfig) -> Result<(), EngineError> {
+    build_sidecar_checked(cfg).map(|_| ())
 }
 
 // A build can carry one backend without the other; selecting the missing one is
@@ -388,6 +610,22 @@ fn no_http_backend() -> EngineError {
     EngineError::Ml(
         "this build lacks the http ML backend; rebuild with the `ml-http` feature \
          or set [engine.ml] backend = \"local\""
+            .into(),
+    )
+}
+#[cfg(not(feature = "ml-sidecar"))]
+fn build_sidecar(_cfg: &MlConfig) -> Result<Arc<dyn MlRecognizer>, EngineError> {
+    Err(no_sidecar_backend())
+}
+#[cfg(not(feature = "ml-sidecar"))]
+fn probe_sidecar(_cfg: &MlConfig) -> Result<(), EngineError> {
+    Err(no_sidecar_backend())
+}
+#[cfg(not(feature = "ml-sidecar"))]
+fn no_sidecar_backend() -> EngineError {
+    EngineError::Ml(
+        "this build lacks the burn-wgpu sidecar ML backend; rebuild with the \
+         `ml-sidecar` feature or set [engine.ml] backend = \"local\""
             .into(),
     )
 }
@@ -627,6 +865,94 @@ mod http_tests {
         assert!(
             http_config(&c).is_err(),
             "auth_token_env naming an unset var must fail closed"
+        );
+    }
+}
+
+// The genuinely-zlauder sidecar seam: the model allowlist must gate the burn
+// child (which fetches its own weights), and it must fire BEFORE any binary
+// resolution / spawn. The supervision, protocol, and GPU work are upstream's
+// (presidio_classifier::backends::sidecar + the burn-server child) and tested
+// there; this guards zlauder's wiring of the security gate.
+#[cfg(all(test, feature = "ml-sidecar"))]
+mod sidecar_tests {
+    use super::*;
+
+    /// The model allowlist gates the sidecar path too: an unauthorized model id is
+    /// refused at `ensure_authorized`, BEFORE the child binary is resolved or
+    /// spawned. Otherwise a model-supplied / injected / typo'd repo id would be
+    /// handed to the burn child, which fetches arbitrary weights from HF (a
+    /// supply-chain vector). `download` routes sidecar → `probe_sidecar` →
+    /// `build_sidecar_checked`, whose first action is the allowlist check.
+    #[test]
+    fn unauthorized_model_refused_before_spawn() {
+        let cfg = MlConfig {
+            backend: MlBackend::Sidecar,
+            model: "attacker/evil-weights".to_string(),
+            // A path that would error loudly at resolution ("could not be resolved")
+            // IF reached; the allowlist must short-circuit before that.
+            sidecar_path: Some("/nonexistent/zzz-burn-server".into()),
+            ..Default::default()
+        };
+        let err = download(&cfg).expect_err("an unlisted repo must be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("not authorized"), "got: {msg}");
+        assert!(
+            !msg.contains("could not be resolved"),
+            "must refuse on the allowlist BEFORE resolving the binary path: {msg}"
+        );
+        // The authorized default passes the gate (checked directly to avoid a real
+        // spawn + GPU init + model fetch).
+        let ok = MlConfig {
+            model: crate::config::AUTHORIZED_ML_MODELS[0].to_string(),
+            ..cfg
+        };
+        assert!(ensure_authorized(&ok).is_ok());
+    }
+
+    /// Fail-closed resolution: an AUTHORIZED model with a non-existent (or
+    /// bare/relative) `sidecar_path` must error at canonicalization — never spawn,
+    /// never let the upstream `Command::new` fall back to a `$PATH` lookup of a bare
+    /// program name (a hijack surface, since the child receives unmasked text). This
+    /// gets PAST `ensure_authorized` into `resolve_sidecar_program`.
+    #[test]
+    fn missing_or_relative_sidecar_binary_fails_closed_at_resolution() {
+        let cfg = MlConfig {
+            backend: MlBackend::Sidecar,
+            model: crate::config::AUTHORIZED_ML_MODELS[0].to_string(),
+            sidecar_path: Some("/nonexistent/zzz-burn-server".into()),
+            ..Default::default()
+        };
+        let err = probe_sidecar(&cfg).expect_err("a missing binary must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("could not be resolved"),
+            "expected a fail-closed resolution error, got: {msg}"
+        );
+        // A RELATIVE sidecar_path must be rejected as non-absolute BEFORE canonicalize
+        // (which would otherwise re-anchor it on the proxy's CWD — the hijack the
+        // absolute-path invariant forecloses). Distinct error from the missing case.
+        let rel = MlConfig {
+            backend: MlBackend::Sidecar,
+            model: crate::config::AUTHORIZED_ML_MODELS[0].to_string(),
+            sidecar_path: Some("zzz-burn-server".into()),
+            ..Default::default()
+        };
+        let rel_err = probe_sidecar(&rel).expect_err("a relative sidecar_path must fail closed");
+        assert!(
+            rel_err.to_string().contains("not an absolute path"),
+            "a relative sidecar_path must be rejected as non-absolute, got: {rel_err}"
+        );
+        // resolve_sidecar_program returns a CANONICAL absolute path for a real file,
+        // so `Command::new` never consults $PATH. Sanity-check canonicalization on a
+        // path we know exists (this test binary itself).
+        let me = std::env::current_exe().expect("current_exe");
+        let resolved = require_executable(me.clone(), "test")
+            .expect("an existing file must resolve");
+        assert!(
+            resolved.is_absolute(),
+            "resolved program must be absolute (no $PATH fallback at spawn): {}",
+            resolved.display()
         );
     }
 }

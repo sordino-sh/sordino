@@ -2518,7 +2518,7 @@ dependencies = [
 [[package]]
 name = "presidio-analyzer"
 version = "0.1.0"
-source = "git+https://github.com/FailSpy/presidio-rs.git?branch=main#2cfcb5e5f12607f8c57ee1ef4dd7d34ca88d1a6c"
+source = "git+https://github.com/FailSpy/presidio-rs.git?branch=main#498e38cffb5630092771e293c6f6b30f25bdd80a"
 dependencies = [
  "phonenumber",
  "presidio-core",
@@ -2534,7 +2534,7 @@ dependencies = [
 [[package]]
 name = "presidio-classifier"
 version = "0.1.0"
-source = "git+https://github.com/FailSpy/presidio-rs.git?branch=main#2cfcb5e5f12607f8c57ee1ef4dd7d34ca88d1a6c"
+source = "git+https://github.com/FailSpy/presidio-rs.git?branch=main#498e38cffb5630092771e293c6f6b30f25bdd80a"
 dependencies = [
  "ahash",
  "candle-core",
@@ -2561,7 +2561,7 @@ dependencies = [
 [[package]]
 name = "presidio-core"
 version = "0.1.0"
-source = "git+https://github.com/FailSpy/presidio-rs.git?branch=main#2cfcb5e5f12607f8c57ee1ef4dd7d34ca88d1a6c"
+source = "git+https://github.com/FailSpy/presidio-rs.git?branch=main#498e38cffb5630092771e293c6f6b30f25bdd80a"
 dependencies = [
  "regex",
  "serde",

@@ -12,7 +12,7 @@ mod config;
 mod detect;
 mod error;
 mod manifest;
-#[cfg(any(feature = "ml", feature = "ml-http"))]
+#[cfg(any(feature = "ml", feature = "ml-http", feature = "ml-sidecar"))]
 pub mod ml;
 mod ml_api;
 mod recognizers;
@@ -245,6 +245,35 @@ fn compute_ml_fp(rt: &MlRuntime) -> u64 {
                     // never wrong; the alternative (out-of-sync) silently breaks the
                     // `fp <=> same_model_params` invariant the module relies on.
                     h.update(&d.http_timeout_secs.to_le_bytes());
+                }
+                crate::config::MlBackend::Sidecar => {
+                    // MUST mirror `same_model_params`'s Sidecar identity (same
+                    // `fp <=> same_model_params` invariant noted in the Http arm):
+                    // model, revision, sidecar_path, banded_attention. `min_score`
+                    // is hashed above (shared). Encoding style mirrors the Local arm
+                    // (field bytes + Some/None markers); the leading `fp_tag` byte
+                    // makes cross-backend collision impossible regardless.
+                    h.update(d.model.as_bytes());
+                    h.update(&[0]);
+                    match &d.revision {
+                        Some(r) => {
+                            h.update(&[1]);
+                            h.update(r.as_bytes());
+                        }
+                        None => {
+                            h.update(&[0]);
+                        }
+                    };
+                    match &d.sidecar_path {
+                        Some(p) => {
+                            h.update(&[1]);
+                            h.update(p.as_bytes());
+                        }
+                        None => {
+                            h.update(&[0]);
+                        }
+                    };
+                    h.update(&[d.banded_attention as u8]);
                 }
             };
         }
@@ -646,6 +675,11 @@ impl MaskEngine {
                          or backend = \"local\""
                     }
                     crate::config::MlBackend::Local => "",
+                    crate::config::MlBackend::Sidecar => {
+                        " — set [engine.ml] required = false to degrade to regex-only, \
+                         or verify the burn-server binary path and GPU availability \
+                         (see /zlauder:doctor)"
+                    }
                 };
                 Some(format!(
                     "ml required but not ready (status: {:?}{}) — refusing to send text \
@@ -2341,6 +2375,73 @@ mod tests {
         assert_eq!(
             http_fp(30, false),
             http_fp(30, true),
+            "required is refusal policy, not identity; ml_fp must not move"
+        );
+    }
+
+    // Sidecar analogue of `ml_fp_tracks_same_model_params_identity`: every field in
+    // `same_model_params`'s Sidecar arm (sidecar_path, banded_attention; model/revision
+    // shared) must move `compute_ml_fp`, and `required` must not. Without this, a future
+    // edit dropping a field from one of the two Sidecar lists would silently break the
+    // `fp <=> same_model_params` invariant only for the sidecar backend.
+    #[test]
+    fn ml_fp_tracks_sidecar_identity() {
+        fn sidecar_fp(
+            model: &str,
+            revision: Option<&str>,
+            path: &str,
+            banded: bool,
+            required: bool,
+        ) -> u64 {
+            let rt = MlRuntime {
+                status: MlStatus::Ready,
+                recognizer: Some(Arc::new(InfallibleMl(Arc::new(MockPerson::new("X"))))),
+                desired: Some(MlConfig {
+                    enabled: true,
+                    backend: MlBackend::Sidecar,
+                    model: model.to_string(),
+                    revision: revision.map(str::to_string),
+                    sidecar_path: Some(path.into()),
+                    banded_attention: banded,
+                    required: Some(required),
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            compute_ml_fp(&rt)
+        }
+        let base = || sidecar_fp("org/model-a", Some("v1"), "/opt/a/burn-server", true, false);
+        // Every field in the Sidecar `same_model_params` arm is recognizer identity, so
+        // each must move the fp (else a reload keeps the old, wrong cache key).
+        assert_ne!(
+            base(),
+            sidecar_fp("org/model-b", Some("v1"), "/opt/a/burn-server", true, false),
+            "model is recognizer identity; ml_fp must move with it"
+        );
+        assert_ne!(
+            base(),
+            sidecar_fp("org/model-a", Some("v2"), "/opt/a/burn-server", true, false),
+            "revision is recognizer identity; ml_fp must move with it"
+        );
+        assert_ne!(
+            base(),
+            sidecar_fp("org/model-a", None, "/opt/a/burn-server", true, false),
+            "revision Some->None is identity; ml_fp must move with it"
+        );
+        assert_ne!(
+            base(),
+            sidecar_fp("org/model-a", Some("v1"), "/opt/b/burn-server", true, false),
+            "sidecar_path is recognizer identity; ml_fp must move with it"
+        );
+        assert_ne!(
+            base(),
+            sidecar_fp("org/model-a", Some("v1"), "/opt/a/burn-server", false, false),
+            "banded_attention is recognizer identity; ml_fp must move with it"
+        );
+        // `required` is refusal policy, not identity — flipping it must not move the fp.
+        assert_eq!(
+            base(),
+            sidecar_fp("org/model-a", Some("v1"), "/opt/a/burn-server", true, true),
             "required is refusal policy, not identity; ml_fp must not move"
         );
     }

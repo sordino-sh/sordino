@@ -76,6 +76,15 @@ ml = ["dep:presidio-classifier", "presidio-classifier/backend-candle"]
 # Independent of `ml`, so a slim regex+http build
 # (`--no-default-features --features ml-http`) skips the whole Candle stack.
 ml-http = ["dep:presidio-classifier", "presidio-classifier/backend-http", "dep:secrecy"]
+# Out-of-process burn-wgpu GPU sidecar (`[engine.ml] backend = "sidecar"`). This
+# crate links NO burn/wgpu/cubecl: `backend-sidecar` is just the supervision core
+# (`dep:serde_json`, GPU-free). The GPU lives in the SEPARATE
+# `presidio-classifier-burn-server` child binary (built upstream with
+# `backend-burn`), which the engine spawns by path. Reload-safe by construction —
+# a fresh child = a fresh cubecl global, sidestepping the in-process single-init
+# brick. Independent of `ml`/`ml-http`; opt-in (NOT default) until the GPU
+# verification matrix runs on the target platforms.
+ml-sidecar = ["dep:presidio-classifier", "presidio-classifier/backend-sidecar"]
 # Opt-in NVIDIA build: enables candle-CUDA (the `ml`/`select()` candle path then
 # resolves cuda > metal > cpu). SEPARATE artifact — the binary gains a hard
 # libcuda.so launch dependency (won't start on a non-NVIDIA host) and the build
