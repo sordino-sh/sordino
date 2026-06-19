@@ -2197,15 +2197,18 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
 /// ZlauDeR's own command text (no user PII), and only a human keystroke reaches this hook, so the
 /// exception widens nothing an attacker controls.
 ///
-/// The decision uses only fast LOCAL reads (the baked route + `$ANTHROPIC_BASE_URL`) — no
-/// network. This matters BECAUSE a UserPromptSubmit hook that hangs (30s timeout) or crashes
-/// FAILS OPEN (the prompt proceeds unmasked); only an explicit block decision is fail-closed.
-/// Every read on this path is non-panicking by construction: `project_root` (env/cwd with a
-/// fallback), `canonical` (`canonicalize` with an `unwrap_or_else` fallback), `registry_get` /
-/// `project_baked_route` (fallible `fs::read` + `serde` that degrade to `None`), and
-/// `session_routed_through` (env + string compare) — none `unwrap`/`expect`/index, so no panic
-/// path precedes the block emission. A missing binary likewise fails open at the shell wrapper,
-/// which is correct: no zlauder installed ⇒ no masking promise ⇒ nothing to gate.
+/// The decision uses fast LOCAL reads (the baked route + `$ANTHROPIC_BASE_URL`) plus, ONLY when a
+/// block actually turns on it, ONE ~600ms-bounded `/healthz` identity probe (`intake_identity_ok`)
+/// — never an unbounded read. This matters BECAUSE a UserPromptSubmit hook that hangs (30s timeout)
+/// or crashes FAILS OPEN (the prompt proceeds unmasked); only an explicit block decision is
+/// fail-closed. The identity probe is bounded far under that 30s and degrades to "not ours → BLOCK"
+/// on any failure, so it cannot fail open. Every read on this path is non-panicking by construction:
+/// `project_root` (env/cwd with a fallback), `canonical` (`canonicalize` with an `unwrap_or_else`
+/// fallback), `registry_get` / `project_baked_route` (fallible `fs::read` + `serde` that degrade to
+/// `None`), `session_routed_through` (env + string compare), and `intake_identity_ok` (a fallible
+/// `reqwest` send that degrades to `false`) — none `unwrap`/`expect`/index, so no panic path
+/// precedes the block emission. A missing binary likewise fails open at the shell wrapper, which is
+/// correct: no zlauder installed ⇒ no masking promise ⇒ nothing to gate.
 fn user_prompt_submit() -> Result<()> {
     // Drain the hook payload so the pipe never blocks, and pull the submitted prompt out of it —
     // we need the text to let ZlauDeR's own control-plane commands through a closed gate (below).
@@ -2222,10 +2225,12 @@ fn user_prompt_submit() -> Result<()> {
     let opted_out =
         zlauder_state::registry_get(&root) == Some(zlauder_state::PlumbState::Optout);
     let baked_port = project_baked_route(&root);
-    // Routed iff this session's $ANTHROPIC_BASE_URL points at the baked proxy port. If the proxy
-    // is down, a routed session still fails-closed AT the proxy (never unmasked), so "routed"
-    // is the right allow condition.
-    let routed = baked_port
+    // Cheap LOCAL check: does this session's $ANTHROPIC_BASE_URL point at the baked proxy port?
+    // This ALONE is NOT enough to stand the gate down — a foreign/dead process can hold that port
+    // (our proxy died and something else grabbed it; a reconcile that never landed), and the session
+    // would egress UNMASKED to it. The real ALLOW condition is identity-verified below
+    // (`intake_identity_ok`); this string match only distinguishes the two block REASONS.
+    let env_routed = baked_port
         .is_some_and(|p| session_routed_through(&format!("http://127.0.0.1:{p}")));
     // VALUE-aware, unlike the presence-based ZLAUDER_NO_AUTO_ENABLE: this disables a fail-CLOSED
     // SECURITY control, so a user who sets `=0` meaning "off" must NOT accidentally turn the gate
@@ -2234,25 +2239,53 @@ fn user_prompt_submit() -> Result<()> {
         .map(|v| is_truthy_flag(&v))
         .unwrap_or(false);
 
-    // Fail-CLOSED block decision FIRST, from the local reads above only (this path must never
-    // hang or fail-open). Block iff the gate fires AND the prompt isn't a `/zlauder:` control-
-    // plane command — the recovery levers (/zlauder:disable to opt out and continue, enable to
-    // retry, status/doctor/verify to inspect) must never be trapped inside the gate they'd
-    // release. Those prompts are ZlauDeR's own command text (no zlauder command takes a PII
-    // argument) and only a human keystroke reaches this hook, so passing them widens nothing an
-    // attacker holds; a prompt that merely MENTIONS a command stays blocked (it could carry PII).
-    if intake_should_block(opted_out, baked_port.is_some(), routed, escape_hatch)
+    // The ONLY network read on the block-decision path: confirm the baked port is OUR live,
+    // nonce-verified proxy. Run it ONLY when a block actually turns on it — plumbed, not opted out,
+    // not escape-hatched, not a `/zlauder:` command (all of which ALLOW regardless) — AND only when
+    // the session env already points at the baked port (else it's the never-routed case, no point
+    // probing). It is ~600ms-bounded and fail-CLOSED (timeout/unverified → not ours → BLOCK), far
+    // under the 30s hook timeout that fails OPEN. This closes the bare-string-compare hole: a
+    // foreign/dead listener on the baked port no longer reads as "routed".
+    let must_check = baked_port.is_some()
+        && !opted_out
+        && !escape_hatch
+        && !prompt_is_zlauder_command(&prompt);
+    let identity_ok = if must_check && env_routed {
+        baked_port.is_some_and(|p| intake_identity_ok(p, &root))
+    } else {
+        false
+    };
+
+    // Block iff the gate fires AND the prompt isn't a `/zlauder:` control-plane command — the
+    // recovery levers (/zlauder:disable to opt out and continue, enable to retry,
+    // status/doctor/verify to inspect) must never be trapped inside the gate they'd release. Those
+    // prompts are ZlauDeR's own command text (no zlauder command takes a PII argument) and only a
+    // human keystroke reaches this hook, so passing them widens nothing; a prompt that merely
+    // MENTIONS a command stays blocked (it could carry PII).
+    if intake_should_block_verified(opted_out, baked_port.is_some(), identity_ok, escape_hatch)
         && !prompt_is_zlauder_command(&prompt)
     {
-        // PLUMBED but THIS session is NOT routed: the prompt would reach the API UNMASKED.
         // `decision:"block"` (exit 0) is the fail-closed contract; the reason is shown to the user.
-        let reason = "ZlauDeR PII masking is enabled for this project, but THIS Claude Code session \
-                      is not yet routed through the masking proxy — so your message would reach the \
-                      API provider UNMASKED (real PII, not tokens). Restart Claude Code once to \
-                      activate masking; every session after the first picks it up automatically. \
-                      Prefer to continue this session as-is? Run /zlauder:disable to turn masking off \
-                      for this project, or set ZLAUDER_NO_INTAKE_GATE=1 to bypass the gate for now. \
-                      (Only what the provider sees is affected — you always see your own plaintext.)";
+        // Two distinct cases: (1) this session isn't pointed at the baked port yet (the common
+        // post-enable "restart to activate"); (2) it IS pointed there, but the listener can't be
+        // verified as OUR proxy — down, replaced, or a foreign process — which would egress UNMASKED.
+        let reason = if env_routed {
+            "ZlauDeR PII masking is enabled and THIS Claude Code session is routed to the masking \
+             port, but the process now answering there can't be verified as ZlauDeR's proxy — it may \
+             be down, replaced, or a different local process — so your message could reach the API \
+             provider UNMASKED (or hang). Restart Claude Code once so ZlauDeR re-routes this session \
+             to its live proxy. Prefer to continue as-is? Run /zlauder:disable to turn masking off \
+             for this project, or set ZLAUDER_NO_INTAKE_GATE=1 to bypass the gate for now. (Only what \
+             the provider sees is affected — you always see your own plaintext.)"
+        } else {
+            "ZlauDeR PII masking is enabled for this project, but THIS Claude Code session is not yet \
+             routed through the masking proxy — so your message would reach the API provider UNMASKED \
+             (real PII, not tokens). Restart Claude Code once to activate masking; every session after \
+             the first picks it up automatically. Prefer to continue this session as-is? Run \
+             /zlauder:disable to turn masking off for this project, or set ZLAUDER_NO_INTAKE_GATE=1 to \
+             bypass the gate for now. (Only what the provider sees is affected — you always see your \
+             own plaintext.)"
+        };
         println!("{}", json!({ "decision": "block", "reason": reason }));
         return Ok(());
     }
@@ -2268,12 +2301,19 @@ fn user_prompt_submit() -> Result<()> {
 }
 
 /// Fail-CLOSED intake-gate decision (pure — for testing). BLOCK iff this project is plumbed
-/// through us AND this session is NOT routed to it, and neither the opt-out nor the
-/// `ZLAUDER_NO_INTAKE_GATE` escape hatch applies. Every other state is an ALLOW: not plumbed
-/// (no masking intent), already routed (masking active / fails-closed at the proxy), opted out,
-/// or escape-hatched.
-fn intake_should_block(opted_out: bool, plumbed: bool, routed: bool, escape_hatch: bool) -> bool {
-    !escape_hatch && !opted_out && plumbed && !routed
+/// through us AND this session is NOT confirmed reaching OUR identity-verified proxy
+/// (`identity_ok` = the env points at the baked port AND that port is our live nonce-verified
+/// proxy), and neither the opt-out nor the `ZLAUDER_NO_INTAKE_GATE` escape hatch applies. Every
+/// other state is an ALLOW: not plumbed (no masking intent), identity-verified (reaching our proxy,
+/// which fails-closed there), opted out, or escape-hatched. `identity_ok` replaces the former bare
+/// `routed` URL string-match — a foreign/dead listener on the baked port no longer reads as routed.
+fn intake_should_block_verified(
+    opted_out: bool,
+    plumbed: bool,
+    identity_ok: bool,
+    escape_hatch: bool,
+) -> bool {
+    !escape_hatch && !opted_out && plumbed && !identity_ok
 }
 
 /// Truthy-flag parse for an env value (pure — for testing). Only an explicitly affirmative value
@@ -2461,6 +2501,52 @@ fn session_mask_state(
     Some(SessionStatus { state, port: routed_port, profile })
 }
 
+/// Bounded proxy-IDENTITY check, single-sourced for the intake gate and [`routed_proxy_status`]:
+/// is `port` our LIVE, nonce-verified proxy for `root`? One `/healthz` round-trip under `timeout`.
+/// Returns the verified rendezvous record on success, `None` on ANY error/mismatch (fail-CLOSED):
+/// the live rendezvous port must equal `port`, the record must carry a nonce, and the process there
+/// must echo that nonce on `x-zlauder-nonce` — so a FOREIGN server squatting the port (no nonce) is
+/// never mistaken for ours. The caller supplies `client` + `timeout` so the whole probe stays inside
+/// a single deadline (the gate's ~600ms; `routed_proxy_status`'s shared budget).
+fn verified_proxy_rec(
+    port: u16,
+    root: &str,
+    client: &reqwest::blocking::Client,
+    timeout: Duration,
+) -> Option<zlauder_state::Rendezvous> {
+    let (live, rec) = zlauder_state::live_port(root)?;
+    if live != port || rec.nonce.is_empty() {
+        return None;
+    }
+    let echoed = client
+        .get(format!("http://127.0.0.1:{live}/healthz"))
+        .timeout(timeout)
+        .send()
+        .ok()
+        .filter(|r| r.status().is_success())
+        .and_then(|r| {
+            r.headers()
+                .get("x-zlauder-nonce")
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_string)
+        })
+        .is_some_and(|n| n == rec.nonce);
+    echoed.then_some(rec)
+}
+
+/// The intake gate's ALLOW condition: is the baked `port` our live, identity-verified proxy?
+/// A self-contained, ~600ms-bounded, fail-CLOSED wrapper over [`verified_proxy_rec`] — the gate's
+/// block decision must never hang (a UserPromptSubmit hook that times out FAILS OPEN), so the probe
+/// carries its own short deadline and any failure (no client, proxy down, stale record, FOREIGN
+/// listener) returns `false` ⇒ the gate BLOCKs. Replaces the former bare `session_routed_through`
+/// URL string-compare, which credited a foreign/dead listener on the baked port as "routed".
+fn intake_identity_ok(port: u16, root: &str) -> bool {
+    let Ok(client) = reqwest::blocking::Client::builder().build() else {
+        return false;
+    };
+    verified_proxy_rec(port, root, &client, Duration::from_millis(600)).is_some()
+}
+
 /// For a session whose env IS routed to `routed_port`: confirm the listener is our identity-
 /// verified proxy (rendezvous nonce echoed over `/healthz`) and read `enabled`/`profile`. Mirrors
 /// the statusline's `render_segment` verification but returns a typed state. Uses a SHORT timeout
@@ -2482,30 +2568,14 @@ fn routed_proxy_status(routed_port: u16, root: &str) -> (MaskState, String) {
             .unwrap_or(Duration::ZERO)
             .max(Duration::from_millis(50))
     };
-    // Identity: the live rendezvous port must equal the routed port AND the process there must
-    // echo our recorded nonce — closing the foreign-server-on-a-colliding-port hole.
-    let Some((live, rec)) = zlauder_state::live_port(root) else { return unconfirmed };
-    if live != routed_port || rec.nonce.is_empty() {
+    // Identity: confirm the listener on `routed_port` is OUR live nonce-verified proxy (single-
+    // sourced with the intake gate via `verified_proxy_rec`), closing the foreign-server-on-a-
+    // colliding-port hole. The verified record carries the admin key the config read below needs.
+    let Some(rec) = verified_proxy_rec(routed_port, root, &client, remaining()) else {
         return unconfirmed;
-    }
-    let id_ok = client
-        .get(format!("http://127.0.0.1:{live}/healthz"))
-        .timeout(remaining())
-        .send()
-        .ok()
-        .filter(|r| r.status().is_success())
-        .and_then(|r| {
-            r.headers()
-                .get("x-zlauder-nonce")
-                .and_then(|v| v.to_str().ok())
-                .map(str::to_string)
-        })
-        .is_some_and(|n| n == rec.nonce);
-    if !id_ok {
-        return unconfirmed;
-    }
+    };
     match client
-        .get(format!("http://127.0.0.1:{live}/zlauder/config"))
+        .get(format!("http://127.0.0.1:{routed_port}/zlauder/config"))
         .timeout(remaining())
         .header("x-zlauder-key", &rec.admin_key)
         .send()
@@ -4917,20 +4987,38 @@ mod route_gate_tests {
     }
 
     #[test]
-    fn intake_gate_blocks_only_plumbed_unrouted_no_escape() {
-        // The one BLOCK state: plumbed, not routed, not opted out, no escape hatch.
-        assert!(intake_should_block(false, true, false, false));
+    fn intake_should_block_verified_truth_table() {
+        // INDEPENDENT oracle (not the function's own formula): the gate BLOCKs in EXACTLY one of
+        // the 16 states — plumbed, identity NOT verified, not opted out, no escape hatch. Every
+        // other combination ALLOWs. This pins the fail-closed contract over the whole input space.
+        for opted_out in [false, true] {
+            for plumbed in [false, true] {
+                for identity_ok in [false, true] {
+                    for escape_hatch in [false, true] {
+                        let expect =
+                            (opted_out, plumbed, identity_ok, escape_hatch) == (false, true, false, false);
+                        assert_eq!(
+                            intake_should_block_verified(opted_out, plumbed, identity_ok, escape_hatch),
+                            expect,
+                            "row opted_out={opted_out} plumbed={plumbed} identity_ok={identity_ok} escape_hatch={escape_hatch}"
+                        );
+                    }
+                }
+            }
+        }
 
-        // Allowed: already routed this session (masking active / fails-closed at the proxy).
-        assert!(!intake_should_block(false, true, true, false));
-        // Allowed: not plumbed through us (no masking intent — never gate a foreign project).
-        assert!(!intake_should_block(false, false, false, false));
-        // Allowed: opted out (sending direct is exactly what opt-out means).
-        assert!(!intake_should_block(true, true, false, false));
-        // Allowed: the ZLAUDER_NO_INTAKE_GATE escape hatch overrides everything.
-        assert!(!intake_should_block(false, true, false, true));
-        // Escape hatch wins even over the block state with all other flags set to block.
-        assert!(!intake_should_block(false, true, false, true));
+        // Named anchors for the load-bearing rows:
+        // The one BLOCK state — plumbed, identity unverified (proxy down / FOREIGN listener on the
+        // baked port / never routed), not opted out, no escape hatch.
+        assert!(intake_should_block_verified(false, true, false, false));
+        // Identity-verified → reaching OUR proxy (fails-closed there) → ALLOW.
+        assert!(!intake_should_block_verified(false, true, true, false));
+        // Not plumbed → no masking intent → never gate a foreign project.
+        assert!(!intake_should_block_verified(false, false, false, false));
+        // Opted out → sending direct is exactly what opt-out means.
+        assert!(!intake_should_block_verified(true, true, false, false));
+        // ZLAUDER_NO_INTAKE_GATE escape hatch overrides even the block state.
+        assert!(!intake_should_block_verified(false, true, false, true));
     }
 
     #[test]
