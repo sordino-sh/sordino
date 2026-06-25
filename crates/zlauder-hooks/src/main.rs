@@ -4258,10 +4258,10 @@ mod prompt_spoof_tests {
 /// Backs `/zlauder:zdr`. Targets THIS session's conversation — the SessionStart hook
 /// baked the id into `ANTHROPIC_BASE_URL` as `.../zlauder/session/<id>`, which this
 /// process inherits, so the CLI keys the same id the proxy sees on the wire.
-fn zdr_cmd(port: Option<u16>, action: Option<ZdrAction>) -> Result<()> {
+fn zdr_cmd(action: Option<ZdrAction>) -> Result<()> {
     let root = canonical(&project_root());
-    let port = port.unwrap_or_else(|| pick_port(&root));
-    let key = key_for(port).context("reading session state (is the proxy running?)")?;
+    let (port, key) = live_identity(&root)
+        .context("could not reach this project's proxy — is a `claude` session running here?")?;
     let conv = conversation_from_base_url().context(
         "this session is not ZDR-routable: ANTHROPIC_BASE_URL has no /zlauder/session/<id> \
          segment. Run /zlauder:enable and restart Claude Code so the proxy sees a session id.",

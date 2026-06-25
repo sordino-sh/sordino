@@ -1,7 +1,7 @@
 ---
 description: View or change ZlauDeR ZDR (Zero-Data-Retention) trusted routing for THIS session — status, on/off, and the configured targets. Optional; off unless you configure [zdr] targets.
 argument-hint: "[status | on [config] | off | config]"
-allowed-tools: Bash
+allowed-tools: Bash(bash "${CLAUDE_PLUGIN_ROOT}/scripts/zdr.sh":*)
 ---
 
 !`bash "${CLAUDE_PLUGIN_ROOT}/scripts/zdr.sh" "$ARGUMENTS"`
