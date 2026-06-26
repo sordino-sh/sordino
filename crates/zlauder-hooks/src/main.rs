@@ -152,6 +152,25 @@ enum Cmd {
         #[command(subcommand)]
         action: SettingsAction,
     },
+    /// Codex preflight: detect whether a usable OpenAI API key is reachable for the masking
+    /// proxy's custom provider, and REFUSE (non-zero exit) when not.
+    ///
+    /// The zlauder Codex plugin routes Codex's OpenAI provider through the local masking proxy
+    /// by configuring a custom provider with `env_key = "OPENAI_API_KEY"`. A custom provider's
+    /// `api_key()` reads ONLY the `OPENAI_API_KEY` ENV var and hard-errors when it is absent or
+    /// empty — it does NOT fall back to a ChatGPT-subscription token or to `auth.json`. So if a
+    /// user only has ChatGPT-subscription auth (or an API key sitting in `auth.json` but NOT
+    /// exported to the env), every Codex request fails at provider construction — nothing is
+    /// sent, therefore nothing is masked. This subcommand detects that up front.
+    ///
+    /// Exit 0 iff a usable env key is present (mode=apikey); non-zero otherwise, with a clear
+    /// refusal on stderr. `--json` prints `{"mode": ..., "route_ok": <bool>}` to stdout.
+    CodexAuthCheck {
+        /// Emit machine-readable JSON (`{"mode": ..., "route_ok": <bool>}`) instead of the
+        /// human refusal/confirmation. The exit code is still set (0 iff route_ok).
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -355,6 +374,251 @@ fn main() -> Result<()> {
             keep_thinking,
         ),
         Cmd::Settings { action } => settings_cmd(action),
+        Cmd::CodexAuthCheck { json } => codex_auth_check_cmd(json),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// codex-auth-check — detect a usable OpenAI API key for Codex's masking-proxy
+// custom provider, and REFUSE when not. See `Cmd::CodexAuthCheck` for the
+// failure mechanism this guards.
+// ---------------------------------------------------------------------------
+
+/// Classification of how Codex auth is set up, from the masking-proxy's point of view.
+/// `route_ok` is true ONLY when the custom provider's `env_key="OPENAI_API_KEY"` Bearer
+/// lookup will find a usable value — i.e. an exported `sk-` env key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CodexAuthMode {
+    /// An `sk-`-shaped `$OPENAI_API_KEY` is exported — the provider will read it. route_ok.
+    ApiKey,
+    /// A ChatGPT subscription (auth_mode=chatgpt / a `tokens` object), or no auth at all.
+    /// The provider has no env key to read → fails at construction. NOT route_ok.
+    Chatgpt,
+    /// An API key is on file in auth.json but NOT exported to the env. The single most
+    /// actionable case: the fix is one `export`. NOT route_ok.
+    KeyNotExported,
+    /// Anything else (personal_access_token, bedrock_api_key, or an unrecognized shape).
+    /// Fail-closed. NOT route_ok.
+    Other,
+}
+
+impl CodexAuthMode {
+    /// The stable string the `--json` form and downstream consumers key on.
+    fn as_str(self) -> &'static str {
+        match self {
+            CodexAuthMode::ApiKey => "apikey",
+            CodexAuthMode::Chatgpt => "chatgpt",
+            CodexAuthMode::KeyNotExported => "key-not-exported",
+            CodexAuthMode::Other => "other",
+        }
+    }
+    /// True iff this mode means the custom provider has a usable env key (only `ApiKey`).
+    /// Used by tests to assert the mode↔route_ok invariant.
+    #[cfg(test)]
+    fn route_ok(self) -> bool {
+        matches!(self, CodexAuthMode::ApiKey)
+    }
+}
+
+/// PURE detection: given the `$OPENAI_API_KEY` env value (if any) and the parsed `auth.json`
+/// (if any, as a `serde_json::Value`), classify the auth situation. No env mutation, no I/O —
+/// directly unit-testable. Returns `(mode, route_ok)`; an optional unmapped-auth_mode note is
+/// surfaced by the caller (see [`detect_codex_auth`]).
+///
+/// Precedence mirrors codex's own `api_key()` lookup: an exported, `sk-`-shaped env key wins
+/// outright (rule 1); otherwise we inspect auth.json and ALWAYS fail closed.
+fn classify_codex_auth(env_key: Option<&str>, auth_json: Option<&Value>) -> (CodexAuthMode, bool) {
+    // Rule 1: an exported, non-empty, sk-shaped env key is exactly what the custom provider's
+    // env_key="OPENAI_API_KEY" Bearer lookup reads. Trim to reject whitespace-only values.
+    if let Some(k) = env_key {
+        let k = k.trim();
+        if !k.is_empty() && k.starts_with("sk-") {
+            return (CodexAuthMode::ApiKey, true);
+        }
+        // present-but-not-sk-shaped (or whitespace-only) → fall through to auth.json.
+    }
+
+    // Rule 2/3: no usable exported env key. Inspect auth.json (fail closed on anything).
+    let Some(auth) = auth_json else {
+        // No auth.json (or it was empty/unparseable) → treat as ChatGPT/none. NOT route_ok.
+        return (CodexAuthMode::Chatgpt, false);
+    };
+
+    let auth_mode = auth
+        .get("auth_mode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let has_api_key_field = auth
+        .get("OPENAI_API_KEY")
+        .and_then(Value::as_str)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let has_tokens = auth.get("tokens").map(|t| !t.is_null()).unwrap_or(false);
+    let has_pat = auth
+        .get("personal_access_token")
+        .and_then(Value::as_str)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false);
+    let has_bedrock = auth.get("bedrock_api_key").map(|b| !b.is_null()).unwrap_or(false);
+
+    // An API key on file (field present, or auth_mode==apikey) but NOT exported to the env:
+    // the most actionable refusal. The env key was already checked above and is unusable.
+    if has_api_key_field || auth_mode == Some("apikey") {
+        return (CodexAuthMode::KeyNotExported, false);
+    }
+    if auth_mode == Some("chatgpt") || has_tokens {
+        return (CodexAuthMode::Chatgpt, false);
+    }
+    if auth_mode == Some("personal_access_token") || has_pat {
+        return (CodexAuthMode::Other, false);
+    }
+    if auth_mode == Some("bedrock_api_key") || has_bedrock {
+        return (CodexAuthMode::Other, false);
+    }
+
+    // Unrecognized auth_mode / shape the detector cannot classify → fail closed.
+    (CodexAuthMode::Other, false)
+}
+
+/// Was the auth.json's `auth_mode` an UNMAPPED value (one we don't classify by name and that
+/// didn't otherwise match a known field)? The caller surfaces this on stderr so an unexpected
+/// codex auth mode can be reported. Returns the offending string when so.
+fn unmapped_auth_mode(auth_json: Option<&Value>) -> Option<String> {
+    let auth = auth_json?;
+    let am = auth
+        .get("auth_mode")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    const KNOWN: &[&str] = &[
+        "apikey",
+        "chatgpt",
+        "personal_access_token",
+        "bedrock_api_key",
+    ];
+    if KNOWN.contains(&am) {
+        return None;
+    }
+    // An unknown auth_mode that nevertheless carried a recognized field is already classified
+    // by that field — not "unmapped". Only flag when nothing else matched it.
+    let classifiable_by_field = auth
+        .get("OPENAI_API_KEY")
+        .and_then(Value::as_str)
+        .map(|s| !s.trim().is_empty())
+        .unwrap_or(false)
+        || auth.get("tokens").map(|t| !t.is_null()).unwrap_or(false)
+        || auth
+            .get("personal_access_token")
+            .and_then(Value::as_str)
+            .map(|s| !s.trim().is_empty())
+            .unwrap_or(false)
+        || auth.get("bedrock_api_key").map(|b| !b.is_null()).unwrap_or(false);
+    if classifiable_by_field {
+        None
+    } else {
+        Some(am.to_string())
+    }
+}
+
+/// Read + parse `$CODEX_HOME/auth.json` (CODEX_HOME defaults to `~/.codex`), non-panicking.
+/// ANY read/parse failure (missing file, bad JSON, no home dir) degrades to `None` — which the
+/// pure classifier treats as the safe REFUSE path.
+fn read_codex_auth_json() -> Option<Value> {
+    let codex_home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|h| h.join(".codex")))?;
+    let path = codex_home.join("auth.json");
+    let raw = std::fs::read_to_string(&path).ok()?;
+    serde_json::from_str::<Value>(&raw).ok()
+}
+
+/// Best-effort home directory from the environment ($HOME on Unix, $USERPROFILE on Windows).
+/// No external crate; returns `None` rather than panicking when unset.
+fn home_dir() -> Option<PathBuf> {
+    #[cfg(windows)]
+    let var = "USERPROFILE";
+    #[cfg(not(windows))]
+    let var = "HOME";
+    std::env::var_os(var)
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+}
+
+/// Run the live detection: read the real `$OPENAI_API_KEY` env + `auth.json`, classify, and
+/// surface any unmapped auth_mode note. Returns `(mode, route_ok, unmapped_note)`.
+fn detect_codex_auth() -> (CodexAuthMode, bool, Option<String>) {
+    let env_key = std::env::var("OPENAI_API_KEY").ok();
+    let auth = read_codex_auth_json();
+    let (mode, route_ok) = classify_codex_auth(env_key.as_deref(), auth.as_ref());
+    let note = unmapped_auth_mode(auth.as_ref());
+    (mode, route_ok, note)
+}
+
+/// The shared refusal text printed to stderr for every `route_ok==false` case. Explains the
+/// REAL mechanism so a user knows why their ChatGPT login won't work and what to do.
+fn codex_refusal_message(mode: CodexAuthMode) -> String {
+    let specific = match mode {
+        CodexAuthMode::KeyNotExported => {
+            "You have an OpenAI API key on file (auth.json) but it is not exported as the \
+             OPENAI_API_KEY environment variable. The Codex custom provider reads the ENV var, \
+             not auth.json — export it (export OPENAI_API_KEY=sk-...) before launching codex, \
+             then re-run enable.\n\n"
+        }
+        CodexAuthMode::Chatgpt => {
+            "Detected a ChatGPT-subscription login (or no OpenAI auth at all).\n\n"
+        }
+        CodexAuthMode::Other => {
+            "Detected an OpenAI auth mode that does not export an OPENAI_API_KEY env var \
+             (e.g. a personal access token or Bedrock key).\n\n"
+        }
+        CodexAuthMode::ApiKey => "", // unreachable for route_ok==false
+    };
+    format!(
+        "{specific}zlauder masking cannot be enabled for Codex with this auth. The masking \
+         proxy routes Codex's OpenAI provider through a custom provider whose \
+         env_key=OPENAI_API_KEY. When that env var has no value, codex fails at provider \
+         construction with a missing-OPENAI_API_KEY env error — it never falls back to your \
+         ChatGPT login — so the session cannot make ANY requests, and nothing is masked because \
+         nothing is sent.\n\n\
+         Fix: set OPENAI_API_KEY to a real OpenAI API key (sk-...) and re-run enable.\n  \
+         export OPENAI_API_KEY=sk-...",
+    )
+}
+
+/// `zlauder-hooks codex-auth-check [--json]`. Exit 0 iff a usable exported env key is present;
+/// non-zero (with a refusal on stderr) otherwise.
+fn codex_auth_check_cmd(json: bool) -> Result<()> {
+    let (mode, route_ok, unmapped) = detect_codex_auth();
+
+    // Always surface an unmapped auth_mode on stderr so it can be reported, regardless of form.
+    if let Some(am) = &unmapped {
+        eprintln!(
+            "note: unrecognized codex auth_mode {am:?} in auth.json — treating as unusable \
+             (fail-closed). Please report this auth_mode."
+        );
+    }
+
+    if json {
+        println!(
+            "{}",
+            json!({ "mode": mode.as_str(), "route_ok": route_ok })
+        );
+        // Belt-and-suspenders: even in --json mode, surface the refusal mechanism on stderr
+        // (stdout stays JSON-only) so anyone running this directly sees WHY route_ok is false.
+        if !route_ok {
+            eprintln!("{}", codex_refusal_message(mode));
+        }
+    } else if route_ok {
+        println!("codex-auth-check: OK (mode=apikey) — OPENAI_API_KEY is exported; the masking proxy can route Codex.");
+    } else {
+        eprintln!("{}", codex_refusal_message(mode));
+    }
+
+    if route_ok {
+        Ok(())
+    } else {
+        std::process::exit(1);
     }
 }
 
@@ -5642,5 +5906,150 @@ mod doctor_tests {
         // Status labels are stable (consumed by the JSON output + plugin command).
         assert_eq!(ProbeStatus::Pass.label(), "PASS");
         assert_eq!(ProbeStatus::Fail.label(), "FAIL");
+    }
+}
+
+#[cfg(test)]
+mod codex_auth_check_tests {
+    use super::{CodexAuthMode, classify_codex_auth, unmapped_auth_mode};
+    use serde_json::json;
+
+    // Convenience: assert the PURE classifier returns the expected (mode-string, route_ok).
+    fn check(env: Option<&str>, auth: Option<serde_json::Value>, mode: CodexAuthMode, ok: bool) {
+        let (m, r) = classify_codex_auth(env, auth.as_ref());
+        assert_eq!(m, mode, "mode mismatch for env={env:?} auth={auth:?}");
+        assert_eq!(r, ok, "route_ok mismatch for env={env:?} auth={auth:?}");
+        // route_ok must equal mode.route_ok() and "apikey" must be the only true case.
+        assert_eq!(r, m.route_ok());
+        assert_eq!(r, m.as_str() == "apikey");
+    }
+
+    #[test]
+    fn exported_sk_key_is_apikey_route_ok() {
+        // Rule 1: an exported, sk-shaped env key passes regardless of auth.json.
+        check(Some("sk-real"), None, CodexAuthMode::ApiKey, true);
+        check(
+            Some("sk-real"),
+            Some(json!({ "tokens": { "id_token": "x" } })),
+            CodexAuthMode::ApiKey,
+            true,
+        );
+    }
+
+    #[test]
+    fn chatgpt_tokens_without_env_refuses() {
+        check(
+            None,
+            Some(json!({ "tokens": { "id_token": "x", "access_token": "y" } })),
+            CodexAuthMode::Chatgpt,
+            false,
+        );
+        // auth_mode=="chatgpt" with no tokens object classifies the same.
+        check(
+            None,
+            Some(json!({ "auth_mode": "chatgpt" })),
+            CodexAuthMode::Chatgpt,
+            false,
+        );
+    }
+
+    #[test]
+    fn api_key_on_file_but_not_exported_refuses() {
+        // The actionable case: key in auth.json, nothing exported → key-not-exported.
+        check(
+            None,
+            Some(json!({ "OPENAI_API_KEY": "sk-x" })),
+            CodexAuthMode::KeyNotExported,
+            false,
+        );
+        // auth_mode=="apikey" alone (no field) is also key-not-exported.
+        check(
+            None,
+            Some(json!({ "auth_mode": "apikey" })),
+            CodexAuthMode::KeyNotExported,
+            false,
+        );
+    }
+
+    #[test]
+    fn personal_access_token_is_other() {
+        check(
+            None,
+            Some(json!({ "auth_mode": "personal_access_token", "personal_access_token": "pat-x" })),
+            CodexAuthMode::Other,
+            false,
+        );
+        // A bare personal_access_token field (unrecognized/absent auth_mode) also classifies.
+        check(
+            None,
+            Some(json!({ "personal_access_token": "pat-x" })),
+            CodexAuthMode::Other,
+            false,
+        );
+    }
+
+    #[test]
+    fn bedrock_is_other() {
+        check(
+            None,
+            Some(json!({ "auth_mode": "bedrock_api_key" })),
+            CodexAuthMode::Other,
+            false,
+        );
+        check(
+            None,
+            Some(json!({ "bedrock_api_key": { "key": "abc" } })),
+            CodexAuthMode::Other,
+            false,
+        );
+    }
+
+    #[test]
+    fn unrecognized_auth_mode_fails_closed_to_other() {
+        check(
+            None,
+            Some(json!({ "auth_mode": "some_future_mode" })),
+            CodexAuthMode::Other,
+            false,
+        );
+        // ...and it is surfaced as an unmapped auth_mode for reporting.
+        let auth = json!({ "auth_mode": "some_future_mode" });
+        assert_eq!(unmapped_auth_mode(Some(&auth)).as_deref(), Some("some_future_mode"));
+    }
+
+    #[test]
+    fn env_present_but_empty_or_whitespace_falls_through() {
+        // Empty / whitespace-only env is NOT apikey — it falls through to auth.json.
+        check(Some(""), None, CodexAuthMode::Chatgpt, false);
+        check(Some("   "), None, CodexAuthMode::Chatgpt, false);
+        // Non-sk-shaped env (e.g. a leaked ChatGPT token) is also not apikey.
+        check(Some("not-an-sk-key"), None, CodexAuthMode::Chatgpt, false);
+        // And an empty env still lets auth.json drive the (still-refusing) classification.
+        check(
+            Some(""),
+            Some(json!({ "OPENAI_API_KEY": "sk-x" })),
+            CodexAuthMode::KeyNotExported,
+            false,
+        );
+    }
+
+    #[test]
+    fn no_auth_json_at_all_refuses_as_chatgpt() {
+        check(None, None, CodexAuthMode::Chatgpt, false);
+    }
+
+    #[test]
+    fn known_auth_mode_is_not_flagged_unmapped() {
+        for am in ["apikey", "chatgpt", "personal_access_token", "bedrock_api_key"] {
+            let auth = json!({ "auth_mode": am });
+            assert_eq!(unmapped_auth_mode(Some(&auth)), None, "{am} should be known");
+        }
+        // No auth.json and no auth_mode → nothing to flag.
+        assert_eq!(unmapped_auth_mode(None), None);
+        assert_eq!(unmapped_auth_mode(Some(&json!({}))), None);
+        // An unknown auth_mode that nevertheless carries a recognized field is classified by
+        // that field, not "unmapped".
+        let auth = json!({ "auth_mode": "weird", "tokens": { "id_token": "x" } });
+        assert_eq!(unmapped_auth_mode(Some(&auth)), None);
     }
 }
