@@ -316,7 +316,8 @@ but **off by default** and runs only after you download the model:
 - **Hot-load.** `model on` loads the model in the **background**; the status goes
   `loading → ready`. While loading, masking keeps running **regex-only** — your
   text is *not* filtered through the ML model yet, so you can keep working or wait.
-  The status line shows `⏳ml` (loading) → `🧠` (ready). `model off` is instant.
+  The status line shows `⏳ml` (loading) → `🧠ml` (ready); the `ml` text stays legible on
+  terminals whose font can't render the emoji. `model off` is instant.
 - **CPU.** Inference runs on CPU (`prefer_gpu = false`); the `cuda`/`metal` Candle
   features are out of scope here. Request masking is offloaded to a blocking pool
   and capped so concurrent requests don't oversubscribe the CPU.
