@@ -171,6 +171,48 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Route (or stop routing) Codex's OpenAI traffic through the masking proxy by editing the
+    /// custom-provider block in `$CODEX_HOME/config.toml` (the one writable config layer that
+    /// survives Codex's project-config denylist). A format-preserving, atomic, reversible
+    /// toml_edit merge — NEVER a `toml::Value` round-trip (that drops the user's comments and
+    /// formatting). The block is marked `zlauder_managed = true`; a same-id block WITHOUT that
+    /// marker is user-owned and is never overwritten/removed. Exit codes mirror `SettingsAction`:
+    /// 0 = changed, 3 = no-op (already in the target state), non-zero = error/refusal on stderr.
+    ///
+    /// NOTE: this writes ONLY the `[model_providers.<id>]` block + top-level `model_provider`.
+    /// It does NOT write a `[hooks]` block (a later atomic owns the hook wiring).
+    CodexConfig {
+        #[command(subcommand)]
+        action: CodexConfigAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum CodexConfigAction {
+    /// Insert/replace `[model_providers.<id>]` (default id `zlauder`) pointed at `--url` and set
+    /// `model_provider = "<id>"`, preserving the user's PRIOR provider so `disable` can restore
+    /// it. REFUSES (writes nothing, non-zero) if a same-id block exists WITHOUT our marker.
+    Enable {
+        /// Proxy base URL to set as `base_url`, e.g. `http://127.0.0.1:PORT/v1`.
+        #[arg(long)]
+        url: String,
+        /// Provider id (the `[model_providers.<id>]` table key). Defaults to `zlauder`.
+        #[arg(long = "provider-id")]
+        provider_id: Option<String>,
+    },
+    /// Remove OUR `[model_providers.<id>]` block (only if it carries `zlauder_managed = true`)
+    /// and restore the saved prior `model_provider` (or drop the top-level key if none saved).
+    Disable {
+        /// Provider id to remove. Defaults to `zlauder`.
+        #[arg(long = "provider-id")]
+        provider_id: Option<String>,
+    },
+    /// Print the effective top-level `model_provider` and `[model_providers.<id>].base_url`.
+    Show {
+        /// Provider id to inspect. Defaults to `zlauder`.
+        #[arg(long = "provider-id")]
+        provider_id: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -375,6 +417,7 @@ fn main() -> Result<()> {
         ),
         Cmd::Settings { action } => settings_cmd(action),
         Cmd::CodexAuthCheck { json } => codex_auth_check_cmd(json),
+        Cmd::CodexConfig { action } => codex_config_cmd(action),
     }
 }
 
@@ -619,6 +662,535 @@ fn codex_auth_check_cmd(json: bool) -> Result<()> {
         Ok(())
     } else {
         std::process::exit(1);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// codex-config — route Codex's OpenAI provider through the masking proxy by editing
+// $CODEX_HOME/config.toml. Format-preserving, atomic, reversible (toml_edit, never a
+// toml::Value round-trip). See `Cmd::CodexConfig`.
+// ---------------------------------------------------------------------------
+
+/// Default provider id (the `[model_providers.<id>]` table key) when `--provider-id` is absent.
+const CODEX_DEFAULT_PROVIDER_ID: &str = "zlauder";
+/// The ownership marker key. Only a block carrying `<MARKER> = true` is ours to replace/remove.
+const ZLAUDER_MANAGED_KEY: &str = "zlauder_managed";
+/// Where the prior top-level `model_provider` is stashed (inside our block) so disable restores it.
+const ZLAUDER_PRIOR_KEY: &str = "zlauder_prior_provider";
+
+/// Outcome of the pure `codex_enable_merge` / `codex_disable_merge` transforms, mapped to the
+/// shell exit-code contract: `Changed` => exit 0, `NoOp` => exit 3, `Refused` => non-zero error.
+enum CodexMergeOutcome {
+    /// A change was produced; carries the new full config text to write atomically.
+    Changed(String),
+    /// Already in the target state — write nothing, exit 3.
+    NoOp,
+    /// Refused (a user-owned same-id block blocks us). Carries the stderr message; write nothing.
+    Refused(String),
+}
+
+/// Resolve `$CODEX_HOME` (default `~/.codex`) → its `config.toml`. Mirrors `read_codex_auth_json`'s
+/// CODEX_HOME resolution so auth-check and config write agree on the same home.
+fn codex_config_path() -> Result<PathBuf> {
+    let codex_home = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|h| h.join(".codex")))
+        .context("cannot resolve $CODEX_HOME (no CODEX_HOME env and no home dir)")?;
+    Ok(codex_home.join("config.toml"))
+}
+
+/// Is `[model_providers.<id>]` present AND carrying our `zlauder_managed = true` marker?
+/// Returns `(present, ours)`: `present` = a table exists under that id at all; `ours` = it
+/// exists and the marker is `true`. An UNMARKED present block is user-owned (`present && !ours`).
+fn codex_block_ownership(doc: &toml_edit::DocumentMut, id: &str) -> (bool, bool) {
+    let Some(providers) = doc.get("model_providers").and_then(|i| i.as_table_like()) else {
+        return (false, false);
+    };
+    let Some(block) = providers.get(id).and_then(|i| i.as_table_like()) else {
+        return (false, false);
+    };
+    let ours = block
+        .get(ZLAUDER_MANAGED_KEY)
+        .and_then(|i| i.as_value())
+        .and_then(|v| v.as_bool())
+        == Some(true);
+    (true, ours)
+}
+
+/// PURE enable transform: given the current config text + id + url, return the merge outcome.
+/// Refuses if a same-id block exists without our marker; no-ops if already in the exact target
+/// state; otherwise inserts/replaces our block (preserving every other key + comment + format).
+fn codex_enable_merge(current: &str, id: &str, url: &str) -> CodexMergeOutcome {
+    let mut doc = match current.parse::<toml_edit::DocumentMut>() {
+        Ok(d) => d,
+        Err(e) => {
+            return CodexMergeOutcome::Refused(format!(
+                "$CODEX_HOME/config.toml is not valid TOML; refusing to overwrite: {e}"
+            ));
+        }
+    };
+
+    let (present, ours) = codex_block_ownership(&doc, id);
+    if present && !ours {
+        return CodexMergeOutcome::Refused(format!(
+            "a [model_providers.{id}] block already exists in $CODEX_HOME/config.toml and is NOT \
+             managed by zlauder. Refusing to overwrite it. Pick a different id with --provider-id, \
+             or remove your existing [model_providers.{id}] block first."
+        ));
+    }
+
+    // Capture the user's PRIOR top-level model_provider BEFORE we change it. Only meaningful when
+    // it exists and differs from <id> AND we have not already stashed one (idempotency: a re-enable
+    // must not clobber a previously-saved prior with our own id).
+    let prior_provider = doc
+        .get("model_provider")
+        .and_then(|i| i.as_value())
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let already_saved_prior = doc
+        .get("model_providers")
+        .and_then(|i| i.as_table_like())
+        .and_then(|p| p.get(id))
+        .and_then(|i| i.as_table_like())
+        .and_then(|b| b.get(ZLAUDER_PRIOR_KEY))
+        .and_then(|i| i.as_value())
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Idempotency: the EXACT target state already present → no-op. We compare the FULL set of
+    // load-bearing keys (not just provider+url): a marked block missing supports_websockets=false
+    // (e.g. written by an older plugin version, or a partial/tampered block) must be RE-WRITTEN,
+    // not no-op'd — otherwise the session would silently use the WebSocket transport that bypasses
+    // the HTTP masking proxy. (zlauder_prior_provider is preserved on a re-enable.)
+    if ours {
+        let cur_provider = doc
+            .get("model_provider")
+            .and_then(|i| i.as_value())
+            .and_then(|v| v.as_str());
+        let block = doc
+            .get("model_providers")
+            .and_then(|i| i.as_table_like())
+            .and_then(|p| p.get(id))
+            .and_then(|i| i.as_table_like());
+        let block_matches_target = block.is_some_and(|b| {
+            let s = |k: &str| b.get(k).and_then(|i| i.as_value()).and_then(|v| v.as_str());
+            let f = |k: &str| b.get(k).and_then(|i| i.as_value()).and_then(|v| v.as_bool());
+            s("base_url") == Some(url)
+                && s("wire_api") == Some("responses")
+                && s("env_key") == Some("OPENAI_API_KEY")
+                && f("requires_openai_auth") == Some(false)
+                && f("supports_websockets") == Some(false)
+        });
+        if cur_provider == Some(id) && block_matches_target {
+            return CodexMergeOutcome::NoOp;
+        }
+    }
+
+    // Decide which prior to record. Prefer a prior we ALREADY saved (re-enable preserves it);
+    // else the live top-level model_provider when it exists and differs from <id>.
+    let prior_to_record: Option<String> = already_saved_prior.or_else(|| {
+        prior_provider
+            .filter(|p| p != id)
+    });
+
+    // Build the managed block fresh (a replace drops any stale keys the user couldn't have set on
+    // our marked block). Order keys deterministically for the worked-trace test.
+    let mut block = toml_edit::Table::new();
+    block["name"] = toml_edit::value("ZlauDeR Masking Proxy");
+    block["base_url"] = toml_edit::value(url);
+    block["env_key"] = toml_edit::value("OPENAI_API_KEY");
+    block["wire_api"] = toml_edit::value("responses");
+    block["requires_openai_auth"] = toml_edit::value(false);
+    block["supports_websockets"] = toml_edit::value(false);
+    block[ZLAUDER_MANAGED_KEY] = toml_edit::value(true);
+    if let Some(prior) = prior_to_record {
+        block[ZLAUDER_PRIOR_KEY] = toml_edit::value(prior);
+    }
+
+    // Ensure the `[model_providers]` parent table exists, then set our sub-table.
+    if !doc.contains_key("model_providers") {
+        doc["model_providers"] = toml_edit::Item::Table(toml_edit::Table::new());
+    }
+    doc["model_providers"][id] = toml_edit::Item::Table(block);
+    doc["model_provider"] = toml_edit::value(id);
+
+    CodexMergeOutcome::Changed(doc.to_string())
+}
+
+/// PURE disable transform: remove OUR marked `[model_providers.<id>]` block and restore the saved
+/// prior model_provider (or drop the top-level key if none saved and it equals <id>). A no-op when
+/// there is no marked block (an unmarked user block is left untouched).
+fn codex_disable_merge(current: &str, id: &str) -> CodexMergeOutcome {
+    let mut doc = match current.parse::<toml_edit::DocumentMut>() {
+        Ok(d) => d,
+        Err(e) => {
+            return CodexMergeOutcome::Refused(format!(
+                "$CODEX_HOME/config.toml is not valid TOML; refusing to overwrite: {e}"
+            ));
+        }
+    };
+
+    let (_present, ours) = codex_block_ownership(&doc, id);
+    if !ours {
+        // No managed block to remove (absent, or a user-owned unmarked block we must not touch).
+        return CodexMergeOutcome::NoOp;
+    }
+
+    // Pull the saved prior provider out of our block before removing it.
+    let saved_prior = doc
+        .get("model_providers")
+        .and_then(|i| i.as_table_like())
+        .and_then(|p| p.get(id))
+        .and_then(|i| i.as_table_like())
+        .and_then(|b| b.get(ZLAUDER_PRIOR_KEY))
+        .and_then(|i| i.as_value())
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Remove our sub-table.
+    if let Some(providers) = doc
+        .get_mut("model_providers")
+        .and_then(|i| i.as_table_like_mut())
+    {
+        providers.remove(id);
+    }
+    // Drop an emptied `[model_providers]` parent so we don't leave a dangling empty table.
+    let providers_empty = doc
+        .get("model_providers")
+        .and_then(|i| i.as_table_like())
+        .map(|t| t.is_empty())
+        .unwrap_or(false);
+    if providers_empty {
+        doc.remove("model_providers");
+    }
+
+    // Restore the top-level model_provider.
+    match saved_prior {
+        Some(prior) => {
+            doc["model_provider"] = toml_edit::value(prior);
+        }
+        None => {
+            // No saved prior: drop our top-level key only if it still points at us.
+            let points_at_us = doc
+                .get("model_provider")
+                .and_then(|i| i.as_value())
+                .and_then(|v| v.as_str())
+                == Some(id);
+            if points_at_us {
+                doc.remove("model_provider");
+            }
+        }
+    }
+
+    CodexMergeOutcome::Changed(doc.to_string())
+}
+
+/// Atomically write `text` to `path` via a same-dir temp + rename (mirrors `atomic_write_json`'s
+/// durability contract for the TOML target). Creates the parent dir if absent.
+fn atomic_write_text(path: &Path, text: &str) -> Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let tmp = dir.join(format!(".config.toml.tmp-{}", std::process::id()));
+    if let Err(e) = std::fs::write(&tmp, text.as_bytes()) {
+        return Err(e).with_context(|| format!("writing {}", tmp.display()));
+    }
+    if let Err(e) = std::fs::rename(&tmp, path) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("replacing {}", path.display()));
+    }
+    Ok(())
+}
+
+/// `zlauder-hooks codex-config {enable,disable,show}`. Exit 0 = changed, 3 = no-op, non-zero =
+/// error/refusal. The merges are pure (`codex_enable_merge`/`codex_disable_merge`); this only does
+/// the I/O (read CODEX_HOME, apply, atomic write) + the exit-code mapping.
+fn codex_config_cmd(action: CodexConfigAction) -> Result<()> {
+    match action {
+        CodexConfigAction::Enable { url, provider_id } => {
+            let id = provider_id.as_deref().unwrap_or(CODEX_DEFAULT_PROVIDER_ID);
+            let path = codex_config_path()?;
+            // Distinguish "no file yet" (enable creates one) from an UNREADABLE existing file
+            // (permission error / invalid UTF-8). Swallowing the latter to an empty doc would let
+            // the atomic write replace — and silently destroy — the user's real config, violating
+            // the non-destructive-merge contract. Mirror the Disable path below.
+            let current = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+                Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+            };
+            match codex_enable_merge(&current, id, &url) {
+                CodexMergeOutcome::Changed(out) => {
+                    atomic_write_text(&path, &out)?;
+                    Ok(())
+                }
+                CodexMergeOutcome::NoOp => std::process::exit(3),
+                CodexMergeOutcome::Refused(msg) => bail!(msg),
+            }
+        }
+        CodexConfigAction::Disable { provider_id } => {
+            let id = provider_id.as_deref().unwrap_or(CODEX_DEFAULT_PROVIDER_ID);
+            let path = codex_config_path()?;
+            let current = match std::fs::read_to_string(&path) {
+                Ok(t) => t,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // No file → nothing to disable.
+                    std::process::exit(3);
+                }
+                Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+            };
+            match codex_disable_merge(&current, id) {
+                CodexMergeOutcome::Changed(out) => {
+                    atomic_write_text(&path, &out)?;
+                    Ok(())
+                }
+                CodexMergeOutcome::NoOp => std::process::exit(3),
+                CodexMergeOutcome::Refused(msg) => bail!(msg),
+            }
+        }
+        CodexConfigAction::Show { provider_id } => {
+            let id = provider_id.as_deref().unwrap_or(CODEX_DEFAULT_PROVIDER_ID);
+            let path = codex_config_path()?;
+            let current = std::fs::read_to_string(&path).unwrap_or_default();
+            let doc = current
+                .parse::<toml_edit::DocumentMut>()
+                .unwrap_or_else(|_| toml_edit::DocumentMut::new());
+            let provider = doc
+                .get("model_provider")
+                .and_then(|i| i.as_value())
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unset)");
+            let base_url = doc
+                .get("model_providers")
+                .and_then(|i| i.as_table_like())
+                .and_then(|p| p.get(id))
+                .and_then(|i| i.as_table_like())
+                .and_then(|b| b.get("base_url"))
+                .and_then(|i| i.as_value())
+                .and_then(|v| v.as_str())
+                .unwrap_or("(unset)");
+            println!("model_provider = {provider}");
+            println!("model_providers.{id}.base_url = {base_url}");
+            Ok(())
+        }
+    }
+}
+
+#[cfg(test)]
+mod codex_config_tests {
+    use super::{
+        CODEX_DEFAULT_PROVIDER_ID, CodexMergeOutcome, codex_disable_merge, codex_enable_merge,
+    };
+
+    const URL: &str = "http://127.0.0.1:18920/v1";
+    const ID: &str = CODEX_DEFAULT_PROVIDER_ID;
+
+    fn changed(out: CodexMergeOutcome) -> String {
+        match out {
+            CodexMergeOutcome::Changed(s) => s,
+            CodexMergeOutcome::NoOp => panic!("expected Changed, got NoOp"),
+            CodexMergeOutcome::Refused(m) => panic!("expected Changed, got Refused: {m}"),
+        }
+    }
+
+    /// Parse to a `toml_edit::DocumentMut` purely for semantic assertions (and to prove the
+    /// emitted text is valid TOML). We use toml_edit (already a dep) rather than pulling in `toml`.
+    fn doc(text: &str) -> toml_edit::DocumentMut {
+        text.parse::<toml_edit::DocumentMut>()
+            .unwrap_or_else(|e| panic!("output is not valid TOML: {e}\n---\n{text}"))
+    }
+
+    /// Top-level `model_provider` as a str (None if absent/non-string).
+    fn provider_of(d: &toml_edit::DocumentMut) -> Option<&str> {
+        d.get("model_provider")
+            .and_then(|i| i.as_value())
+            .and_then(|v| v.as_str())
+    }
+
+    /// A key inside `[model_providers.<id>]` as a str.
+    fn block_str<'a>(d: &'a toml_edit::DocumentMut, id: &str, key: &str) -> Option<&'a str> {
+        d.get("model_providers")
+            .and_then(|i| i.as_table_like())
+            .and_then(|p| p.get(id))
+            .and_then(|i| i.as_table_like())
+            .and_then(|b| b.get(key))
+            .and_then(|i| i.as_value())
+            .and_then(|v| v.as_str())
+    }
+
+    /// A key inside `[model_providers.<id>]` as a bool.
+    fn block_bool(d: &toml_edit::DocumentMut, id: &str, key: &str) -> Option<bool> {
+        d.get("model_providers")
+            .and_then(|i| i.as_table_like())
+            .and_then(|p| p.get(id))
+            .and_then(|i| i.as_table_like())
+            .and_then(|b| b.get(key))
+            .and_then(|i| i.as_value())
+            .and_then(|v| v.as_bool())
+    }
+
+    /// Is `[model_providers.<id>]` present at all?
+    fn has_block(d: &toml_edit::DocumentMut, id: &str) -> bool {
+        d.get("model_providers")
+            .and_then(|i| i.as_table_like())
+            .and_then(|p| p.get(id))
+            .is_some()
+    }
+
+    // GATE CASE 1 — worked trace: empty config + url → exact target block, enable would exit 0.
+    #[test]
+    fn enable_on_empty_writes_exact_target_block() {
+        let out = changed(codex_enable_merge("", ID, URL));
+        let d = doc(&out);
+        assert_eq!(provider_of(&d), Some("zlauder"));
+        assert_eq!(block_str(&d, ID, "base_url"), Some(URL));
+        assert_eq!(block_str(&d, ID, "name"), Some("ZlauDeR Masking Proxy"));
+        assert_eq!(block_str(&d, ID, "env_key"), Some("OPENAI_API_KEY"));
+        assert_eq!(block_str(&d, ID, "wire_api"), Some("responses"));
+        assert_eq!(block_bool(&d, ID, "requires_openai_auth"), Some(false));
+        assert_eq!(block_bool(&d, ID, "supports_websockets"), Some(false));
+        assert_eq!(block_bool(&d, ID, "zlauder_managed"), Some(true));
+        // No prior to record on an empty config.
+        assert_eq!(block_str(&d, ID, "zlauder_prior_provider"), None);
+    }
+
+    // GATE CASE 2 — idempotency: a second enable with the same url is a no-op (exit-3 semantics),
+    // and produces no duplicate table.
+    #[test]
+    fn second_enable_same_url_is_noop() {
+        let once = changed(codex_enable_merge("", ID, URL));
+        match codex_enable_merge(&once, ID, URL) {
+            CodexMergeOutcome::NoOp => {}
+            CodexMergeOutcome::Changed(s) => panic!("second enable should no-op, got change:\n{s}"),
+            CodexMergeOutcome::Refused(m) => panic!("second enable should no-op, got refusal: {m}"),
+        }
+        // exactly one occurrence of our table header.
+        assert_eq!(once.matches("[model_providers.zlauder]").count(), 1, "{once}");
+    }
+
+    // GATE CASE 3 — round-trip falsifier: prior model_provider, an unrelated acme block, and a
+    // top-level comment all survive enable→disable; no zlauder table remains; provider restored.
+    #[test]
+    fn round_trip_preserves_comment_acme_and_restores_provider() {
+        let original = "# top-level comment the user wrote\n\
+            model_provider = \"openai\"\n\
+            \n\
+            [model_providers.acme]\n\
+            name = \"Acme\"\n\
+            base_url = \"https://acme.example/v1\"\n";
+        let enabled = changed(codex_enable_merge(original, ID, URL));
+        // After enable: provider points at us, prior is recorded, acme + comment intact.
+        let ev = doc(&enabled);
+        assert_eq!(provider_of(&ev), Some("zlauder"));
+        assert_eq!(block_str(&ev, ID, "zlauder_prior_provider"), Some("openai"));
+        assert!(enabled.contains("# top-level comment the user wrote"), "comment lost on enable:\n{enabled}");
+        assert!(has_block(&ev, "acme"));
+
+        let disabled = changed(codex_disable_merge(&enabled, ID));
+        let dv = doc(&disabled);
+        // provider restored to openai; no zlauder block; acme + comment intact.
+        assert_eq!(provider_of(&dv), Some("openai"));
+        assert!(
+            !has_block(&dv, ID),
+            "zlauder block must be gone:\n{disabled}"
+        );
+        assert!(
+            has_block(&dv, "acme"),
+            "KILL: acme block was dropped — destructive merge:\n{disabled}"
+        );
+        assert!(
+            disabled.contains("# top-level comment the user wrote"),
+            "KILL: top-level comment was dropped — destructive merge:\n{disabled}"
+        );
+    }
+
+    // GATE CASE 4 — ownership-marker falsifier.
+    #[test]
+    fn enable_refuses_unmarked_user_block() {
+        let user_owned = "[model_providers.zlauder]\n\
+            name = \"My Own Thing\"\n\
+            base_url = \"https://mine.example/v1\"\n";
+        match codex_enable_merge(user_owned, ID, URL) {
+            CodexMergeOutcome::Refused(_) => {}
+            other => panic!(
+                "enable must REFUSE an unmarked same-id user block, got {}",
+                match other {
+                    CodexMergeOutcome::Changed(s) => format!("Changed:\n{s}"),
+                    CodexMergeOutcome::NoOp => "NoOp".to_string(),
+                    CodexMergeOutcome::Refused(_) => unreachable!(),
+                }
+            ),
+        }
+    }
+
+    #[test]
+    fn disable_removes_our_marked_block_and_restores_prior() {
+        let enabled = changed(codex_enable_merge(
+            "model_provider = \"openai\"\n",
+            ID,
+            URL,
+        ));
+        let disabled = changed(codex_disable_merge(&enabled, ID));
+        let dv = doc(&disabled);
+        assert_eq!(provider_of(&dv), Some("openai"));
+        assert!(!has_block(&dv, ID));
+    }
+
+    #[test]
+    fn disable_is_noop_on_unmarked_user_block() {
+        let user_owned = "model_provider = \"zlauder\"\n\
+            \n\
+            [model_providers.zlauder]\n\
+            name = \"My Own Thing\"\n\
+            base_url = \"https://mine.example/v1\"\n";
+        match codex_disable_merge(user_owned, ID) {
+            CodexMergeOutcome::NoOp => {}
+            CodexMergeOutcome::Changed(s) => {
+                panic!("disable must NOT touch an unmarked user block, got change:\n{s}")
+            }
+            CodexMergeOutcome::Refused(m) => panic!("unexpected refusal: {m}"),
+        }
+    }
+
+    // Prior-provider preservation across a re-enable: a re-enable that changes the url must NOT
+    // clobber the previously-saved prior with our own id.
+    #[test]
+    fn re_enable_preserves_saved_prior() {
+        let enabled = changed(codex_enable_merge("model_provider = \"openai\"\n", ID, URL));
+        let new_url = "http://127.0.0.1:29999/v1";
+        let re = changed(codex_enable_merge(&enabled, ID, new_url));
+        let rv = doc(&re);
+        assert_eq!(
+            block_str(&rv, ID, "zlauder_prior_provider"),
+            Some("openai"),
+            "re-enable must preserve the original prior provider, not overwrite it with our id:\n{re}"
+        );
+        assert_eq!(block_str(&rv, ID, "base_url"), Some(new_url));
+    }
+
+    #[test]
+    fn stale_marked_block_with_wrong_ws_is_rewritten_not_noop() {
+        // A zlauder-managed block whose URL matches but whose supports_websockets is WRONG (true,
+        // e.g. an older plugin version or a partial write) must be RE-WRITTEN, not idempotently
+        // no-op'd — a no-op would leave the WebSocket transport that bypasses the HTTP masking proxy.
+        let stale = format!(
+            "model_provider = \"{ID}\"\n\
+             [model_providers.{ID}]\n\
+             name = \"ZlauDeR Masking Proxy\"\n\
+             base_url = \"{URL}\"\n\
+             env_key = \"OPENAI_API_KEY\"\n\
+             wire_api = \"responses\"\n\
+             requires_openai_auth = false\n\
+             supports_websockets = true\n\
+             zlauder_managed = true\n"
+        );
+        // `changed` panics on NoOp, so this asserts the stale block was NOT idempotently skipped.
+        let out = changed(codex_enable_merge(&stale, ID, URL));
+        let d = doc(&out);
+        assert_eq!(
+            block_bool(&d, ID, "supports_websockets"),
+            Some(false),
+            "re-write must heal supports_websockets back to false:\n{out}"
+        );
     }
 }
 
