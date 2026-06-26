@@ -3341,12 +3341,24 @@ fn pii_suffix(n: u64) -> String {
 }
 
 /// Compact ML indicator appended to the status line when masking is on.
+///
+/// Every state pairs its status glyph with the literal text `ml`, for two reasons.
+/// (1) The `🧠` brain (U+1F9E0) is a 2017 codepoint that DEFAULTS to color-emoji
+/// presentation, so a terminal/font with no color-emoji fallback (Nerd Fonts ship none;
+/// bare xterm, the Linux VT, older consoles) draws it as tofu or nothing. `ready` used to
+/// be the ONLY ML state without a text companion, so on those hosts it degraded to an
+/// INVISIBLE blank while masking was genuinely active — the brain "isn't showing" bug. The
+/// trailing `ml` keeps the indicator legible there (matching the loading/failed arms).
+/// (2) The brain is VS16-qualified (`\u{fe0f}`) so a renderer that CAN draw it selects the
+/// color, width-2 emoji glyph rather than a mono text-presentation fallback — presenting a
+/// consistent 2-cell width to the DOWNSTREAM Claude Code statusline renderer (zlauder-hooks
+/// itself does no width clipping; `compose_line` only joins segments).
 fn ml_indicator(ml: Option<&MlSnap>) -> &'static str {
     match ml.map(|m| (m.status.as_str(), m.last_runtime_error.is_some())) {
-        Some(("ready", false)) => " \u{1f9e0}",   // 🧠 filtering
-        Some(("ready", true)) => " \u{26a0}\u{1f9e0}", // ⚠🧠 loaded but endpoint failing
-        Some(("loading", _)) => " \u{23f3}ml",    // ⏳ml loading — not filtered yet
-        Some(("failed", _)) => " \u{26a0}ml",     // ⚠ml load failed
+        Some(("ready", false)) => " \u{1f9e0}\u{fe0f}ml", // 🧠ml filtering
+        Some(("ready", true)) => " \u{26a0}\u{1f9e0}\u{fe0f}ml", // ⚠🧠ml loaded but endpoint failing
+        Some(("loading", _)) => " \u{23f3}ml", // ⏳ml loading — not filtered yet
+        Some(("failed", _)) => " \u{26a0}ml",  // ⚠ml load failed
         _ => "",
     }
 }
@@ -4998,6 +5010,40 @@ mod route_gate_tests {
         assert_eq!(render_on(&snap, 18820, SlMode::ShieldOnly), "\u{1f6e1}");
         // Compact carries port/profile chrome, so it is NOT the bare shield.
         assert_ne!(render_on(&snap, 18820, SlMode::Compact), "\u{1f6e1}");
+    }
+
+    /// A1 regression guard: every LIVE ML state carries the literal `ml` text so the indicator
+    /// stays legible on terminals/fonts that can't render the emoji glyph — the brain `🧠` used
+    /// to be the lone glyph-only state and went INVISIBLE there while masking was active. Also
+    /// pins the exact glyphs and the VS16 qualifier on the brain.
+    #[test]
+    fn ml_indicator_states_keep_ml_text_fallback() {
+        let snap = |status: &str, runtime_err: bool| -> MlSnap {
+            serde_json::from_value(serde_json::json!({
+                "status": status,
+                "last_runtime_error": runtime_err.then_some("boom"),
+            }))
+            .unwrap()
+        };
+
+        // Exact renderings: brain is VS16-qualified, and every live state ends in the `ml` anchor.
+        assert_eq!(ml_indicator(Some(&snap("ready", false))), " \u{1f9e0}\u{fe0f}ml");
+        assert_eq!(ml_indicator(Some(&snap("ready", true))), " \u{26a0}\u{1f9e0}\u{fe0f}ml");
+        assert_eq!(ml_indicator(Some(&snap("loading", false))), " \u{23f3}ml");
+        assert_eq!(ml_indicator(Some(&snap("failed", false))), " \u{26a0}ml");
+
+        // The load-bearing invariant: no live ML state is glyph-only. Strip every non-ASCII
+        // glyph and the readable `ml` token must survive, else a glyph-less terminal shows blank.
+        for (status, rerr) in [("ready", false), ("ready", true), ("loading", false), ("failed", false)] {
+            let s = ml_indicator(Some(&snap(status, rerr)));
+            let ascii: String = s.chars().filter(char::is_ascii).collect();
+            assert!(ascii.contains("ml"), "{status:?} rerr={rerr} lost its ml fallback: {s:?}");
+        }
+
+        // Inactive / absent / unrecognized status → no indicator at all.
+        assert_eq!(ml_indicator(None), "");
+        assert_eq!(ml_indicator(Some(&snap("disabled", false))), "");
+        assert_eq!(ml_indicator(Some(&snap("bananas", false))), "");
     }
 
     #[test]
