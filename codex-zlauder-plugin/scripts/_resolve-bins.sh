@@ -11,12 +11,18 @@ zlauder__is_windows_bash() {
   esac
 }
 
-# Normalize CODEX_PLUGIN_ROOT by re-deriving it from THIS file's own path ONLY when the
+# Normalize the plugin root by re-deriving it from THIS file's own path ONLY when the
 # inherited value is missing or in native-Windows form (a `DRIVE:` prefix or a backslash):
 # a `!bash` block doesn't export it (empty), and on Windows a hook exports it as a native
 # C:\... path whose drive-colon splits PATH when prepended below. `cd ... && pwd` always
 # emits MSYS form (/c/...), which prepends cleanly. A value already in MSYS/POSIX form is
 # correct and is left untouched (so we don't override a good host root with a resolved variant).
+#
+# Source: Codex's hook engine injects CLAUDE_PLUGIN_ROOT / PLUGIN_ROOT (NOT the CODEX_ name),
+# so accept the fallback chain CODEX_PLUGIN_ROOT -> CLAUDE_PLUGIN_ROOT -> PLUGIN_ROOT, and
+# fall back to the BASH_SOURCE re-derivation last when none are set. The normalized value is
+# written into CODEX_PLUGIN_ROOT, the canonical var the rest of this file reads.
+export CODEX_PLUGIN_ROOT="${CODEX_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}}"
 case "${CODEX_PLUGIN_ROOT:-}" in
   '' | *'\'* | [A-Za-z]:*)
     _zl_pr="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd || true)"
@@ -60,8 +66,8 @@ export ZLAUDER_HOOKS_BIN="zlauder-hooks${ZLAUDER_EXE_SUFFIX}"
 zlauder__workspace() {
   if [ -n "${ZLAUDER_WORKSPACE:-}" ]; then
     printf '%s\n' "$ZLAUDER_WORKSPACE"
-  elif [ -n "${CODEX_PLUGIN_ROOT:-}" ]; then
-    printf '%s\n' "${CODEX_PLUGIN_ROOT}/.."
+  elif [ -n "${CODEX_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}}" ]; then
+    printf '%s\n' "${CODEX_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}}/.."
   fi
 }
 
@@ -75,7 +81,7 @@ zlauder__has_both() {
 }
 
 zlauder__build_bins() {
-  local data_dir="${CODEX_PLUGIN_DATA:-}"
+  local data_dir="${CODEX_PLUGIN_DATA:-${CLAUDE_PLUGIN_DATA:-${PLUGIN_DATA:-}}}"
   local workspace; workspace="$(zlauder__workspace)"
   if [ -z "$workspace" ] || [ ! -f "$workspace/Cargo.toml" ]; then
     zlauder__warn "ZlauDeR: no prebuilt binary for this platform and no cargo workspace at \"${workspace:-<unset>}\"."
@@ -119,8 +125,8 @@ zlauder__build_bins() {
 zlauder_resolve_bins() {
   local allow_build=1
   if [ "${1:-}" = "--no-build" ]; then allow_build=0; fi
-  local plugin_root="${CODEX_PLUGIN_ROOT:-}"
-  local data_dir="${CODEX_PLUGIN_DATA:-}"
+  local plugin_root="${CODEX_PLUGIN_ROOT:-${CLAUDE_PLUGIN_ROOT:-${PLUGIN_ROOT:-}}}"
+  local data_dir="${CODEX_PLUGIN_DATA:-${CLAUDE_PLUGIN_DATA:-${PLUGIN_DATA:-}}}"
   local triple; triple="$(zlauder__host_triple)"
   local workspace; workspace="$(zlauder__workspace)"
   ZLAUDER_BIN_DIR=""
