@@ -179,8 +179,10 @@ enum Cmd {
     /// marker is user-owned and is never overwritten/removed. Exit codes mirror `SettingsAction`:
     /// 0 = changed, 3 = no-op (already in the target state), non-zero = error/refusal on stderr.
     ///
-    /// NOTE: this writes ONLY the `[model_providers.<id>]` block + top-level `model_provider`.
-    /// It does NOT write a `[hooks]` block (a later atomic owns the hook wiring).
+    /// NOTE: `enable` writes the `[model_providers.<id>]` block + top-level `model_provider`, and
+    /// — when `--hooks-dir` is given — ALSO the ownership-aware `[hooks]` SessionStart/UserPromptSubmit
+    /// entries pointing at the plugin scripts; `disable` removes only OUR provider block and hook
+    /// entries, preserving any user-owned blocks/hooks.
     CodexConfig {
         #[command(subcommand)]
         action: CodexConfigAction,
@@ -212,6 +214,19 @@ enum Cmd {
     /// the session (a likely `-c`/`-p` provider override) — detect+warn only, never a block, and
     /// gracefully absent when A8 is unreachable.
     CodexUserPromptSubmit,
+    /// Codex per-session override report (backs the verify skill's A8 line). Performs the
+    /// KEY-BEARING authenticated read of `GET /zlauder/session/{session_id}/routed` on this
+    /// project's verified proxy and prints a one-line human verdict on stdout:
+    ///   - `routed`        — inbound from this session reached the proxy recently;
+    ///   - `not-routed`    — no inbound from this session (possible `-c`/`-p` override / not-yet-routed);
+    ///   - `unavailable`   — A8 endpoint/proxy/key not reachable (older Codex build or proxy down).
+    /// A REPORT only: always exits 0, never blocks. The admin key is resolved internally (via the
+    /// same nonce-verified proxy identity probe the hook uses) so the skill needs no admin key — a
+    /// bare keyless curl would always 403 against this key-gated endpoint.
+    CodexSessionRouted {
+        /// The raw Codex session/thread UUID (the key A8 indexes inbound `last_seen` by).
+        session_id: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -226,6 +241,13 @@ enum CodexConfigAction {
         /// Provider id (the `[model_providers.<id>]` table key). Defaults to `zlauder`.
         #[arg(long = "provider-id")]
         provider_id: Option<String>,
+        /// Absolute path to the plugin's `scripts/` dir. When given, enable ALSO installs the
+        /// `[[hooks.SessionStart]]` / `[[hooks.UserPromptSubmit]]` entries pointing at
+        /// `<hooks-dir>/codex-session-start.sh` and `<hooks-dir>/codex-user-prompt-submit.sh`
+        /// (codex >0.140 fires hooks only from $CODEX_HOME). Ownership-aware: our entries are
+        /// added alongside any user hooks, never clobbering them. Omit to write routing only.
+        #[arg(long = "hooks-dir")]
+        hooks_dir: Option<String>,
     },
     /// Remove OUR `[model_providers.<id>]` block (only if it carries `zlauder_managed = true`)
     /// and restore the saved prior `model_provider` (or drop the top-level key if none saved).
@@ -447,6 +469,7 @@ fn main() -> Result<()> {
         Cmd::CodexConfig { action } => codex_config_cmd(action),
         Cmd::CodexSessionStart => codex_session_start_cmd(),
         Cmd::CodexUserPromptSubmit => codex_user_prompt_submit_cmd(),
+        Cmd::CodexSessionRouted { session_id } => codex_session_routed_cmd(&session_id),
     }
 }
 
@@ -914,6 +937,254 @@ fn codex_disable_merge(current: &str, id: &str) -> CodexMergeOutcome {
     CodexMergeOutcome::Changed(doc.to_string())
 }
 
+/// The two Codex hook events we wire (SessionStart + UserPromptSubmit) paired with the basename of
+/// the wrapper script that handles each. Ownership on disable is determined by matching a hook
+/// command against these basenames — so removing OUR entries never touches a user's own hooks.
+const CODEX_HOOK_SCRIPTS: &[(&str, &str)] = &[
+    ("SessionStart", "codex-session-start.sh"),
+    ("UserPromptSubmit", "codex-user-prompt-submit.sh"),
+];
+
+/// Does `command` reference one of OUR hook scripts (by basename)? A user hook with a different
+/// command basename is foreign and must be preserved. The match is on the trailing path component
+/// so it is robust to whatever absolute `hooks-dir` the plugin resolved.
+fn codex_hook_command_is_ours(command: &str, script: &str) -> bool {
+    command
+        .rsplit(['/', '\\'])
+        .next()
+        .map(|base| base == script)
+        .unwrap_or(false)
+        || command == script
+}
+
+/// PURE [hooks]-merge for ENABLE: given the current config text and the absolute `hooks_dir`,
+/// idempotently add a `[[hooks.SessionStart]]` / `[[hooks.UserPromptSubmit]]` MatcherGroup whose
+/// single command is `<hooks_dir>/<script>`, ONLY when no existing entry for that event already
+/// carries OUR command (by basename). User hook entries are preserved untouched. Returns the new
+/// full config text and whether anything changed. Text in → (text, changed) out, for unit testing
+/// without a real $CODEX_HOME.
+fn codex_hooks_enable_merge(current: &str, hooks_dir: &str) -> (String, bool) {
+    let mut doc = match current.parse::<toml_edit::DocumentMut>() {
+        Ok(d) => d,
+        // An unparseable doc is handled (refused) by the provider merge that runs first; if we ever
+        // reach here on bad TOML, make no change rather than panic.
+        Err(_) => return (current.to_string(), false),
+    };
+    let dir = hooks_dir.trim_end_matches(['/', '\\']);
+    let mut changed = false;
+
+    if !doc.contains_key("hooks") {
+        // Lazily created only if we actually add something below; defer until first insert.
+    }
+
+    for (event, script) in CODEX_HOOK_SCRIPTS {
+        let command = format!("{dir}/{script}");
+
+        // NORMALIZE a present-but-wrong-shape event value into an array-of-tables BEFORE we reconcile
+        // or append. TOML lets the user write this event two equivalent ways:
+        //   [[hooks.SessionStart]]            (toml_edit: ArrayOfTables — what we emit)
+        //   SessionStart = [ { ... } ]        (toml_edit: an inline Array of inline tables)
+        // Both are valid Codex config, but `as_array_of_tables_mut()` returns None for the second.
+        // Without this step the reconcile loop below never sees the user's inline entries (found_ours
+        // stays false) AND the append guard short-circuits (`contains_key(event)` is true, yet
+        // `as_array_of_tables_mut()` is None) — so OUR hook is silently dropped while `changed` may
+        // already be true from the other event/provider, making enable.sh report a success/restart
+        // for a hook that was never installed. Rewriting the inline array as an array-of-tables
+        // preserves every user entry and lets both the reconcile and append paths operate on it.
+        if let Some(hooks_tbl) = doc.get_mut("hooks").and_then(|h| h.as_table_mut()) {
+            let needs_normalize = hooks_tbl
+                .get(event)
+                .map(|i| i.as_array().is_some() && i.as_array_of_tables().is_none())
+                .unwrap_or(false);
+            if needs_normalize {
+                let mut normalized = toml_edit::ArrayOfTables::new();
+                if let Some(arr) = hooks_tbl.get(event).and_then(|i| i.as_array()) {
+                    for v in arr.iter() {
+                        // Re-home each inline table as a standalone table; skip any non-table member
+                        // (a malformed entry Codex would itself reject) rather than fail the merge.
+                        if let Some(it) = v.as_inline_table() {
+                            normalized.push(it.clone().into_table());
+                        }
+                    }
+                }
+                hooks_tbl.insert(event, toml_edit::Item::ArrayOfTables(normalized));
+            }
+        }
+
+        // Reconcile any EXISTING entry that carries OUR script (by basename). Two cases:
+        //   - its command already equals our DESIRED absolute path  → already correct, skip;
+        //   - it carries our basename but a DIFFERENT (stale) path   → UPDATE it in place to the new
+        //     path and mark changed. This is the re-install case (a versioned/content-addressed
+        //     CLAUDE_PLUGIN_ROOT changes the absolute dir): a basename-only "already ours → continue"
+        //     would silently leave the stale, now-nonexistent path wired, so the hooks stop firing.
+        let mut found_ours = false;
+        let mut updated = false;
+        if let Some(arr) = doc
+            .get_mut("hooks")
+            .and_then(|h| h.as_table_mut())
+            .and_then(|h| h.get_mut(event))
+            .and_then(|i| i.as_array_of_tables_mut())
+        {
+            for grp in arr.iter_mut() {
+                let Some(inner) = grp.get_mut("hooks").and_then(|i| i.as_array_mut()) else {
+                    continue;
+                };
+                for h in inner.iter_mut() {
+                    let Some(t) = h.as_inline_table_mut() else {
+                        continue;
+                    };
+                    let is_ours = t
+                        .get("command")
+                        .and_then(|v| v.as_str())
+                        .map(|c| codex_hook_command_is_ours(c, script))
+                        .unwrap_or(false);
+                    if !is_ours {
+                        continue;
+                    }
+                    found_ours = true;
+                    let current_cmd = t.get("command").and_then(|v| v.as_str());
+                    if current_cmd != Some(command.as_str()) {
+                        t.insert("command", command.clone().into());
+                        updated = true;
+                    }
+                }
+            }
+        }
+        if found_ours {
+            // Our entry already exists; we either left it (correct path) or rewrote its command.
+            changed |= updated;
+            continue;
+        }
+
+        // Build our MatcherGroup: { matcher = "*", hooks = [{ type = "command", command = ... }] }.
+        let mut hook = toml_edit::InlineTable::new();
+        hook.insert("type", "command".into());
+        hook.insert("command", command.into());
+        let mut inner = toml_edit::Array::new();
+        inner.push(toml_edit::Value::InlineTable(hook));
+        let mut group = toml_edit::Table::new();
+        group["matcher"] = toml_edit::value("*");
+        group["hooks"] = toml_edit::value(inner);
+
+        // Ensure [hooks] exists, then append to (or create) the event's array-of-tables.
+        if !doc.contains_key("hooks") {
+            doc["hooks"] = toml_edit::Item::Table(toml_edit::Table::new());
+        }
+        let hooks_tbl = doc["hooks"].as_table_mut().expect("hooks is a table");
+        if !hooks_tbl.contains_key(event) {
+            hooks_tbl.insert(event, toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
+        }
+        if let Some(arr) = hooks_tbl.get_mut(event).and_then(|i| i.as_array_of_tables_mut()) {
+            arr.push(group);
+            changed = true;
+        }
+    }
+
+    if changed {
+        (doc.to_string(), true)
+    } else {
+        (current.to_string(), false)
+    }
+}
+
+/// PURE [hooks]-merge for DISABLE: remove ONLY the MatcherGroups whose command references one of
+/// OUR scripts (matched by basename), preserving every user hook entry. If removing our group
+/// empties an event's array, drop the now-empty array; if that empties `[hooks]`, drop it too.
+/// Returns the new full config text and whether anything changed.
+fn codex_hooks_disable_merge(current: &str) -> (String, bool) {
+    let mut doc = match current.parse::<toml_edit::DocumentMut>() {
+        Ok(d) => d,
+        Err(_) => return (current.to_string(), false),
+    };
+    let mut changed = false;
+
+    for (event, script) in CODEX_HOOK_SCRIPTS {
+        let Some(hooks_tbl) = doc.get_mut("hooks").and_then(|i| i.as_table_mut()) else {
+            continue;
+        };
+        // Mirror enable's normalization so disable also reaches OUR entry when the event is written
+        // as an inline `SessionStart = [ {...} ]` array instead of `[[hooks.SessionStart]]`. Only
+        // normalize when OUR script is actually present in that inline array — otherwise we'd rewrite
+        // a purely-user inline array and spuriously report `changed` for a no-op disable.
+        let inline_has_ours = hooks_tbl
+            .get(event)
+            .filter(|i| i.as_array_of_tables().is_none())
+            .and_then(|i| i.as_array())
+            .map(|arr| {
+                arr.iter().any(|v| {
+                    v.as_inline_table()
+                        .and_then(|t| t.get("hooks"))
+                        .and_then(|h| h.as_array())
+                        .map(|inner| {
+                            inner.iter().any(|h| {
+                                h.as_inline_table()
+                                    .and_then(|t| t.get("command"))
+                                    .and_then(|v| v.as_str())
+                                    .map(|c| codex_hook_command_is_ours(c, script))
+                                    .unwrap_or(false)
+                            })
+                        })
+                        .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false);
+        if inline_has_ours {
+            let mut normalized = toml_edit::ArrayOfTables::new();
+            if let Some(arr) = hooks_tbl.get(event).and_then(|i| i.as_array()) {
+                for v in arr.iter() {
+                    if let Some(it) = v.as_inline_table() {
+                        normalized.push(it.clone().into_table());
+                    }
+                }
+            }
+            hooks_tbl.insert(event, toml_edit::Item::ArrayOfTables(normalized));
+        }
+        let Some(arr) = hooks_tbl.get_mut(event).and_then(|i| i.as_array_of_tables_mut()) else {
+            continue;
+        };
+        // Drop any group whose inner hooks reference OUR script basename.
+        arr.retain(|grp| {
+            let is_ours = grp
+                .get("hooks")
+                .and_then(|i| i.as_array())
+                .map(|inner| {
+                    inner.iter().any(|h| {
+                        h.as_inline_table()
+                            .and_then(|t| t.get("command"))
+                            .and_then(|v| v.as_str())
+                            .map(|c| codex_hook_command_is_ours(c, script))
+                            .unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false);
+            if is_ours {
+                changed = true;
+            }
+            !is_ours
+        });
+        // Drop the now-empty event array.
+        if arr.is_empty() {
+            hooks_tbl.remove(event);
+        }
+    }
+
+    // Drop an emptied [hooks] parent.
+    let hooks_empty = doc
+        .get("hooks")
+        .and_then(|i| i.as_table_like())
+        .map(|t| t.is_empty())
+        .unwrap_or(false);
+    if hooks_empty {
+        doc.remove("hooks");
+    }
+
+    if changed {
+        (doc.to_string(), true)
+    } else {
+        (current.to_string(), false)
+    }
+}
+
 /// Atomically write `text` to `path` via a same-dir temp + rename (mirrors `atomic_write_json`'s
 /// durability contract for the TOML target). Creates the parent dir if absent.
 fn atomic_write_text(path: &Path, text: &str) -> Result<()> {
@@ -935,7 +1206,11 @@ fn atomic_write_text(path: &Path, text: &str) -> Result<()> {
 /// the I/O (read CODEX_HOME, apply, atomic write) + the exit-code mapping.
 fn codex_config_cmd(action: CodexConfigAction) -> Result<()> {
     match action {
-        CodexConfigAction::Enable { url, provider_id } => {
+        CodexConfigAction::Enable {
+            url,
+            provider_id,
+            hooks_dir,
+        } => {
             let id = provider_id.as_deref().unwrap_or(CODEX_DEFAULT_PROVIDER_ID);
             let path = codex_config_path()?;
             // Distinguish "no file yet" (enable creates one) from an UNREADABLE existing file
@@ -947,13 +1222,23 @@ fn codex_config_cmd(action: CodexConfigAction) -> Result<()> {
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
                 Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
             };
-            match codex_enable_merge(&current, id, &url) {
-                CodexMergeOutcome::Changed(out) => {
-                    atomic_write_text(&path, &out)?;
-                    Ok(())
-                }
-                CodexMergeOutcome::NoOp => std::process::exit(3),
+            // Provider merge first (it owns the unparseable-TOML refusal). Then layer the hooks
+            // merge onto the resulting text. A run that changes EITHER the provider block or the
+            // [hooks] entries is Changed (exit 0); only an all-no-op run is exit 3.
+            let (after_provider, provider_changed) = match codex_enable_merge(&current, id, &url) {
+                CodexMergeOutcome::Changed(out) => (out, true),
+                CodexMergeOutcome::NoOp => (current.clone(), false),
                 CodexMergeOutcome::Refused(msg) => bail!(msg),
+            };
+            let (final_text, hooks_changed) = match hooks_dir {
+                Some(ref dir) => codex_hooks_enable_merge(&after_provider, dir),
+                None => (after_provider, false),
+            };
+            if provider_changed || hooks_changed {
+                atomic_write_text(&path, &final_text)?;
+                Ok(())
+            } else {
+                std::process::exit(3)
             }
         }
         CodexConfigAction::Disable { provider_id } => {
@@ -967,13 +1252,19 @@ fn codex_config_cmd(action: CodexConfigAction) -> Result<()> {
                 }
                 Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
             };
-            match codex_disable_merge(&current, id) {
-                CodexMergeOutcome::Changed(out) => {
-                    atomic_write_text(&path, &out)?;
-                    Ok(())
-                }
-                CodexMergeOutcome::NoOp => std::process::exit(3),
+            // Remove the provider block (owns the unparseable refusal), then strip OUR hook
+            // entries. Changed if EITHER changed; an all-no-op run is exit 3.
+            let (after_provider, provider_changed) = match codex_disable_merge(&current, id) {
+                CodexMergeOutcome::Changed(out) => (out, true),
+                CodexMergeOutcome::NoOp => (current.clone(), false),
                 CodexMergeOutcome::Refused(msg) => bail!(msg),
+            };
+            let (final_text, hooks_changed) = codex_hooks_disable_merge(&after_provider);
+            if provider_changed || hooks_changed {
+                atomic_write_text(&path, &final_text)?;
+                Ok(())
+            } else {
+                std::process::exit(3)
             }
         }
         CodexConfigAction::Show { provider_id } => {
@@ -1551,6 +1842,33 @@ fn a8_routed_recently(port: u16, root: &str, raw_session_id: &str) -> Option<boo
         .filter(|r| r.status().is_success())?;
     let v: Value = resp.json().ok()?;
     v.get("routed_recently").and_then(Value::as_bool)
+}
+
+/// `zlauder-hooks codex-session-routed <session_id>` — the KEY-BEARING per-session override report
+/// for the verify skill. Resolves this project's proxy port from the live `$CODEX_HOME` route (the
+/// same source the intake hook uses), then performs the authenticated A8 read via [`a8_routed_recently`]
+/// (which supplies the admin key from the nonce-verified proxy identity). Prints a single human line
+/// and ALWAYS exits 0 — it is a report, never a gate. A bare keyless curl from the skill would always
+/// 403 against this key-gated endpoint; this subcommand is the only way the skill can read it.
+fn codex_session_routed_cmd(session_id: &str) -> Result<()> {
+    let root = canonical(&project_root());
+    // Resolve our loopback port from the codex config route (matches the hook's port source).
+    let port = codex_config_path()
+        .ok()
+        .map(|p| std::fs::read_to_string(p).unwrap_or_default())
+        .and_then(|text| codex_route_from_config(&text, CODEX_DEFAULT_PROVIDER_ID))
+        .map(|(_url, port)| port);
+
+    let verdict = match port {
+        Some(p) => a8_routed_recently(p, &root, session_id),
+        None => None,
+    };
+    match verdict {
+        Some(true) => println!("routed"),
+        Some(false) => println!("not-routed"),
+        None => println!("unavailable"),
+    }
+    Ok(())
 }
 
 /// `zlauder-hooks codex-user-prompt-submit`. Reads the UserPromptSubmit payload on stdin, computes
@@ -2135,10 +2453,12 @@ mod codex_session_start_tests {
 mod codex_config_tests {
     use super::{
         CODEX_DEFAULT_PROVIDER_ID, CodexMergeOutcome, codex_disable_merge, codex_enable_merge,
+        codex_hooks_disable_merge, codex_hooks_enable_merge,
     };
 
     const URL: &str = "http://127.0.0.1:18920/v1";
     const ID: &str = CODEX_DEFAULT_PROVIDER_ID;
+    const HOOKS_DIR: &str = "/opt/zlauder/codex-zlauder-plugin/scripts";
 
     fn changed(out: CodexMergeOutcome) -> String {
         match out {
@@ -2347,6 +2667,290 @@ mod codex_config_tests {
             Some(false),
             "re-write must heal supports_websockets back to false:\n{out}"
         );
+    }
+
+    // ---- [hooks]-merge: ownership-aware SessionStart + UserPromptSubmit wiring ----
+
+    /// Count MatcherGroups under `[hooks.<event>]` whose inner command basename equals `script`.
+    fn count_our_hook(d: &toml_edit::DocumentMut, event: &str, script: &str) -> usize {
+        d.get("hooks")
+            .and_then(|h| h.as_table_like())
+            .and_then(|h| h.get(event))
+            .and_then(|a| a.as_array_of_tables())
+            .map(|groups| {
+                groups
+                    .iter()
+                    .filter(|grp| {
+                        grp.get("hooks")
+                            .and_then(|i| i.as_array())
+                            .map(|inner| {
+                                inner.iter().any(|h| {
+                                    h.as_inline_table()
+                                        .and_then(|t| t.get("command"))
+                                        .and_then(|v| v.as_str())
+                                        .map(|c| c.rsplit('/').next() == Some(script))
+                                        .unwrap_or(false)
+                                })
+                            })
+                            .unwrap_or(false)
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// Total MatcherGroups under `[hooks.<event>]` (ours + user's).
+    fn count_event_groups(d: &toml_edit::DocumentMut, event: &str) -> usize {
+        d.get("hooks")
+            .and_then(|h| h.as_table_like())
+            .and_then(|h| h.get(event))
+            .and_then(|a| a.as_array_of_tables())
+            .map(|g| g.len())
+            .unwrap_or(0)
+    }
+
+    // GATE — enable on an empty config writes both event entries pointing at the hooks-dir scripts.
+    #[test]
+    fn hooks_enable_on_empty_writes_both_events() {
+        let (out, ch) = codex_hooks_enable_merge("", HOOKS_DIR);
+        assert!(ch, "enable on empty must change");
+        let d = doc(&out);
+        assert_eq!(count_our_hook(&d, "SessionStart", "codex-session-start.sh"), 1);
+        assert_eq!(
+            count_our_hook(&d, "UserPromptSubmit", "codex-user-prompt-submit.sh"),
+            1
+        );
+        // commands carry the absolute hooks-dir.
+        assert!(
+            out.contains(&format!("{HOOKS_DIR}/codex-session-start.sh")),
+            "absolute session-start path missing:\n{out}"
+        );
+        assert!(
+            out.contains(&format!("{HOOKS_DIR}/codex-user-prompt-submit.sh")),
+            "absolute user-prompt-submit path missing:\n{out}"
+        );
+    }
+
+    // GATE — a second enable is idempotent (no duplicate MatcherGroups).
+    #[test]
+    fn hooks_enable_is_idempotent() {
+        let (once, _) = codex_hooks_enable_merge("", HOOKS_DIR);
+        let (twice, ch2) = codex_hooks_enable_merge(&once, HOOKS_DIR);
+        assert!(!ch2, "second enable must be a no-op (no change)");
+        let d = doc(&twice);
+        assert_eq!(
+            count_our_hook(&d, "SessionStart", "codex-session-start.sh"),
+            1,
+            "no duplicate SessionStart group:\n{twice}"
+        );
+        assert_eq!(
+            count_our_hook(&d, "UserPromptSubmit", "codex-user-prompt-submit.sh"),
+            1,
+            "no duplicate UserPromptSubmit group:\n{twice}"
+        );
+    }
+
+    // GATE — enable PRESERVES a pre-existing user [[hooks.SessionStart]] entry (adds ours alongside).
+    #[test]
+    fn hooks_enable_preserves_user_session_start() {
+        let user = "[[hooks.SessionStart]]\n\
+            matcher = \"*\"\n\
+            [[hooks.SessionStart.hooks]]\n\
+            type = \"command\"\n\
+            command = \"/home/me/my-own-hook.sh\"\n";
+        let (out, ch) = codex_hooks_enable_merge(user, HOOKS_DIR);
+        assert!(ch);
+        let d = doc(&out);
+        // The user's SessionStart group survives, and ours is added alongside → 2 groups total.
+        assert_eq!(
+            count_event_groups(&d, "SessionStart"),
+            2,
+            "user entry must be preserved alongside ours:\n{out}"
+        );
+        assert_eq!(count_our_hook(&d, "SessionStart", "codex-session-start.sh"), 1);
+        assert!(
+            out.contains("/home/me/my-own-hook.sh"),
+            "user hook command lost:\n{out}"
+        );
+        // UserPromptSubmit (which the user had none of) gets ours.
+        assert_eq!(
+            count_our_hook(&d, "UserPromptSubmit", "codex-user-prompt-submit.sh"),
+            1
+        );
+    }
+
+    // GATE (FIX) — enable must NOT silently no-op when the event is written as an INLINE array
+    // (`SessionStart = [ {...} ]`) rather than `[[hooks.SessionStart]]`. The old code keyed solely on
+    // `as_array_of_tables_mut()` (None for an inline array) → reconcile skipped + append guard
+    // short-circuited → our hook dropped while `changed` could be true from the other event. After the
+    // fix the inline array is normalized to an array-of-tables, the user entry is preserved, and ours
+    // is appended.
+    #[test]
+    fn hooks_enable_normalizes_inline_array_event() {
+        // User wrote SessionStart as an inline array of inline tables (valid TOML, different shape).
+        let user = "[hooks]\n\
+            SessionStart = [ { matcher = \"*\", hooks = [ { type = \"command\", command = \"/home/me/my-own-hook.sh\" } ] } ]\n";
+        // Sanity: this really IS the inline-array shape that returns None from as_array_of_tables.
+        {
+            let d = doc(user);
+            assert!(
+                d.get("hooks")
+                    .and_then(|h| h.as_table_like())
+                    .and_then(|h| h.get("SessionStart"))
+                    .map(|i| i.as_array().is_some() && i.as_array_of_tables().is_none())
+                    .unwrap_or(false),
+                "fixture must be an inline array (not array-of-tables)"
+            );
+        }
+        let (out, ch) = codex_hooks_enable_merge(user, HOOKS_DIR);
+        assert!(ch, "enable against an inline-array event MUST change (install ours)");
+        let d = doc(&out);
+        // Our hook is actually installed (the bug dropped it).
+        assert_eq!(
+            count_our_hook(&d, "SessionStart", "codex-session-start.sh"),
+            1,
+            "KILL: our SessionStart hook was dropped on an inline-array config:\n{out}"
+        );
+        // The user's pre-existing entry is preserved (re-homed, not destroyed).
+        assert!(
+            out.contains("/home/me/my-own-hook.sh"),
+            "user inline hook lost on normalization:\n{out}"
+        );
+        assert_eq!(
+            count_event_groups(&d, "SessionStart"),
+            2,
+            "user entry + ours = 2 groups after normalization:\n{out}"
+        );
+        // And it round-trips: a second enable is now a clean no-op.
+        let (_again, ch2) = codex_hooks_enable_merge(&out, HOOKS_DIR);
+        assert!(!ch2, "re-enable after normalization must be a no-op:\n{_again}");
+    }
+
+    // GATE (FIX) — disable must also reach OUR entry when it lives in an inline-array event, removing
+    // ours while preserving the user's inline entry.
+    #[test]
+    fn hooks_disable_handles_inline_array_event() {
+        // Inline array carrying BOTH a user hook and ours.
+        let user = format!(
+            "[hooks]\n\
+             SessionStart = [ \
+             {{ matcher = \"*\", hooks = [ {{ type = \"command\", command = \"/home/me/my-own-hook.sh\" }} ] }}, \
+             {{ matcher = \"*\", hooks = [ {{ type = \"command\", command = \"{HOOKS_DIR}/codex-session-start.sh\" }} ] }} ]\n"
+        );
+        let (disabled, ch) = codex_hooks_disable_merge(&user);
+        assert!(ch, "disable must change (it removed our inline entry)");
+        let d = doc(&disabled);
+        assert_eq!(
+            count_our_hook(&d, "SessionStart", "codex-session-start.sh"),
+            0,
+            "our SessionStart entry must be removed from the inline array:\n{disabled}"
+        );
+        assert!(
+            disabled.contains("/home/me/my-own-hook.sh"),
+            "KILL: user inline hook removed on disable:\n{disabled}"
+        );
+        // A purely-user inline array (no entry of ours) must be a clean no-op (not a spurious rewrite).
+        let user_only = "[hooks]\n\
+            SessionStart = [ { matcher = \"*\", hooks = [ { type = \"command\", command = \"/home/me/my-own-hook.sh\" } ] } ]\n";
+        let (out2, ch2) = codex_hooks_disable_merge(user_only);
+        assert!(!ch2, "disable on a user-only inline array must be a no-op:\n{out2}");
+    }
+
+    // GATE (FIX #2) — re-enable from a DIFFERENT hooks-dir UPDATES our stale command in place
+    // (versioned/content-addressed CLAUDE_PLUGIN_ROOT case). A basename-only "already ours →
+    // continue" would leave the old, now-nonexistent path wired and the hooks would stop firing.
+    #[test]
+    fn hooks_enable_from_new_dir_updates_stale_command() {
+        const OLD_DIR: &str = "/opt/zlauder/v1/codex-zlauder-plugin/scripts";
+        const NEW_DIR: &str = "/opt/zlauder/v2/codex-zlauder-plugin/scripts";
+        let (v1, _) = codex_hooks_enable_merge("", OLD_DIR);
+        assert!(v1.contains(&format!("{OLD_DIR}/codex-session-start.sh")));
+
+        let (v2, ch) = codex_hooks_enable_merge(&v1, NEW_DIR);
+        assert!(ch, "re-enable from a new dir must change (stale path rewritten)");
+        let d = doc(&v2);
+        // Still exactly ONE of each (updated in place, NOT duplicated).
+        assert_eq!(
+            count_our_hook(&d, "SessionStart", "codex-session-start.sh"),
+            1,
+            "must not duplicate on re-enable from a new dir:\n{v2}"
+        );
+        assert_eq!(
+            count_our_hook(&d, "UserPromptSubmit", "codex-user-prompt-submit.sh"),
+            1,
+            "must not duplicate on re-enable from a new dir:\n{v2}"
+        );
+        // The NEW path is wired and the OLD (now-nonexistent) path is GONE.
+        assert!(
+            v2.contains(&format!("{NEW_DIR}/codex-session-start.sh")),
+            "new SessionStart path must be wired:\n{v2}"
+        );
+        assert!(
+            v2.contains(&format!("{NEW_DIR}/codex-user-prompt-submit.sh")),
+            "new UserPromptSubmit path must be wired:\n{v2}"
+        );
+        assert!(
+            !v2.contains(OLD_DIR),
+            "KILL: stale hooks-dir path must be purged on re-enable:\n{v2}"
+        );
+
+        // And a SECOND re-enable from the SAME new dir is now a clean no-op (no spurious change).
+        let (v3, ch3) = codex_hooks_enable_merge(&v2, NEW_DIR);
+        assert!(!ch3, "re-enable from the same dir must be a no-op:\n{v3}");
+    }
+
+    // GATE — disable removes ONLY our entries (by basename) and leaves the user entry intact.
+    #[test]
+    fn hooks_disable_removes_only_ours_preserving_user() {
+        // Start from a user SessionStart hook + our two entries layered on.
+        let user = "[[hooks.SessionStart]]\n\
+            matcher = \"*\"\n\
+            [[hooks.SessionStart.hooks]]\n\
+            type = \"command\"\n\
+            command = \"/home/me/my-own-hook.sh\"\n";
+        let (enabled, _) = codex_hooks_enable_merge(user, HOOKS_DIR);
+        let (disabled, ch) = codex_hooks_disable_merge(&enabled);
+        assert!(ch, "disable must change (it removed our entries)");
+        let d = doc(&disabled);
+        // Ours gone; user's SessionStart survives.
+        assert_eq!(
+            count_our_hook(&d, "SessionStart", "codex-session-start.sh"),
+            0,
+            "our SessionStart entry must be removed:\n{disabled}"
+        );
+        assert_eq!(
+            count_event_groups(&d, "SessionStart"),
+            1,
+            "exactly the user's SessionStart group should remain:\n{disabled}"
+        );
+        assert!(
+            disabled.contains("/home/me/my-own-hook.sh"),
+            "KILL: user hook removed on disable:\n{disabled}"
+        );
+        // Our UserPromptSubmit entry (the user had none) is gone AND its empty array is dropped.
+        assert_eq!(count_event_groups(&d, "UserPromptSubmit"), 0);
+        assert!(
+            !disabled.contains("UserPromptSubmit"),
+            "empty UserPromptSubmit array should be dropped:\n{disabled}"
+        );
+    }
+
+    // GATE — disable on a config with only-our entries drops them and the now-empty arrays + [hooks].
+    #[test]
+    fn hooks_disable_only_ours_drops_empty_hooks_table() {
+        let (enabled, _) = codex_hooks_enable_merge("", HOOKS_DIR);
+        let (disabled, ch) = codex_hooks_disable_merge(&enabled);
+        assert!(ch);
+        let d = doc(&disabled);
+        assert_eq!(count_event_groups(&d, "SessionStart"), 0);
+        assert_eq!(count_event_groups(&d, "UserPromptSubmit"), 0);
+        assert!(
+            d.get("hooks").is_none(),
+            "empty [hooks] table must be dropped:\n{disabled}"
+        );
+        // A second disable is a no-op.
+        let (_again, ch2) = codex_hooks_disable_merge(&disabled);
+        assert!(!ch2, "disable on a config with no hooks must be a no-op");
     }
 }
 

@@ -1,4 +1,5 @@
 {
+  "_note": "On codex >0.140 these plugin-manifest hooks are INERT — the plugin_hooks feature that loaded them was removed. The WORKING wiring is the $CODEX_HOME/config.toml [hooks] block that `zlauder-hooks codex-config enable` (driven by the enable skill) writes pointing at these same scripts. This file is retained for forward-compat / documentation. ${CLAUDE_PLUGIN_ROOT} is the env var codex injects for the plugin root; a bare ./ relative path is unsafe (resolves against the hook engine's CWD, not the plugin).",
   "hooks": {
     "SessionStart": [
       {
@@ -6,7 +7,18 @@
         "hooks": [
           {
             "type": "command",
-            "command": "./scripts/session-start.sh"
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/codex-session-start.sh"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/scripts/codex-user-prompt-submit.sh"
           }
         ]
       }

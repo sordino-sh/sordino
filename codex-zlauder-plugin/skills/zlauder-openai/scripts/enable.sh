@@ -35,9 +35,16 @@ if [ -z "${BASE_URL:-}" ]; then
 fi
 URL="${BASE_URL%/}/v1"
 
-# (3) Write/replace the custom-provider block. Exit 0 = changed, 3 = already enabled.
+# Resolve the plugin's scripts/ dir (the hook wrappers live there) so codex-config
+# installs the $CODEX_HOME [hooks] entries alongside the routing block. Prefer the
+# canonical CODEX_PLUGIN_ROOT the resolver normalizes; fall back to this script's path.
+PLUGIN_ROOT="${CODEX_PLUGIN_ROOT:-$(cd "$SCRIPT_DIR/../../.." && pwd)}"
+HOOKS_DIR="$PLUGIN_ROOT/scripts"
+
+# (3) Write/replace the custom-provider block AND install the [hooks] entries.
+# Exit 0 = changed (provider and/or hooks), 3 = already fully enabled.
 set +e
-"$HOOKS" codex-config enable --url "$URL"
+"$HOOKS" codex-config enable --url "$URL" --hooks-dir "$HOOKS_DIR"
 rc=$?
 set -e
 if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then
@@ -49,5 +56,6 @@ if [ "$rc" -eq 3 ]; then
 else
   printf '%s\n' "ZlauDeR: Codex routing enabled — masking proxy at $URL."
 fi
-printf '%s\n' "Next: REVIEW and TRUST this plugin's hooks, then RESTART codex so the new config.toml route takes effect."
+printf '%s\n' "Routing + the SessionStart/UserPromptSubmit masking hooks were written to \$CODEX_HOME/config.toml."
+printf '%s\n' "Next: REVIEW and TRUST this plugin's hooks, then RESTART codex so the new config.toml route + hooks take effect (codex > 0.140 required)."
 printf '%s\n' "A usable OPENAI_API_KEY (sk-...) must be exported in the environment codex runs in, or requests will fail at provider construction."
