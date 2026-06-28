@@ -1770,6 +1770,80 @@ async fn zdr_unverified_target_refuses_fail_closed() {
     assert!(def_cap.body.lock().unwrap().is_empty());
 }
 
+// H1 race seal (A5): a RESTORED selection — one already present in the in-memory
+// `zdr_sessions` map at AppState construction, exactly as A4's `reload_zdr_sessions`
+// feeds it BEFORE the server begins serving — whose target is invalidated to
+// `!user_verified` by a concurrent control-plane change, is RE-VALIDATED AT ENTRY
+// (`resolve_pinned_mode`) and refuses 403 with ZERO bytes egressed. It must never
+// dispatch against an engage-time verification snapshot (which would be `Ok(Normal)`
+// → a silent leak). This codifies that the entry-time fail-closed taxonomy survives
+// A4: the selection is placed (engage succeeds while verified) and only THEN the
+// registry is swapped to the same-named-but-unverified target, so the refusal can
+// only come from the re-read at request entry, not from the engage-time path.
+#[tokio::test]
+async fn entry_revalidation_refuses_unverified_restored() {
+    let def_cap = Captured::default();
+    let def_up = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(def_cap.clone());
+    let def_addr = spawn(def_up).await;
+
+    // Construct with the target VERIFIED so the selection can be placed (mirrors A4
+    // restoring a pin that was valid at the time it was persisted).
+    let verified = ZdrTarget::new(
+        "restored".into(),
+        &format!("http://{def_addr}"),
+        TrustBasis::SelfHosted,
+        true, // user_verified at engage time
+        vec![],
+        "k".into(),
+    )
+    .unwrap();
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let mut state = zdr_state(engine, format!("http://{def_addr}"), verified);
+    // Place the RESTORED selection in the in-memory map (as A4's reload would, before
+    // the server serves).
+    state.set_zdr_selection("conv1", "restored").unwrap();
+
+    // Concurrent control-plane change: the SAME target is now `!user_verified`. Swap the
+    // registry before serving — the restored selection is now stale-but-still-pinned.
+    let invalidated = ZdrTarget::new(
+        "restored".into(),
+        &format!("http://{def_addr}"),
+        TrustBasis::SelfHosted,
+        false, // no longer user_verified
+        vec![],
+        "k".into(),
+    )
+    .unwrap();
+    let mut map = std::collections::HashMap::new();
+    map.insert("restored".to_string(), Arc::new(invalidated));
+    state.zdr_targets = Arc::new(map);
+
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/zlauder/session/conv1/v1/messages"))
+        .json(&serde_json::json!({"model":"m","max_tokens":1,"messages":[]}))
+        .send()
+        .await
+        .unwrap();
+    // resolve_pinned_mode returned Err (403), never Ok(Normal): the restored pin is
+    // re-validated at entry and refused.
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a restored selection whose target is now !user_verified must refuse 403 at entry, \
+         never silently downgrade to Normal"
+    );
+    // Zero bytes egressed to the default upstream — the fail-closed taxonomy held.
+    assert!(
+        def_cap.body.lock().unwrap().is_empty(),
+        "fail-closed: nothing may be dispatched on a restored-then-invalidated selection"
+    );
+}
+
 // The OpenAI-compatible endpoints refuse a ZDR-active conversation (501) — the
 // foundation is Anthropic-wire only; never silently route it to Anthropic.
 #[tokio::test]
