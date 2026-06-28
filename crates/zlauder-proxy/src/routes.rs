@@ -114,6 +114,14 @@ async fn healthz() -> Response {
 
 /// Audit reveal: `GET /zlauder/reveal/{token}` with header `x-zlauder-key`.
 /// Local operator affordance only; not reachable by the upstream model.
+///
+// EV-A INVARIANT (load-bearing, do not weaken):
+/// Reveal is unconditional/local-only TODAY (key-gated, off the model path). If a future
+/// EV-A clearance gate is added here, it MUST consume the [`PinnedMode`] captured at request
+/// entry via [`resolve_pinned_mode`] → [`crate::zdr::RevealClearanceCtx::from_pinned`] →
+/// `permits_reveal()`. It MUST NOT re-read `st.zdr_selection`/`st.zdr_sessions` nor the
+/// statusline belief (a concurrent control-plane flip could strand an in-flight reveal), and
+/// `PinnedMode::Normal` (incl. absent selection) ⇒ reveal-DENY.
 async fn reveal(
     State(st): State<AppState>,
     hdrs: HeaderMap,

@@ -218,6 +218,15 @@ pub struct ZdrSelection {
 /// The trust posture resolved **once at request entry** and carried by value
 /// through mask → dispatch → unmask. Fail-closed; the resolution taxonomy lives in
 /// [`crate::routes`].
+///
+// EV-A INVARIANT (load-bearing, do not weaken):
+/// Any future reveal-clearance decision MUST consume the [`PinnedMode`] captured at
+/// request entry (`resolve_pinned_mode`, see [`crate::routes`]) — never a re-read of
+/// `zdr_selection`/`zdr_sessions` nor the statusline belief, both of which a concurrent
+/// control-plane change can flip out from under an in-flight request. The only sanctioned
+/// path is [`RevealClearanceCtx::from_pinned`] → [`RevealClearanceCtx::permits_reveal`],
+/// which takes the captured mode BY VALUE and cannot reach `AppState`. `PinnedMode::Normal`
+/// (which includes the absent-selection case) ⇒ reveal-DENY.
 #[derive(Clone)]
 pub enum PinnedMode {
     /// No ZDR selection — today's masked Anthropic path (default upstream, verbatim
@@ -236,6 +245,36 @@ impl PinnedMode {
             PinnedMode::Zdr(t) => Some(t),
             PinnedMode::Normal => None,
         }
+    }
+}
+
+/// EV-A reveal-clearance capability token (D5/H5 foundation — affordance only; NOT yet
+/// wired into live reveal, which stays unconditional/local-only).
+///
+// EV-A INVARIANT (load-bearing, do not weaken):
+/// A sealed wrapper around the [`PinnedMode`] captured at request entry. Its ONLY
+/// constructor is [`RevealClearanceCtx::from_pinned`] (the pin-decision point) and its
+/// ONLY consumer is [`RevealClearanceCtx::permits_reveal`], which takes `&self` — NOT
+/// `&AppState`. This makes it structurally impossible for a future
+/// `reveal_audit_gated(token, ctx: &RevealClearanceCtx)` to re-read `zdr_sessions` /
+/// `zdr_selection` or the statusline belief: the clearance can be derived ONLY from the
+/// captured mode. `PinnedMode::Normal` (incl. absent selection) ⇒ `permits_reveal()==false`.
+pub struct RevealClearanceCtx(PinnedMode);
+
+impl RevealClearanceCtx {
+    /// The ONLY constructor: derive clearance from the [`PinnedMode`] captured at request
+    /// entry. Consumes only `&PinnedMode` — there is deliberately NO `from_app_state`
+    /// path, so a future caller cannot smuggle a re-read of `st.zdr_sessions` in here.
+    // Unwired in this foundation (D5 is affordance-only; live reveal stays unconditional).
+    // The live consumer arrives when EV-A wires `reveal_audit_gated` here.
+    #[allow(dead_code)]
+    pub(crate) fn from_pinned(p: &PinnedMode) -> Self {
+        RevealClearanceCtx(p.clone())
+    }
+
+    /// Clearance predicate. Keys solely off the captured mode; ZDR ⇒ permit, Normal ⇒ deny.
+    pub fn permits_reveal(&self) -> bool {
+        self.0.is_zdr()
     }
 }
 
@@ -604,6 +643,30 @@ mod tests {
                 String::new(),
             )
             .is_ok()
+        );
+    }
+
+    #[test]
+    fn reveal_clearance_denies_absent_zdr() {
+        // EV-A / D5 falsifier: clearance keys SOLELY off the captured PinnedMode.
+        // Normal (incl. absent selection) ⇒ DENY; a verified ZDR target ⇒ permit.
+        assert!(
+            !RevealClearanceCtx::from_pinned(&PinnedMode::Normal).permits_reveal(),
+            "absent/Normal mode must deny reveal-clearance"
+        );
+        let target = ZdrTarget::new(
+            "box".into(),
+            "http://127.0.0.1:8080",
+            TrustBasis::SelfHosted,
+            true,
+            vec![],
+            "sk-ant-api03-deadbeef".into(),
+        )
+        .expect("valid verified target");
+        let t = std::sync::Arc::new(target);
+        assert!(
+            RevealClearanceCtx::from_pinned(&PinnedMode::Zdr(t)).permits_reveal(),
+            "captured ZDR mode must permit reveal-clearance"
         );
     }
 
