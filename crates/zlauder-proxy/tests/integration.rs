@@ -2590,7 +2590,7 @@ mod zdr_persist {
         // then is dropped from disk; keep stays restored.
         std::fs::remove_dir_all(reports.join("rev.json")).unwrap();
         let s3 = state_for(root, vec![target("box", true)]);
-        let report3 = s3
+        let _report3 = s3
             .reload_zdr_sessions(s3.load_persisted_selections())
             .expect("retry boot ok");
         assert!(s3.zdr_selection("rev").is_none(), "still fail-closed on retry");
@@ -2649,6 +2649,125 @@ mod zdr_persist {
             s.zdr_selection("c").map(|x| x.target),
             Some("box".to_string()),
             "disengage write failure MUST re-insert (else next recycle resurrects ZDR off-disk)"
+        );
+    }
+
+    // ---- ACCEPTANCE (A10fix2 / Fix 1): disengage is WRITE-FIRST, no Normal window -----
+    // A failed durable write must NEVER have removed the in-memory entry — the conversation
+    // stays ZDR-pinned (memory==disk==engaged) so a still-durably-pinned conversation can never
+    // route Normal during the write window. This strengthens the rollback test to the
+    // write-first ordering: there is no removed-then-reinserted transient at all.
+    #[test]
+    #[cfg(unix)]
+    fn disengage_write_failure_keeps_conversation_engaged_no_normal_window() {
+        let g = StateDirGuard::new("disengage-writefirst");
+        let root = "/proj/disengage-writefirst";
+
+        let s = state_for(root, vec![target("box", true)]);
+        s.set_zdr_selection("c", "box").unwrap();
+        assert_eq!(s.zdr_selection("c").map(|x| x.target), Some("box".into()));
+
+        // Make the sessions dir un-writable so the disengage write fails.
+        let blocked = block_sessions_dir(g.path());
+        let res = s.clear_zdr_selection("c");
+        let _ = std::fs::remove_file(&blocked); // cleanup
+        assert!(res.is_err(), "unwritable dir must surface Err (fail-closed)");
+        assert_eq!(
+            s.zdr_selection("c").map(|x| x.target),
+            Some("box".to_string()),
+            "write-FIRST: the entry was NEVER removed (no Normal window); still durably ZDR-pinned"
+        );
+    }
+
+    // ---- ACCEPTANCE (A10fix2 / Fix 1): success removes ONLY after a durable write -----
+    #[test]
+    fn disengage_success_removes_only_after_durable_write() {
+        let g = StateDirGuard::new("disengage-success");
+        let root = "/proj/disengage-success";
+
+        let s = state_for(root, vec![target("box", true)]);
+        s.set_zdr_selection("c", "box").unwrap();
+        assert_eq!(s.zdr_selection("c").map(|x| x.target), Some("box".into()));
+
+        // Writable dir: disengage succeeds and reports the entry was present.
+        let was_present = s.clear_zdr_selection("c").expect("clear must succeed");
+        assert!(was_present, "clear of a present conversation returns Ok(true)");
+        assert!(
+            s.zdr_selection("c").is_none(),
+            "after a successful durable write the entry IS removed (disengaged)"
+        );
+
+        // The on-disk selections file no longer contains the conversation.
+        let on_disk = std::fs::read_to_string(selections_path(g.path(), root)).unwrap();
+        assert!(
+            !on_disk.contains("\"c\""),
+            "durable selections file no longer holds c after disengage: {on_disk}"
+        );
+    }
+
+    // ---- ACCEPTANCE (A10fix2 / Fix 2): prune preserves unconsumed reports -------------
+    // An OLD per-conversation `<conv>.json` report is an UNCONSUMED transition signal and must
+    // survive prune (else a >14d-dormant reverted user gets a SILENT Normal routing change). The
+    // genuinely-ageable artifacts — a `.global-seen` marker and a `.json.corrupt-<ts>`
+    // quarantine — ARE pruned. prune_old_reports is private; it always runs first inside
+    // reload_zdr_sessions, so an Absent reload drives it.
+    #[test]
+    #[cfg(unix)]
+    fn prune_keeps_unconsumed_report_removes_stale_marker() {
+        let g = StateDirGuard::new("prune-preserve");
+        let root = "/proj/prune-preserve";
+
+        let s = state_for(root, vec![target("box", true)]);
+        // Ensure the reports dir exists.
+        std::fs::create_dir_all(g.path().join("zdr-reports")).unwrap();
+
+        let reports = g.path().join("zdr-reports");
+        let report = report_path(g.path(), "conv-a"); // <conv>.json — pending signal
+        let marker = reports.join("conv-a.global-seen"); // hooks-internal consumed marker
+        let quarantine = reports.join("pk.json.corrupt-1700000000"); // dead quarantine
+        // REGRESSION (A10fix2 round 2): a conversation id literally containing `.json.corrupt-`
+        // sanitizes UNCHANGED (sanitize_component keeps `.`/`-`/`_`/alnum), so its pending report
+        // file is `evil.json.corrupt-9.json` — it `contains(".json.corrupt-")` and would be wrongly
+        // pruned by an unanchored quarantine match, silently dropping an unconsumed revert signal.
+        // The `.json`-ending guard must keep it. (All chars here are filename-safe so the test
+        // filename is byte-identical to the production sanitize_component output.)
+        let report_namespace_trap = report_path(g.path(), "evil.json.corrupt-9");
+        std::fs::write(&report, b"{\"some\":\"report\"}").unwrap();
+        std::fs::write(&marker, b"epoch").unwrap();
+        std::fs::write(&quarantine, b"corrupt bytes").unwrap();
+        std::fs::write(&report_namespace_trap, b"{\"trap\":\"report\"}").unwrap();
+
+        // Age all four well past REPORT_MAX_AGE_SECS (14d).
+        for p in [&report, &marker, &quarantine, &report_namespace_trap] {
+            let out = std::process::Command::new("touch")
+                .arg("-d")
+                .arg("30 days ago")
+                .arg(p)
+                .status()
+                .expect("touch runs");
+            assert!(out.success(), "touch -d must succeed");
+        }
+
+        // Drive prune via an Absent reload (prune runs unconditionally, first).
+        s.reload_zdr_sessions(PersistedLoad::Absent)
+            .expect("absent reload ok");
+
+        assert!(
+            report.is_file(),
+            "an UNCONSUMED <conv>.json report is a pending signal and MUST survive prune"
+        );
+        assert!(
+            report_namespace_trap.is_file(),
+            "a <conv>.json report whose id contains `.json.corrupt-` is STILL a pending signal and \
+             MUST survive prune (the `.json`-ending guard, not the unanchored contains-match)"
+        );
+        assert!(
+            !marker.exists(),
+            "an OLD .global-seen marker IS ageable and must be pruned"
+        );
+        assert!(
+            !quarantine.exists(),
+            "an OLD .json.corrupt-<ts> quarantine is dead and must be pruned"
         );
     }
 

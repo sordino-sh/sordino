@@ -261,35 +261,46 @@ impl AppState {
         Ok(())
     }
 
-    /// Disengage ZDR for a conversation, persisting the pruned selection set AFTER the
-    /// in-memory mutation. Returns whether a selection was present. **Fail-closed (S1):** if
-    /// the durable write fails, the just-removed entry is RE-INSERTED (rollback) and `Err` is
-    /// returned — so a successful in-memory disengage whose disk write failed (which would
-    /// leave the OLD selection on disk and RESURRECT ZDR on the next recycle) can never
-    /// happen. A clear of a conversation that was NOT present still rewrites the unchanged
-    /// file; if that write errs there is nothing to roll back — return `Err`.
+    /// Disengage ZDR for a conversation **write-first**: the pruned selection set is made
+    /// durable BEFORE the in-memory entry is removed. Returns whether a selection was present.
+    /// **Fail-closed (S1, D1):** unlike ENGAGE — whose transient state is ZDR (the STRONGER
+    /// posture, so map-first is safe) — a map-first DISENGAGE would make its transient state
+    /// `Normal` (the WEAKER posture): during the write I/O the entry would already be gone, so a
+    /// concurrent request (which takes only `zdr_sessions`, never `SELECTIONS_WRITE_LOCK`) would
+    /// resolve `PinnedMode::Normal` and route to the DEFAULT endpoint for a conversation that is
+    /// still DURABLY ZDR-pinned. To close that fail-open window the order is reversed: (1)
+    /// snapshot the pruned set WITHOUT mutating the live map and record whether the entry was
+    /// present, dropping the lock with the entry STILL in the map; (2) `write_selections` FIRST —
+    /// on `Err` the map is untouched (still engaged), so just return `Err` (memory == disk ==
+    /// engaged, nothing to roll back); (3) only AFTER the write is durable, briefly re-lock and
+    /// remove the entry. A clear of a not-present conversation still rewrites the unchanged file
+    /// and returns `Ok(false)` on success / `Err` on failure. There is NO window where a
+    /// still-durably-pinned conversation routes `Normal`; the only transient is "disk says
+    /// disengaged, map still ZDR" for the microsecond before the remove — which routes ZDR
+    /// (fail-closed, safe).
     pub fn clear_zdr_selection(&self, conversation: &str) -> Result<bool, PersistError> {
         // Same process-wide write serialization as `set_zdr_selection`, acquired FIRST and
-        // strictly before `zdr_sessions`, held across {snapshot + write + rollback}.
+        // strictly before `zdr_sessions`, held across {snapshot + write + remove}.
         let _wguard = SELECTIONS_WRITE_LOCK
             .lock()
             .unwrap_or_else(|p| p.into_inner());
-        let (entries, removed) = {
-            let mut map = self.zdr_sessions.lock().expect("zdr_sessions mutex poisoned");
-            let removed = map.remove(conversation);
-            (Self::snapshot_persisted(&map), removed)
-        }; // lock dropped here
-        if let Err(e) = self.write_selections(&entries) {
-            // Rollback only if we actually removed something.
-            if let Some(sel) = removed {
-                self.zdr_sessions
-                    .lock()
-                    .expect("zdr_sessions mutex poisoned")
-                    .insert(conversation.to_string(), sel);
-            }
-            return Err(e);
-        }
-        Ok(removed.is_some())
+        // (1) Compute the pruned snapshot WITHOUT mutating the live map; capture presence.
+        // The lock is released with the entry STILL in the map — concurrent routing keeps
+        // resolving ZDR until the durable write below succeeds.
+        let (entries, was_present) = {
+            let map = self.zdr_sessions.lock().expect("zdr_sessions mutex poisoned");
+            let was_present = map.contains_key(conversation);
+            (Self::snapshot_persisted_excluding(&map, conversation), was_present)
+        }; // lock dropped here — entry still present in the map
+        // (2) Write-FIRST. On failure the map is untouched (still engaged): memory == disk ==
+        // engaged, so there is nothing to roll back — just surface the Err (admin → 5xx).
+        self.write_selections(&entries)?;
+        // (3) Disengage is now DURABLE — only NOW remove the in-memory entry.
+        self.zdr_sessions
+            .lock()
+            .expect("zdr_sessions mutex poisoned")
+            .remove(conversation);
+        Ok(was_present)
     }
 
     /// Snapshot of currently-active ZDR sessions as `(conversation, target)` pairs,
@@ -359,6 +370,27 @@ impl AppState {
     fn snapshot_persisted(map: &HashMap<String, ZdrSelection>) -> Vec<PersistedSelection> {
         let mut v: Vec<PersistedSelection> = map
             .iter()
+            .map(|(c, s)| PersistedSelection {
+                conversation: c.clone(),
+                target: s.target.clone(),
+            })
+            .collect();
+        v.sort_by(|a, b| a.conversation.cmp(&b.conversation));
+        v
+    }
+
+    /// Snapshot the live map as a deterministically-ordered `Vec<PersistedSelection>`,
+    /// EXCLUDING `conversation`, WITHOUT mutating the map. This is the write-first disengage
+    /// primitive (D1): `clear_zdr_selection` persists this pruned set BEFORE it removes the
+    /// in-memory entry, so a still-durably-pinned conversation never routes `Normal` during the
+    /// write window. Identical ordering/contract to [`snapshot_persisted`] minus the one key.
+    fn snapshot_persisted_excluding(
+        map: &HashMap<String, ZdrSelection>,
+        conversation: &str,
+    ) -> Vec<PersistedSelection> {
+        let mut v: Vec<PersistedSelection> = map
+            .iter()
+            .filter(|(c, _)| c.as_str() != conversation)
             .map(|(c, s)| PersistedSelection {
                 conversation: c.clone(),
                 target: s.target.clone(),
@@ -566,7 +598,17 @@ impl AppState {
         atomic_write_0600(&path, &bytes)
     }
 
-    /// Best-effort prune of report files older than [`REPORT_MAX_AGE_SECS`]. Never fatal.
+    /// Best-effort prune of GENUINELY-AGEABLE report-dir artifacts older than
+    /// [`REPORT_MAX_AGE_SECS`]. Never fatal. **D1:** the prune must NEVER delete a pending
+    /// per-conversation `<conv>.json` report — those are UNCONSUMED transition signals (A6
+    /// consumes a report ONLY by `remove_file` on the user's next UserPromptSubmit in that
+    /// conversation), so an existing report = a pending signal. Pruning one would mean a user
+    /// dormant in a reverted conversation for > 14 days returns to a SILENT Normal routing
+    /// change (the kill-condition). So the prune is restricted to the two artifacts that are NOT
+    /// pending signals and DO accumulate: the hooks-internal `<conv>.global-seen` consumed-epoch
+    /// markers (a pruned marker just means a future NEW corrupt epoch re-emits — safe) and the
+    /// `<project_key>.json.corrupt-<ts>` quarantine files (dead). Everything else — all
+    /// `<conv>.json` reports AND the `<project_key>.global.json` sentinel — is PRESERVED.
     fn prune_old_reports() -> std::io::Result<()> {
         let dir = Self::zdr_reports_dir()?;
         let now = now_unix();
@@ -576,6 +618,24 @@ impl AppState {
                 Err(_) => continue,
             };
             if !md.is_file() {
+                continue;
+            }
+            // Only the genuinely-ageable, NON-pending-signal artifacts are prunable. A
+            // `<conv>.json` report is an unconsumed transition signal and the
+            // `<project_key>.global.json` sentinel is a pending signal too — both end in `.json`,
+            // so both are SKIPPED here. The `.json`-ending guard is LOAD-BEARING, not redundant:
+            // `sanitize_component` preserves `.`/`-`/`_`, so a conversation id literally containing
+            // `.json.corrupt-` sanitizes unchanged into a report file `<...>.json.corrupt-<...>.json`
+            // that would otherwise match `contains(".json.corrupt-")` and be wrongly pruned —
+            // deleting an unconsumed transition signal (the exact silent-revert kill-condition this
+            // prune exists to avoid). The genuine quarantine file is `<project_key>.json.corrupt-<ts>`
+            // (a numeric ts suffix — it never ends in `.json`), so excluding ALL `.json`-ending
+            // names keeps every report/sentinel and still prunes the real quarantine + markers.
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let prunable = !name.ends_with(".json")
+                && (name.ends_with(".global-seen") || name.contains(".json.corrupt-"));
+            if !prunable {
                 continue;
             }
             let age_ok = md
