@@ -17,8 +17,22 @@ use zlauder_proxy::{
     monitor::Monitor,
     routes::router as proxy_router,
     state::AppState,
-    zdr::{TrustBasis, ZdrTarget},
+    zdr::{TrustBasis, ZdrSelection, ZdrTarget},
 };
+
+/// Insert a ZDR selection into the in-memory map ONLY (no disk persistence), for routing
+/// tests that exercise `resolve_pinned_mode` and do NOT assert on-disk state. This keeps the
+/// outer routing tests off the process-global `ZLAUDER_STATE_DIR`, so they never race the
+/// `zdr_persist` tests' state-dir manipulation. The disk-writing `set_zdr_selection` is only
+/// needed by the persistence tests, which isolate it under their own `StateDirGuard`.
+fn engage_in_memory(state: &AppState, conversation: &str, target: &str) {
+    state.zdr_sessions.lock().unwrap().insert(
+        conversation.to_string(),
+        ZdrSelection {
+            target: target.to_string(),
+        },
+    );
+}
 
 /// Build an `AppState` for tests (no real config files; reload points at a
 /// nonexistent user layer so it's a deterministic no-op).
@@ -1649,7 +1663,7 @@ async fn zdr_session_routes_to_target_with_zdr_key_not_subscription() {
 
     let engine = MaskEngine::new(EngineConfig::default()).unwrap();
     let state = zdr_state(engine, format!("http://{def_addr}"), target);
-    state.set_zdr_selection("conv1", "trusted").unwrap();
+    engage_in_memory(&state, "conv1", "trusted");
     let proxy_addr = spawn(proxy_router(state)).await;
 
     let client = reqwest::Client::new();
@@ -1719,7 +1733,7 @@ async fn zdr_unknown_selection_refuses_fail_closed() {
     .unwrap();
     let engine = MaskEngine::new(EngineConfig::default()).unwrap();
     let state = zdr_state(engine, format!("http://{def_addr}"), target);
-    state.set_zdr_selection("conv1", "ghost").unwrap(); // not in the registry
+    engage_in_memory(&state, "conv1", "ghost"); // not in the registry
     let proxy_addr = spawn(proxy_router(state)).await;
 
     let client = reqwest::Client::new();
@@ -1756,7 +1770,7 @@ async fn zdr_unverified_target_refuses_fail_closed() {
     .unwrap();
     let engine = MaskEngine::new(EngineConfig::default()).unwrap();
     let state = zdr_state(engine, format!("http://{def_addr}"), target);
-    state.set_zdr_selection("conv1", "unverified").unwrap();
+    engage_in_memory(&state, "conv1", "unverified");
     let proxy_addr = spawn(proxy_router(state)).await;
 
     let client = reqwest::Client::new();
@@ -1803,7 +1817,7 @@ async fn entry_revalidation_refuses_unverified_restored() {
     let mut state = zdr_state(engine, format!("http://{def_addr}"), verified);
     // Place the RESTORED selection in the in-memory map (as A4's reload would, before
     // the server serves).
-    state.set_zdr_selection("conv1", "restored").unwrap();
+    engage_in_memory(&state, "conv1", "restored");
 
     // Concurrent control-plane change: the SAME target is now `!user_verified`. Swap the
     // registry before serving — the restored selection is now stale-but-still-pinned.
@@ -1864,7 +1878,7 @@ async fn zdr_openai_path_refuses() {
     .unwrap();
     let engine = MaskEngine::new(EngineConfig::default()).unwrap();
     let state = zdr_state(engine, format!("http://{def_addr}"), target);
-    state.set_zdr_selection("conv1", "trusted").unwrap();
+    engage_in_memory(&state, "conv1", "trusted");
     let proxy_addr = spawn(proxy_router(state)).await;
 
     let client = reqwest::Client::new();
