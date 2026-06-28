@@ -2497,10 +2497,16 @@ struct GlobalRevert {
     reason: String,
 }
 
+/// Max bytes for a sanitized filename COMPONENT. Mirrors the proxy's `SANITIZE_COMPONENT_MAX`.
+const SANITIZE_COMPONENT_MAX: usize = 200;
+
 /// Reduce a conversation id / project key to a single safe filename component. BYTE-IDENTICAL
 /// to the proxy's `sanitize_component` (state.rs) — the report-file key A6 reads MUST match the
 /// key A4 writes, or the signal never fires. Keeps `[A-Za-z0-9._-]`, replaces the rest with `_`,
-/// and never yields an empty or dot-only name (prefixes `_`).
+/// never yields an empty or dot-only name (prefixes `_`), and is length-bounded to
+/// [`SANITIZE_COMPONENT_MAX`] bytes (overlong → prefix + `-` + a stable blake3 hash of the FULL
+/// sanitized string, so an overlong conversation id can never make the marker write `ENAMETOOLONG`
+/// while the proxy report write also gets bounded identically).
 fn sanitize_component(s: &str) -> String {
     let mut out: String = s
         .chars()
@@ -2514,6 +2520,16 @@ fn sanitize_component(s: &str) -> String {
         .collect();
     if out.is_empty() || out.chars().all(|c| c == '.') {
         out = format!("_{out}");
+    }
+    // Bound the length. `out` is ASCII by construction (only `[A-Za-z0-9._-]`), so byte- and
+    // char-length coincide and slicing on a byte index is always on a char boundary. Hash the
+    // FULL sanitized string so distinct long ids stay distinct and both sides derive the same name.
+    if out.len() > SANITIZE_COMPONENT_MAX {
+        const HASH_HEX: usize = 16;
+        const PREFIX: usize = SANITIZE_COMPONENT_MAX - HASH_HEX - 1; // prefix + '-' + 16 hex
+        let mut h = blake3::Hasher::new();
+        h.update(out.as_bytes());
+        out = format!("{}-{}", &out[..PREFIX], &h.finalize().to_hex()[..HASH_HEX]);
     }
     out
 }
@@ -5770,6 +5786,53 @@ mod route_gate_tests {
         assert_eq!(sanitize_component("."), "_.");
         assert_eq!(sanitize_component(".."), "_..");
         assert_eq!(sanitize_component("uuid-AaZz09"), "uuid-AaZz09");
+
+        // OVERLONG id (the ENAMETOOLONG vector): the sanitized component MUST be length-bounded
+        // (<= SANITIZE_COMPONENT_MAX) so neither the proxy report write (`<comp>.json`) nor the
+        // hooks marker write (`<comp>.global-seen`) can fail with ENAMETOOLONG, and BOTH sides must
+        // derive the IDENTICAL name. The overlong input is already filename-safe here (all `a`s),
+        // so the sanitized string equals the input → we can recompute the expected bounded form
+        // exactly the way the (private) proxy writer does and pin both at byte-equality.
+        let overlong = "a".repeat(5000);
+        let got = sanitize_component(&overlong);
+        assert!(
+            got.len() <= SANITIZE_COMPONENT_MAX,
+            "bounded component must fit: got {} > {}",
+            got.len(),
+            SANITIZE_COMPONENT_MAX
+        );
+        // Recompute the exact derivation the proxy writer uses (prefix + '-' + 16 hex of blake3 of
+        // the FULL sanitized string). If the proxy ever diverges, this pin breaks.
+        const HASH_HEX: usize = 16;
+        const PREFIX: usize = SANITIZE_COMPONENT_MAX - HASH_HEX - 1;
+        let mut h = blake3::Hasher::new();
+        h.update(overlong.as_bytes());
+        let expected = format!("{}-{}", &overlong[..PREFIX], &h.finalize().to_hex()[..HASH_HEX]);
+        assert_eq!(got, expected, "overlong derivation must match the proxy writer byte-for-byte");
+
+        // Distinct overlong ids stay distinct (the hash of the full sanitized string differentiates
+        // them even though their prefixes collide).
+        let other = format!("{}b", "a".repeat(4999));
+        assert_ne!(
+            sanitize_component(&overlong),
+            sanitize_component(&other),
+            "distinct long ids must not collide after bounding"
+        );
+    }
+
+    #[test]
+    fn report_filename_is_length_bounded() {
+        // The full report/marker FILENAME (component + extension) must stay under the 255-byte
+        // limit common to ext4/APFS/NTFS for ANY conversation id, including a pathological one.
+        let overlong = "z/".repeat(4000); // 8000 chars, all non-safe → all `_` after sanitize
+        let comp = sanitize_component(&overlong);
+        assert!(comp.len() <= SANITIZE_COMPONENT_MAX);
+        // The longest extension the readers/writers use is `.global-seen` (12 bytes).
+        assert!(
+            format!("{comp}.global-seen").len() <= 255,
+            "report/marker filename must fit on every target FS"
+        );
+        assert!(format!("{comp}.json").len() <= 255);
     }
 
     #[test]

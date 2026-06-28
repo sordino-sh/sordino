@@ -480,12 +480,35 @@ impl AppState {
                     };
                     // A per-conversation report write failure is NOT boot-fatal — the routing
                     // decision is already safe in memory (Restored routes ZDR; Reverted was
-                    // DROPPED so it fails closed to Normal). Log and continue.
+                    // DROPPED from the map so it fails closed to Normal). Log and continue.
+                    //
+                    // BUT for a REVERTED outcome the report is the ONLY signal A6 has to tell the
+                    // user "ZDR could NOT be restored" (D1). If that write fails AND we also drop
+                    // the entry from `survivors`, the entry is gone from map+disk with NO report —
+                    // a SILENT Normal egress, the exact kill-condition. So on a failed Reverted
+                    // report write, KEEP the entry on disk: the next boot re-loads it, re-validates
+                    // (still invalid → re-reverts), and RETRIES the report — the revert becomes
+                    // eventually-visible instead of permanently-silent. The in-memory map still
+                    // does NOT restore it (it routes masked-Normal, data-safe). A SUCCESSFUL
+                    // Reverted report → dropped as before (reported + cleaned up). A Restored
+                    // report-write failure is non-degrading (the entry is already in map+survivors
+                    // and routes ZDR correctly) → keep today's behavior.
                     if let Err(e) = self.write_report(&outcome) {
                         tracing::warn!(
                             "zlauder ZDR: could not write reload report for a conversation ({e}); \
                              the in-memory decision still holds"
                         );
+                        if let ReloadOutcome::Reverted { conversation, .. } = &outcome {
+                            tracing::warn!(
+                                "zlauder ZDR: retaining reverted selection for {conversation} on \
+                                 disk so the next boot retries the revert report (avoids a silent \
+                                 Normal egress with no recorded revert)"
+                            );
+                            survivors.push(PersistedSelection {
+                                conversation: conversation.clone(),
+                                target: entry.target.clone(),
+                            });
+                        }
                     }
                     report.outcomes.push(outcome);
                 }
@@ -607,9 +630,20 @@ fn atomic_write_0600(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Max bytes for a sanitized filename COMPONENT. The final filename is
+/// `<component>.json` / `<component>.global-seen` (≤ ~14 extra bytes), so a 200-byte component
+/// keeps the whole name well under the 255-byte limit common to ext4/APFS/NTFS — an overlong
+/// conversation id can never make the report/marker write fail with `ENAMETOOLONG`.
+const SANITIZE_COMPONENT_MAX: usize = 200;
+
 /// Reduce a conversation id to a single safe filename component so a hostile/path-bearing id
 /// (`../../etc/foo`) can never escape the report dir. Keeps `[A-Za-z0-9._-]`, replaces the
-/// rest with `_`, and never yields an empty or dot-only name.
+/// rest with `_`, never yields an empty or dot-only name, and is length-bounded to
+/// [`SANITIZE_COMPONENT_MAX`] bytes (an overlong id is deterministically truncated to a prefix
+/// plus a stable blake3 hash of the FULL sanitized string, keeping distinct long ids distinct).
+///
+/// MUST stay BYTE-IDENTICAL to the hooks-side replica (`zlauder-hooks` `sanitize_component`): the
+/// report-file key A6 reads has to match the key A4 writes, or the transition signal never fires.
 fn sanitize_component(s: &str) -> String {
     let mut out: String = s
         .chars()
@@ -623,6 +657,16 @@ fn sanitize_component(s: &str) -> String {
         .collect();
     if out.is_empty() || out.chars().all(|c| c == '.') {
         out = format!("_{out}");
+    }
+    // Bound the length. `out` is ASCII by construction (only `[A-Za-z0-9._-]`), so byte- and
+    // char-length coincide and slicing on a byte index is always on a char boundary. Hash the
+    // FULL sanitized string so distinct long ids stay distinct and both sides derive the same name.
+    if out.len() > SANITIZE_COMPONENT_MAX {
+        const HASH_HEX: usize = 16;
+        const PREFIX: usize = SANITIZE_COMPONENT_MAX - HASH_HEX - 1; // prefix + '-' + 16 hex
+        let mut h = blake3::Hasher::new();
+        h.update(out.as_bytes());
+        out = format!("{}-{}", &out[..PREFIX], &h.finalize().to_hex()[..HASH_HEX]);
     }
     out
 }

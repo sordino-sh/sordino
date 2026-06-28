@@ -2485,16 +2485,21 @@ mod zdr_persist {
     }
 
     // ---- ACCEPTANCE: one unwritable per-conv report does not abort reload --
+    // NEW CONTRACT (A10/D1): a per-conv report write failure is non-fatal AND — for a REVERTED
+    // outcome — must NOT silently drop the entry from disk. Here c1 REVERTS (its target is no
+    // longer verified) and its report write is forced to fail; c2 RESTORES (target still verified).
+    // The failed-report REVERT must be RETAINED on disk (next boot retries the revert report), the
+    // map stays fail-closed (c1 NOT restored), and c2's restore is intact in both map and disk.
     #[test]
     #[cfg(unix)]
     fn loaded_boot_survives_unwritable_one_report() {
         let g = StateDirGuard::new("one-report-fail");
         let root = "/proj/one-report-fail";
 
-        // Engage c1→box and c2→box durably.
+        // Engage c1→old and c2→box durably (both verified at engage time).
         {
-            let s = state_for(root, vec![target("box", true)]);
-            s.set_zdr_selection("c1", "box").unwrap();
+            let s = state_for(root, vec![target("old", true), target("box", true)]);
+            s.set_zdr_selection("c1", "old").unwrap();
             s.set_zdr_selection("c2", "box").unwrap();
         }
 
@@ -2504,16 +2509,18 @@ mod zdr_persist {
         std::fs::create_dir_all(&reports).unwrap();
         std::fs::create_dir_all(reports.join("c1.json")).unwrap();
 
+        // Reload with ONLY "box" verified → c1 reverts (target gone), c2 restores.
         let s2 = state_for(root, vec![target("box", true)]);
         let report = s2
             .reload_zdr_sessions(s2.load_persisted_selections())
             .expect("a single unwritable report must NOT fail the boot");
 
-        // Both restored in memory (the routing decision holds regardless of the report write).
-        assert_eq!(
-            s2.zdr_selection("c1").map(|s| s.target),
-            Some("box".to_string())
+        // c1 reverted → fail-closed: NOT in the in-memory map.
+        assert!(
+            s2.zdr_selection("c1").is_none(),
+            "reverted c1 must stay dropped from the map (masked-Normal, data-safe)"
         );
+        // c2 restored → in the map.
         assert_eq!(
             s2.zdr_selection("c2").map(|s| s.target),
             Some("box".to_string())
@@ -2521,6 +2528,84 @@ mod zdr_persist {
         assert_eq!(report.outcomes.len(), 2);
         // c2's report file was still written.
         assert!(report_path(g.path(), "c2").is_file());
+
+        // The FAILED-report REVERT (c1) must be RETAINED on disk so the next boot retries it,
+        // while the RESTORED c2 is also on disk. (Previously c1 was dropped → a silent loss.)
+        let sel = std::fs::read_to_string(selections_path(g.path(), root)).unwrap();
+        assert!(
+            sel.contains("\"c1\""),
+            "reverted c1 with a failed report MUST be kept on disk for next-boot retry: {sel}"
+        );
+        assert!(sel.contains("\"c2\""), "restored c2 still on disk: {sel}");
+    }
+
+    // ---- ACCEPTANCE (A10/D1): a Reverted entry whose report write fails is KEPT on disk for
+    // a next-boot retry (never a silent Normal egress), while the in-memory map stays fail-closed
+    // and a SAME-boot Restored entry is unaffected. ----
+    #[test]
+    #[cfg(unix)]
+    fn reverted_report_write_failure_keeps_entry_for_retry() {
+        let g = StateDirGuard::new("revert-retry");
+        let root = "/proj/revert-retry";
+
+        // Durably engage rev→old and keep→box (both verified at engage time).
+        {
+            let s = state_for(root, vec![target("old", true), target("box", true)]);
+            s.set_zdr_selection("rev", "old").unwrap();
+            s.set_zdr_selection("keep", "box").unwrap();
+        }
+
+        // Force rev's report write to FAIL by occupying its report path with a directory.
+        let reports = g.path().join("zdr-reports");
+        std::fs::create_dir_all(&reports).unwrap();
+        std::fs::create_dir_all(reports.join("rev.json")).unwrap();
+
+        // Reload with only "box" verified → rev reverts (target gone, report write fails), keep
+        // restores.
+        let s2 = state_for(root, vec![target("box", true)]);
+        let report = s2
+            .reload_zdr_sessions(s2.load_persisted_selections())
+            .expect("a failed revert report must NOT abort the boot");
+
+        // Map is fail-closed: rev NOT restored (routes masked-Normal), keep restored.
+        assert!(
+            s2.zdr_selection("rev").is_none(),
+            "reverted rev must NEVER be in the map (fail-closed)"
+        );
+        assert_eq!(
+            s2.zdr_selection("keep").map(|s| s.target),
+            Some("box".to_string())
+        );
+
+        // On disk: rev RETAINED (failed report → keep for retry), keep RETAINED (restored).
+        let sel = std::fs::read_to_string(selections_path(g.path(), root)).unwrap();
+        assert!(
+            sel.contains("\"rev\""),
+            "failed-report revert kept on disk for next-boot retry (no silent loss): {sel}"
+        );
+        assert!(sel.contains("\"keep\""), "restored keep on disk: {sel}");
+
+        // Next boot RETRIES: clear the blocking directory so the report write can succeed, reload
+        // again from the retained disk state. rev re-reverts and now WRITES its report (visible),
+        // then is dropped from disk; keep stays restored.
+        std::fs::remove_dir_all(reports.join("rev.json")).unwrap();
+        let s3 = state_for(root, vec![target("box", true)]);
+        let report3 = s3
+            .reload_zdr_sessions(s3.load_persisted_selections())
+            .expect("retry boot ok");
+        assert!(s3.zdr_selection("rev").is_none(), "still fail-closed on retry");
+        assert!(
+            report_path(g.path(), "rev").is_file(),
+            "the retry boot finally WRITES rev's revert report → eventually visible"
+        );
+        // rev now reported → dropped from disk; keep still present.
+        let sel3 = std::fs::read_to_string(selections_path(g.path(), root)).unwrap();
+        assert!(
+            !sel3.contains("\"rev\""),
+            "after a SUCCESSFUL revert report, rev is dropped from disk: {sel3}"
+        );
+        assert!(sel3.contains("\"keep\""), "keep still on disk after retry: {sel3}");
+        let _ = report;
     }
 
     // ---- ACCEPTANCE (S1): live engage rolls back on persist failure --------
