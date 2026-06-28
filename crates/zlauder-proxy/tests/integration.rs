@@ -2562,6 +2562,135 @@ mod zdr_persist {
         }
     }
 
+    // ---- ACCEPTANCE (A10fix4): the global Corrupt sentinel is a CURRENT-INSTANCE signal ----
+    // A past corrupt boot writes `<project_key>.global.json`. On a LATER clean boot (Absent or
+    // Loaded) the sentinel must be REMOVED — otherwise A6's consume_zdr_transitions narrates the
+    // stale "ALL ZDR selections lost" line to every conversation first seen on the clean boot
+    // (including brand-new ones), crying wolf forever. We drive a real corrupt boot first so the
+    // sentinel lands at the EXACT production path (the test crate cannot recompute project_key),
+    // then assert a subsequent clean reload removes it.
+    #[test]
+    fn clean_boot_clears_stale_global_sentinel() {
+        // --- Absent clean boot clears the stale sentinel ---
+        {
+            let g = StateDirGuard::new("clean-clears-sentinel-absent");
+            let root = "/proj/clean-clears-sentinel-absent";
+
+            // Prior corrupt boot: seed + corrupt the selections file, reload → writes sentinel
+            // AND quarantines the file (so the NEXT load is Absent).
+            {
+                let seed = state_for(root, vec![target("box", true)]);
+                seed.set_zdr_selection("seed", "box").unwrap();
+            }
+            let sp = selections_path(g.path(), root);
+            std::fs::write(&sp, b"{\"conversa").unwrap();
+            let corrupt = state_for(root, vec![]);
+            corrupt
+                .reload_zdr_sessions(corrupt.load_persisted_selections())
+                .expect("global revert writable → Ok");
+            let sentinel = global_report_path(g.path(), root);
+            assert!(
+                sentinel.exists(),
+                "the prior corrupt boot must have written the global sentinel"
+            );
+
+            // Now a CLEAN Absent boot (the corrupt file was quarantined away).
+            let clean = state_for(root, vec![]);
+            assert!(matches!(
+                clean.load_persisted_selections(),
+                PersistedLoad::Absent
+            ));
+            clean
+                .reload_zdr_sessions(clean.load_persisted_selections())
+                .expect("clean Absent reload ok");
+            assert!(
+                !sentinel.exists(),
+                "an Absent clean boot MUST remove the stale global Corrupt sentinel (else it \
+                 cries wolf to every new conversation)"
+            );
+        }
+
+        // --- Loaded clean boot clears the stale sentinel ---
+        {
+            let g = StateDirGuard::new("clean-clears-sentinel-loaded");
+            let root = "/proj/clean-clears-sentinel-loaded";
+
+            // Prior corrupt boot writes the sentinel at the real path.
+            {
+                let seed = state_for(root, vec![target("box", true)]);
+                seed.set_zdr_selection("seed", "box").unwrap();
+            }
+            let sp = selections_path(g.path(), root);
+            std::fs::write(&sp, b"{\"conversa").unwrap();
+            let corrupt = state_for(root, vec![]);
+            corrupt
+                .reload_zdr_sessions(corrupt.load_persisted_selections())
+                .expect("global revert writable → Ok");
+            let sentinel = global_report_path(g.path(), root);
+            assert!(sentinel.exists(), "corrupt boot wrote the sentinel");
+
+            // Re-seed a VALID selections file (the quarantine removed the corrupt one) so the
+            // next load is Loaded(_), then clean-reload it.
+            {
+                let seed = state_for(root, vec![target("box", true)]);
+                seed.set_zdr_selection("seed", "box").unwrap();
+            }
+            let clean = state_for(root, vec![target("box", true)]);
+            assert!(
+                matches!(clean.load_persisted_selections(), PersistedLoad::Loaded(_)),
+                "re-seeded file must classify Loaded"
+            );
+            clean
+                .reload_zdr_sessions(clean.load_persisted_selections())
+                .expect("clean Loaded reload ok");
+            assert!(
+                !sentinel.exists(),
+                "a Loaded clean boot MUST remove the stale global Corrupt sentinel"
+            );
+        }
+    }
+
+    // ---- ACCEPTANCE (A10fix4): a CURRENT-instance corrupt boot STILL writes the sentinel ----
+    // The fix must NOT over-correct: when THIS boot is corrupt, the epoch-bearing sentinel must
+    // be (re)written so consumers narrate the real corrupt revert.
+    #[test]
+    fn corrupt_boot_still_writes_current_sentinel() {
+        let g = StateDirGuard::new("corrupt-writes-current-sentinel");
+        let root = "/proj/corrupt-writes-current-sentinel";
+
+        {
+            let seed = state_for(root, vec![target("box", true)]);
+            seed.set_zdr_selection("seed", "box").unwrap();
+        }
+        let sp = selections_path(g.path(), root);
+        std::fs::write(&sp, b"{\"conversa").unwrap();
+
+        let s = state_for(root, vec![]);
+        let report = s
+            .reload_zdr_sessions(s.load_persisted_selections())
+            .expect("global revert writable → Ok");
+        // Single global "*" revert outcome, as before.
+        assert_eq!(report.outcomes.len(), 1);
+        assert!(matches!(
+            &report.outcomes[0],
+            ReloadOutcome::Reverted { conversation, .. } if conversation == "*"
+        ));
+        // The sentinel exists and carries a current (>0) epoch — the current-instance corrupt
+        // signal still fires.
+        let sentinel = global_report_path(g.path(), root);
+        assert!(
+            sentinel.exists(),
+            "a CURRENT corrupt boot MUST write the global sentinel (no over-correction)"
+        );
+        let gv: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&sentinel).unwrap()).unwrap();
+        assert_eq!(gv["conversation"], "*");
+        assert!(
+            gv["epoch"].as_u64().unwrap() > 0,
+            "current-instance corrupt sentinel must carry an epoch: {gv}"
+        );
+    }
+
     // ---- ACCEPTANCE: perm-denied selections file → Corrupt (never Absent) ----
     #[test]
     #[cfg(unix)]

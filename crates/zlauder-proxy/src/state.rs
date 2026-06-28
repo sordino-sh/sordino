@@ -474,7 +474,12 @@ impl AppState {
         let _ = Self::prune_old_reports();
         match load {
             // First boot — empty map, empty report, silent. NO synthetic revert.
-            PersistedLoad::Absent => Ok(ZdrReloadReport::default()),
+            // This boot's selection state was readable (no file ⇒ nothing corrupt), so clear
+            // any stale Corrupt sentinel a PAST corrupt boot left behind (signal hygiene).
+            PersistedLoad::Absent => {
+                self.clear_global_revert();
+                Ok(ZdrReloadReport::default())
+            }
 
             PersistedLoad::Corrupt(reason) => {
                 // Fail-CLOSED-and-visible. The proxy cannot enumerate which conversations the
@@ -511,6 +516,12 @@ impl AppState {
             }
 
             PersistedLoad::Loaded(entries) => {
+                // The selections file parsed cleanly — THIS boot is not corrupt — so clear any
+                // stale Corrupt sentinel a past corrupt boot left behind. The per-entry outcomes
+                // below (Restored/Reverted) are about INDIVIDUAL selections; the global sentinel
+                // is a whole-instance "ALL selections were lost" signal and does not belong to a
+                // clean boot regardless of how individual entries resolve. Signal hygiene only.
+                self.clear_global_revert();
                 // Dedupe by conversation BEFORE the restore/revert loop so each conversation
                 // is processed EXACTLY ONCE. The selections file is normally serialized from a
                 // `HashMap`, so it never contains duplicate conversations — but it is a `0600`
@@ -616,6 +627,37 @@ impl AppState {
         let bytes = serde_json::to_vec_pretty(&body)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
         atomic_write_0600(&path, &bytes)
+    }
+
+    /// Best-effort removal of the global Corrupt sentinel on a CLEAN boot (Absent/Loaded).
+    /// The sentinel must reflect ONLY the current boot instance: if THIS boot's selection
+    /// state was readable (not corrupt), any sentinel still on disk was written by a PAST
+    /// corrupt boot and is now stale. Leaving it would make A6's `consume_zdr_transitions`
+    /// narrate the global "ALL ZDR selections lost" line to every conversation first seen on
+    /// this (clean) boot — including brand-new ones that never had a ZDR selection — turning a
+    /// real corrupt-revert signal into perpetual noise. Removing it means a future corrupt boot
+    /// writes a NEW-epoch sentinel, and the `.global-seen` markers' stale epoch correctly
+    /// re-triggers a fresh emit then. Signal hygiene ONLY: a `NotFound` (no sentinel) or ANY
+    /// other error is non-fatal — it must never fail the boot or change routing.
+    fn clear_global_revert(&self) {
+        match self.global_report_path() {
+            Ok(path) => {
+                if let Err(e) = std::fs::remove_file(&path) {
+                    if e.kind() != ErrorKind::NotFound {
+                        tracing::warn!(
+                            "zlauder ZDR: could not clear the stale global Corrupt sentinel on a \
+                             clean boot ({e}); a past-corrupt signal may re-narrate (non-fatal)"
+                        );
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "zlauder ZDR: could not resolve the global Corrupt sentinel path on a clean \
+                     boot ({e}); skipping stale-sentinel cleanup (non-fatal)"
+                );
+            }
+        }
     }
 
     /// Quarantine the unparseable selections file by renaming it to
