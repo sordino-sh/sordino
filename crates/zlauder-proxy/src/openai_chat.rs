@@ -46,6 +46,15 @@ async fn chat_completions_inner(
     if let Some(resp) = routes::secrets_gate(&st) {
         return resp;
     }
+    // Bare-path defense-in-depth: a bare `/v1/chat/completions` carrying
+    // x-zlauder-conversation naming a LIVE pin must refuse (409) rather than route to the
+    // default endpoint. NON-consuming header read BEFORE into_parts; runs only when the
+    // URL has no session id (precedence: URL id > header id > none).
+    if let Some(resp) =
+        routes::bare_path_zdr_guard(&st, &req, conversation.as_deref(), "/v1/chat/completions")
+    {
+        return resp;
+    }
     // ZDR is Anthropic-wire only in the foundation: refuse a ZDR-active conversation
     // on the OpenAI-compatible path rather than silently routing it to Anthropic with
     // the subscription credential (fail-closed; never silent-downgrade).

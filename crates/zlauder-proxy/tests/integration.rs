@@ -67,13 +67,19 @@ struct Captured {
     body: Arc<Mutex<String>>,
     headers: Arc<Mutex<HeaderMap>>,
     bodies: Arc<Mutex<Vec<String>>>,
+    paths: Arc<Mutex<Vec<String>>>,
 }
 
 async fn fake_upstream(
     State(cap): State<Captured>,
-    headers: HeaderMap,
-    body: Bytes,
+    req: axum::extract::Request,
 ) -> Json<serde_json::Value> {
+    cap.paths
+        .lock()
+        .unwrap()
+        .push(req.uri().path().to_string());
+    let headers = req.headers().clone();
+    let body = axum::body::to_bytes(req.into_body(), usize::MAX).await.unwrap();
     let s = String::from_utf8_lossy(&body).to_string();
     *cap.body.lock().unwrap() = s.clone();
     cap.bodies.lock().unwrap().push(s.clone());
@@ -2630,4 +2636,308 @@ mod zdr_persist {
             "on-disk persisted set MUST equal the final in-memory map (no stale-snapshot rename)"
         );
     }
+}
+
+// ---- A7 / H2+H3 / D2: ZDR-aware passthrough + bare-path defense-in-depth ------------
+
+/// A capture upstream that records EVERY request (path + body) on ANY path via a
+/// fallback — so passthrough relays (`/v1/files`, `/v1/batches`, …) and stripped session
+/// paths are all observed. Reuses the shared `Captured` (its `paths` Vec + `body`).
+async fn fake_capture_any(State(cap): State<Captured>, req: axum::extract::Request) -> StatusCode {
+    cap.paths
+        .lock()
+        .unwrap()
+        .push(req.uri().path().to_string());
+    let body = axum::body::to_bytes(req.into_body(), usize::MAX).await.unwrap();
+    let s = String::from_utf8_lossy(&body).to_string();
+    *cap.body.lock().unwrap() = s.clone();
+    cap.bodies.lock().unwrap().push(s);
+    StatusCode::OK
+}
+
+fn capture_any_state(default_base: String) -> (AppState, Captured) {
+    // A registered, user_verified target so engaging a pin resolves (PinnedMode::Zdr).
+    let def_cap = Captured::default();
+    let target = ZdrTarget::new(
+        "trusted".into(),
+        // The target base is irrelevant for the refusal tests (they never reach upstream),
+        // but must be a valid http base; point it at a sink the test never spawns.
+        "http://127.0.0.1:1/zdr-unused",
+        TrustBasis::SelfHosted,
+        true,
+        vec![],
+        "zdr-key".into(),
+    )
+    .unwrap();
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = zdr_state(engine, default_base, target);
+    (state, def_cap)
+}
+
+// Pinned session passthrough: `/zlauder/session/<pinned>/v1/files` and `/v1/batches`
+// → 409, ZERO bytes on the default upstream. Non-pinned `/zlauder/session/<c>/v1/files`
+// → the default upstream records EXACTLY `/v1/files` (prefix stripped).
+#[tokio::test]
+async fn passthrough_refuses_pinned_zero_bytes() {
+    let def_cap = Captured::default();
+    let def_up = Router::new()
+        .fallback(fake_capture_any)
+        .with_state(def_cap.clone());
+    let def_addr = spawn(def_up).await;
+
+    let (state, _) = capture_any_state(format!("http://{def_addr}"));
+    // `zdr_state` already registered the `trusted` target. Pin one conversation in-memory;
+    // the strip path uses a second, NON-pinned conversation id (`c1`).
+    engage_in_memory(&state, "pinned", "trusted");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let client = reqwest::Client::new();
+
+    // (a) pinned /v1/files via session prefix → 409, nothing upstream.
+    let r_files = client
+        .post(format!("http://{proxy_addr}/zlauder/session/pinned/v1/files"))
+        .body("plaintext eve@example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_files.status(), reqwest::StatusCode::CONFLICT);
+
+    // (b) pinned /v1/batches via session prefix → 409, nothing upstream.
+    let r_batch = client
+        .post(format!("http://{proxy_addr}/zlauder/session/pinned/v1/batches"))
+        .body("plaintext eve@example.com")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_batch.status(), reqwest::StatusCode::CONFLICT);
+
+    assert!(
+        def_cap.body.lock().unwrap().is_empty(),
+        "fail-closed: ZERO bytes egressed to the default upstream for a pinned passthrough"
+    );
+    assert!(
+        def_cap.paths.lock().unwrap().is_empty(),
+        "default upstream must never be contacted for a pinned passthrough"
+    );
+
+    // (c) NON-pinned session /v1/files → relayed, recorded path EXACTLY /v1/files.
+    let r_ok = client
+        .post(format!("http://{proxy_addr}/zlauder/session/c1/v1/files"))
+        .body("hi")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(r_ok.status(), reqwest::StatusCode::OK);
+    let paths = def_cap.paths.lock().unwrap().clone();
+    assert_eq!(
+        paths,
+        vec!["/v1/files".to_string()],
+        "non-pinned session prefix must be stripped to exactly /v1/files (got {paths:?})"
+    );
+}
+
+// THE round-1 HIGH leak: a BARE `POST /v1/files` (no session prefix) carrying
+// `x-zlauder-conversation: <pinned>` + a PII body MUST refuse 409 with ZERO bytes — the
+// verbatim relay never masks, so any egress here would be PLAINTEXT to the default endpoint.
+#[tokio::test]
+async fn bare_passthrough_header_refuses_pinned_zero_bytes() {
+    let def_cap = Captured::default();
+    let def_up = Router::new()
+        .fallback(fake_capture_any)
+        .with_state(def_cap.clone());
+    let def_addr = spawn(def_up).await;
+
+    let (state, _) = capture_any_state(format!("http://{def_addr}"));
+    engage_in_memory(&state, "c1", "trusted");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/files"))
+        .header("x-zlauder-conversation", "c1")
+        .body("attach eve@example.com here")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(
+        def_cap.body.lock().unwrap().is_empty(),
+        "fail-closed: NO body (plaintext OR masked) may egress on a header-pinned bare passthrough"
+    );
+    assert!(
+        def_cap.paths.lock().unwrap().is_empty(),
+        "the default upstream must never be contacted for a header-pinned bare passthrough"
+    );
+}
+
+// Traversal hardening: `/zlauder/session/c1/../v1/batches` (c1 NOT pinned) must be refused
+// 400 BEFORE the is_batches/pin checks — never relayed as `/../v1/batches`.
+#[tokio::test]
+async fn session_traversal_batches_refused() {
+    let def_cap = Captured::default();
+    let def_up = Router::new()
+        .fallback(fake_capture_any)
+        .with_state(def_cap.clone());
+    let def_addr = spawn(def_up).await;
+
+    let (state, _) = capture_any_state(format!("http://{def_addr}"));
+    // c1 deliberately NOT pinned — the refusal must come from traversal hardening, not a pin.
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    // reqwest/url normalize `..` out of the path before sending, which would defeat the
+    // test. Send a RAW HTTP/1.1 request over a TcpStream so the literal `..` segment
+    // reaches the handler verbatim.
+    let status = raw_post_status(
+        proxy_addr,
+        "/zlauder/session/c1/../v1/batches",
+        "plaintext eve@example.com",
+    )
+    .await;
+    assert_eq!(status, 400, "traversal must be refused 400 (got {status})");
+    assert!(
+        def_cap.body.lock().unwrap().is_empty() && def_cap.paths.lock().unwrap().is_empty(),
+        "a traversal must be refused, never relayed (no bytes/path upstream)"
+    );
+}
+
+/// Send a RAW HTTP/1.1 POST with the path verbatim (no URL normalization) and return the
+/// numeric status code from the response status line. Used to drive `..`-traversal cases
+/// that reqwest would otherwise normalize away.
+async fn raw_post_status(addr: SocketAddr, raw_path: &str, body: &str) -> u16 {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+    let req = format!(
+        "POST {raw_path} HTTP/1.1\r\nHost: {addr}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(req.as_bytes()).await.unwrap();
+    let mut resp = String::new();
+    stream.read_to_string(&mut resp).await.unwrap();
+    // Status line: "HTTP/1.1 400 Bad Request"
+    resp.split_whitespace()
+        .nth(1)
+        .and_then(|c| c.parse::<u16>().ok())
+        .unwrap_or(0)
+}
+
+// Bare `/v1/messages` + `x-zlauder-conversation: <pinned>` → 409, ZERO bytes upstream.
+#[tokio::test]
+async fn bare_path_header_refuses_pinned() {
+    let def_cap = Captured::default();
+    let def_up = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(def_cap.clone());
+    let def_addr = spawn(def_up).await;
+
+    let (state, _) = capture_any_state(format!("http://{def_addr}"));
+    engage_in_memory(&state, "c1", "trusted");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("x-zlauder-conversation", "c1")
+        .json(&serde_json::json!({
+            "model":"m","max_tokens":1,
+            "messages":[{"role":"user","content":[{"type":"text","text":"eve@example.com"}]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(
+        def_cap.body.lock().unwrap().is_empty(),
+        "fail-closed: a header-pinned bare /v1/messages must egress ZERO bytes"
+    );
+}
+
+// Bare `/v1/chat/completions` + header (pinned) → 409, ZERO bytes upstream.
+#[tokio::test]
+async fn bare_openai_chat_header_refuses_pinned() {
+    let def_cap = Captured::default();
+    let def_up = Router::new()
+        .route("/v1/chat/completions", post(fake_openai_chat_upstream))
+        .with_state(def_cap.clone());
+    let def_addr = spawn(def_up).await;
+
+    let (state, _) = capture_any_state(format!("http://{def_addr}"));
+    engage_in_memory(&state, "c1", "trusted");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .header("x-zlauder-conversation", "c1")
+        .json(&serde_json::json!({
+            "model":"gpt","messages":[{"role":"user","content":"eve@example.com"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(
+        def_cap.body.lock().unwrap().is_empty(),
+        "fail-closed: a header-pinned bare /v1/chat/completions must egress ZERO bytes"
+    );
+}
+
+// Bare `/v1/responses` + header (pinned) → 409, ZERO bytes upstream.
+#[tokio::test]
+async fn bare_openai_responses_header_refuses_pinned() {
+    let def_cap = Captured::default();
+    let def_up = Router::new()
+        .route("/v1/responses", post(fake_responses_upstream))
+        .with_state(def_cap.clone());
+    let def_addr = spawn(def_up).await;
+
+    let (state, _) = capture_any_state(format!("http://{def_addr}"));
+    engage_in_memory(&state, "c1", "trusted");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .header("x-zlauder-conversation", "c1")
+        .json(&serde_json::json!({"model":"gpt","input":"eve@example.com"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(
+        def_cap.body.lock().unwrap().is_empty(),
+        "fail-closed: a header-pinned bare /v1/responses must egress ZERO bytes"
+    );
+}
+
+// RESIDUAL (data-safe, NOT a kill-condition): a pinned conversation, bare `/v1/messages`
+// with NO header → routed masked-Normal to the default upstream (a masked token, never
+// plaintext). The pin can't be looked up without an id, so this is by-design.
+#[tokio::test]
+async fn bare_path_no_header_is_masked_normal() {
+    let def_cap = Captured::default();
+    let def_up = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(def_cap.clone());
+    let def_addr = spawn(def_up).await;
+
+    let (state, _) = capture_any_state(format!("http://{def_addr}"));
+    engage_in_memory(&state, "c1", "trusted");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model":"m","max_tokens":1,
+            "messages":[{"role":"user","content":[{"type":"text","text":"eve@example.com"}]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let body = def_cap.body.lock().unwrap().clone();
+    assert!(
+        !body.is_empty() && !body.contains("eve@example.com") && body.contains("[EMAIL_ADDRESS_"),
+        "header-absent bare request is masked-Normal (masked token, never plaintext): {body}"
+    );
 }

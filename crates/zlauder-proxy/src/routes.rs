@@ -201,6 +201,13 @@ async fn messages_inner(st: AppState, req: Request, conversation: Option<String>
     if let Some(resp) = secrets_gate(&st) {
         return resp;
     }
+    // Bare-path defense-in-depth: a bare `/v1/messages` carrying x-zlauder-conversation
+    // naming a LIVE pin must refuse rather than route masked-Normal to the default
+    // endpoint. NON-consuming header read BEFORE into_parts; runs only when the URL has
+    // no session id (precedence: URL id > header id > none).
+    if let Some(resp) = bare_path_zdr_guard(&st, &req, conversation.as_deref(), "/v1/messages") {
+        return resp;
+    }
     // Pin the trust posture from the session-route id BEFORE masking, by value.
     let pinned = match resolve_pinned_mode(&st, conversation.as_deref()) {
         Ok(p) => p,
@@ -301,6 +308,12 @@ async fn count_tokens_inner(st: AppState, req: Request, conversation: Option<Str
     if let Some(resp) = secrets_gate(&st) {
         return resp;
     }
+    // Bare-path defense-in-depth (header-named live pin → refuse). See `messages_inner`.
+    if let Some(resp) =
+        bare_path_zdr_guard(&st, &req, conversation.as_deref(), "/v1/messages/count_tokens")
+    {
+        return resp;
+    }
     // Count tokens against the SAME trust target as the conversation's messages.
     let pinned = match resolve_pinned_mode(&st, conversation.as_deref()) {
         Ok(p) => p,
@@ -350,6 +363,41 @@ async fn passthrough(State(st): State<AppState>, req: Request) -> Response {
     relay_verbatim(&st, req).await
 }
 
+/// Parse a `/zlauder/session/<id>/<rest>` verbatim-relay path with a SIMPLE string
+/// match (split on '/', the segment after `session` is the id, everything after it is
+/// `rest`). Returns `(id, rest)` where `rest` begins with a leading '/' (the path the
+/// upstream should see once the prefix is stripped, e.g. `/v1/files`). Returns `None`
+/// for any path that is NOT session-prefixed.
+fn parse_session_prefix(path: &str) -> Option<(String, String)> {
+    // Path is "/zlauder/session/<id>/<rest...>". Strip the literal prefix, then split
+    // the id off the remainder at the first '/'.
+    let after = path.strip_prefix("/zlauder/session/")?;
+    let (id, rest) = match after.split_once('/') {
+        Some((id, rest)) => (id, rest),
+        // "/zlauder/session/<id>" with no trailing path — no inner path to relay.
+        None => (after, ""),
+    };
+    if id.is_empty() {
+        return None;
+    }
+    Some((id.to_string(), format!("/{rest}")))
+}
+
+/// True when a (prefix-stripped) inner relay path targets `/v1/batches`. ZDR forbids
+/// the batches path entirely (it is verbatim, never masked, and may carry PII), so a
+/// pinned conversation must never reach it — via the session prefix or otherwise.
+fn is_batches(path: &str) -> bool {
+    let p = path.split('?').next().unwrap_or(path);
+    p == "/v1/batches" || p.starts_with("/v1/batches/")
+}
+
+/// True when any '/'-segment of `rest` is exactly `..` — a path traversal. A legit
+/// client never sends one; we refuse it BEFORE any pin/batches check so `..` can never
+/// evade those checks by hiding the real target behind a traversal segment.
+fn has_traversal(rest: &str) -> bool {
+    rest.split('/').any(|seg| seg == "..")
+}
+
 pub(crate) async fn relay_verbatim(st: &AppState, req: Request) -> Response {
     let (parts, body) = req.into_parts();
     let body_bytes = match to_bytes(body, MAX_BODY).await {
@@ -361,12 +409,81 @@ pub(crate) async fn relay_verbatim(st: &AppState, req: Request) -> Response {
         .path_and_query()
         .map(|p| p.as_str())
         .unwrap_or_else(|| parts.uri.path());
+    let path_only = parts.uri.path();
+
+    // Session-prefixed verbatim relay: `/zlauder/session/<id>/<rest>`.
+    if let Some((id, rest)) = parse_session_prefix(path_only) {
+        // Traversal hardening FIRST — a legit client never sends `..`; refusing here
+        // prevents `..` from evading the is_batches / pin checks by masking the real
+        // target (e.g. `/zlauder/session/c1/../v1/batches`).
+        if has_traversal(&rest) {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "malformed session passthrough path (traversal segment refused)",
+            );
+        }
+        // A pinned (ZDR) conversation must never relay verbatim to the DEFAULT endpoint —
+        // the verbatim relay never masks, so this would egress plaintext. Refuse 409 with
+        // ZERO bytes upstream (return BEFORE any send).
+        if st.zdr_selection(&id).is_some() {
+            return err(
+                StatusCode::CONFLICT,
+                "this conversation is ZDR-pinned — refusing to relay a verbatim passthrough to \
+                 the default endpoint (fail-closed; the passthrough path does not mask)",
+            );
+        }
+        // /v1/batches is always refused under the session prefix even when NOT pinned —
+        // it is a verbatim, never-masked, potentially-PII-bearing path.
+        if is_batches(&rest) {
+            return err(
+                StatusCode::CONFLICT,
+                "/v1/batches is refused for a session-scoped conversation (never masked; \
+                 fail-closed)",
+            );
+        }
+        // Not pinned: STRIP the `/zlauder/session/<id>` prefix so the relayed path is
+        // exactly the inner path (e.g. `/v1/files`), carrying the original query string.
+        let relay_path = match parts.uri.query() {
+            Some(q) => format!("{rest}?{q}"),
+            None => rest,
+        };
+        let adapter =
+            AnthropicNative::for_mode(&st.upstream_base, st.upstream_host(), &PinnedMode::Normal);
+        let wire = adapter.build(&parts.headers, &relay_path, body_bytes.to_vec());
+        return relay_built(st, &parts, wire).await;
+    }
+
+    // BARE passthrough (no `/zlauder/session/` prefix). The relay never masks, so a bare
+    // request carrying `x-zlauder-conversation: <pinned>` would egress PLAINTEXT to the
+    // default endpoint for a ZDR-pinned conversation. Refuse 409 ZERO bytes when the
+    // header names a live pin — extending the header-present defense to EVERY egress path.
+    if let Some(conv) = monitor::conversation_from_headers(&parts.headers)
+        && st.zdr_selection(&conv).is_some()
+    {
+        return err(
+            StatusCode::CONFLICT,
+            "this conversation is ZDR-pinned (x-zlauder-conversation) — refusing to relay a \
+             verbatim passthrough to the default endpoint (fail-closed; the passthrough path \
+             does not mask)",
+        );
+    }
+
     // The verbatim relay (the `passthrough` fallback) is non-session, so it is always
     // Normal in the foundation — there is no conversation id to carry a ZDR selection.
     // Routing through the adapter keeps the egress seam uniform (and byte-identical
     // for the Normal path).
     let adapter = AnthropicNative::for_mode(&st.upstream_base, st.upstream_host(), &PinnedMode::Normal);
     let wire = adapter.build(&parts.headers, path_q, body_bytes.to_vec());
+    relay_built(st, &parts, wire).await
+}
+
+/// Send a built verbatim-relay request and stream the upstream response back. Factored
+/// out so the session-prefix-stripped path and the bare path share one egress site.
+async fn relay_built(
+    st: &AppState,
+    parts: &http::request::Parts,
+    wire: crate::wire_adapter::WireRequest,
+) -> Response {
     let resp = match st
         .http
         .request(parts.method.clone(), &wire.url)
@@ -385,6 +502,40 @@ pub(crate) async fn relay_verbatim(st: &AppState, req: Request) -> Response {
         headers::downstream_response_headers(&h, false),
         Body::from_stream(resp.bytes_stream()),
     )
+}
+
+/// Defense-in-depth for the BARE inner intake handlers (`/v1/messages`,
+/// `/v1/messages/count_tokens`, `/v1/chat/completions`, `/v1/responses` — NO session
+/// prefix in the URL). Runs ONLY when the path carries no conversation id, BEFORE
+/// `resolve_pinned_mode` / `into_parts`, reading the `x-zlauder-conversation` header via
+/// a NON-consuming `req.headers()`. If the header names a conversation with a LIVE ZDR
+/// pin, refuse 409 ZERO bytes rather than route it masked-Normal to the default endpoint
+/// — the header is a routing signal for a pinned conversation, so honouring it means
+/// refusing the default-endpoint egress. Returns `None` (no header / no live pin) to let
+/// the handler proceed as before. Precedence: URL session-id > header-id > none.
+pub(crate) fn bare_path_zdr_guard(
+    st: &AppState,
+    req: &Request,
+    conversation: Option<&str>,
+    endpoint: &str,
+) -> Option<Response> {
+    // Only the header-id path is in scope here: a URL session-id already drove
+    // `resolve_pinned_mode`, and a None header means there is no pin to consult.
+    if conversation.is_some() {
+        return None;
+    }
+    let conv = monitor::conversation_from_headers(req.headers())?;
+    if st.zdr_selection(&conv).is_some() {
+        return Some(err(
+            StatusCode::CONFLICT,
+            &format!(
+                "this conversation is ZDR-pinned (x-zlauder-conversation) — refusing the bare \
+                 {endpoint} request to the default endpoint (fail-closed; route it via the \
+                 session-scoped ZDR path)"
+            ),
+        ));
+    }
+    None
 }
 
 // The `Err` variant is an axum `Response` (an early-return short-circuit), which
