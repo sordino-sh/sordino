@@ -719,7 +719,22 @@ pub async fn zdr_set(
             ),
         );
     }
-    st.set_zdr_selection(&conversation, &name);
+    // Fail-closed-and-VISIBLE (S1): the durable write may fail; a 5xx (not 200) is the
+    // falsifiable contract that the failure is non-silent. Returns BEFORE building the
+    // success snapshot so the body never claims "engaged" on a write failure.
+    match st.set_zdr_selection(&conversation, &name) {
+        Ok(()) => {}
+        Err(e) => {
+            return text(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!(
+                    "ZDR engage could NOT be made durable ({e}) — NOT engaged; the selection \
+                     would be lost on the next proxy restart. Check the state dir is writable, \
+                     then retry /zlauder:zdr."
+                ),
+            );
+        }
+    };
     let mut snap = zdr_status(&st, &conversation);
     if let Some(obj) = snap.as_object_mut() {
         obj.insert("engaged".into(), json!(name));
@@ -746,7 +761,21 @@ pub async fn zdr_clear(
     if !st.authed(&hdrs) {
         return forbidden();
     }
-    let was_active = st.clear_zdr_selection(&conversation);
+    // Fail-closed-and-VISIBLE (S1): a failed durable write of the disengage must NOT report
+    // success — the old selection would still be on disk and RESURRECT on the next restart.
+    let was_active = match st.clear_zdr_selection(&conversation) {
+        Ok(b) => b,
+        Err(e) => {
+            return text(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!(
+                    "ZDR disengage could NOT be made durable ({e}) — STILL engaged; it would \
+                     resurrect on the next restart. Check the state dir is writable, then retry \
+                     /zlauder:zdr off."
+                ),
+            );
+        }
+    };
     let mut snap = zdr_status(&st, &conversation);
     if let Some(obj) = snap.as_object_mut() {
         obj.insert("disengaged".into(), json!(was_active));

@@ -1649,7 +1649,7 @@ async fn zdr_session_routes_to_target_with_zdr_key_not_subscription() {
 
     let engine = MaskEngine::new(EngineConfig::default()).unwrap();
     let state = zdr_state(engine, format!("http://{def_addr}"), target);
-    state.set_zdr_selection("conv1", "trusted");
+    state.set_zdr_selection("conv1", "trusted").unwrap();
     let proxy_addr = spawn(proxy_router(state)).await;
 
     let client = reqwest::Client::new();
@@ -1719,7 +1719,7 @@ async fn zdr_unknown_selection_refuses_fail_closed() {
     .unwrap();
     let engine = MaskEngine::new(EngineConfig::default()).unwrap();
     let state = zdr_state(engine, format!("http://{def_addr}"), target);
-    state.set_zdr_selection("conv1", "ghost"); // not in the registry
+    state.set_zdr_selection("conv1", "ghost").unwrap(); // not in the registry
     let proxy_addr = spawn(proxy_router(state)).await;
 
     let client = reqwest::Client::new();
@@ -1756,7 +1756,7 @@ async fn zdr_unverified_target_refuses_fail_closed() {
     .unwrap();
     let engine = MaskEngine::new(EngineConfig::default()).unwrap();
     let state = zdr_state(engine, format!("http://{def_addr}"), target);
-    state.set_zdr_selection("conv1", "unverified");
+    state.set_zdr_selection("conv1", "unverified").unwrap();
     let proxy_addr = spawn(proxy_router(state)).await;
 
     let client = reqwest::Client::new();
@@ -1790,7 +1790,7 @@ async fn zdr_openai_path_refuses() {
     .unwrap();
     let engine = MaskEngine::new(EngineConfig::default()).unwrap();
     let state = zdr_state(engine, format!("http://{def_addr}"), target);
-    state.set_zdr_selection("conv1", "trusted");
+    state.set_zdr_selection("conv1", "trusted").unwrap();
     let proxy_addr = spawn(proxy_router(state)).await;
 
     let client = reqwest::Client::new();
@@ -1913,4 +1913,633 @@ async fn zdr_control_endpoint_engage_status_and_refuse() {
     let delj: serde_json::Value = del.json().await.unwrap();
     assert_eq!(delj["active"], serde_json::Value::Null);
     assert_eq!(delj["disengaged"], serde_json::json!(true));
+}
+
+// ===========================================================================
+// A4 / H1 / D1 — persist + reload + re-validate per-conversation ZDR selection
+// ===========================================================================
+//
+// These tests drive `state_dir()` (which keys off the process-global
+// `ZLAUDER_STATE_DIR` env var) so they SERIALIZE behind a single mutex and each
+// points at its own temp dir. They are synchronous (`#[test]`) because every
+// persistence method (set/clear/load/reload) is synchronous.
+
+mod zdr_persist {
+    use super::*;
+    use std::path::{Path, PathBuf};
+    use std::sync::Mutex as StdMutex;
+    use zlauder_proxy::state::{PersistedLoad, PersistedSelection, ReloadOutcome};
+
+    // Serializes the `ZLAUDER_STATE_DIR` env mutation across the parallel test harness.
+    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// RAII: set `ZLAUDER_STATE_DIR` to a fresh temp dir for the duration, restoring the
+    /// prior value (and removing the temp tree) on drop. Holds the serialization guard.
+    struct StateDirGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        dir: PathBuf,
+        prev: Option<std::ffi::OsString>,
+    }
+    impl StateDirGuard {
+        fn new(tag: &str) -> StateDirGuard {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+            let dir = std::env::temp_dir().join(format!(
+                "zlauder-zdr-persist-{}-{}-{}",
+                std::process::id(),
+                tag,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let prev = std::env::var_os("ZLAUDER_STATE_DIR");
+            // SAFETY: serialized by ENV_LOCK; no other thread reads/writes this var
+            // concurrently for the guard's lifetime.
+            unsafe { std::env::set_var("ZLAUDER_STATE_DIR", &dir) };
+            StateDirGuard {
+                _lock: lock,
+                dir,
+                prev,
+            }
+        }
+        fn path(&self) -> &Path {
+            &self.dir
+        }
+    }
+    impl Drop for StateDirGuard {
+        fn drop(&mut self) {
+            // SAFETY: still serialized by the held ENV_LOCK guard.
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("ZLAUDER_STATE_DIR", v),
+                    None => std::env::remove_var("ZLAUDER_STATE_DIR"),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn engine() -> MaskEngine {
+        MaskEngine::new(EngineConfig::default()).unwrap()
+    }
+
+    /// An `AppState` rooted at a stable project path so `project_key` (and thus the
+    /// selections/report file names) are deterministic for a single test.
+    fn state_for(root: &str, targets: Vec<ZdrTarget>) -> AppState {
+        let mut s = mk_state(engine(), "http://127.0.0.1:1".into(), "test-key");
+        s.project_root = Arc::new(root.to_string());
+        let mut map = std::collections::HashMap::new();
+        for t in targets {
+            map.insert(t.name.clone(), Arc::new(t));
+        }
+        s.zdr_targets = Arc::new(map);
+        s
+    }
+
+    fn target(name: &str, verified: bool) -> ZdrTarget {
+        ZdrTarget::new(
+            name.into(),
+            "http://127.0.0.1:9",
+            TrustBasis::SelfHosted,
+            verified,
+            vec![],
+            "zdr-secret-key-bytes".into(),
+        )
+        .unwrap()
+    }
+
+    // The selections/global files are named by `project_key(root)`, which the test crate
+    // cannot recompute (no direct blake3/zlauder-state dep). Each test uses its OWN temp
+    // state dir, so there is at most ONE such file — discover it by globbing rather than by
+    // name. (`root` is accepted for call-site clarity; the dir is single-tenant per test.)
+    fn selections_path(dir: &Path, _root: &str) -> PathBuf {
+        find_one(&dir.join("zdr-sessions"), |n| {
+            n.ends_with(".json") && !n.contains(".corrupt-")
+        })
+        .unwrap_or_else(|| dir.join("zdr-sessions").join("MISSING.json"))
+    }
+    fn report_path(dir: &Path, conversation: &str) -> PathBuf {
+        dir.join("zdr-reports").join(format!("{conversation}.json"))
+    }
+    fn global_report_path(dir: &Path, _root: &str) -> PathBuf {
+        find_one(&dir.join("zdr-reports"), |n| n.ends_with(".global.json"))
+            .unwrap_or_else(|| dir.join("zdr-reports").join("MISSING.global.json"))
+    }
+
+    /// The single directory entry whose file name matches `pred`, or `None`.
+    fn find_one(dir: &Path, pred: impl Fn(&str) -> bool) -> Option<PathBuf> {
+        std::fs::read_dir(dir)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .find(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(&pred)
+                    .unwrap_or(false)
+            })
+    }
+
+    #[cfg(unix)]
+    fn set_mode(p: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(mode)).unwrap();
+    }
+
+    /// Make the `zdr-sessions` SUBDIR un-creatable by occupying its path with a regular
+    /// FILE — a robust write-failure injection that the production `create_dir_all` +
+    /// `chmod 0700` cannot undo (chmod on a dir we own is always permitted, so a 0500 mode
+    /// would be silently reset; a wrong file TYPE is permanent). Returns the path so the
+    /// caller can remove it for cleanup.
+    fn block_sessions_dir(state_dir: &Path) -> PathBuf {
+        let p = state_dir.join("zdr-sessions");
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::write(&p, b"not a dir").unwrap();
+        p
+    }
+    /// Same robust injection for the report dir (used to force the global-revert write to
+    /// fail on the Corrupt branch).
+    fn block_reports_dir(state_dir: &Path) -> PathBuf {
+        let p = state_dir.join("zdr-reports");
+        let _ = std::fs::remove_dir_all(&p);
+        std::fs::write(&p, b"not a dir").unwrap();
+        p
+    }
+
+    // ---- ACCEPTANCE: concrete trace 1 -------------------------------------
+    // Persisted [box(verified), gone(missing)] + unverified entry → restored verified,
+    // dropped missing, dropped unverified, disk rewritten, NO credential bytes on disk,
+    // the persisted JSON carries the NAME "box" not the resolved key bytes.
+    #[test]
+    fn persisted_selection_revalidates_fail_closed() {
+        let g = StateDirGuard::new("revalidate");
+        let root = "/proj/revalidate";
+
+        // First, durably engage three conversations on a state where ALL three targets
+        // resolve verified, so the selections file holds all three.
+        {
+            let s = state_for(
+                root,
+                vec![target("box", true), target("old", true), target("raw", true)],
+            );
+            s.set_zdr_selection("c1", "box").unwrap();
+            s.set_zdr_selection("c2", "old").unwrap(); // will be "missing" on reload
+            s.set_zdr_selection("c3", "raw").unwrap(); // will be "unverified" on reload
+        }
+
+        // The on-disk selections file must carry the NAME, never the key bytes.
+        let sel_bytes = std::fs::read(selections_path(g.path(), root)).unwrap();
+        let sel_str = String::from_utf8(sel_bytes).unwrap();
+        assert!(sel_str.contains("\"box\""), "persisted name present: {sel_str}");
+        assert!(
+            !sel_str.contains("zdr-secret-key-bytes"),
+            "NO credential bytes may reach the selections file: {sel_str}"
+        );
+
+        // Reload with a registry where only `box` resolves verified; `old` is absent and
+        // `raw` is present-but-unverified.
+        let s2 = state_for(root, vec![target("box", true), target("raw", false)]);
+        let load = s2.load_persisted_selections();
+        assert!(matches!(load, PersistedLoad::Loaded(_)), "{load:?}");
+        let report = s2.reload_zdr_sessions(load).expect("reload must not fail");
+
+        // In-memory map: only c1→box survives.
+        assert_eq!(
+            s2.zdr_selection("c1").map(|s| s.target),
+            Some("box".to_string())
+        );
+        assert!(s2.zdr_selection("c2").is_none(), "missing target dropped");
+        assert!(s2.zdr_selection("c3").is_none(), "unverified target dropped");
+
+        // Report outcomes.
+        assert!(report.outcomes.contains(&ReloadOutcome::Restored {
+            conversation: "c1".into(),
+            target: "box".into()
+        }));
+        assert!(report.outcomes.contains(&ReloadOutcome::Reverted {
+            conversation: "c2".into(),
+            reason: "target no longer configured".into()
+        }));
+        assert!(report.outcomes.contains(&ReloadOutcome::Reverted {
+            conversation: "c3".into(),
+            reason: "target no longer user_verified".into()
+        }));
+
+        // Per-conversation report files written.
+        let r1: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report_path(g.path(), "c1")).unwrap()).unwrap();
+        assert_eq!(r1["kind"], "restored");
+        assert_eq!(r1["target"], "box");
+        let r2: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report_path(g.path(), "c2")).unwrap()).unwrap();
+        assert_eq!(r2["kind"], "reverted");
+
+        // Disk rewritten to ONLY the surviving entry, still carrying the name not the key.
+        let rewritten = std::fs::read_to_string(selections_path(g.path(), root)).unwrap();
+        assert!(rewritten.contains("\"box\""));
+        assert!(!rewritten.contains("\"old\""), "dropped entry gone from disk");
+        assert!(!rewritten.contains("\"raw\""), "dropped entry gone from disk");
+        assert!(!rewritten.contains("zdr-secret-key-bytes"));
+    }
+
+    // ---- ACCEPTANCE: corrupt boot fails when the global revert is unwritable ----
+    // S1 ordering: corrupt selections file present + report dir unwritable → the
+    // global-revert WRITE fails → reload returns Err (boot fails; no silent empty map).
+    #[test]
+    #[cfg(unix)]
+    fn corrupt_boot_fails_when_global_revert_unwritable() {
+        let g = StateDirGuard::new("corrupt-fatal");
+        let root = "/proj/corrupt-fatal";
+
+        // Create the real key-named selections file by engaging once, then corrupt it
+        // in place (torn write — invalid JSON).
+        {
+            let s = state_for(root, vec![target("box", true)]);
+            s.set_zdr_selection("seed", "box").unwrap();
+        }
+        let sp = selections_path(g.path(), root);
+        std::fs::write(&sp, b"{\"conversa").unwrap();
+
+        // Make the report dir UN-CREATABLE so the global-revert write fails (occupy its
+        // path with a regular file — survives the production create_dir_all/chmod).
+        let blocked = block_reports_dir(g.path());
+
+        let s = state_for(root, vec![target("box", true)]);
+        let load = s.load_persisted_selections();
+        assert!(
+            matches!(load, PersistedLoad::Corrupt(_)),
+            "torn write must classify Corrupt, got {load:?}"
+        );
+        let res = s.reload_zdr_sessions(load);
+        // Remove the blocker so the temp tree can be cleaned up.
+        let _ = std::fs::remove_file(&blocked);
+        assert!(
+            res.is_err(),
+            "a failed global-revert write on Corrupt MUST fail the boot (no silent empty map)"
+        );
+        // The in-memory map stays empty (never silently Normal-routed with a hidden ZDR).
+        assert!(s.zdr_selection("c1").is_none());
+    }
+
+    // ---- ACCEPTANCE: Corrupt distinct from first boot ---------------------
+    // Corrupt → empty map + global "*" revert (epoch-bearing) + file quarantined.
+    // Absent → empty map, NO report, silent.
+    #[test]
+    fn corrupt_emits_global_revert_absent_is_silent() {
+        // Corrupt path.
+        {
+            let g = StateDirGuard::new("corrupt-visible");
+            let root = "/proj/corrupt-visible";
+            // Create the real key-named selections file, then corrupt it in place.
+            {
+                let seed = state_for(root, vec![target("box", true)]);
+                seed.set_zdr_selection("seed", "box").unwrap();
+            }
+            let sp = selections_path(g.path(), root);
+            std::fs::write(&sp, b"{\"conversa").unwrap();
+
+            let s = state_for(root, vec![]);
+            let report = s
+                .reload_zdr_sessions(s.load_persisted_selections())
+                .expect("global revert is writable here → Ok");
+            // Single global "*" revert.
+            assert_eq!(report.outcomes.len(), 1);
+            assert!(matches!(
+                &report.outcomes[0],
+                ReloadOutcome::Reverted { conversation, .. } if conversation == "*"
+            ));
+            // Global file carries an epoch.
+            let gv: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(global_report_path(g.path(), root)).unwrap())
+                    .unwrap();
+            assert_eq!(gv["conversation"], "*");
+            assert!(gv["epoch"].as_u64().unwrap() > 0, "epoch must be present: {gv}");
+            // The unparseable file was quarantined (renamed away) → original gone.
+            assert!(!sp.exists(), "corrupt file must be quarantined (renamed)");
+            let quarantined: Vec<_> = std::fs::read_dir(sp.parent().unwrap())
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .contains(".json.corrupt-")
+                })
+                .collect();
+            assert_eq!(quarantined.len(), 1, "exactly one quarantined file");
+            assert!(s.zdr_selection("anything").is_none());
+        }
+        // Absent path: first boot → empty map, NO report, silent.
+        {
+            let g = StateDirGuard::new("first-boot");
+            let root = "/proj/first-boot";
+            let s = state_for(root, vec![]);
+            assert!(matches!(s.load_persisted_selections(), PersistedLoad::Absent));
+            let report = s
+                .reload_zdr_sessions(s.load_persisted_selections())
+                .unwrap();
+            assert!(report.outcomes.is_empty(), "first boot must be silent");
+            assert!(!global_report_path(g.path(), root).exists());
+        }
+    }
+
+    // ---- ACCEPTANCE: perm-denied selections file → Corrupt (never Absent) ----
+    #[test]
+    #[cfg(unix)]
+    fn perm_denied_selections_classifies_corrupt_not_absent() {
+        let g = StateDirGuard::new("perm-denied");
+        let root = "/proj/perm-denied";
+        // Create the real key-named selections file, then make it unreadable.
+        {
+            let seed = state_for(root, vec![target("box", true)]);
+            seed.set_zdr_selection("seed", "box").unwrap();
+        }
+        let sp = selections_path(g.path(), root);
+        set_mode(&sp, 0o000); // unreadable
+
+        let s = state_for(root, vec![]);
+        let load = s.load_persisted_selections();
+        set_mode(&sp, 0o600); // restore for cleanup
+        assert!(
+            matches!(load, PersistedLoad::Corrupt(_)),
+            "perm-denied must be Corrupt, never Absent/silent: {load:?}"
+        );
+    }
+
+    // ---- ACCEPTANCE: clean empty array is Loaded(vec![]), not Corrupt ------
+    #[test]
+    fn empty_array_is_loaded_not_corrupt() {
+        let g = StateDirGuard::new("empty-array");
+        let root = "/proj/empty-array";
+        // Create the real key-named selections file, then overwrite with a clean empty array.
+        {
+            let seed = state_for(root, vec![target("box", true)]);
+            seed.set_zdr_selection("seed", "box").unwrap();
+        }
+        let sp = selections_path(g.path(), root);
+        std::fs::write(&sp, b"[]").unwrap();
+        let s = state_for(root, vec![]);
+        match s.load_persisted_selections() {
+            PersistedLoad::Loaded(v) => assert!(v.is_empty()),
+            other => panic!("clean empty array must be Loaded(vec![]), got {other:?}"),
+        }
+        let report = s
+            .reload_zdr_sessions(s.load_persisted_selections())
+            .unwrap();
+        assert!(report.outcomes.is_empty(), "no false global revert on []");
+        assert!(!global_report_path(g.path(), root).exists());
+    }
+
+    // ---- ACCEPTANCE: one unwritable per-conv report does not abort reload --
+    #[test]
+    #[cfg(unix)]
+    fn loaded_boot_survives_unwritable_one_report() {
+        let g = StateDirGuard::new("one-report-fail");
+        let root = "/proj/one-report-fail";
+
+        // Engage c1→box and c2→box durably.
+        {
+            let s = state_for(root, vec![target("box", true)]);
+            s.set_zdr_selection("c1", "box").unwrap();
+            s.set_zdr_selection("c2", "box").unwrap();
+        }
+
+        // Pre-create c1.json as a DIRECTORY so the per-conv report file write for c1 fails,
+        // while c2's write still succeeds.
+        let reports = g.path().join("zdr-reports");
+        std::fs::create_dir_all(&reports).unwrap();
+        std::fs::create_dir_all(reports.join("c1.json")).unwrap();
+
+        let s2 = state_for(root, vec![target("box", true)]);
+        let report = s2
+            .reload_zdr_sessions(s2.load_persisted_selections())
+            .expect("a single unwritable report must NOT fail the boot");
+
+        // Both restored in memory (the routing decision holds regardless of the report write).
+        assert_eq!(
+            s2.zdr_selection("c1").map(|s| s.target),
+            Some("box".to_string())
+        );
+        assert_eq!(
+            s2.zdr_selection("c2").map(|s| s.target),
+            Some("box".to_string())
+        );
+        assert_eq!(report.outcomes.len(), 2);
+        // c2's report file was still written.
+        assert!(report_path(g.path(), "c2").is_file());
+    }
+
+    // ---- ACCEPTANCE (S1): live engage rolls back on persist failure --------
+    #[test]
+    #[cfg(unix)]
+    fn live_engage_rolls_back_on_persist_failure() {
+        let g = StateDirGuard::new("engage-rollback");
+        let root = "/proj/engage-rollback";
+
+        // Make the zdr-sessions dir UN-CREATABLE so the selections write fails.
+        let blocked = block_sessions_dir(g.path());
+
+        let s = state_for(root, vec![target("box", true)]);
+        let res = s.set_zdr_selection("c", "box");
+        let _ = std::fs::remove_file(&blocked); // cleanup
+        assert!(res.is_err(), "unwritable dir must surface Err (S1)");
+        assert!(
+            s.zdr_selection("c").is_none(),
+            "in-memory insert MUST be rolled back on write failure (no silent loss across recycle)"
+        );
+    }
+
+    // ---- ACCEPTANCE (S1): live disengage re-inserts on persist failure -----
+    #[test]
+    #[cfg(unix)]
+    fn live_disengage_rolls_back_on_persist_failure() {
+        let g = StateDirGuard::new("disengage-rollback");
+        let root = "/proj/disengage-rollback";
+
+        let s = state_for(root, vec![target("box", true)]);
+        // Durably engage first (dir writable).
+        s.set_zdr_selection("c", "box").unwrap();
+        assert_eq!(s.zdr_selection("c").map(|x| x.target), Some("box".into()));
+
+        // Now make the dir un-creatable so the disengage write fails.
+        let blocked = block_sessions_dir(g.path());
+        let res = s.clear_zdr_selection("c");
+        let _ = std::fs::remove_file(&blocked); // cleanup
+        assert!(res.is_err(), "unwritable dir must surface Err (S1)");
+        assert_eq!(
+            s.zdr_selection("c").map(|x| x.target),
+            Some("box".to_string()),
+            "disengage write failure MUST re-insert (else next recycle resurrects ZDR off-disk)"
+        );
+    }
+
+    // ---- ACCEPTANCE (S1): zdr_set returns 5xx (not 200) on persist failure --
+    // Drives the admin surface through the router with an unwritable state dir.
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn zdr_set_returns_5xx_when_persist_fails() {
+        let g = StateDirGuard::new("set-5xx");
+        let root = "/proj/set-5xx";
+
+        // Make the zdr-sessions dir un-creatable so the durable write fails.
+        let blocked = block_sessions_dir(g.path());
+
+        let mut s = state_for(root, vec![target("box", true)]);
+        s.zdr_default = Arc::new(Some("box".into()));
+        let proxy_addr = spawn(proxy_router(s)).await;
+
+        let client = reqwest::Client::new();
+        let resp = client
+            .post(format!("http://{proxy_addr}/zlauder/session/cx/zdr"))
+            .header("x-zlauder-key", "test-key")
+            .json(&serde_json::json!({"config":"box"}))
+            .send()
+            .await
+            .unwrap();
+        let status = resp.status();
+        let body = resp.text().await.unwrap();
+        let _ = std::fs::remove_file(&blocked); // cleanup
+
+        assert!(
+            status.is_server_error(),
+            "persist failure MUST surface as 5xx (not 200), got {status}"
+        );
+        assert!(
+            !body.contains("\"engaged\""),
+            "body must NOT claim engaged on a persist failure: {body}"
+        );
+    }
+
+    // ---- ACCEPTANCE (finding 1): a failed SWITCH rolls back to the prior target ----
+    // Engage c on X durably, then a switch c X->Y whose write fails must leave c==X (NOT
+    // None) in memory AND X still on disk — never a third diverged state.
+    #[test]
+    #[cfg(unix)]
+    fn live_engage_switch_rolls_back_to_prior_target() {
+        let g = StateDirGuard::new("switch-rollback");
+        let root = "/proj/switch-rollback";
+
+        let s = state_for(root, vec![target("X", true), target("Y", true)]);
+        // Durably engage c on X (dir writable).
+        s.set_zdr_selection("c", "X").unwrap();
+        assert_eq!(s.zdr_selection("c").map(|x| x.target), Some("X".into()));
+
+        // Now make the dir un-creatable so the SWITCH write fails.
+        let blocked = block_sessions_dir(g.path());
+        let res = s.set_zdr_selection("c", "Y");
+        let _ = std::fs::remove_file(&blocked); // cleanup
+        assert!(res.is_err(), "unwritable dir must surface Err (S1)");
+        assert_eq!(
+            s.zdr_selection("c").map(|x| x.target),
+            Some("X".to_string()),
+            "a failed switch MUST restore the PRIOR target X (not None); else X is dropped \
+             unannounced and resurrects on the next recycle"
+        );
+
+        // Disk faithfulness: re-persist from the (rolled-back) memory now that the dir is
+        // writable again, and confirm the durable file holds ONLY X — proving the failed
+        // switch never durably advanced to Y and memory==disk==X.
+        s.set_zdr_selection("c", "X").unwrap();
+        let on_disk = std::fs::read_to_string(selections_path(g.path(), root)).unwrap();
+        assert!(on_disk.contains("\"X\""), "disk holds X: {on_disk}");
+        assert!(!on_disk.contains("\"Y\""), "Y never persisted: {on_disk}");
+    }
+
+    // ---- ACCEPTANCE (finding 2): the cap is enforced VISIBLY at engage time ----
+    // Once the live map holds MAX distinct conversations, a NEW engage is refused with Err
+    // (→ 5xx) rather than silently truncated off disk; the persisted set always equals the
+    // in-memory set (no silent divergence).
+    #[test]
+    fn engage_refuses_when_cap_reached() {
+        const MAX: usize = 1000; // mirrors MAX_PERSISTED_SELECTIONS
+        let g = StateDirGuard::new("cap-visible");
+        let root = "/proj/cap-visible";
+
+        let s = state_for(root, vec![target("box", true)]);
+        // Fill the live map to MAX with distinct conversations.
+        for i in 0..MAX {
+            s.set_zdr_selection(&format!("c{i:04}"), "box").unwrap();
+        }
+        assert_eq!(s.zdr_active().len(), MAX, "map filled to MAX");
+
+        // A NEW engage past the cap is refused (fail-closed-and-visible).
+        let res = s.set_zdr_selection("overflow", "box");
+        assert!(res.is_err(), "a NEW engage at the cap MUST surface Err (→5xx)");
+        assert!(
+            s.zdr_selection("overflow").is_none(),
+            "the refused conversation must NOT be in memory"
+        );
+
+        // A switch/re-engage of an EXISTING conversation is still allowed (no growth).
+        s.set_zdr_selection("c0000", "box").unwrap();
+
+        // The persisted file's entry count exactly equals the in-memory map length — no
+        // silent truncation divergence.
+        let persisted: Vec<serde_json::Value> =
+            serde_json::from_slice(&std::fs::read(selections_path(g.path(), root)).unwrap())
+                .unwrap();
+        assert_eq!(
+            persisted.len(),
+            s.zdr_active().len(),
+            "persisted set count MUST equal the in-memory map length (no silent truncation)"
+        );
+        assert_eq!(persisted.len(), MAX);
+    }
+
+    // ---- ACCEPTANCE (finding 3): concurrent set/clear keep disk == final memory ----
+    // Multiple threads doing set/clear on DISTINCT conversations against one shared AppState
+    // must observe NO spurious Err (no temp-path collision) and leave the on-disk persisted
+    // set exactly equal to the final in-memory map (no stale-snapshot rename winning).
+    #[test]
+    fn concurrent_set_clear_keeps_disk_consistent() {
+        let g = StateDirGuard::new("concurrent");
+        let root = "/proj/concurrent";
+
+        let s = std::sync::Arc::new(state_for(root, vec![target("box", true)]));
+        let spurious_err = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let mut handles = Vec::new();
+        for t in 0..4 {
+            let s = std::sync::Arc::clone(&s);
+            let spurious_err = std::sync::Arc::clone(&spurious_err);
+            handles.push(std::thread::spawn(move || {
+                for i in 0..50 {
+                    let conv = format!("t{t}-c{i:03}");
+                    if let Err(_e) = s.set_zdr_selection(&conv, "box") {
+                        spurious_err.store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    // Disengage every other one so the final map is a known mix.
+                    if i % 2 == 0 {
+                        if let Err(_e) = s.clear_zdr_selection(&conv) {
+                            spurious_err.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        assert!(
+            !spurious_err.load(std::sync::atomic::Ordering::Relaxed),
+            "no spurious PersistError may occur from a temp-path collision"
+        );
+
+        // On-disk persisted set must exactly equal the FINAL in-memory map.
+        let persisted: Vec<PersistedSelection> =
+            serde_json::from_slice(&std::fs::read(selections_path(g.path(), root)).unwrap())
+                .unwrap();
+        let mut disk: Vec<(String, String)> = persisted
+            .into_iter()
+            .map(|p| (p.conversation, p.target))
+            .collect();
+        disk.sort();
+        let mut mem = s.zdr_active();
+        mem.sort();
+        assert_eq!(
+            disk, mem,
+            "on-disk persisted set MUST equal the final in-memory map (no stale-snapshot rename)"
+        );
+    }
 }
