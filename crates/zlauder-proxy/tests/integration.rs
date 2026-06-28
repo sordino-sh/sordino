@@ -2337,6 +2337,131 @@ mod zdr_persist {
         assert!(!rewritten.contains("zdr-secret-key-bytes"));
     }
 
+    // ---- ACCEPTANCE (A10fix3 Fix 1): dedupe duplicate-conversation entries on reload ----
+    // A 0600 selections file is normally serialized from a HashMap (never duplicated), but
+    // the user could hand-edit it. A file with TWO entries for the same conversation —
+    // [{c, valid}, {c, missing}] — must NOT process `c` twice (which used to restore `c`
+    // into the map via the first/valid entry AND overwrite c.json=Reverted via the
+    // second/missing entry — a map says ZDR / report says Reverted contradiction). The
+    // dedupe (last-wins) processes `c` EXACTLY ONCE: the LAST entry (missing target) wins,
+    // so the map drops `c` AND c.json reports Reverted — they AGREE.
+    #[test]
+    fn reload_dedupes_duplicate_conversation_map_matches_report() {
+        let g = StateDirGuard::new("dedupe-last-wins");
+        let root = "/proj/dedupe-last-wins";
+
+        // Create the real key-named selections file via a single engage, then overwrite it
+        // in place with a hand-tampered DUPLICATE-conversation array (still valid JSON).
+        {
+            let s = state_for(root, vec![target("box", true)]);
+            s.set_zdr_selection("seed", "box").unwrap();
+        }
+        let sp = selections_path(g.path(), root);
+        // [{c, box(valid)}, {c, gone(missing)}] — duplicate conversation `c`, last = missing.
+        let dup = serde_json::json!([
+            {"conversation": "c", "target": "box"},
+            {"conversation": "c", "target": "gone"},
+        ]);
+        std::fs::write(&sp, serde_json::to_vec(&dup).unwrap()).unwrap();
+
+        // Reload with a registry where ONLY `box` resolves verified; `gone` is absent.
+        let s2 = state_for(root, vec![target("box", true)]);
+        let load = s2.load_persisted_selections();
+        assert!(matches!(load, PersistedLoad::Loaded(_)), "{load:?}");
+        let report = s2.reload_zdr_sessions(load).expect("reload must not fail");
+
+        // Processed EXACTLY ONCE: exactly one outcome for `c`.
+        let c_outcomes: Vec<_> = report
+            .outcomes
+            .iter()
+            .filter(|o| {
+                matches!(o,
+                    ReloadOutcome::Restored { conversation, .. }
+                    | ReloadOutcome::Reverted { conversation, .. } if conversation == "c")
+            })
+            .collect();
+        assert_eq!(
+            c_outcomes.len(),
+            1,
+            "duplicate conversation must be processed exactly once (got {c_outcomes:?})"
+        );
+
+        // Last-wins: the `gone` (missing) entry wins → Reverted, NOT Restored.
+        assert!(
+            matches!(c_outcomes[0], ReloadOutcome::Reverted { .. }),
+            "last-occurrence (missing target) must win → Reverted (got {:?})",
+            c_outcomes[0]
+        );
+
+        // MAP == REPORT: the in-memory map drops `c` (routes masked-Normal) AND the
+        // c.json report says Reverted — no contradiction.
+        assert!(
+            s2.zdr_selection("c").is_none(),
+            "last-wins missing target means the in-memory map must NOT route `c` ZDR"
+        );
+        let rep: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report_path(g.path(), "c")).unwrap()).unwrap();
+        assert_eq!(
+            rep["kind"], "reverted",
+            "c.json must AGREE with the dropped-from-map decision (both Normal/Reverted)"
+        );
+
+        // The rewritten survivors file has NO duplicate `c` entry (the dropped one is gone).
+        let rewritten = std::fs::read_to_string(selections_path(g.path(), root)).unwrap();
+        let survivors: Vec<PersistedSelection> = serde_json::from_str(&rewritten).unwrap();
+        assert!(
+            !survivors.iter().any(|e| e.conversation == "c"),
+            "a reverted (missing) conversation must not linger on disk: {rewritten}"
+        );
+    }
+
+    // ---- ACCEPTANCE (A10fix3 Fix 1, mirror): last-wins where the LAST entry is VALID ----
+    // [{c, gone(missing)}, {c, box(valid)}] → last (valid) wins → Restored, map routes ZDR,
+    // c.json=Restored — again map==report, processed once.
+    #[test]
+    fn reload_dedupe_last_valid_wins_map_matches_report() {
+        let g = StateDirGuard::new("dedupe-last-valid");
+        let root = "/proj/dedupe-last-valid";
+
+        {
+            let s = state_for(root, vec![target("box", true)]);
+            s.set_zdr_selection("seed", "box").unwrap();
+        }
+        let sp = selections_path(g.path(), root);
+        // Duplicate `c`: first missing, LAST valid → last-wins keeps the valid one.
+        let dup = serde_json::json!([
+            {"conversation": "c", "target": "gone"},
+            {"conversation": "c", "target": "box"},
+        ]);
+        std::fs::write(&sp, serde_json::to_vec(&dup).unwrap()).unwrap();
+
+        let s2 = state_for(root, vec![target("box", true)]);
+        let load = s2.load_persisted_selections();
+        let report = s2.reload_zdr_sessions(load).expect("reload must not fail");
+
+        let c_outcomes: Vec<_> = report
+            .outcomes
+            .iter()
+            .filter(|o| {
+                matches!(o,
+                    ReloadOutcome::Restored { conversation, .. }
+                    | ReloadOutcome::Reverted { conversation, .. } if conversation == "c")
+            })
+            .collect();
+        assert_eq!(c_outcomes.len(), 1, "processed exactly once: {c_outcomes:?}");
+
+        // Last (valid) wins → Restored, map routes ZDR, report Restored — agree.
+        assert_eq!(
+            s2.zdr_selection("c").map(|s| s.target),
+            Some("box".to_string()),
+            "last-occurrence valid target must restore `c` into the map"
+        );
+        let rep: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(report_path(g.path(), "c")).unwrap()).unwrap();
+        assert_eq!(rep["kind"], "restored");
+        assert_eq!(rep["target"], "box");
+    }
+
     // ---- ACCEPTANCE: corrupt boot fails when the global revert is unwritable ----
     // S1 ordering: corrupt selections file present + report dir unwritable → the
     // global-revert WRITE fails → reload returns Err (boot fails; no silent empty map).
@@ -3101,6 +3226,43 @@ async fn session_traversal_batches_refused() {
     assert!(
         def_cap.body.lock().unwrap().is_empty() && def_cap.paths.lock().unwrap().is_empty(),
         "a traversal must be refused, never relayed (no bytes/path upstream)"
+    );
+}
+
+// A10fix3 Fix 2: the verbatim relay's session-prefix pin check must percent-DECODE the
+// conversation-id segment before the pin lookup, so a percent-encoded id resolves to the
+// SAME key the control plane persists (axum `Path<String>` decodes; the pin in zdr_sessions
+// is keyed on the decoded id). `c%31` decodes to `c1`; a relay to
+// `/zlauder/session/c%31/v1/files` for the pinned `c1` MUST be REFUSED (409, ZERO bytes
+// upstream) — not relayed because the raw segment `c%31` missed the pin. reqwest would decode
+// `%31` before sending, defeating the test, so drive a RAW HTTP/1.1 request that keeps the
+// literal `%31` on the wire.
+#[tokio::test]
+async fn relay_pin_check_decodes_percent_encoded_session_id() {
+    let def_cap = Captured::default();
+    let def_up = Router::new()
+        .fallback(fake_capture_any)
+        .with_state(def_cap.clone());
+    let def_addr = spawn(def_up).await;
+
+    let (state, _) = capture_any_state(format!("http://{def_addr}"));
+    // Pin the DECODED id `c1` — exactly the key the session handlers / zdr_set persist.
+    engage_in_memory(&state, "c1", "trusted");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    // Percent-encoded "c1" == "c%31". Send raw so the encoding survives to the handler.
+    let status =
+        raw_post_status(proxy_addr, "/zlauder/session/c%31/v1/files", "plaintext eve@example.com")
+            .await;
+    assert_eq!(
+        status, 409,
+        "a percent-encoded session id for a pinned conversation must resolve to the pin and \
+         REFUSE the verbatim relay (got {status})"
+    );
+    assert!(
+        def_cap.body.lock().unwrap().is_empty() && def_cap.paths.lock().unwrap().is_empty(),
+        "fail-closed: ZERO bytes egressed to the default upstream for the percent-encoded \
+         pinned passthrough"
     );
 }
 

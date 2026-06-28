@@ -384,6 +384,45 @@ fn parse_session_prefix(path: &str) -> Option<(String, String)> {
     Some((id.to_string(), format!("/{rest}")))
 }
 
+/// Percent-DECODE a single path segment (the conversation id) so a percent-encoded id in a
+/// session-prefixed relay path resolves to the SAME key the control plane persists: the
+/// session handlers and `zdr_set` receive the id via axum `Path<String>`, which percent-DECODES
+/// it, so the pin in `zdr_sessions` is keyed on the decoded id. The verbatim relay extracts the
+/// id from the RAW (still-encoded) path segment, so without decoding, `/zlauder/session/c%31/…`
+/// would MISS a pin keyed on `c1` and RELAY plaintext instead of refusing.
+///
+/// Decodes ONLY this one segment for the pin LOOKUP — it does NOT touch the relayed path. Returns
+/// `None` (fail-closed: the caller treats the pin as if it could not be resolved cleanly) on any
+/// malformed `%`-escape (truncated or non-hex) OR a decode that is not valid UTF-8, so a
+/// malformed-encoded id can never silently bypass the pin check.
+///
+/// Not exercised by LIVE ids — `safe_conversation_id` normalizes to `[A-Za-z0-9_-]`, which never
+/// percent-encodes, so this is a no-op there — but it closes a defense-in-depth consistency gap.
+fn percent_decode_segment(seg: &str) -> Option<String> {
+    let bytes = seg.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' => {
+                // Need exactly two hex digits following the '%'.
+                let hi = bytes.get(i + 1).copied()?;
+                let lo = bytes.get(i + 2).copied()?;
+                let hi = (hi as char).to_digit(16)?;
+                let lo = (lo as char).to_digit(16)?;
+                out.push((hi * 16 + lo) as u8);
+                i += 3;
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    // A decoded id that is not valid UTF-8 can never be a live key — fail closed.
+    String::from_utf8(out).ok()
+}
+
 /// True when a (prefix-stripped) inner relay path targets `/v1/batches`. ZDR forbids
 /// the batches path entirely (it is verbatim, never masked, and may carry PII), so a
 /// pinned conversation must never reach it — via the session prefix or otherwise.
@@ -426,7 +465,18 @@ pub(crate) async fn relay_verbatim(st: &AppState, req: Request) -> Response {
         // A pinned (ZDR) conversation must never relay verbatim to the DEFAULT endpoint —
         // the verbatim relay never masks, so this would egress plaintext. Refuse 409 with
         // ZERO bytes upstream (return BEFORE any send).
-        if st.zdr_selection(&id).is_some() {
+        //
+        // Key the pin lookup on the PERCENT-DECODED id so it resolves to the SAME key the
+        // session handlers / `zdr_set` persist (they receive the id via axum `Path<String>`,
+        // which percent-decodes). A malformed `%`-escape decodes to `None` → fail closed
+        // (refuse) rather than relay a malformed-encoded path that might name a pin.
+        let Some(decoded_id) = percent_decode_segment(&id) else {
+            return err(
+                StatusCode::BAD_REQUEST,
+                "malformed session passthrough path (invalid percent-encoding in conversation id)",
+            );
+        };
+        if st.zdr_selection(&decoded_id).is_some() {
             return err(
                 StatusCode::CONFLICT,
                 "this conversation is ZDR-pinned — refusing to relay a verbatim passthrough to \

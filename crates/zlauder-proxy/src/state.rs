@@ -430,6 +430,37 @@ impl AppState {
         }
     }
 
+    /// Collapse duplicate-conversation entries to ONE entry per conversation, LAST occurrence
+    /// wins, PRESERVING first-seen order of the survivors (deterministic). Matches how a
+    /// `HashMap`-serialized selections file would collapse duplicates, so this is a no-op on a
+    /// normally-written file and only disciplines a hand-tampered one. Guarantees the
+    /// restore/revert loop processes each conversation exactly once → in-memory map and
+    /// `<conv>.json` report always agree.
+    fn dedupe_persisted_last_wins(entries: Vec<PersistedSelection>) -> Vec<PersistedSelection> {
+        // Last-wins: keep the latest target for each conversation.
+        let mut winner: HashMap<String, String> = HashMap::new();
+        // Stable first-seen ordering of the surviving conversations (deterministic output).
+        let mut order: Vec<String> = Vec::new();
+        for entry in entries {
+            if !winner.contains_key(&entry.conversation) {
+                order.push(entry.conversation.clone());
+            }
+            winner.insert(entry.conversation, entry.target);
+        }
+        order
+            .into_iter()
+            .map(|conversation| {
+                let target = winner
+                    .remove(&conversation)
+                    .expect("winner map populated for every ordered conversation");
+                PersistedSelection {
+                    conversation,
+                    target,
+                }
+            })
+            .collect()
+    }
+
     /// Re-validate the persisted selections at boot and install the surviving ones into the
     /// in-memory map. Fallible in EXACTLY ONE branch — a failed global-revert WRITE on
     /// Corrupt — which propagates so the proxy does NOT bind the listener. Every other path
@@ -480,6 +511,20 @@ impl AppState {
             }
 
             PersistedLoad::Loaded(entries) => {
+                // Dedupe by conversation BEFORE the restore/revert loop so each conversation
+                // is processed EXACTLY ONCE. The selections file is normally serialized from a
+                // `HashMap`, so it never contains duplicate conversations — but it is a `0600`
+                // file the user could hand-edit, and a duplicated conversation (e.g. one valid
+                // and one missing target) would otherwise process the conversation twice:
+                // last-write-wins on the `<conv>.json` report, but the in-memory map could still
+                // carry the earlier restore — a map/report contradiction (the map routes ZDR
+                // while A6 reads the report as Reverted/Normal). Collapsing duplicates here makes
+                // the map and the report ALWAYS agree per conversation.
+                //
+                // Winner = LAST occurrence (deterministic), matching how a `HashMap`-serialized
+                // file would collapse duplicates (the last `insert` for a key wins) — so the
+                // dedupe is a no-op on a normally-written file and only disciplines a tampered one.
+                let entries = Self::dedupe_persisted_last_wins(entries);
                 let mut report = ZdrReloadReport::default();
                 let mut survivors: Vec<PersistedSelection> = Vec::new();
                 for entry in entries {
