@@ -1719,6 +1719,106 @@ async fn zdr_session_routes_to_target_with_zdr_key_not_subscription() {
     assert!(client_text.contains("dana@example.com"));
 }
 
+// H4/D4: the CAPTURED upstream destination rides each RequestRecord, value-free
+// (target NAME only), so a ZDR-routed request is distinguishable from a silently-
+// degraded Normal one in BOTH the snapshot JSON and (via `r.upstream`) the monitor UI.
+// A ZDR pin (engaged via the in-memory selection) records `"zdr:box"`; an unpinned
+// request records `"anthropic"`. The value is sourced from the PinnedMode captured at
+// routing time, NOT a re-read of `zdr_sessions` — and never carries the ZdrKey.
+#[tokio::test]
+async fn request_record_captures_destination() {
+    // --- ZDR-pinned request: captured upstream == "zdr:box" ---
+    let zdr_cap = Captured::default();
+    let zdr_up = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(zdr_cap.clone());
+    let zdr_addr = spawn(zdr_up).await;
+
+    let secret_zdr_key = "zdr-key-SECRET-bytes-xyz";
+    let target = ZdrTarget::new(
+        "box".into(),
+        &format!("http://{zdr_addr}"),
+        TrustBasis::SelfHosted,
+        true,
+        vec![],
+        secret_zdr_key.into(),
+    )
+    .unwrap();
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = zdr_state(engine, format!("http://{zdr_addr}"), target);
+    engage_in_memory(&state, "conv1", "box");
+    // Hold a Monitor handle before `state` is moved into the router.
+    let monitor = state.monitor.clone();
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let client = reqwest::Client::new();
+    client
+        .post(format!("http://{proxy_addr}/zlauder/session/conv1/v1/messages"))
+        .header("anthropic-version", "2023-06-01")
+        .json(&serde_json::json!({
+            "model":"claude-test","max_tokens":10,
+            "messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    let snap = monitor.snapshot();
+    let rec = snap
+        .records
+        .iter()
+        .find(|r| r.conversation_id == "conv1")
+        .expect("a record for the ZDR conversation");
+    assert_eq!(
+        rec.upstream.as_deref(),
+        Some("zdr:box"),
+        "ZDR pin captures the target NAME as the destination"
+    );
+    // VALUE-FREE: the serialized record carries only the target NAME, never key bytes.
+    let serialized = serde_json::to_string(rec).unwrap();
+    assert!(
+        !serialized.contains(secret_zdr_key),
+        "ZdrKey bytes must NEVER appear in a serialized record: {serialized}"
+    );
+
+    // --- unpinned (Normal) request: captured upstream == "anthropic" ---
+    let def_cap = Captured::default();
+    let def_up = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(def_cap.clone());
+    let def_addr = spawn(def_up).await;
+    let engine2 = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state2 = mk_state(engine2, format!("http://{def_addr}"), "test-key");
+    let monitor2 = state2.monitor.clone();
+    let proxy2_addr = spawn(proxy_router(state2)).await;
+
+    client
+        .post(format!("http://{proxy2_addr}/v1/messages"))
+        .header("x-api-key", "sk-secret-123")
+        .header("anthropic-version", "2023-06-01")
+        .json(&serde_json::json!({
+            "model":"claude-test","max_tokens":10,
+            "messages":[{"role":"user","content":[{"type":"text","text":"hi"}]}]
+        }))
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+
+    let snap2 = monitor2.snapshot();
+    let rec2 = snap2.records.first().expect("a record for the Normal request");
+    assert_eq!(
+        rec2.upstream.as_deref(),
+        Some("anthropic"),
+        "an unpinned request records the Normal destination (distinguishable from ZDR)"
+    );
+}
+
 // A selection naming an UNKNOWN target refuses (409) — fail-closed, never silently
 // routed to the default endpoint.
 #[tokio::test]

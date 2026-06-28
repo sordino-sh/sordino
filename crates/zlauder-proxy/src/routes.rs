@@ -230,6 +230,7 @@ async fn messages_inner(st: AppState, req: Request, conversation: Option<String>
         conversation,
         &masked,
         &manifest,
+        &pinned,
     );
     let record_id = ticket.id().to_string();
     if let Err(resp) = monitor::maybe_approve(&st, ticket).await {

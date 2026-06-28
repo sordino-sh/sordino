@@ -436,6 +436,18 @@ select:focus { outline: none; border-color: var(--cyan-dim); box-shadow: 0 0 0 1
 /* PII egress badge: red (real plaintext leaving), distinct from the amber "+N surfaces". */
 .new-flag.pii-flag { color: #fff; background: var(--bad); box-shadow: 0 0 12px -2px var(--bad); margin-left: 4px; }
 .spotlight-pii { color: var(--bad); font-weight: 700; }
+/* Captured upstream destination chip (H4/D4) — a ZDR-routed request must be visually
+   distinct in the records view from a silently-degraded Normal ("anthropic") one. */
+.dest-badge {
+  font-size: 8.5px; letter-spacing: .06em; font-weight: 600; text-transform: uppercase;
+  border-radius: 99px; padding: 1px 7px; white-space: nowrap; flex: none;
+}
+.dest-badge.zdr {
+  color: #08110d; background: var(--good); box-shadow: 0 0 12px -3px var(--good);
+}
+.dest-badge.normal {
+  color: var(--ink-dim); background: var(--bg-inset); border: 1px solid var(--line);
+}
 
 /* ---------- review pane ---------- */
 .review { position: relative; z-index: 1; overflow-y: auto; padding: 20px 22px 60px; min-height: 0; }

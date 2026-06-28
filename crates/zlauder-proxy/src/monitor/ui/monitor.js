@@ -7,7 +7,8 @@
                        updated_ms, decision, request_preview, request_spans,
                        response_preview, response_spans, response_status,
                        tokens[], tags[], rejection_reason, turn_index,
-                       request_surfaces[], response_surfaces[], delta }
+                       request_surfaces[], response_surfaces[], delta,
+                       human_turn_index, upstream? }
      Surface         { label, role?, kind, runs[], block_hash }
      Run             { text, token? }      // token ABSENT => plain run
      TokenRef        { token, value, entity_kind, surface }
@@ -116,6 +117,21 @@ function fmtClock(ms) {
   const s = Math.max(0, Math.ceil(ms / 1000));
   const m = Math.floor(s / 60);
   return `${m}:${String(s % 60).padStart(2, '0')}`;
+}
+
+/* Per-request CAPTURED destination chip (H4/D4). Reads the value-free RequestRecord.upstream
+   ("anthropic" | "zdr:<name>", target NAME only — never key material) captured at routing time.
+   A ZDR-routed request renders a distinct 'ZDR · <name>' chip so a silently-degraded Normal
+   request (no selection → "anthropic") is visually distinguishable in the records view. Old
+   snapshots (upstream absent) render nothing. */
+function destBadge(r) {
+  const u = r.upstream;
+  if (!u) return '';
+  if (u.startsWith('zdr:')) {
+    const name = u.slice(4);
+    return `<span class="dest-badge zdr" title="routed to verified ZDR target '${attr(name)}' (zero-data-retention)">ZDR &middot; ${esc(name)}</span>`;
+  }
+  return `<span class="dest-badge normal" title="routed to the default Anthropic upstream (Normal — not ZDR)">${esc(u)}</span>`;
 }
 function clockClass(ms) {
   if (ms == null) return '';
@@ -819,6 +835,7 @@ function renderTraffic(flashId) {
       + `<div class="rec-top">`
       +   turnPip
       +   `<span class="rec-endpoint">${esc(r.endpoint)}</span>`
+      +   destBadge(r)
       +   (pending ? `<span class="rec-clock ${clockClass(rem)}" data-countdown="${esc(r.id)}">&#9201; ${fmtClock(rem)}</span>` : '')
       +   (inflight ? `<span class="rec-clock live" data-elapsed="${esc(r.id)}">&#9201; ${fmtClock(ela)} streaming</span>` : '')
       +   (r.delta && r.delta.is_first ? `<span class="new-flag">FIRST</span>`

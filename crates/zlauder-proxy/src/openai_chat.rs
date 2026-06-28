@@ -86,6 +86,9 @@ async fn chat_completions_inner(
         conversation,
         &masked,
         &manifest,
+        // The OpenAI-compat handler 501-refuses a Zdr pin above, so the captured mode here
+        // is always Normal → record "anthropic".
+        &PinnedMode::Normal,
     );
     let record_id = ticket.id().to_string();
     if let Err(resp) = monitor::maybe_approve(&st, ticket).await {

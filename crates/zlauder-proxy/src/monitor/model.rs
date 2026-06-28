@@ -251,6 +251,16 @@ pub struct RequestRecord {
     /// (fail toward showing). Presentation grouping only. Additive; deserializes to `0`.
     #[serde(default)]
     pub human_turn_index: u32,
+    /// CAPTURED upstream destination for this request, value-free: `"anthropic"` for a
+    /// Normal pin, or `"zdr:<target-name>"` for a ZDR pin. Populated from the
+    /// [`PinnedMode`](crate::zdr::PinnedMode) captured at routing time (NOT a re-read of
+    /// the live ZDR selection at record time), so a silently-degraded request (no ZDR
+    /// selection → routed Normal) records `"anthropic"` and is distinguishable in both
+    /// the snapshot JSON and the monitor UI from a genuinely ZDR-routed one. Carries the
+    /// target NAME only — never any key material (`ZdrTarget` is not `Serialize`).
+    /// Additive; deserializes to `None` on old snapshots.
+    #[serde(default)]
+    pub upstream: Option<String>,
 }
 
 /// Provenance class of a masked value, carried on every [`TokenLedgerEntry`].
