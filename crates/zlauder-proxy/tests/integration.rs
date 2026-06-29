@@ -2105,6 +2105,13 @@ async fn zdr_openai_path_refuses() {
 // key-gated.
 #[tokio::test]
 async fn zdr_control_endpoint_engage_status_and_refuse() {
+    // This test drives the LIVE POST/DELETE /zdr routes, whose handlers
+    // (`set_zdr_selection`/`clear_zdr_selection`) write to the process-global
+    // `state_dir()`. Isolate that I/O under the shared `ENV_LOCK` + a private temp
+    // dir so a concurrent `zdr_persist` test can never see this test's selection
+    // file land in its single-tenant temp dir (the prior load-dependent flake).
+    // Safe to hold across `.await`: every test here is current-thread `#[tokio::test]`.
+    let _state_dir = zdr_persist::StateDirGuard::new("zdr-control-endpoint");
     let def_cap = Captured::default();
     let def_up = Router::new()
         .route("/v1/messages", post(fake_upstream))
@@ -2226,13 +2233,19 @@ mod zdr_persist {
 
     /// RAII: set `ZLAUDER_STATE_DIR` to a fresh temp dir for the duration, restoring the
     /// prior value (and removing the temp tree) on drop. Holds the serialization guard.
-    struct StateDirGuard {
+    ///
+    /// `pub(super)` so live-route tests OUTSIDE this module that write to `state_dir()`
+    /// (e.g. the control-endpoint POST/DELETE test) can serialize behind the SAME
+    /// `ENV_LOCK` and land their writes in an isolated temp dir — otherwise their
+    /// unguarded `set_zdr_selection` writes leak into a concurrent guard's temp dir and
+    /// break the single-tenant `find_one` assumption here.
+    pub(super) struct StateDirGuard {
         _lock: std::sync::MutexGuard<'static, ()>,
         dir: PathBuf,
         prev: Option<std::ffi::OsString>,
     }
     impl StateDirGuard {
-        fn new(tag: &str) -> StateDirGuard {
+        pub(super) fn new(tag: &str) -> StateDirGuard {
             let lock = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
             let dir = std::env::temp_dir().join(format!(
                 "zlauder-zdr-persist-{}-{}-{}",
