@@ -8,6 +8,8 @@ use std::time::Duration;
 use tokio::sync::{broadcast, oneshot};
 use zlauder_engine::UnmaskManifest;
 
+use crate::zdr::PinnedMode;
+
 use super::capture::{CapKind, ResponseCapture};
 use super::delta::compute_delta;
 use super::model::{
@@ -249,6 +251,7 @@ impl Monitor {
         conversation_id: Option<String>,
         masked_body: &[u8],
         manifest: &UnmaskManifest,
+        pinned: &PinnedMode,
     ) -> ReviewTicket {
         // Compute everything that does NOT depend on shared state BEFORE taking the
         // lock. The masked body can be 100KB+ and `surfaces_from_body` parses it as
@@ -256,6 +259,14 @@ impl Monitor {
         // would serialize the realtime hot path (every request blocks on every
         // other request's parse). Only the seq/turn/delta bookkeeping needs `inner`.
         let now = now_ms();
+        // Value-free captured destination: the target NAME only (never the ZdrKey — a
+        // ZdrTarget is not Serialize). Derived from the mode CAPTURED at routing time and
+        // threaded in here, NOT a re-read of the live ZDR selection (EV-A discipline), so a
+        // silently-degraded request (no selection → routed Normal) records "anthropic".
+        let upstream = Some(match pinned {
+            PinnedMode::Normal => "anthropic".to_string(),
+            PinnedMode::Zdr(t) => format!("zdr:{}", t.name),
+        });
         let request_preview = preview(masked_body);
         let tokens = token_previews(manifest);
         let request_spans = spans_from_manifest(manifest, &request_preview);
@@ -439,6 +450,7 @@ impl Monitor {
             response_surfaces: Vec::new(),
             delta,
             human_turn_index,
+            upstream,
         };
         push_record(&mut inner.records, record.clone());
         drop(inner);
@@ -1225,7 +1237,7 @@ mod tests {
 
     fn record(m: &Monitor, b: &[u8]) -> String {
         let manifest = UnmaskManifest::new();
-        m.record_llm_request("/v1/messages", "POST", None, b, &manifest)
+        m.record_llm_request("/v1/messages", "POST", None, b, &manifest, &PinnedMode::Normal)
             .id()
             .to_string()
     }
@@ -1325,6 +1337,7 @@ mod tests {
                 Some("session-xyz".to_string()),
                 &body(&[("user", json!("hi"))]),
                 &manifest,
+                &PinnedMode::Normal,
             )
             .id()
             .to_string();
@@ -1338,7 +1351,7 @@ mod tests {
         let manifest = UnmaskManifest::new();
         let b = serde_json::to_vec(&json!({ "metadata": { "k": "v" } })).unwrap();
         let id = m
-            .record_llm_request("/v1/messages", "POST", None, &b, &manifest)
+            .record_llm_request("/v1/messages", "POST", None, &b, &manifest, &PinnedMode::Normal)
             .id()
             .to_string();
         assert_eq!(convo_of(&m, &id), "unknown");
@@ -1473,7 +1486,7 @@ mod tests {
         let manifest = UnmaskManifest::new();
         let huge = "y".repeat(9000);
         let id = m
-            .record_llm_request("/v1/messages", "POST", Some(huge), &body(&[("user", json!("hi"))]), &manifest)
+            .record_llm_request("/v1/messages", "POST", Some(huge), &body(&[("user", json!("hi"))]), &manifest, &PinnedMode::Normal)
             .id()
             .to_string();
         let cid = convo_of(&m, &id);
@@ -1481,7 +1494,7 @@ mod tests {
         assert!(cid.len() <= 18, "bounded length: {cid}");
         // A normal explicit id still passes through verbatim and still wins over content.
         let ok = m
-            .record_llm_request("/v1/messages", "POST", Some("session-xyz".to_string()), &body(&[("user", json!("hi"))]), &manifest)
+            .record_llm_request("/v1/messages", "POST", Some("session-xyz".to_string()), &body(&[("user", json!("hi"))]), &manifest, &PinnedMode::Normal)
             .id()
             .to_string();
         assert_eq!(convo_of(&m, &ok), "session-xyz");
@@ -1668,7 +1681,7 @@ mod tests {
         let m = Monitor::new();
         let manifest = manifest_cvv_and_email();
         let id = m
-            .record_llm_request("/v1/messages", "POST", None, &body(&[("user", json!("go"))]), &manifest)
+            .record_llm_request("/v1/messages", "POST", None, &body(&[("user", json!("go"))]), &manifest, &PinnedMode::Normal)
             .id()
             .to_string();
         m.record_dispatched(&id);
@@ -1689,7 +1702,7 @@ mod tests {
         let m = Monitor::new();
         let manifest = manifest_cvv_and_email();
         let id = m
-            .record_llm_request("/v1/messages", "POST", None, &body(&[("user", json!("go"))]), &manifest)
+            .record_llm_request("/v1/messages", "POST", None, &body(&[("user", json!("go"))]), &manifest, &PinnedMode::Normal)
             .id()
             .to_string();
         m.record_dispatched(&id);
@@ -1720,7 +1733,7 @@ mod tests {
         // The turn's request carries NO local plaintext → empty manifest (the gap condition).
         let manifest = UnmaskManifest::new();
         let id = m
-            .record_llm_request("/v1/messages", "POST", None, &body(&[("user", json!("show the url"))]), &manifest)
+            .record_llm_request("/v1/messages", "POST", None, &body(&[("user", json!("show the url"))]), &manifest, &PinnedMode::Normal)
             .id()
             .to_string();
         m.record_dispatched(&id);
@@ -1767,12 +1780,12 @@ mod tests {
         let m = Monitor::new();
         // A request masking a distinct value seeds the ledger.
         let early = manifest_with("[EMAIL_0001]", "alice@example.com");
-        m.record_llm_request("/v1/messages", "POST", None, &body(&[("user", json!("hi"))]), &early);
+        m.record_llm_request("/v1/messages", "POST", None, &body(&[("user", json!("hi"))]), &early, &PinnedMode::Normal);
 
         // Flood the 500-record ring so the seeding record is evicted.
         for i in 0..(MAX_RECORDS + 5) {
             let b = body(&[("user", json!(format!("turn {i}")))]);
-            m.record_llm_request("/v1/messages", "POST", Some(format!("c{i}")), &b, &UnmaskManifest::new());
+            m.record_llm_request("/v1/messages", "POST", Some(format!("c{i}")), &b, &UnmaskManifest::new(), &PinnedMode::Normal);
         }
 
         let snap = m.snapshot();
@@ -2102,7 +2115,7 @@ mod tests {
     }
 
     fn record_with(m: &Monitor, b: &[u8], manifest: &UnmaskManifest) -> String {
-        m.record_llm_request("/v1/messages", "POST", None, b, manifest)
+        m.record_llm_request("/v1/messages", "POST", None, b, manifest, &PinnedMode::Normal)
             .id()
             .to_string()
     }

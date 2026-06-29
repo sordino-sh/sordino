@@ -17,7 +17,7 @@ use anyhow::Context;
 use clap::Parser;
 use zlauder_engine::{EngineConfig, MaskEngine, MlConfig};
 use zlauder_proxy::{
-    bind, config, ml, monitor::Monitor, routes, secrets as proxy_secrets, state::AppState,
+    bind, config, ml, monitor::Monitor, routes, secrets as proxy_secrets, state::AppState, zdr,
 };
 
 #[derive(Parser, Debug)]
@@ -91,6 +91,27 @@ async fn main() -> anyhow::Result<()> {
     let secrets_gating = secret_specs.iter().any(|s| s.required);
     let proot_for_secrets = project_root.clone();
 
+    // Resolve ZDR trust-routing targets ONCE at startup (env-sourced creds; this is
+    // synchronous and never blocks). A failed/OAuth-shaped target is dropped with a
+    // loud line — never silently registered — so a session that later selects it
+    // fails closed at selection time rather than leaking to a half-configured target.
+    let resolved_zdr = zdr::resolve_targets(&cfg.zdr);
+    for e in &resolved_zdr.errors {
+        tracing::warn!("zlauder ZDR config: {e}");
+    }
+    if !resolved_zdr.targets.is_empty() {
+        tracing::info!(
+            "zlauder: {} ZDR target(s) registered ({}); routing-only, masking still applies",
+            resolved_zdr.targets.len(),
+            resolved_zdr
+                .targets
+                .keys()
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
     // Keep the ML config to drive the background load once we're serving.
     let ml_cfg = cfg.engine.ml.clone();
     let engine = build_engine(cfg.engine)?;
@@ -138,7 +159,48 @@ async fn main() -> anyhow::Result<()> {
         // projects); else closed until the background resolve confirms all required.
         secrets_ready: Arc::new(AtomicBool::new(!secrets_gating)),
         secrets_status: Arc::new(RwLock::new(proxy_secrets::SecretsStatus::default())),
+        zdr_targets: Arc::new(resolved_zdr.targets),
+        zdr_default: Arc::new(resolved_zdr.default),
+        // Start empty; `reload_zdr_sessions` below installs the surviving persisted
+        // selections (or, on a corrupt/perm-denied file, leaves it empty with a visible
+        // global revert) before we ever serve a request.
+        zdr_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
     };
+
+    // Reload + re-validate the per-conversation ZDR selections that survived the last
+    // recycle (A4/H1/D1). Fail-closed: a corrupt/perm-denied selections file is NEVER read
+    // as an empty map — it becomes a visible global revert and the file is quarantined; a
+    // first boot stays silent. The ONLY boot-fatal case is a Corrupt branch whose
+    // global-revert WRITE itself fails (we cannot make the degrade visible), which `?`
+    // propagates so the listener is never bound and no request egresses silently Normal.
+    // Audited ordering decision (finding 4): the `?` below is boot-fatal on the Corrupt branch
+    // whose global-revert write itself fails, and it runs AFTER the listener bind at ~:81. That
+    // bind is SAFE despite preceding this fatal `?` because the listener is bound-but-unpublished
+    // and never-served at this point: the bind exists ONLY to obtain the port (read just below,
+    // fed into AppState.port + the rendezvous), while BOTH `write_rendezvous` (~:223, which
+    // publishes this proxy's port+key so a client can find it) and `axum::serve` (~:278, which
+    // installs the accept loop) are DOWNSTREAM of this `?`. On a fatal reload, main returns Err
+    // and the process exits BEFORE publishing its port and BEFORE any acceptor runs — so no
+    // client can route to it and no request is ever served Normal (no silent unmasked egress).
+    let reload_report = state
+        .reload_zdr_sessions(state.load_persisted_selections())
+        .context("re-validating persisted ZDR selections at boot")?;
+    for outcome in &reload_report.outcomes {
+        match outcome {
+            zlauder_proxy::state::ReloadOutcome::Restored {
+                conversation,
+                target,
+            } => tracing::info!(
+                "zlauder ZDR: restored selection for conversation {conversation} -> {target}"
+            ),
+            zlauder_proxy::state::ReloadOutcome::Reverted {
+                conversation,
+                reason,
+            } => tracing::warn!(
+                "zlauder ZDR: reverted conversation {conversation} to Normal ({reason})"
+            ),
+        }
+    }
 
     // Hold engine/secrets handles so we can kick off background work after we start
     // serving (the router consumes `state`).

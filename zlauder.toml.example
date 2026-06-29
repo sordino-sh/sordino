@@ -172,3 +172,28 @@ patterns = ['^\d{4}$']
 # is_regex = true
 # priority = 10
 # apply_to_surfaces = ["user_message", "tool_result"]
+
+# ──────────────────────────────────────────────────────────────────────────────
+# [zdr] — OPTIONAL: ZDR (Zero-Data-Retention) trusted routing.
+#
+# Off by default; the product does not expect this configured. It lets you flag a
+# single session (`/zlauder:zdr on [config]`) to route to an endpoint YOU have
+# independently verified as non-retaining — swapping the upstream + credential on
+# the fly. Engaging BREAKS the prompt cache, so it is never automatic. Masking
+# still fully applies under ZDR (the endpoint receives tokens, not real values —
+# routing only). zlauder cannot verify zero-retention; only you can.
+#
+# Credentials are REFERENCED via `from_env` (an env var name) — NEVER inline. A
+# subscription / OAuth token (sk-ant-oat…) is refused (Anthropic ToS). Engaging an
+# unverified target is refused.
+#
+# [zdr]
+# default = "local-llama"          # engaged by `/zlauder:zdr on` with no config named
+#
+# [[zdr.target]]
+# name = "local-llama"
+# base_url = "http://127.0.0.1:8080"   # a self-hosted llama.cpp serving /v1/messages
+# trust_basis = "self_hosted"          # contractual | provider_architecture | self_hosted | attested_tee
+# user_verified = true                 # YOUR assertion this endpoint is zero-retention
+# # from_env = "ZDR_LOCAL_KEY"         # env var holding the API key (omit for a no-auth box)
+# # extra_headers = { "anthropic-beta" = "..." }   # non-secret only (auth headers refused)

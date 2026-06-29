@@ -1,6 +1,8 @@
 //! Verbatim header passthrough with hop-by-hop filtering.
 
-use http::header::{ACCEPT_ENCODING, HOST, HeaderMap, HeaderValue};
+use http::header::{ACCEPT_ENCODING, HOST, HeaderMap, HeaderName, HeaderValue};
+
+use crate::zdr::ZdrTarget;
 
 const HOP_BY_HOP: &[&str] = &[
     "host",
@@ -30,6 +32,55 @@ pub fn upstream_request_headers(incoming: &HeaderMap, upstream_host: &str) -> He
             continue;
         }
         out.append(name.clone(), value.clone());
+    }
+    if let Ok(h) = HeaderValue::from_str(upstream_host) {
+        out.insert(HOST, h);
+    }
+    out.insert(ACCEPT_ENCODING, HeaderValue::from_static("identity"));
+    out
+}
+
+/// Headers to send to a **ZDR** target. Like [`upstream_request_headers`] but it
+/// **strips the client's credentials** (the subscription `authorization` bearer and
+/// any `x-api-key`) — that token must NEVER reach a third-party endpoint (ToS +
+/// leak) — and injects the target's env-sourced ZDR credential as `x-api-key`,
+/// then the target's (config-validated, non-secret) extra headers, then the
+/// rewritten `Host`. An empty credential means a no-auth endpoint (nothing injected).
+pub fn upstream_request_headers_zdr(
+    incoming: &HeaderMap,
+    upstream_host: &str,
+    target: &ZdrTarget,
+) -> HeaderMap {
+    let mut out = HeaderMap::new();
+    for (name, value) in incoming.iter() {
+        let n = name.as_str();
+        if is_hop_by_hop(n) {
+            continue;
+        }
+        // Strip the CLIENT's credentials — never forward the subscription token to a
+        // ZDR target. ZDR auth is injected below from the env-sourced credential.
+        if n.eq_ignore_ascii_case("authorization") || n.eq_ignore_ascii_case("x-api-key") {
+            continue;
+        }
+        out.append(name.clone(), value.clone());
+    }
+    // Target-specific extra headers (non-secret; auth-bearing names are rejected both
+    // at config load AND in `ZdrTarget::new`). Applied FIRST so the proxy-controlled
+    // credential and Host below always win — an extra header can never override the
+    // injected `x-api-key` or the rewritten `Host`, regardless of how the target was
+    // constructed (defense in depth beyond the name rejection).
+    for (k, v) in &target.extra_headers {
+        if let (Ok(name), Ok(val)) = (HeaderName::from_bytes(k.as_bytes()), HeaderValue::from_str(v))
+        {
+            out.insert(name, val);
+        }
+    }
+    // Inject the ZDR credential (env-sourced, in-process only). Empty ⇒ no-auth.
+    let key = target.key();
+    if !key.is_empty()
+        && let Ok(v) = HeaderValue::from_str(key.as_str())
+    {
+        out.insert("x-api-key", v);
     }
     if let Ok(h) = HeaderValue::from_str(upstream_host) {
         out.insert(HOST, h);

@@ -227,6 +227,12 @@ enum Cmd {
         /// The raw Codex session/thread UUID (the key A8 indexes inbound `last_seen` by).
         session_id: String,
     },
+    /// View or change the ZDR (trusted-routing) posture for THIS session (backs
+    /// `/zlauder:zdr`). Optional; off unless the user configures `[zdr]` targets.
+    Zdr {
+        #[command(subcommand)]
+        action: Option<ZdrAction>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -262,6 +268,22 @@ enum CodexConfigAction {
         #[arg(long = "provider-id")]
         provider_id: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum ZdrAction {
+    /// Show this session's ZDR status + configured targets (default).
+    Status,
+    /// Engage ZDR for this session (uses the `[zdr]` default if no config named).
+    /// BREAKS the prompt cache — never automatic.
+    On {
+        /// The `[zdr]` target name (omit to use the configured default).
+        config: Option<String>,
+    },
+    /// Disengage ZDR (back to the masked Anthropic path). Also breaks the cache.
+    Off,
+    /// List the configured ZDR targets (names + trust basis + verified flag).
+    Config,
 }
 
 #[derive(Subcommand)]
@@ -449,6 +471,7 @@ fn main() -> Result<()> {
         Cmd::Reveal { token } => reveal(token),
         Cmd::Monitor => monitor_cmd(),
         Cmd::Secrets { action } => secrets_cmd(action),
+        Cmd::Zdr { action } => zdr_cmd(action),
         Cmd::Scrub {
             transcript,
             values,
@@ -5051,7 +5074,23 @@ fn user_prompt_submit() -> Result<()> {
     // steady state. The block decision above is already made, so the best-effort short-timeout
     // proxy read inside can only drop a status line, never fail-open the gate.
     if let Some(conv) = conversation {
-        emit_mask_delta(&conv, opted_out, baked_port, escape_hatch, &root);
+        // Collect BOTH the mask-delta line and any ZDR transition lines, then emit them as a
+        // SINGLE UserPromptSubmit hook JSON object (one `additionalContext` block). Claude Code's
+        // command-hook stdout parser is a plain `JSON.parse` over the ENTIRE trimmed stdout, so two
+        // top-level objects (one mask-delta + one-or-more ZDR-transition) would make the parse throw
+        // and CC would fall back to injecting the raw JSON soup as plaintext — while the one-shot ZDR
+        // report file has already been consumed (remove_file'd / marker stamped). Coalescing keeps
+        // the clean additionalContext channel intact on the canonical post-recycle turn (a recycle
+        // both restores ZDR *and* flips the mask state, so both lines fire on the same turn).
+        let mut lines: Vec<String> = Vec::new();
+        // H1/D1: surface A4's reload report (ZDR restored/reverted, or a global corrupt revert)
+        // exactly once per conversation per distinct instance — a recycle is never a SILENT routing
+        // change. The mask-delta line goes first (it persists session state as a side effect).
+        if let Some(line) = mask_delta_line(&conv, opted_out, baked_port, escape_hatch, &root) {
+            lines.push(line);
+        }
+        lines.extend(zdr_transition_lines(&conv, &root));
+        emit_session_additional_context(&lines);
     }
     Ok(())
 }
@@ -5170,6 +5209,197 @@ fn mask_delta_message(s: &SessionStatus) -> String {
              ZLAUDER_NO_INTAKE_GATE to re-enable the gate."
             .to_string(),
     }
+}
+
+// -- A6/H1/D1: one-time ZDR restored/reverted transition signal -------------------
+//
+// A4 (proxy) writes two kinds of reload report under `<state_dir>/zdr-reports/`:
+//   * one PER-CONVERSATION `<sanitize_component(conversation)>.json` holding a single
+//     serialized `ReloadOutcome` (serde `#[serde(tag="kind", rename_all="snake_case")]`);
+//   * one PROJECT-SCOPED `<project_key>.global.json` epoch-bearing Corrupt sentinel.
+// A6 consumes them through the EXISTING mask-delta channel so a recycle is never a SILENT
+// routing change — exactly once per conversation per distinct instance. The proxy's structs
+// are private, so we define matching `Deserialize` mirrors here; the field/tag shape and the
+// `sanitize_component` filename function are byte-faithful to the proxy writer (grounded).
+
+/// Mirror of the proxy's `ReloadOutcome` (private there). Tag/casing MUST match the writer:
+/// `{"kind":"restored","conversation":..,"target":..}` / `{"kind":"reverted",..,"reason":..}`.
+#[derive(serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ReloadOutcome {
+    Restored { target: String },
+    Reverted { reason: String },
+}
+
+/// Mirror of the proxy's epoch-bearing global Corrupt sentinel
+/// (`{"epoch":<u64>,"conversation":"*","reason":..}`). Only `epoch` + `reason` are read.
+#[derive(serde::Deserialize)]
+struct GlobalRevert {
+    epoch: u64,
+    reason: String,
+}
+
+/// Max bytes for a sanitized filename COMPONENT. Mirrors the proxy's `SANITIZE_COMPONENT_MAX`.
+const SANITIZE_COMPONENT_MAX: usize = 200;
+
+/// Reduce a conversation id / project key to a single safe filename component. BYTE-IDENTICAL
+/// to the proxy's `sanitize_component` (state.rs) — the report-file key A6 reads MUST match the
+/// key A4 writes, or the signal never fires. Keeps `[A-Za-z0-9._-]`, replaces the rest with `_`,
+/// never yields an empty or dot-only name (prefixes `_`), and is length-bounded to
+/// [`SANITIZE_COMPONENT_MAX`] bytes (overlong → prefix + `-` + a stable blake3 hash of the FULL
+/// sanitized string, so an overlong conversation id can never make the marker write `ENAMETOOLONG`
+/// while the proxy report write also gets bounded identically).
+fn sanitize_component(s: &str) -> String {
+    let mut out: String = s
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if out.is_empty() || out.chars().all(|c| c == '.') {
+        out = format!("_{out}");
+    }
+    // Bound the length. `out` is ASCII by construction (only `[A-Za-z0-9._-]`), so byte- and
+    // char-length coincide and slicing on a byte index is always on a char boundary. Hash the
+    // FULL sanitized string so distinct long ids stay distinct and both sides derive the same name.
+    if out.len() > SANITIZE_COMPONENT_MAX {
+        const HASH_HEX: usize = 16;
+        const PREFIX: usize = SANITIZE_COMPONENT_MAX - HASH_HEX - 1; // prefix + '-' + 16 hex
+        let mut h = blake3::Hasher::new();
+        h.update(out.as_bytes());
+        out = format!("{}-{}", &out[..PREFIX], &h.finalize().to_hex()[..HASH_HEX]);
+    }
+    out
+}
+
+/// The `ZlauDeR:`-prefixed model-facing line for a per-conversation reload outcome — same
+/// channel + framing discipline as [`mask_delta_message`] (factual, a verification/recovery
+/// path, never a prompt-injection shape).
+fn zdr_report_message(outcome: &ReloadOutcome) -> String {
+    match outcome {
+        ReloadOutcome::Restored { target } => format!(
+            "ZlauDeR: ZDR restored → {target} for this conversation. Your traffic routes to your \
+             verified non-retaining endpoint again."
+        ),
+        ReloadOutcome::Reverted { reason } => format!(
+            "ZlauDeR: ZDR could NOT be restored ({reason}) — this conversation is on the masked \
+             Anthropic path. Re-engage with /zlauder:zdr after confirming the target."
+        ),
+    }
+}
+
+/// The `ZlauDeR:`-prefixed line for the project-scoped global Corrupt revert.
+fn zdr_global_message(reason: &str) -> String {
+    format!(
+        "ZlauDeR: ZDR selection state was unreadable at startup ({reason}) — ALL ZDR selections \
+         were lost across this restart and every conversation is now on the masked Anthropic \
+         path. Re-engage with /zlauder:zdr per conversation."
+    )
+}
+
+/// Two-source, lock-free consume of A4's reload reports for `conversation`, returning the lines
+/// to narrate THIS turn (empty in the steady state). `reports_dir` is explicit for testability
+/// (mirrors [`read_mask_state_at`]). `conversation` is already `safe_conversation_id`-normalized
+/// (the SAME key A4 persists under); `project_key` keys the single shared global sentinel.
+///
+/// Source 1 — per-conversation report (S1-safe, CLAIM-BEFORE-EMIT): parse
+/// `<reports>/<sanitize_component(conv)>.json`, then gate the emit on `remove_file` SUCCEEDING —
+/// only the racer whose claim returns `Ok` emits; a concurrent same-conversation racer that loses
+/// the claim emits nothing (the idempotency contract). The parse GUARDS the claim so a torn /
+/// half-written file is never removed (left for the next turn).
+///
+/// Source 2 — global Corrupt sentinel (EPOCH-keyed): read `<reports>/<project_key>.global.json`
+/// (NEVER delete it — other conversations still need to see it). Compare its `epoch` to a
+/// per-conversation marker `<reports>/<sanitize_component(conv)>.global-seen` whose CONTENT is the
+/// last-seen epoch; emit ONLY when the file exists AND (no marker OR marker-epoch != file-epoch),
+/// then OVERWRITE the marker with the current epoch. A bare touch-file marker would suppress a
+/// SECOND distinct corrupt boot (→ silent Normal); the epoch compare re-emits each distinct
+/// instance exactly once per conversation.
+fn consume_zdr_transitions(
+    reports_dir: &Path,
+    conversation: &str,
+    project_key: &str,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    let safe_conv = sanitize_component(conversation);
+
+    // Source 1: per-conversation report, claim-before-emit.
+    let report_path = reports_dir.join(format!("{safe_conv}.json"));
+    if let Ok(raw) = std::fs::read_to_string(&report_path)
+        && let Ok(outcome) = serde_json::from_str::<ReloadOutcome>(&raw)
+    {
+        // The parse SUCCEEDED (not torn): the file is a real report. Make `remove_file` the
+        // CLAIM that gates the emit — ONLY the racer whose remove succeeds narrates.
+        if std::fs::remove_file(&report_path).is_ok() {
+            lines.push(zdr_report_message(&outcome));
+        }
+    }
+
+    // Source 2: global Corrupt sentinel, epoch-keyed (NEVER deleted).
+    let global_path = reports_dir.join(format!("{project_key}.global.json"));
+    if let Ok(raw) = std::fs::read_to_string(&global_path)
+        && let Ok(global) = serde_json::from_str::<GlobalRevert>(&raw)
+    {
+        let marker_path = reports_dir.join(format!("{safe_conv}.global-seen"));
+        let seen_epoch = std::fs::read_to_string(&marker_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        if seen_epoch != Some(global.epoch) {
+            lines.push(zdr_global_message(&global.reason));
+            // Stamp the marker with THIS epoch so the same instance never re-narrates; a later
+            // distinct corrupt boot (new epoch) re-emits exactly once.
+            let _ = std::fs::write(&marker_path, global.epoch.to_string());
+        }
+    }
+
+    lines
+}
+
+/// The directory A4 writes reload reports into (`<state_dir>/zdr-reports/`). `None` when the
+/// state dir can't be resolved — the consume is then simply silent (best-effort, never fatal).
+fn zdr_reports_dir() -> Option<PathBuf> {
+    Some(zlauder_state::state_dir().ok()?.join("zdr-reports"))
+}
+
+/// Best-effort consume of A4's ZDR reload transitions for this conversation, returning the
+/// model-facing lines to narrate THIS turn (empty in the steady state). The caller coalesces these
+/// with the mask-delta line into ONE UserPromptSubmit `additionalContext` block — emitting them as
+/// separate top-level JSON objects would break CC's whole-stdout `JSON.parse`. The one-shot consume
+/// side effects (report `remove_file`, `.global-seen` marker stamp) happen here regardless.
+fn zdr_transition_lines(conversation: &str, root: &str) -> Vec<String> {
+    let Some(reports_dir) = zdr_reports_dir() else { return Vec::new() };
+    let project_key = zlauder_state::project_key(root);
+    consume_zdr_transitions(&reports_dir, conversation, &project_key)
+}
+
+/// Emit `lines` to the model as a SINGLE UserPromptSubmit hook JSON object — one `additionalContext`
+/// block with the lines joined by newlines. Claude Code parses a command hook's ENTIRE stdout as one
+/// `JSON.parse` document, so a hook turn must print AT MOST ONE top-level object; concatenated
+/// objects make the parse throw and CC falls back to injecting the raw stdout as plaintext. Silent
+/// when `lines` is empty (the steady state) so no empty additionalContext is posted.
+fn emit_session_additional_context(lines: &[String]) {
+    if let Some(obj) = session_additional_context_json(lines) {
+        println!("{obj}");
+    }
+}
+
+/// Build the single UserPromptSubmit hook JSON object for `lines` (joined by newlines into one
+/// `additionalContext` block), or `None` when there is nothing to narrate. Factored out so the
+/// "exactly one top-level JSON document per turn" invariant is testable without capturing stdout.
+fn session_additional_context_json(lines: &[String]) -> Option<serde_json::Value> {
+    if lines.is_empty() {
+        return None;
+    }
+    Some(json!({
+        "hookSpecificOutput": {
+            "hookEventName": "UserPromptSubmit",
+            "additionalContext": lines.join("\n")
+        }
+    }))
 }
 
 /// Per-session status record path (`<state_dir>/session-status/<conversation>.json`). `conversation`
@@ -5353,36 +5583,29 @@ fn routed_proxy_status(routed_port: u16, root: &str) -> (MaskState, String) {
     }
 }
 
-/// On an ALLOW turn, post a masking-status line to the model IFF this session crossed the masked
-/// boundary since it was last told (see [`should_narrate`]). Best-effort: an undetermined state
-/// (`None`) or an unkeyable session is simply silent. Always tracks the latest state so the next
-/// turn's delta is computed against reality.
-fn emit_mask_delta(
+/// On an ALLOW turn, compute the masking-status line to post to the model IFF this session crossed
+/// the masked boundary since it was last told (see [`should_narrate`]), returning `Some(line)` to
+/// narrate or `None` to stay silent. Best-effort: an undetermined state (`None`) or an unkeyable
+/// session is simply silent. ALWAYS tracks the latest state (the side effect below) so the next
+/// turn's delta is computed against reality — even when no line is returned. The caller coalesces
+/// the returned line with any ZDR-transition lines into ONE hook JSON object.
+fn mask_delta_line(
     conversation: &str,
     opted_out: bool,
     baked_port: Option<u16>,
     escape_hatch: bool,
     root: &str,
-) {
-    let Some(cur) = session_mask_state(opted_out, baked_port, escape_hatch, root) else { return };
+) -> Option<String> {
+    let cur = session_mask_state(opted_out, baked_port, escape_hatch, root)?;
     let prev = read_session_mask_state(conversation);
-    if should_narrate(prev, cur.state) {
-        println!(
-            "{}",
-            json!({
-                "hookSpecificOutput": {
-                    "hookEventName": "UserPromptSubmit",
-                    "additionalContext": mask_delta_message(&cur)
-                }
-            })
-        );
-    }
+    let line = should_narrate(prev, cur.state).then(|| mask_delta_message(&cur));
     // ALWAYS persist, even when unchanged: `should_narrate` already gates the model-facing line, so
     // the rewrite costs no tokens — but it keeps an actively-masked session's record mtime FRESH so
     // `prune_stale_status` can't evict a live baseline. If it did, a later `Masked -> Off` would
     // read `prev == None` and `should_narrate(None, Off) == false` — a SILENT un-masking. The write
     // is the per-turn activity signal the prune relies on.
     write_session_mask_state(conversation, cur.state);
+    line
 }
 
 /// Outcome of bringing this project's proxy up. The proxy is project-keyed (a record
@@ -6031,6 +6254,8 @@ fn unverified(port: u16, mode: SlMode) -> String {
 /// this session — i.e. unique PII values caught — so it doubles as the "N PII" count.
 fn render_on(s: &Snapshot, port: u16, mode: SlMode) -> String {
     let ml = ml_indicator(s.ml.as_ref());
+    // Per-session ZDR segment: shown only when THIS conversation is ZDR-routed.
+    let zdr = zdr_suffix(&s.zdr, conversation_from_base_url().as_deref());
     match mode {
         SlMode::Off => String::new(),
         // ShieldOnly's whole purpose: the bare 🛡, and ONLY here (confirmed-masking). Every
@@ -6038,21 +6263,35 @@ fn render_on(s: &Snapshot, port: u16, mode: SlMode) -> String {
         SlMode::ShieldOnly => "\u{1f6e1}".to_string(),
         SlMode::Min => "\u{1f6e1}".to_string(), // 🛡 only
         SlMode::Compact => format!(
-            "\u{1f6e1} :{port} {}{}{}{}",
+            "\u{1f6e1} :{port} {}{}{}{}{}",
             s.config.profile,
             ml,
             pii_suffix(s.token_count),
-            key_suffix(s.secrets.as_ref())
+            key_suffix(s.secrets.as_ref()),
+            zdr,
         ),
         SlMode::Verbose => format!(
-            "\u{1f6e1} ON :{port} {} t={:.2}{} {} PII [{}]{}",
+            "\u{1f6e1} ON :{port} {} t={:.2}{} {} PII [{}]{}{}",
             s.config.profile,
             s.config.score_threshold,
             ml,
             s.token_count,
             s.config.enabled_categories.join(","),
-            key_suffix(s.secrets.as_ref())
+            key_suffix(s.secrets.as_ref()),
+            zdr,
         ),
+    }
+}
+
+/// ` 🔒ZDR·<config>` when THIS session's conversation is in the proxy's active ZDR
+/// set; empty otherwise (absent when off — no visual noise for the common case).
+fn zdr_suffix(zdr: &ZdrSummary, conversation: Option<&str>) -> String {
+    let Some(conv) = conversation else {
+        return String::new();
+    };
+    match zdr.active.iter().find(|a| a.conversation == conv) {
+        Some(a) => format!(" \u{1f512}ZDR\u{b7}{}", a.config), // 🔒ZDR·name
+        None => String::new(),
     }
 }
 
@@ -6966,6 +7205,134 @@ mod prompt_spoof_tests {
     }
 }
 
+// ---------------------------------------------------------------------------
+// zdr (Trust switch)
+// ---------------------------------------------------------------------------
+
+/// Backs `/zlauder:zdr`. Targets THIS session's conversation — the SessionStart hook
+/// baked the id into `ANTHROPIC_BASE_URL` as `.../zlauder/session/<id>`, which this
+/// process inherits, so the CLI keys the same id the proxy sees on the wire.
+fn zdr_cmd(action: Option<ZdrAction>) -> Result<()> {
+    let root = canonical(&project_root());
+    let (port, key) = live_identity(&root)
+        .context("could not reach this project's proxy — is a `claude` session running here?")?;
+    let conv = conversation_from_base_url().context(
+        "this session is not ZDR-routable: ANTHROPIC_BASE_URL has no /zlauder/session/<id> \
+         segment. Run /zlauder:enable and restart Claude Code so the proxy sees a session id.",
+    )?;
+    let url = format!(
+        "http://127.0.0.1:{port}/zlauder/session/{}/zdr",
+        percent_encode(&conv)
+    );
+    let client = blocking_client();
+    match action.unwrap_or(ZdrAction::Status) {
+        ZdrAction::Status => {
+            let snap = json_or_err(client.get(&url).header("x-zlauder-key", &key).send()?)?;
+            print_zdr_status(&snap);
+        }
+        ZdrAction::Config => {
+            let snap = json_or_err(client.get(&url).header("x-zlauder-key", &key).send()?)?;
+            print_zdr_configs(&snap);
+        }
+        ZdrAction::On { config } => {
+            let body = serde_json::json!({ "config": config });
+            let resp = json_or_err(
+                client
+                    .post(&url)
+                    .header("x-zlauder-key", &key)
+                    .json(&body)
+                    .send()?,
+            )
+            .context("engaging ZDR")?;
+            if let Some(w) = resp.get("warning").and_then(|v| v.as_str()) {
+                println!("{w}\n");
+            }
+            print_zdr_status(&resp);
+        }
+        ZdrAction::Off => {
+            let resp = json_or_err(client.delete(&url).header("x-zlauder-key", &key).send()?)?;
+            println!("ZDR disengaged — this session is back on the masked Anthropic path.");
+            println!("(The prompt cache breaks once on the next turn.)\n");
+            print_zdr_status(&resp);
+        }
+    }
+    Ok(())
+}
+
+/// Print the per-session ZDR status from a `{active, default, configured}` payload.
+/// The chrome ALWAYS frames ZDR as the USER's assertion — never as verified.
+fn print_zdr_status(snap: &Value) {
+    match snap.get("active").and_then(|v| v.as_str()) {
+        Some(name) => println!(
+            "ZDR: ON — this session routes to '{name}' (your assertion; zlauder cannot verify a \
+             provider is zero-retention). Masking still applies — values are NOT revealed."
+        ),
+        None => println!("ZDR: OFF — this session uses the normal masked Anthropic path."),
+    }
+    if let Some(def) = snap.get("default").and_then(|v| v.as_str()) {
+        println!("  default config: {def}");
+    }
+    let n = snap
+        .get("configured")
+        .and_then(|v| v.as_array())
+        .map(|a| a.len())
+        .unwrap_or(0);
+    println!("  {n} configured target(s) — `/zlauder:zdr config` to list.");
+}
+
+/// Print the configured ZDR targets (value-free view: never a credential).
+fn print_zdr_configs(snap: &Value) {
+    let configured = snap.get("configured").and_then(|v| v.as_array());
+    match configured {
+        Some(arr) if !arr.is_empty() => {
+            println!("Configured ZDR targets (asserted by you — zlauder cannot verify ZDR):");
+            for t in arr {
+                let name = t.get("name").and_then(|v| v.as_str()).unwrap_or("?");
+                let basis = t.get("trust_basis").and_then(|v| v.as_str()).unwrap_or("?");
+                let verified = t
+                    .get("user_verified")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let has_key = t.get("has_key").and_then(|v| v.as_bool()).unwrap_or(false);
+                let vflag = if verified {
+                    "verified"
+                } else {
+                    "UNVERIFIED — cannot engage"
+                };
+                let kflag = if has_key { "key" } else { "no-auth" };
+                println!("  - {name}  [{basis}; {vflag}; {kflag}]");
+            }
+        }
+        _ => println!(
+            "No ZDR targets configured (this is optional). Add a `[[zdr.target]]` to zlauder.toml \
+             to enable trusted routing."
+        ),
+    }
+}
+
+/// Extract the conversation id the proxy will see, from the inherited
+/// `ANTHROPIC_BASE_URL` (the SessionStart hook baked it in as
+/// `.../zlauder/session/<id>`). `None` when this session isn't session-routed.
+fn conversation_from_base_url() -> Option<String> {
+    conversation_from_url(&std::env::var("ANTHROPIC_BASE_URL").ok()?)
+}
+
+/// Pure parser for the conversation id embedded in a base URL (testable without env).
+fn conversation_from_url(url: &str) -> Option<String> {
+    const MARKER: &str = "/zlauder/session/";
+    // Consider only the PATH: drop any query/fragment first so the marker can't be
+    // matched inside a `?redirect=/zlauder/session/…`-style query, and the host can't
+    // contain it (a host has no `/`). Then the marker only ever matches the real path.
+    let path = url.split(['?', '#']).next().unwrap_or(url);
+    let idx = path.find(MARKER)? + MARKER.len();
+    let id = path[idx..].split('/').next().unwrap_or("").trim();
+    if id.is_empty() {
+        None
+    } else {
+        Some(id.to_string())
+    }
+}
+
 /// PreToolUse broker resolver (T2). Reads the hook payload from stdin, asks the proxy
 /// to resolve allow-listed broker tokens into `tool_input`, and emits `updatedInput`.
 /// Every failure path is silent (emit nothing, exit 0) so the tool runs with the
@@ -7384,6 +7751,26 @@ struct Snapshot {
     /// never values.
     #[serde(default)]
     secrets: Option<SecretsSummary>,
+    /// Optional ZDR (Trust switch) summary (absent on older proxies). Active sessions
+    /// + value-free target views — never a credential.
+    #[serde(default)]
+    zdr: ZdrSummary,
+}
+
+/// The proxy's `zdr` block. `active` lists the currently ZDR-routed conversations
+/// (so the statusline can show a per-session segment); no credential ever appears.
+#[derive(serde::Deserialize, Default)]
+struct ZdrSummary {
+    #[serde(default)]
+    active: Vec<ZdrActive>,
+}
+
+#[derive(serde::Deserialize)]
+struct ZdrActive {
+    #[serde(default)]
+    conversation: String,
+    #[serde(default)]
+    config: String,
 }
 
 /// The proxy's `secrets` block, counts only.
@@ -7981,6 +8368,261 @@ mod route_gate_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // -- A6/H1/D1: ZDR transition signal --------------------------------------------
+
+    /// A fresh, isolated zdr-reports dir for one test (keyed by pid + tag so parallel
+    /// tests never collide), pre-created.
+    fn fresh_reports_dir(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("zlauder-zdr-reports-{}-{tag}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// Write a per-conversation report file exactly as A4's `write_report` does: the file is
+    /// named `<sanitize_component(conv)>.json` and holds one serialized `ReloadOutcome` (the
+    /// proxy uses `to_vec_pretty` with `#[serde(tag="kind", rename_all="snake_case")]`).
+    fn write_restored(dir: &std::path::Path, conv: &str, target: &str) {
+        let body = json!({ "kind": "restored", "conversation": conv, "target": target });
+        std::fs::write(
+            dir.join(format!("{}.json", sanitize_component(conv))),
+            serde_json::to_vec_pretty(&body).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn write_reverted(dir: &std::path::Path, conv: &str, reason: &str) {
+        let body = json!({ "kind": "reverted", "conversation": conv, "reason": reason });
+        std::fs::write(
+            dir.join(format!("{}.json", sanitize_component(conv))),
+            serde_json::to_vec_pretty(&body).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Write the project-scoped global Corrupt sentinel exactly as A4's `write_global_revert`:
+    /// `<project_key>.global.json` holding `{"epoch":..,"conversation":"*","reason":..}`.
+    fn write_global(dir: &std::path::Path, project_key: &str, epoch: u64, reason: &str) {
+        let body = json!({ "epoch": epoch, "conversation": "*", "reason": reason });
+        std::fs::write(
+            dir.join(format!("{project_key}.global.json")),
+            serde_json::to_vec_pretty(&body).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn zdr_transition_narrated_once() {
+        let dir = fresh_reports_dir("narrate-once");
+        let pk = "pk0";
+        write_restored(&dir, "c1", "box");
+
+        // First consume: the Restored line, and the report file is claimed (removed).
+        let first = consume_zdr_transitions(&dir, "c1", pk);
+        assert_eq!(first.len(), 1, "expected exactly one line, got {first:?}");
+        assert!(
+            first[0].contains("ZDR restored → box for this conversation"),
+            "unexpected line: {}",
+            first[0]
+        );
+        assert!(first[0].starts_with("ZlauDeR:"));
+        assert!(
+            !dir.join("c1.json").exists(),
+            "report file must be removed by the claim"
+        );
+
+        // Second consume (file absent): no line — fires exactly once.
+        assert!(consume_zdr_transitions(&dir, "c1", pk).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn global_corrupt_reemits_on_new_epoch() {
+        let dir = fresh_reports_dir("global-epoch");
+        let pk = "pkG";
+
+        // Epoch E1, no marker → emit + stamp E1.
+        write_global(&dir, pk, 1001, "selections file unparseable");
+        let r1 = consume_zdr_transitions(&dir, "cX", pk);
+        assert_eq!(r1.len(), 1);
+        assert!(r1[0].contains("ZDR selection state was unreadable at startup"));
+        assert!(r1[0].contains("selections file unparseable"));
+        let marker = dir.join("cX.global-seen");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "1001");
+
+        // Same file (E1) + marker E1 → no line.
+        assert!(consume_zdr_transitions(&dir, "cX", pk).is_empty());
+
+        // Global rewritten to a NEW epoch E2 → emit AGAIN + restamp E2 (the S2 fix:
+        // a bare touch-file marker would have suppressed this second corrupt instance).
+        write_global(&dir, pk, 2002, "selections file unparseable again");
+        let r3 = consume_zdr_transitions(&dir, "cX", pk);
+        assert_eq!(r3.len(), 1, "a new corrupt epoch must re-emit");
+        assert_eq!(std::fs::read_to_string(&marker).unwrap().trim(), "2002");
+
+        // And it settles again after re-stamping.
+        assert!(consume_zdr_transitions(&dir, "cX", pk).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zdr_per_conv_emits_only_if_claim_succeeds() {
+        let dir = fresh_reports_dir("claim");
+        let pk = "pkC";
+
+        // Claim-time race: the report file is pre-removed (a same-conversation racer already
+        // claimed it). `remove_file` cannot succeed → NO per-conv line. We model this by simply
+        // having no file present at consume time.
+        assert!(
+            consume_zdr_transitions(&dir, "c1", pk).is_empty(),
+            "no file to claim → no emit"
+        );
+
+        // And the normal lifecycle: one successful consume emits, the second (now-absent file)
+        // emits nothing.
+        write_reverted(&dir, "c1", "target no longer configured");
+        let first = consume_zdr_transitions(&dir, "c1", pk);
+        assert_eq!(first.len(), 1);
+        assert!(first[0].contains("ZDR could NOT be restored (target no longer configured)"));
+        assert!(consume_zdr_transitions(&dir, "c1", pk).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zdr_two_conversations_consume_independently() {
+        let dir = fresh_reports_dir("two-conv");
+        let pk = "pk2";
+        write_restored(&dir, "c1", "box");
+        write_reverted(&dir, "c2", "target no longer user_verified");
+
+        // c1 consumes its own Restored line and does NOT erase c2's file.
+        let r1 = consume_zdr_transitions(&dir, "c1", pk);
+        assert_eq!(r1.len(), 1);
+        assert!(r1[0].contains("ZDR restored → box"));
+        assert!(dir.join("c2.json").exists(), "c1 must not erase c2's report");
+
+        // c2 consumes its own Reverted line.
+        let r2 = consume_zdr_transitions(&dir, "c2", pk);
+        assert_eq!(r2.len(), 1);
+        assert!(r2[0].contains("ZDR could NOT be restored (target no longer user_verified)"));
+
+        // Each fired exactly once.
+        assert!(consume_zdr_transitions(&dir, "c1", pk).is_empty());
+        assert!(consume_zdr_transitions(&dir, "c2", pk).is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Round-2 HIGH fix: when a mask-delta line AND one-or-more ZDR-transition lines both fire on
+    /// the same turn (the canonical post-recycle case), they MUST be coalesced into a SINGLE
+    /// top-level hook JSON object. Claude Code parses a command hook's ENTIRE stdout as one
+    /// `JSON.parse` document; two concatenated objects would throw and CC would inject the raw stdout
+    /// as plaintext — after the one-shot ZDR report was already consumed. This pins the invariant
+    /// that the production emit path (`session_additional_context_json`) yields exactly ONE object
+    /// carrying both lines.
+    #[test]
+    fn session_additional_context_coalesces_into_one_object() {
+        let mask = mask_delta_message(&SessionStatus {
+            state: MaskState::Masked,
+            port: 8787,
+            profile: "balanced".into(),
+        });
+        let zdr = zdr_report_message(&ReloadOutcome::Restored { target: "box".into() });
+        let lines = vec![mask.clone(), zdr.clone()];
+
+        // Empty input → no object emitted (steady state stays silent).
+        assert!(session_additional_context_json(&[]).is_none());
+
+        let obj = session_additional_context_json(&lines).expect("non-empty lines yield one object");
+
+        // Serializing then re-parsing the WHOLE thing must succeed exactly as CC's parser does —
+        // proving it is one valid JSON document, not concatenated objects.
+        let serialized = obj.to_string();
+        let reparsed: serde_json::Value =
+            serde_json::from_str(serialized.trim()).expect("whole stdout must be ONE JSON document");
+        let ctx = reparsed["hookSpecificOutput"]["additionalContext"]
+            .as_str()
+            .expect("additionalContext is a string");
+        // Both lines survive, joined into the single block.
+        assert!(ctx.contains(&mask), "mask-delta line must be present: {ctx}");
+        assert!(ctx.contains(&zdr), "ZDR transition line must be present: {ctx}");
+        assert_eq!(
+            reparsed["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit",
+            "must stay a UserPromptSubmit additionalContext emit"
+        );
+
+        // A lone ZDR line (no mask delta) also produces one well-formed object.
+        let solo = session_additional_context_json(std::slice::from_ref(&zdr))
+            .expect("one line yields one object");
+        let solo_ctx = solo["hookSpecificOutput"]["additionalContext"].as_str().unwrap();
+        assert_eq!(solo_ctx, zdr);
+    }
+
+    #[test]
+    fn sanitize_component_matches_proxy_writer() {
+        // Byte-identical to crates/zlauder-proxy/src/state.rs `sanitize_component`. The proxy's
+        // is private, so this pins the contract against representative inputs (keep [A-Za-z0-9._-],
+        // others → `_`, empty/dot-only → `_`-prefixed).
+        assert_eq!(sanitize_component("conv-123_OK.v2"), "conv-123_OK.v2");
+        assert_eq!(sanitize_component("../../etc/foo"), ".._.._etc_foo");
+        assert_eq!(sanitize_component("a b/c:d"), "a_b_c_d");
+        assert_eq!(sanitize_component(""), "_");
+        assert_eq!(sanitize_component("."), "_.");
+        assert_eq!(sanitize_component(".."), "_..");
+        assert_eq!(sanitize_component("uuid-AaZz09"), "uuid-AaZz09");
+
+        // OVERLONG id (the ENAMETOOLONG vector): the sanitized component MUST be length-bounded
+        // (<= SANITIZE_COMPONENT_MAX) so neither the proxy report write (`<comp>.json`) nor the
+        // hooks marker write (`<comp>.global-seen`) can fail with ENAMETOOLONG, and BOTH sides must
+        // derive the IDENTICAL name. The overlong input is already filename-safe here (all `a`s),
+        // so the sanitized string equals the input → we can recompute the expected bounded form
+        // exactly the way the (private) proxy writer does and pin both at byte-equality.
+        let overlong = "a".repeat(5000);
+        let got = sanitize_component(&overlong);
+        assert!(
+            got.len() <= SANITIZE_COMPONENT_MAX,
+            "bounded component must fit: got {} > {}",
+            got.len(),
+            SANITIZE_COMPONENT_MAX
+        );
+        // Recompute the exact derivation the proxy writer uses (prefix + '-' + 16 hex of blake3 of
+        // the FULL sanitized string). If the proxy ever diverges, this pin breaks.
+        const HASH_HEX: usize = 16;
+        const PREFIX: usize = SANITIZE_COMPONENT_MAX - HASH_HEX - 1;
+        let mut h = blake3::Hasher::new();
+        h.update(overlong.as_bytes());
+        let expected = format!("{}-{}", &overlong[..PREFIX], &h.finalize().to_hex()[..HASH_HEX]);
+        assert_eq!(got, expected, "overlong derivation must match the proxy writer byte-for-byte");
+
+        // Distinct overlong ids stay distinct (the hash of the full sanitized string differentiates
+        // them even though their prefixes collide).
+        let other = format!("{}b", "a".repeat(4999));
+        assert_ne!(
+            sanitize_component(&overlong),
+            sanitize_component(&other),
+            "distinct long ids must not collide after bounding"
+        );
+    }
+
+    #[test]
+    fn report_filename_is_length_bounded() {
+        // The full report/marker FILENAME (component + extension) must stay under the 255-byte
+        // limit common to ext4/APFS/NTFS for ANY conversation id, including a pathological one.
+        let overlong = "z/".repeat(4000); // 8000 chars, all non-safe → all `_` after sanitize
+        let comp = sanitize_component(&overlong);
+        assert!(comp.len() <= SANITIZE_COMPONENT_MAX);
+        // The longest extension the readers/writers use is `.global-seen` (12 bytes).
+        assert!(
+            format!("{comp}.global-seen").len() <= 255,
+            "report/marker filename must fit on every target FS"
+        );
+        assert!(format!("{comp}.json").len() <= 255);
+    }
+
     #[test]
     fn first_cwd_in_jsonl_extracts_exact_path_or_none() {
         let dir = std::env::temp_dir().join(format!("zlauder-cwd-{}", std::process::id()));
@@ -8328,7 +8970,45 @@ mod statusline_tests {
 
 #[cfg(test)]
 mod route_tests {
-    use super::base_url_matches;
+    use super::{base_url_matches, conversation_from_url};
+
+    #[test]
+    fn conversation_id_extracted_from_session_base_url() {
+        assert_eq!(
+            conversation_from_url("http://127.0.0.1:8787/zlauder/session/abc123"),
+            Some("abc123".to_string())
+        );
+        // Trailing path segments after the id are ignored.
+        assert_eq!(
+            conversation_from_url("http://127.0.0.1:8787/zlauder/session/abc123/v1/messages"),
+            Some("abc123".to_string())
+        );
+        // A non-session (plain) base URL has no conversation id.
+        assert_eq!(conversation_from_url("http://127.0.0.1:8787"), None);
+        assert_eq!(conversation_from_url("https://api.anthropic.com"), None);
+        // An empty id segment is not a valid conversation.
+        assert_eq!(conversation_from_url("http://x/zlauder/session/"), None);
+        // The marker in a query/fragment is NOT the path — must not mis-key.
+        assert_eq!(
+            conversation_from_url("https://api.anthropic.com/?redirect=/zlauder/session/evil"),
+            None
+        );
+        // A real path id with a trailing query is still extracted.
+        assert_eq!(
+            conversation_from_url("http://x/zlauder/session/abc?foo=bar"),
+            Some("abc".to_string())
+        );
+        // Same for a fragment: marker in a fragment is not the path; a trailing
+        // fragment after a real id is stripped.
+        assert_eq!(
+            conversation_from_url("https://api.anthropic.com/#/zlauder/session/evil"),
+            None
+        );
+        assert_eq!(
+            conversation_from_url("http://x/zlauder/session/abc#frag"),
+            Some("abc".to_string())
+        );
+    }
 
     #[test]
     fn matches_exact_and_trailing_slash() {

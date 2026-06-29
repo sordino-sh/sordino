@@ -20,6 +20,7 @@ use zlauder_engine::{
     EngineError, MAX_TOKEN_LEN, MaskEngine, MaskStats, Surface, UnmaskManifest, token_regex,
 };
 
+use crate::zdr::PinnedMode;
 use crate::{headers, monitor, routes, sse, state::AppState, walk};
 
 const MAX_BODY: usize = 64 * 1024 * 1024;
@@ -45,6 +46,29 @@ async fn chat_completions_inner(
     if let Some(resp) = routes::secrets_gate(&st) {
         return resp;
     }
+    // Bare-path defense-in-depth: a bare `/v1/chat/completions` carrying
+    // x-zlauder-conversation naming a LIVE pin must refuse (409) rather than route to the
+    // default endpoint. NON-consuming header read BEFORE into_parts; runs only when the
+    // URL has no session id (precedence: URL id > header id > none).
+    if let Some(resp) =
+        routes::bare_path_zdr_guard(&st, &req, conversation.as_deref(), "/v1/chat/completions")
+    {
+        return resp;
+    }
+    // ZDR is Anthropic-wire only in the foundation: refuse a ZDR-active conversation
+    // on the OpenAI-compatible path rather than silently routing it to Anthropic with
+    // the subscription credential (fail-closed; never silent-downgrade).
+    match routes::resolve_pinned_mode(&st, conversation.as_deref()) {
+        Ok(PinnedMode::Normal) => {}
+        Ok(PinnedMode::Zdr(_)) => {
+            return routes::err(
+                StatusCode::NOT_IMPLEMENTED,
+                "ZDR routing is not supported on the OpenAI-compatible endpoints in this build; \
+                 route this conversation via the Anthropic /v1/messages path",
+            );
+        }
+        Err(resp) => return resp,
+    }
     let (parts, body) = req.into_parts();
     let body_bytes = match to_bytes(body, MAX_BODY).await {
         Ok(b) => b,
@@ -62,6 +86,9 @@ async fn chat_completions_inner(
         conversation,
         &masked,
         &manifest,
+        // The OpenAI-compat handler 501-refuses a Zdr pin above, so the captured mode here
+        // is always Normal → record "anthropic".
+        &PinnedMode::Normal,
     );
     let record_id = ticket.id().to_string();
     if let Err(resp) = monitor::maybe_approve(&st, ticket).await {
@@ -69,7 +96,15 @@ async fn chat_completions_inner(
     }
 
     st.monitor.record_dispatched(&record_id);
-    let resp = match routes::send_upstream(&st, &parts, masked, "/v1/chat/completions").await {
+    let resp = match routes::send_upstream(
+        &st,
+        &parts,
+        masked,
+        "/v1/chat/completions",
+        &PinnedMode::Normal,
+    )
+    .await
+    {
         Ok(r) => r,
         Err(resp) => {
             st.monitor

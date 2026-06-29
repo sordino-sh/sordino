@@ -4651,6 +4651,7 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "zlauder-engine",
  "zlauder-secrets",

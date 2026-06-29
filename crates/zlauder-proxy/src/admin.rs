@@ -132,6 +132,25 @@ pub(crate) fn snapshot(st: &AppState) -> serde_json::Value {
             "required": secrets.required(),
             "entries": secrets.entries,
         },
+        "zdr": zdr_block(st),
+    })
+}
+
+/// The `zdr` block of the snapshot: configured targets (value-free views — NEVER a
+/// credential), the default target, and the currently-active sessions
+/// `[{conversation, config}]`. The statusline reads `active` to decide whether to
+/// show its (per-session) ZDR segment.
+fn zdr_block(st: &AppState) -> serde_json::Value {
+    let configured: Vec<_> = st.zdr_targets.values().map(|t| t.view()).collect();
+    let active: Vec<serde_json::Value> = st
+        .zdr_active()
+        .into_iter()
+        .map(|(conversation, config)| json!({ "conversation": conversation, "config": config }))
+        .collect();
+    json!({
+        "configured": configured,
+        "default": st.zdr_default.as_ref(),
+        "active": active,
     })
 }
 
@@ -655,6 +674,154 @@ pub async fn session_routed(
         "routed_recently": routed_recently,
         "last_seen_ms": last_seen_ms,
     }))
+}
+
+/// `GET /zlauder/session/{conversation}/zdr` (x-zlauder-key) — the **Trust** switch
+/// status for this conversation: its active selection (if any), the default, and the
+/// value-free list of configured targets.
+pub async fn zdr_get(
+    State(st): State<AppState>,
+    hdrs: HeaderMap,
+    Path(conversation): Path<String>,
+) -> Response {
+    if !st.authed(&hdrs) {
+        return forbidden();
+    }
+    json_ok(&zdr_status(&st, &conversation))
+}
+
+/// `POST /zlauder/session/{conversation}/zdr` (x-zlauder-key) — ENGAGE ZDR for this
+/// conversation. Body: `{ "config": "name" }`, or `{}`/`{"config": null}` to use the
+/// configured default. Deny-by-default: an unknown or non-`user_verified` config is
+/// REFUSED (the system cannot verify ZDR — only the user can). Engaging breaks the
+/// Anthropic prompt cache for this conversation, so this is never automatic and the
+/// response front-loads that cost as a warning.
+pub async fn zdr_set(
+    State(st): State<AppState>,
+    hdrs: HeaderMap,
+    Path(conversation): Path<String>,
+    body: Bytes,
+) -> Response {
+    if !st.authed(&hdrs) {
+        return forbidden();
+    }
+    #[derive(Deserialize, Default)]
+    struct Req {
+        #[serde(default)]
+        config: Option<String>,
+    }
+    // An empty body is allowed (⇒ use the default).
+    let req: Req = if body.is_empty() {
+        Req::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(r) => r,
+            Err(e) => {
+                return text(StatusCode::BAD_REQUEST, &format!("invalid zdr body: {e}"));
+            }
+        }
+    };
+    let name = match req.config.or_else(|| st.zdr_default.as_ref().clone()) {
+        Some(n) => n,
+        None => {
+            return text(
+                StatusCode::BAD_REQUEST,
+                "no ZDR config named and no [zdr] default configured",
+            );
+        }
+    };
+    let target = match st.zdr_target(&name) {
+        Some(t) => t,
+        None => {
+            return text(
+                StatusCode::NOT_FOUND,
+                &format!("unknown ZDR config '{name}' (check `[zdr]` targets resolved at startup)"),
+            );
+        }
+    };
+    if !target.user_verified {
+        return text(
+            StatusCode::BAD_REQUEST,
+            &format!(
+                "ZDR config '{name}' is not user_verified — refusing to engage. zlauder cannot \
+                 verify a provider is zero-retention; set `user_verified = true` on this target \
+                 only after you have independently confirmed it."
+            ),
+        );
+    }
+    // Fail-closed-and-VISIBLE (S1): the durable write may fail; a 5xx (not 200) is the
+    // falsifiable contract that the failure is non-silent. Returns BEFORE building the
+    // success snapshot so the body never claims "engaged" on a write failure.
+    match st.set_zdr_selection(&conversation, &name) {
+        Ok(()) => {}
+        Err(e) => {
+            return text(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!(
+                    "ZDR engage could NOT be made durable ({e}) — NOT engaged; the selection \
+                     would be lost on the next proxy restart. Check the state dir is writable, \
+                     then retry /zlauder:zdr."
+                ),
+            );
+        }
+    };
+    let mut snap = zdr_status(&st, &conversation);
+    if let Some(obj) = snap.as_object_mut() {
+        obj.insert("engaged".into(), json!(name));
+        obj.insert(
+            "warning".into(),
+            json!(format!(
+                "ZDR engaged: this conversation now routes to '{name}' ({}). Switching endpoints \
+                 BREAKS the Anthropic prompt cache — the next turn re-pays full input cost. \
+                 Masking still fully applies; values are NOT revealed (routing-only).",
+                target.trust_basis.label()
+            )),
+        );
+    }
+    json_ok(&snap)
+}
+
+/// `DELETE /zlauder/session/{conversation}/zdr` (x-zlauder-key) — DISENGAGE ZDR
+/// (back to the default masked Anthropic path). Also breaks the cache once.
+pub async fn zdr_clear(
+    State(st): State<AppState>,
+    hdrs: HeaderMap,
+    Path(conversation): Path<String>,
+) -> Response {
+    if !st.authed(&hdrs) {
+        return forbidden();
+    }
+    // Fail-closed-and-VISIBLE (S1): a failed durable write of the disengage must NOT report
+    // success — the old selection would still be on disk and RESURRECT on the next restart.
+    let was_active = match st.clear_zdr_selection(&conversation) {
+        Ok(b) => b,
+        Err(e) => {
+            return text(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &format!(
+                    "ZDR disengage could NOT be made durable ({e}) — STILL engaged; it would \
+                     resurrect on the next restart. Check the state dir is writable, then retry \
+                     /zlauder:zdr off."
+                ),
+            );
+        }
+    };
+    let mut snap = zdr_status(&st, &conversation);
+    if let Some(obj) = snap.as_object_mut() {
+        obj.insert("disengaged".into(), json!(was_active));
+    }
+    json_ok(&snap)
+}
+
+/// Per-conversation ZDR status payload shared by the get/set/clear handlers.
+fn zdr_status(st: &AppState, conversation: &str) -> serde_json::Value {
+    let configured: Vec<_> = st.zdr_targets.values().map(|t| t.view()).collect();
+    json!({
+        "conversation": conversation,
+        "active": st.zdr_selection(conversation).map(|s| s.target),
+        "default": st.zdr_default.as_ref(),
+        "configured": configured,
+    })
 }
 
 // --- small response helpers (mirrors routes.rs style) -----------------------
