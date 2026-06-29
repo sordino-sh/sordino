@@ -4584,7 +4584,7 @@ dependencies = [
 
 [[package]]
 name = "zlauder-engine"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "aes-gcm",
  "aho-corasick",
@@ -4611,7 +4611,7 @@ dependencies = [
 
 [[package]]
 name = "zlauder-hooks"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -4628,7 +4628,7 @@ dependencies = [
 
 [[package]]
 name = "zlauder-proxy"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anthropic-wire",
  "anyhow",
@@ -4660,7 +4660,7 @@ dependencies = [
 
 [[package]]
 name = "zlauder-secrets"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "async-trait",
  "dotenvy",
@@ -4674,7 +4674,7 @@ dependencies = [
 
 [[package]]
 name = "zlauder-state"
-version = "0.12.0"
+version = "0.13.0"
 dependencies = [
  "anyhow",
  "blake3",
