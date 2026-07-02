@@ -4249,6 +4249,7 @@ fn doctor(json: bool) -> Result<()> {
         probe_state_dir(),
         probe_project_proxy(&root),
         probe_windows_excluded_range(),
+        probe_no_bare_or_safe_mode_env(),
     ];
     let any_fail = probes.iter().any(|p| p.status == ProbeStatus::Fail);
 
@@ -4634,6 +4635,49 @@ fn probe_windows_excluded_range() -> Probe {
                  protocol=tcp` and pick a port outside the listed blocks",
             ),
         )
+    }
+}
+
+/// Claude Code's `--bare`/`CLAUDE_CODE_SIMPLE=1` and `--safe-mode`/`CLAUDE_CODE_SAFE_MODE=1`
+/// skip plugin-hook loading entirely (confirmed against the shipped cli.js control flow) — a
+/// session started that way never runs ZlauDeR's SessionStart auto-plumb OR its fail-closed
+/// UserPromptSubmit intake gate, so an unrouted project's real PII can reach the API provider
+/// with zero warning. This probe can only ever run FROM a normal (non-bare) session — the same
+/// mechanism that would fire it is exactly what a `--bare` session disables — so it cannot
+/// self-detect a one-off `--bare` flag typed in that same terminal (the user sees that flag
+/// themselves). What it CAN catch: `CLAUDE_CODE_SIMPLE`/`CLAUDE_CODE_SAFE_MODE` silently
+/// exported as a persistent env var (a shell rc file, a CI job, a wrapper script) that would
+/// disable ZlauDeR for every future `claude` invocation from this shell without a `--bare` flag
+/// ever being typed again.
+fn probe_no_bare_or_safe_mode_env() -> Probe {
+    let name = "no --bare/--safe-mode env footgun";
+    let simple_set = std::env::var("CLAUDE_CODE_SIMPLE").is_ok_and(|v| is_truthy_flag(&v));
+    let safe_mode_set = std::env::var("CLAUDE_CODE_SAFE_MODE").is_ok_and(|v| is_truthy_flag(&v));
+    match (simple_set, safe_mode_set) {
+        (false, false) => probe(
+            name,
+            ProbeStatus::Pass,
+            "CLAUDE_CODE_SIMPLE / CLAUDE_CODE_SAFE_MODE are not set in this shell".into(),
+            None,
+        ),
+        (simple, safe) => {
+            let which = match (simple, safe) {
+                (true, true) => "CLAUDE_CODE_SIMPLE and CLAUDE_CODE_SAFE_MODE are",
+                (true, false) => "CLAUDE_CODE_SIMPLE is",
+                _ => "CLAUDE_CODE_SAFE_MODE is",
+            };
+            probe(
+                name,
+                ProbeStatus::Warn,
+                format!(
+                    "{which} set in this shell — every `claude` invocation from here skips \
+                     plugin-hook loading (Claude Code's own --bare/--safe-mode behavior), so \
+                     ZlauDeR's auto-plumb and intake gate never run and PII can reach the API \
+                     provider unmasked with no warning"
+                ),
+                Some("unset it, or run claude without inheriting it, on any project you rely on ZlauDeR for"),
+            )
+        }
     }
 }
 

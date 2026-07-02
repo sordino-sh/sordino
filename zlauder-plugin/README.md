@@ -262,3 +262,50 @@ ORG) need an NLP model and are off by default. The control endpoints
 a `0600` file, so a tool-driven `curl` cannot reveal tokens or flip masking off.
 For the full threat model, the "four arrows" design, what is and isn't masked,
 and the prompt-cache/determinism notes, see the [main repo README](../README.md).
+
+### Invocation shapes ZlauDeR's hooks cannot see
+
+ZlauDeR ships entirely as this plugin's `SessionStart` / `UserPromptSubmit` /
+`PreToolUse` hooks — there is no other lever available to a Claude Code plugin.
+Three real Claude Code invocation shapes bypass that hook layer, verified
+against the shipped `cli.js` (v2.1.198) control flow rather than assumed:
+
+- **`claude --bare` / `--safe-mode`** (env `CLAUDE_CODE_SIMPLE=1` /
+  `CLAUDE_CODE_SAFE_MODE=1`) skip plugin-hook loading entirely — Claude Code's
+  own flag description says as much ("skip hooks/plugins"), and it's not a
+  partial skip: `loadPluginHooks()` simply never runs, so ZlauDeR's fail-closed
+  UserPromptSubmit intake gate never fires for that session. Unlike the two
+  items below, a `--bare`/`--safe-mode` session **does** make real model API
+  calls — if this project's route hasn't already been baked by a prior normal
+  session, real PII can reach the API provider unmasked with **no warning at
+  all**, because the mechanism that would warn is exactly what's disabled.
+  `zlauder:doctor` can only detect this from *within* a normal session
+  (reading its own `CLAUDE_CODE_SIMPLE`/`CLAUDE_CODE_SAFE_MODE` env) — it
+  cannot self-detect from inside a `--bare` session, since ZlauDeR's own hook
+  wouldn't be invoked there either. Avoid `--bare`/`--safe-mode` on projects
+  where you're relying on ZlauDeR, and check your shell/CI environment isn't
+  setting either variable for you.
+- **`claude mcp serve`** (Claude Code exposing its own Bash/Read/Edit/etc. tool
+  surface as an MCP server to any connecting client) never calls the
+  SessionStart or PreToolUse hook-dispatch machinery at all — tool calls
+  execute directly with zero permission decision and zero ZlauDeR
+  involvement. This mode makes no outbound LLM calls of its own, so there's no
+  PII-to-model risk from it specifically, but any connecting MCP client gets
+  ungated local tool access with none of ZlauDeR's protections in effect.
+- **Remote Control's `bash_command` message** (the transport behind
+  `claude remote-control` / `claude daemon remote-control add`) executes a
+  one-shot shell command directly, the same way the local `!cmd` TUI shortcut
+  does — no model turn, no tool executor, no hooks. Same shape as the
+  `mcp serve` gap above: no PII-to-model risk, but arbitrary local shell exec
+  with zero ZlauDeR involvement, reachable from wherever Remote Control is
+  paired.
+
+Everything else in Claude Code's remote-control/remote-drive surface — the
+in-session `/remote-control` toggle, the standalone remote-control daemon's
+spawned `--print --sdk-url` worker processes, background-agent socket attach,
+the IDE bridge, MCP "channel" push, and the generic `--sdk-url` SDK transport
+teammates/sub-agents also use — funnels genuine chat turns through the same
+`UserPromptSubmit` dispatch a locally-typed prompt uses, so the fail-closed
+intake gate above covers it identically; this was verified end-to-end against
+the shipped bundle, not just assumed from the invocation's shape. See
+`e2e/remote-control-first-contact.sh` for the regression test.
