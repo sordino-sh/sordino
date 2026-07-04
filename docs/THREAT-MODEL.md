@@ -580,7 +580,8 @@ provider on every request; that is the product working, not a breach of the prom
 Content on passthrough endpoints (L1), undetected content (N6), inline binary
 payloads (L18), protocol ID fields (L9), schema/contract fields (L20), unknown
 Anthropic-wire fields (L22), user-bypassed `>>…<<` spans (L21), harness-side channels
-(L10), and — when the user points the `http` ML backend at a remote endpoint — every
+(L10), infrastructure URLs/IPs/MAC addresses under the default (Balanced) profile
+(L7), and — when the user points the `http` ML backend at a remote endpoint — every
 un-cached text leaf, pre-masking (L17), leave the machine unmasked. Model-authored
 `thinking`/`redacted_thinking` blocks are the one surface that is neither masked nor
 unmasked — they travel tokenized and opaque end-to-end (L24), so they carry plaintext
