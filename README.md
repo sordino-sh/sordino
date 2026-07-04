@@ -104,6 +104,10 @@ Requires Rust ≥ 1.91 (the `anthropic-wire` dependency is edition 2024).
 ZlauDeR is licensed under the Business Source License 1.1
 (`BUSL-1.1`). See [LICENSE](LICENSE).
 
+Contributions require agreement to a short
+[Contributor License Agreement](CLA.md); see
+[CONTRIBUTING.md](CONTRIBUTING.md).
+
 ## Install into Claude Code
 
 zlauder installs as a **Claude Code plugin** — that is the only supported
