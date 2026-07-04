@@ -32,10 +32,11 @@ Additional Use Grant: You may make production use of the Licensed Work,
                       invoke the Licensed Work, directly or through an
                       interface provided for that purpose.
 
-                      "Third parties" excludes you, your Affiliates, and
-                      your and their employees and contractors (including
-                      subcontractors engaged in work for you or your
-                      Affiliates). An "Affiliate" of a party is an entity
+                      "Third parties" excludes you, your Affiliates, your
+                      and their employees, and contractors and
+                      subcontractors in the course of work performed for
+                      you or your Affiliates. An "Affiliate" of a party is
+                      an entity
                       that controls, is controlled by, or is under common
                       control with that party, where "control" means
                       ownership of more than fifty percent of the voting
@@ -76,7 +77,8 @@ Change License:       GNU Affero General Public License, version 3 or later
                       (AGPL-3.0-or-later)
 
 For information about alternative licensing arrangements for the Licensed Work,
-please contact the Licensor.
+please contact the Licensor via the Licensed Work's repository,
+https://github.com/FailSpy/ZlauDeR.
 
 -----------------------------------------------------------------------------
 

@@ -48,4 +48,4 @@ In your first pull request, add one signature line yourself to
 [CONTRIBUTORS.md](CONTRIBUTORS.md) in the format described there. The pull
 request submitted from your own account adding that line is the record of
 your agreement; it constitutes agreement to this document for all of your
-past and future contributions to ZlauDeR.
+past, present, and future contributions to ZlauDeR.
