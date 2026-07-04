@@ -15,12 +15,16 @@ implies broader protection than what is written here, this document governs.
 
 ZlauDeR is a local HTTP proxy plus editor-hook tooling that sits between an AI coding
 agent (Claude Code, Codex) and its LLM provider. On the outbound path it detects
-sensitive spans (secrets, PII) in request bodies and replaces them with deterministic
-placeholder tokens before the request leaves the machine; on the response path it
-restores tokens the model echoed back, so the session works normally while the provider
-only ever receives the masked form of detected content. It runs entirely on the user's
-machine, bound to loopback, with no accounts, no cloud component, and no telemetry of
-its own.
+sensitive spans (secrets, PII) in request bodies on the masked wire surfaces and
+replaces them with deterministic placeholder tokens before the request leaves the
+machine; on the response path it restores tokens the model echoed back, so the session
+works normally while the provider only ever receives the masked form of detected
+content on those surfaces. The deliberately-passthrough endpoints (`/v1/files`,
+`/v1/batches`, and friends) are NOT masked — §7.1 is the catalog, and any summary of
+this paragraph that drops that qualifier is an over-reading. It runs entirely on the
+user's machine, bound to loopback, with no accounts, no cloud component, and no
+telemetry of its own (one third-party fetch exists: the monitor page loads fonts from
+Google — L19).
 
 ## 2. System overview and trust boundaries
 
@@ -55,9 +59,13 @@ proxy; the hooks are a second, weaker layer.
 
 **What runs where.** The masking engine (`zlauder-engine`), secrets resolution
 (`zlauder-secrets`), proxy (`zlauder-proxy`), and hook binary (`zlauder-hooks`) all run
-locally. The ML classifier runs locally too — in-process (Candle), as a local HTTP
-backend, or as a sidecar child over a private pipe with no port
-(`crates/zlauder-engine/src/config.rs:653-668`).
+locally. ML inference is local for the `local` (in-process Candle) and `sidecar`
+(child process over a private pipe, no port) backends
+(`crates/zlauder-engine/src/config.rs:646-668`). The `http` backend is NOT a locality
+guarantee: it POSTs the raw text of every un-cached leaf to whatever `endpoint` URL
+the user configures, with no loopback requirement (`require_local: false` —
+`crates/zlauder-engine/src/ml.rs:318-327`; `config.rs:560-565`). Pointing it at a
+non-local endpoint creates a second, pre-masking egress channel — see L17.
 
 ## 3. Assets protected
 
@@ -83,7 +91,8 @@ backend, or as a sidecar child over a private pipe with no port
   provider only in masked form.
 - **Accidental egress via agent behavior** — the model summarizing a `.env` file into
   its context, a tool result carrying a customer email, a system prompt embedding a
-  key. All wire surfaces of `/v1/messages` are walked and masked (§5, G2).
+  key. All wire surfaces of the message wires — `/v1/messages` and the
+  OpenAI-compatible endpoints — are walked and masked (§5, G2).
 - **Prompt-injection-driven exfiltration through the masked channel.** A compromised
   or manipulated model that tries to move a registered secret to an egress boundary:
   broker resolution is default-deny at MCP/agent/shell tool boundaries
@@ -127,14 +136,20 @@ Mechanism: `crates/zlauder-engine/src/lib.rs:745-758`.
 Evidence: `secret_masked_even_when_engine_disabled` (`lib.rs:3638`),
 `secret_masked_inside_user_bypass` (`lib.rs:3661`).
 
-**G2 — Mask-or-refuse on the message wire.** `/v1/messages` and `count_tokens` bodies
-are parsed and every content surface walked (system prompt, tool descriptions, user
-messages, tool_use inputs, tool results, assistant text, images/documents). Unparseable
-JSON ⇒ 400; engine error ⇒ 500; never forward unmasked.
+**G2 — Mask-or-refuse on the message wires, Anthropic AND OpenAI-compatible.**
+`/v1/messages` and `count_tokens` bodies are parsed and every content surface walked
+(system prompt, tool descriptions, user messages, tool_use inputs, tool results,
+assistant text, image/document URL sources — base64 payload `data` passes opaque by
+design, see L18). The OpenAI-compatible wire (`/v1/chat/completions`, `/v1/responses`)
+is equally a production mask-or-refuse path, not passthrough: same engine, same
+refuse-on-failure posture (`routes.rs:99-100`; `openai_chat.rs:75-87`;
+`openai_responses.rs:73`). Unparseable JSON ⇒ 400; engine error ⇒ 500; never forward
+unmasked.
 Mechanism: `crates/zlauder-proxy/src/walk.rs:159-244`, `routes.rs:634-648`.
 Evidence: `end_to_end_mask_unmask_and_header_passthrough`
-(`crates/zlauder-proxy/tests/integration.rs:280`); real-CLI e2e harness
-(`e2e/run-e2e.sh` + `e2e/fake_anthropic.py`).
+(`crates/zlauder-proxy/tests/integration.rs:280`);
+`openai_chat_completions_mask_unmask_and_header_passthrough` (`integration.rs:341`);
+real-CLI e2e harness (`e2e/run-e2e.sh` + `e2e/fake_anthropic.py`).
 
 **G3 — Broker tokens never resolve on the display path.** A `[BROKER__…]` token is
 refused by prefix before any manifest/store lookup, so the secret value cannot reach
@@ -146,8 +161,9 @@ Evidence: `broker_secret_minted_and_display_refused` (`lib.rs:3479`).
 **G4 — Broker resolution at tool boundaries is default-deny.** Egress-boundary tools
 (`mcp__*`, Task/Agent) are denied unconditionally; free-form shell tools (Bash-class)
 are denied unconditionally even under an `AnyHost` rule; only an explicit
-`[[broker.allow]]` rule matching secret, tool, and parameter pointer (with optional
-destination-host allow-list; unparseable host ⇒ deny) resolves a value.
+`[[broker.allow]]` rule matching tool and parameter pointer — and secret, when the
+rule names one; an omitted `secret` glob matches every secret (`broker.rs:134`) —
+(with optional destination-host allow-list; unparseable host ⇒ deny) resolves a value.
 Mechanism: `crates/zlauder-engine/src/broker.rs:113-158`.
 Evidence: `broker_resolve_pointers_respects_policy` (`lib.rs:3722`).
 
@@ -156,6 +172,8 @@ shells out (pass/sops/age/…) receives the secret via stdout only — never arg
 in `/proc/<pid>/cmdline`), never env — with stdin nulled, environment scrubbed to an
 allow-list, and `kill_on_drop`.
 Mechanism: `crates/zlauder-secrets/src/broker_spawn.rs:1-12`.
+Evidence: mechanism-cited only — `broker_spawn.rs` carries no unit test; verify by
+reading the cited lines (the exception noted in the closing verification note).
 
 **G6 — Unresolved required secrets hold ALL traffic.** While any `required = true`
 secret is unresolved, every upstream path — including the unmasked verbatim relay,
@@ -195,6 +213,7 @@ an allow-list (`AUTHORIZED_ML_MODELS`); every fetch/load funnels through
 `is_authorized_model`. The sidecar binary is located only by explicit path or env —
 no `PATH` fallback.
 Mechanism: `config.rs:769-788`; `config.rs:573-583`.
+Evidence: `authorized_model_allowlist_admits_default_only` (`config.rs:1439`).
 
 **G11 — Tokens are deterministic and cache-stable.** Session-salted blake3, idempotent
 per (salt, entity type, plaintext), so masking preserves the provider's prompt-cache
@@ -213,11 +232,15 @@ Evidence: `hash_secret_masks_and_is_never_revealable` (`lib.rs:3444`).
 resolves fail-closed at request entry: unknown target ⇒ 409; target not marked
 user-verified ⇒ 403; upstream failure ⇒ 502 with no fallback path to the default
 endpoint. ZDR egress strips the client's `authorization`/`x-api-key` and injects the
-target's env-sourced credential; masking applies unchanged on ZDR requests.
+target's env-sourced credential; masking applies unchanged on ZDR requests. ZDR is
+Anthropic-wire-only: a ZDR-pinned conversation on the OpenAI-compatible endpoints is
+refused with 501, never silently routed (`openai_chat.rs:60-70`,
+`openai_responses.rs:58-68`; see §7.5).
 Mechanism: `routes.rs:174-205,670`; `headers.rs:44-83`; `wire_adapter.rs:10-16,52-59`.
 Evidence: `zdr_unknown_selection_refuses_fail_closed` (integration.rs:1922),
 `zdr_unverified_target_refuses_fail_closed` (1959),
-`zdr_session_routes_to_target_with_zdr_key_not_subscription` (1744).
+`zdr_session_routes_to_target_with_zdr_key_not_subscription` (1744),
+`zdr_openai_path_refuses` (2067).
 
 **G14 — ZDR-pinned conversations cannot leak through cooperating passthrough.** A
 pinned conversation's session-prefixed relay is refused with 409 and zero bytes
@@ -235,6 +258,8 @@ blocks the unconfirmed route.
 Mechanism: `main.rs:155-173,547-598` (`CodexAuthCheck`),
 `codex-zlauder-plugin/scripts/enable.sh:23-25`, `codex_refusal_message`
 (`main.rs:678-698`).
+Evidence: `chatgpt_tokens_without_env_refuses` (`main.rs:9142`),
+`api_key_on_file_but_not_exported_refuses` (`main.rs:9159`).
 
 **G16 — Streaming responses unmask correctly across frame boundaries.** SSE unmasking
 carries at most one partial token so a token straddling deltas is still restored,
@@ -296,6 +321,27 @@ are the required-secrets 503 gate (G6) and the ZDR-pin refusals (G14). This is a
 design decision (these bodies are not reliably maskable), not a bug, and it is the
 single largest scoped exception to any "content is masked" summary of ZlauDeR.
 Mechanism: `routes.rs:362-372` (OPEN, by design).
+
+**L18 — Base64 image/document payloads pass opaque on the masked wires.** On
+`/v1/messages`, image and document blocks are masked only in their URL-source form; a
+`base64` source's `data` field is deliberately skipped (masking would corrupt the
+binary), so a document containing PII attached inline egresses with its content
+unmasked (`walk.rs:255-272`, generic-value guard `walk.rs:338-352`). The OpenAI
+Responses `input_file` part is the same class: `file_data`/`file_id`/`filename` are on
+the never-mask key list and only unknown extra fields are walked
+(`openai_responses.rs:350-352,443-455`) (OPEN, by design — binary payloads are not
+reliably maskable; same class as L1).
+
+**L17 — The `http` ML backend egresses raw text to its configured endpoint.** Every
+un-cached text leaf is POSTed, pre-masking, to the user-configured `endpoint` URL, and
+nothing requires that URL to be loopback (`require_local: false`,
+`crates/zlauder-engine/src/ml.rs:318-327`; privacy note at `config.rs:560-565`). With
+a local endpoint — the intended deployment — nothing leaves the machine; with a remote
+endpoint the user has configured a second, unmasked egress channel that no §5
+guarantee covers. The load-time checks verify the endpoint behaves like a privacy
+filter, not where it runs (OPEN, by design — the backend exists to call an external
+inference server; §2's "runs locally" claim holds only for the `local` and `sidecar`
+backends).
 
 **L7 — The default (Balanced) profile sends URLs, IPs, and MAC addresses in the
 clear.** The Network category is deliberately OFF in Balanced; in-URL credentials are
@@ -388,6 +434,14 @@ Local values are scrubbed to handles (G17); peekable PII is not
 (`monitor/spans.rs:233`) (OPEN, by design — local-machine exposure only, out-of-scope
 adversary).
 
+**L19 — The monitor page loads fonts from Google.** `monitor.html` preconnects to and
+loads stylesheets/fonts from `fonts.googleapis.com` / `fonts.gstatic.com`
+(`crates/zlauder-proxy/src/monitor/ui/monitor.html:7-9`). No captured content is sent
+— it is a static font fetch made by the user's browser — but it is a third-party
+network request that reveals monitor usage (IP address, timing) to Google, and it is
+the one exception to §1's "no cloud component" (OPEN — the fix is bundling the fonts
+into the binary like the rest of the UI).
+
 ### 7.4 Detection-quality limitations
 
 **L14 — ML classifier coverage has named gaps.** The `local` backend's default is
@@ -397,6 +451,12 @@ Silicon GPU) is not separately recall-gated — the recall gate proved CPU-F32 a
 CUDA-BF16 only (`ml.rs:172-174`) (OPEN — tracked follow-up).
 
 ### 7.5 ZDR limitations
+
+ZDR is Anthropic-wire-only in this build: a ZDR-pinned conversation on the
+OpenAI-compatible endpoints (`/v1/chat/completions`, `/v1/responses`) is refused with
+501 rather than routed anywhere (`openai_chat.rs:60-70`, `openai_responses.rs:58-68`;
+test `zdr_openai_path_refuses`, `integration.rs:2067`). Fail-closed — nothing leaks —
+but a Codex/OpenAI-wire user cannot use ZDR routing at all.
 
 **L11 — ZDR trust is asserted, not verified.** The system cannot verify a provider's
 retention posture; only the user can. A target must be explicitly marked
@@ -496,5 +556,6 @@ misrepresentation.
 ---
 
 *Verification note: line numbers reference commit `b5782ad`. The fastest way to check
-any claim: `git grep` the cited test name and run it; every guarantee in §5 names at
-least one.*
+any claim: `git grep` the cited test name and run it; every guarantee in §5 except G5
+names at least one (G5 is mechanism-cited only — `broker_spawn.rs` has no unit test,
+so verify it by reading the twelve cited lines).*
