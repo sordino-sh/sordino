@@ -328,8 +328,10 @@ reaches the proxy is masked or refused regardless of hook health.
 
 ## 7. Known limitations
 
-This section is the complete catalog. Nothing sensitive to a purchasing or adoption
-decision is documented elsewhere but omitted here.
+This section is the complete catalog as verified at the grounded commit (header
+note). Nothing sensitive to a purchasing or adoption decision is documented elsewhere
+but omitted here; a code change that adds an unmasked surface without updating this
+catalog is, per the header contract, a bug in this document.
 
 ### 7.1 Wire surfaces that are not masked
 
@@ -448,7 +450,11 @@ design — an explicit operator kill switch; narrated, key-gated, secret-safe).
 **L9 — Protocol telemetry fields pass verbatim.** Anthropic `metadata.user_id` and the
 OpenAI top-level `user` field egress byte-for-byte (masking them corrupts
 provider-side abuse attribution). A client that puts an email address in one of these
-fields egresses it. Mechanism: `walk.rs:194-206`; `openai_chat.rs:289-292` (OPEN, by
+fields egresses it. Request headers are the same class: the masked wires walk bodies,
+not headers, so client-sent headers pass through untouched (ZDR's credential
+strip-and-swap, G13, is the one header rewrite; evidence:
+`end_to_end_mask_unmask_and_header_passthrough`, `integration.rs:280`).
+Mechanism: `walk.rs:194-206`; `openai_chat.rs:289-292` (OPEN, by
 design; test `metadata_user_id_is_telemetry_passthrough_other_metadata_still_masked`,
 `walk.rs:847`).
 
