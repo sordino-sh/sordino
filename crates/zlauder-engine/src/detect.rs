@@ -52,7 +52,13 @@ use crate::surface::Surface;
 // credential; and it scans EVERY percent-decode level (to a bounded fixpoint) so multiply-
 // and mixed-encoded (`%253D`, `%2526`) structures are caught. These change detection output
 // for unchanged text — bump.
-pub const DETECTOR_VERSION: u64 = 8;
+// v9: UrlCredentialRecognizer's value-capture groups now require 2+ chars (was 1+), so a
+// bare context word (`session`, `sig`, ...) next to a single character no longer masks as
+// a credential. Also added the `preserve_current_date` near-now-date suppression pass
+// (`is_near_now_date`/`is_suppressed`, wired into both the custom-rule pass and
+// `ingest_results`) and extended `AllowList::with_common_words()`. All three change
+// detection output for unchanged (text, config) — bump to abandon stale cache entries.
+pub const DETECTOR_VERSION: u64 = 9;
 
 /// Score the [`LemmaContextAwareEnhancer`] adds when a recognizer's context word
 /// is found near a match (mirrors `LemmaContextAwareEnhancer::new`'s
@@ -369,10 +375,29 @@ fn parse_calendar_date(slice: &str) -> Option<i64> {
     let year: i64 = slice[0..4].parse().ok()?;
     let month: i64 = slice[5..7].parse().ok()?;
     let day: i64 = slice[8..10].parse().ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
         return None;
     }
     Some(days_from_civil(year, month, day))
+}
+
+/// Number of days in `month` (1-12) of the proleptic-Gregorian `year`, leap years
+/// included (divisible by 4, except centuries not divisible by 400). `parse_calendar_date`
+/// calls this AFTER bounding `month` to 1..=12, so the exhaustive match never sees an
+/// out-of-range month. Without this, an impossible date like `2026-02-30` or a
+/// non-leap `2026-02-29` would still parse via `days_from_civil`'s unchecked civil-date
+/// math (which normalizes it forward into March) and could be wrongly compared against
+/// "today" — this closes that gap.
+fn days_in_month(year: i64, month: i64) -> i64 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+            if leap { 29 } else { 28 }
+        }
+        _ => 0,
+    }
 }
 
 /// How many days of slack around "today" still counts as "the current date" for
@@ -898,6 +923,21 @@ mod current_date_tests {
         assert_eq!(parse_calendar_date("not-a-date-x"), None);
         assert_eq!(parse_calendar_date("2026-13-01"), None, "month out of range");
         assert_eq!(parse_calendar_date("2026-01-99"), None, "day out of range");
+        // Leap-year / days-in-month validity, not just a bare 1..=31 range check.
+        assert_eq!(parse_calendar_date("2026-02-30"), None, "February never has 30 days");
+        assert_eq!(parse_calendar_date("2026-02-29"), None, "2026 is not a leap year");
+        assert_eq!(
+            parse_calendar_date("2024-02-29"),
+            Some(days_from_civil(2024, 2, 29)),
+            "2024 IS a leap year (div by 4, not a century)"
+        );
+        assert_eq!(parse_calendar_date("1900-02-29"), None, "1900 is a century, not div by 400 -> not leap");
+        assert_eq!(
+            parse_calendar_date("2000-02-29"),
+            Some(days_from_civil(2000, 2, 29)),
+            "2000 IS a leap year (div by 400)"
+        );
+        assert_eq!(parse_calendar_date("2026-04-31"), None, "April never has 31 days");
     }
 
     #[test]

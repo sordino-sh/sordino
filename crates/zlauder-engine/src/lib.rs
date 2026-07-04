@@ -984,9 +984,10 @@ impl MaskEngine {
     /// feeds the cores and amortizes fixed per-call cost.
     ///
     /// PURELY ADDITIVE — it only ever inserts cache entries that [`Self::mask`] would
-    /// compute identically for the same `(text_hash, surface, policy_fp, ml_fp)` key
-    /// (the key is derived here by the very same [`stripped_for_key`] +
-    /// `surface`/`policy_fp`/`ml_fp` logic `mask` uses). So the masked output is
+    /// compute identically for the same `(text_hash, surface, policy_fp, ml_fp,
+    /// secrets_fp, today_bucket)` key (the key is derived here by the very same
+    /// [`stripped_for_key`] + `surface`/`policy_fp`/`ml_fp`/`secrets_fp`/`today_bucket`
+    /// logic `mask` uses). So the masked output is
     /// unchanged whether or not this ran. Every leaf it deliberately skips — a
     /// user-bypass leaf, a policy-disabled surface, an already-cached leaf, or the
     /// whole batch on an error — simply runs per-leaf in `mask` exactly as before.

@@ -335,13 +335,18 @@ impl AllowList {
         // framing text (system prompt, tool/skill descriptions, status output) is full
         // of vocabulary that reads as PERSON/API_KEY/URL to a generic NER or catch-all
         // regex — "Claude Sonnet 5", "ZlauDeR", the literal token-format example
-        // `[API_KEY_a1b2c3]` — none of which is ever real user PII. The name/URL
-        // patterns are anchored to the whole detected span (detections are matched
-        // whole-slice) so they can't accidentally swallow a real name that merely
-        // contains one of these words; the token-example pattern is intentionally
-        // unanchored since its surrounding quote/bracket punctuation varies by which
-        // recognizer half-matched it.
+        // `[API_KEY_a1b2c3]` — none of which is ever real user PII. Every entry below
+        // matches the WHOLE detected span exactly (exact-match or `^...$`-anchored
+        // pattern) so none of them can accidentally swallow a real name/secret that
+        // merely contains one of these words as a substring.
         al.add_exact_ci("zlauder");
+        // The literal example token handle used in zlauder's own docs/prompts, in each
+        // exact punctuation shape observed live (bare, `[…`, `"[…]"`) — exact-match,
+        // NOT a substring pattern, so it can never suppress an unrelated real secret
+        // that merely happens to contain this string.
+        for w in ["API_KEY_a1b2c3", "[API_KEY_a1b2c3", "\"[API_KEY_a1b2c3]\""] {
+            al.add_exact(w);
+        }
         for p in [
             // "Claude", optionally "Sonnet"/"Opus"/"Haiku", optionally a version number
             // ("Claude", "Claude Sonnet", "Claude Sonnet 5", "Claude Opus 4.8").
@@ -352,10 +357,6 @@ impl AllowList {
             r"(?i)@anthropic\.com$",
             r"(?i)^https?://(www\.)?claude\.ai(/\S*)?$",
             r"(?i)^https?://(www\.)?claude\.com(/\S*)?$",
-            // The literal example token handle used in zlauder's own docs/prompts.
-            // Unanchored: it shows up wrapped in varying quote/bracket combinations
-            // depending on which recognizer half-matched it (bare, `[…`, `"[…]"`).
-            r"API_KEY_a1b2c3",
         ] {
             al.add_pattern(regex::Regex::new(p).expect("built-in allow-list pattern must compile"));
         }

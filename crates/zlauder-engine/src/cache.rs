@@ -31,7 +31,10 @@
 //! ## Disk-persistence seam (DEFERRED — documented, not built)
 //! A future `DiskBackend` would key by `HMAC(session_key, text)` (NOT a bare
 //! content hash, so the file is not a confirmation oracle for "was value X here?")
-//! and store AES-GCM-encrypted detection lists tagged with `(policy_fp, ml_fp)`. No
+//! and store AES-GCM-encrypted detection lists tagged with `(policy_fp, ml_fp,
+//! secrets_fp, today_bucket)` — the full non-text-hash portion of [`CacheKey`], kept
+//! in lock-step here so a future implementer doesn't reproduce a stale subset and
+//! reintroduce the cross-day/cross-secret-rotation staleness these fields close. No
 //! trait / serde is introduced until that backend exists; the in-memory cache
 //! exposes a small `get` / `insert` / `set_cap` surface a backend can wrap. The
 //! inert `detection_cache_persist` / `detection_cache_path` config flags reserve the
