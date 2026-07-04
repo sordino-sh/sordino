@@ -23,9 +23,12 @@ works normally while the provider only ever receives the masked form of detected
 content on those surfaces. The deliberately-passthrough endpoints (`/v1/files`,
 `/v1/batches`, and friends) are NOT masked — §7.1 is the catalog, and any summary of
 this paragraph that drops that qualifier is an over-reading. It runs entirely on the
-user's machine, bound to loopback, with no accounts, no cloud component, no
-telemetry of its own, and no third-party fetches (the monitor UI's former Google Fonts
-load was removed at `bfcd794` — L19, closed).
+user's machine, bound to loopback, with no accounts, no cloud component, and no
+telemetry of its own. "No third-party fetches" holds with exactly one scoped
+exception: enabling the optional ML classifier's `local`/`sidecar` backend downloads
+pinned model weights from Hugging Face — download-only, off by default,
+allowlist-gated (L23). The monitor UI's former Google Fonts load was removed at
+`bfcd794` (L19, closed).
 
 ## 2. System overview and trust boundaries
 
@@ -136,7 +139,8 @@ configuration state lets a known secret value egress in plaintext through the ma
 path. *Scope fence: the guarantee covers the leaves the walkers visit. Schema/contract
 fields that are deliberately never walked (tool `input_schema`; the OpenAI-wire
 contract-key subtrees) sit outside it — a registered secret embedded there egresses
-verbatim. See L20.*
+verbatim (L20) — and so do unknown fields the Anthropic typed parse preserves through
+its `extra` flatten sinks (L22).*
 Mechanism: `crates/zlauder-engine/src/lib.rs:745-758`.
 Evidence: `secret_masked_even_when_engine_disabled` (`lib.rs:3638`),
 `secret_masked_inside_user_bypass` (`lib.rs:3661`).
@@ -144,9 +148,11 @@ Evidence: `secret_masked_even_when_engine_disabled` (`lib.rs:3638`),
 **G2 — Mask-or-refuse on the message wires, Anthropic AND OpenAI-compatible.**
 `/v1/messages` and `count_tokens` bodies are parsed and every content surface walked
 (system prompt, tool descriptions, user messages, tool_use inputs, tool results,
-assistant text, image/document URL sources — base64 payload `data` passes opaque by
-design, see L18; tool `input_schema` and OpenAI-wire contract-key subtrees pass
-verbatim by design, see L20). The OpenAI-compatible wire (`/v1/chat/completions`, `/v1/responses`)
+assistant text, image/document URL sources — base64 payload `data` and OpenAI
+`data:`-URI image URLs pass opaque by design, see L18; tool `input_schema` and
+OpenAI-wire contract-key subtrees pass verbatim by design, see L20; unknown
+Anthropic-wire fields ride the typed `extra` sinks unmasked, see L22). The
+OpenAI-compatible wire (`/v1/chat/completions`, `/v1/responses`)
 is equally a production mask-or-refuse path, not passthrough: same engine, same
 refuse-on-failure posture (`routes.rs:99-100`; `openai_chat.rs:75-87`;
 `openai_responses.rs:73`). Unparseable JSON ⇒ 400; engine error ⇒ 500; never forward
@@ -334,11 +340,14 @@ Mechanism: `routes.rs:362-372` (OPEN, by design).
 `/v1/messages`, image and document blocks are masked only in their URL-source form; a
 `base64` source's `data` field is deliberately skipped (masking would corrupt the
 binary), so a document containing PII attached inline egresses with its content
-unmasked (`walk.rs:255-272`, generic-value guard `walk.rs:338-352`). The OpenAI
-Responses `input_file` part is the same class: `file_data`/`file_id`/`filename` are on
-the never-mask key list and only unknown extra fields are walked
-(`openai_responses.rs:350-352,443-455`) (OPEN, by design — binary payloads are not
-reliably maskable; same class as L1).
+unmasked (`walk.rs:255-272`, generic-value guard `walk.rs:338-352`). On
+`/v1/chat/completions` the inline-image form is the same skip: an `image_url` whose
+URL is a `data:` URI passes opaque — only non-`data:` URLs are masked
+(`openai_chat.rs:332-337`). The OpenAI Responses `input_file` part is the same class:
+`file_data`/`file_id`/`filename` are on the never-mask key list and only unknown extra
+fields are walked (`openai_responses.rs:350-352,443-455`); the Responses
+`input_image`/`image_file` subtrees are skipped whole (L20)
+(OPEN, by design — binary payloads are not reliably maskable; same class as L1).
 
 **L17 — The `http` ML backend egresses raw text to its configured endpoint.** Every
 un-cached text leaf is POSTed, pre-masking, to the user-configured `endpoint` URL, and
@@ -350,6 +359,18 @@ guarantee covers. The load-time checks verify the endpoint behaves like a privac
 filter, not where it runs (OPEN, by design — the backend exists to call an external
 inference server; §2's "runs locally" claim holds only for the `local` and `sidecar`
 backends).
+
+**L23 — Enabling the `local` or `sidecar` ML backend downloads model weights from
+Hugging Face.** This is the one third-party fetch in the product: first load (or an
+explicit `--download-model`) pulls the model checkpoint from the HuggingFace hub into
+the standard `hf-hub` cache (`crates/zlauder-engine/src/ml.rs:226-229,250-270`). It is
+download-only — no user content is sent — ML is off by default (`enabled: false`,
+`config.rs:812`), and the repo id is pinned to the `AUTHORIZED_ML_MODELS` allowlist
+through the single `is_authorized_model` chokepoint (G10; `config.rs:777,786`), so no
+override path can fetch an arbitrary checkpoint. The `http` backend pulls no weights
+(its egress story is L17). §1's "no third-party fetches" is scoped by exactly this
+item (OPEN, by design — the optional ML capability needs weights from somewhere;
+pre-seeding the `hf-hub` cache offline avoids the fetch entirely).
 
 **L7 — The default (Balanced) profile sends URLs, IPs, and MAC addresses in the
 clear.** The Network category is deliberately OFF in Balanced; in-URL credentials are
@@ -369,14 +390,32 @@ reductions. Mechanism: `config.rs:328-368`; `detect.rs:57-58,323-329` (OPEN, by 
 would break the model's tool-call validation — `walk.rs:178-181`). On the
 OpenAI-compatible wires the skip is broader: entire subtrees under contract keys
 (`model`, `tools`, `tool_choice`, `response_format`, `json_schema`, `schema`,
-`input_schema`, `parameters`, `guided_*`, and on Responses also `text`/`format` and
-the file/call ID fields) are skipped before the engine runs
-(`openai_chat.rs:402-417`, `openai_responses.rs:431-455`). Because the skip lives in
+`input_schema`, `parameters`, `guided_*`, and on Responses also `text`/`format`, the
+file/call ID fields, and the `image_file`/`input_image`/`encrypted_content`/
+`signature` subtrees) are skipped before the engine runs
+(`openai_chat.rs:402-417`, `openai_responses.rs:431-455`). An in-URL credential
+inside a skipped subtree (e.g. an `input_image` URL) passes verbatim — asset 3's
+always-on recognizer runs only on walked leaves. Because the skip lives in
 the proxy walker — upstream of the engine — G1's unconditional-secret masking does not
 apply here: a registered secret embedded in a tool schema or contract subtree egresses
-in plaintext. This is the one carve-out from G1. Do not put sensitive values in tool
-schemas or sampling-contract fields (OPEN, by design — masking schema constraints
+in plaintext. This and L22 are the two carve-outs from G1. Do not put sensitive
+values in tool schemas or sampling-contract fields (OPEN, by design — masking schema
+constraints
 corrupts tool-call validation).
+
+**L22 — Unknown fields on the Anthropic typed wire pass verbatim, warn-only.** The
+`/v1/messages` typed parse preserves fields it does not model through serde `extra`
+flatten sinks at the request, message, system-block, and tool levels; the walker logs
+a warning and forwards them UNMASKED (`walk.rs:163,174,181,210`, `warn_unknown_map`
+at `walk.rs:431-441`). Like L20 the skip sits upstream of the engine, so this is a
+carve-out from G1 too: a registered secret placed in such a field egresses in
+plaintext. The exposure is exactly the fields the typed parse accepts but does not
+model — a body that fails the typed parse entirely takes the fail-safe whole-body
+Value-walk instead (every string leaf masked, `walk.rs:26-31`), and the
+OpenAI-compatible wires mask their `extra` maps (`openai_chat.rs:295,317`), so this
+is an Anthropic-typed-wire limitation specifically (OPEN — masking unknown protocol
+fields risks corrupting contract semantics the same way L20 does; the warn log is
+disclosure, not enforcement).
 
 **L21 — The `>>…<<` user-message bypass sends its contents with detection skipped.**
 Text wrapped in `>>…<<` inside a user message is a deliberate one-shot escape hatch:
@@ -471,8 +510,10 @@ adversary).
 Earlier builds preconnected to and loaded stylesheets/fonts from
 `fonts.googleapis.com` / `fonts.gstatic.com` from `monitor.html`; commit `bfcd794`
 removed the fetch, and no `googleapis`/`gstatic` reference remains anywhere in
-`crates/` (verify by grep). The monitor UI is self-contained, and §1's "no cloud
-component, no third-party fetches" now holds without exception (CLOSED).
+`crates/` (verify by grep). The monitor UI is self-contained; §1's "no cloud
+component" now holds without exception, and "no third-party fetches" holds with the
+single scoped exception of the opt-in, allowlist-pinned ML weight download (L23)
+(CLOSED — this item covers the Google-Fonts fetch, which is gone).
 
 ### 7.4 Detection-quality limitations
 
@@ -513,9 +554,11 @@ is not a guarantee, whoever is making it.
 **N1 — ZlauDeR does not make data "never leave your machine."** Masked content — your
 prompts, code, and files with detected spans replaced by tokens — is sent to the LLM
 provider on every request; that is the product working, not a breach of the promise.
-Content on passthrough endpoints (L1), undetected content (N6), protocol ID fields
-(L9), schema/contract fields (L20), user-bypassed `>>…<<` spans (L21), and
-harness-side channels (L10) leave the machine unmasked. The defensible
+Content on passthrough endpoints (L1), undetected content (N6), inline binary
+payloads (L18), protocol ID fields (L9), schema/contract fields (L20), unknown
+Anthropic-wire fields (L22), user-bypassed `>>…<<` spans (L21), harness-side channels
+(L10), and — when the user points the `http` ML backend at a remote endpoint — every
+un-cached text leaf, pre-masking (L17), leave the machine unmasked. The defensible
 statement is: *detected sensitive spans on masked wire surfaces reach the provider
 only in tokenized form, enforced fail-closed at the proxy.* Any absolute "never leaves
 your machine" or "never left your control" reading is wrong, and this paragraph is the
