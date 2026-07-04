@@ -1,6 +1,7 @@
 # ZlauDeR Threat Model
 
-Grounded at `main` (v0.13.0 line, verified at commit `b5782ad`). Every current-behavior
+Grounded at `main` (v0.13.0 line, verified at commit `b5782ad`; the one code change
+since — `bfcd794`, the monitor Google-Fonts removal — is reflected in L19). Every current-behavior
 claim in this document cites the mechanism (file/line at that commit) and, where one
 exists, the test that pins it. If a claim here and the code disagree, the code is right
 and this document has a bug — file it.
@@ -22,9 +23,9 @@ works normally while the provider only ever receives the masked form of detected
 content on those surfaces. The deliberately-passthrough endpoints (`/v1/files`,
 `/v1/batches`, and friends) are NOT masked — §7.1 is the catalog, and any summary of
 this paragraph that drops that qualifier is an over-reading. It runs entirely on the
-user's machine, bound to loopback, with no accounts, no cloud component, and no
-telemetry of its own (one third-party fetch exists: the monitor page loads fonts from
-Google — L19).
+user's machine, bound to loopback, with no accounts, no cloud component, no
+telemetry of its own, and no third-party fetches (the monitor UI's former Google Fonts
+load was removed at `bfcd794` — L19, closed).
 
 ## 2. System overview and trust boundaries
 
@@ -129,9 +130,13 @@ Each guarantee: **statement — mechanism — evidence.** "Refuse" always means 
 is rejected with an error and zero bytes go upstream; ZlauDeR never silently forwards
 on a masking failure.
 
-**G1 — Registered secrets are masked unconditionally.** Engine disabled, surface
-disabled, profile minimal — a registered secret still masks; no configuration state
-lets a known secret value egress in plaintext through the mask path.
+**G1 — Registered secrets are masked unconditionally on every walked leaf.** Engine
+disabled, surface disabled, profile minimal — a registered secret still masks; no
+configuration state lets a known secret value egress in plaintext through the mask
+path. *Scope fence: the guarantee covers the leaves the walkers visit. Schema/contract
+fields that are deliberately never walked (tool `input_schema`; the OpenAI-wire
+contract-key subtrees) sit outside it — a registered secret embedded there egresses
+verbatim. See L20.*
 Mechanism: `crates/zlauder-engine/src/lib.rs:745-758`.
 Evidence: `secret_masked_even_when_engine_disabled` (`lib.rs:3638`),
 `secret_masked_inside_user_bypass` (`lib.rs:3661`).
@@ -140,7 +145,8 @@ Evidence: `secret_masked_even_when_engine_disabled` (`lib.rs:3638`),
 `/v1/messages` and `count_tokens` bodies are parsed and every content surface walked
 (system prompt, tool descriptions, user messages, tool_use inputs, tool results,
 assistant text, image/document URL sources — base64 payload `data` passes opaque by
-design, see L18). The OpenAI-compatible wire (`/v1/chat/completions`, `/v1/responses`)
+design, see L18; tool `input_schema` and OpenAI-wire contract-key subtrees pass
+verbatim by design, see L20). The OpenAI-compatible wire (`/v1/chat/completions`, `/v1/responses`)
 is equally a production mask-or-refuse path, not passthrough: same engine, same
 refuse-on-failure posture (`routes.rs:99-100`; `openai_chat.rs:75-87`;
 `openai_responses.rs:73`). Unparseable JSON ⇒ 400; engine error ⇒ 500; never forward
@@ -172,8 +178,10 @@ shells out (pass/sops/age/…) receives the secret via stdout only — never arg
 in `/proc/<pid>/cmdline`), never env — with stdin nulled, environment scrubbed to an
 allow-list, and `kill_on_drop`.
 Mechanism: `crates/zlauder-secrets/src/broker_spawn.rs:1-12`.
-Evidence: mechanism-cited only — `broker_spawn.rs` carries no unit test; verify by
-reading the cited lines (the exception noted in the closing verification note).
+Evidence: `secret_rides_stdout_not_argv` (`broker_spawn.rs:142`) pins the
+stdout-as-value-channel claim; `env_is_scrubbed` (`broker_spawn.rs:166`) pins the
+environment scrub; `missing_binary_is_binary_missing` and `nonzero_exit_is_auth_error`
+cover the failure paths.
 
 **G6 — Unresolved required secrets hold ALL traffic.** While any `required = true`
 secret is unresolved, every upstream path — including the unmasked verbatim relay,
@@ -356,6 +364,31 @@ claude.ai/claude.com, exactly `noreply@anthropic.com` — not the domain), and a
 near-now-date pass leaves dates close to today unmasked. Both are exact/anchored FP
 reductions. Mechanism: `config.rs:328-368`; `detect.rs:57-58,323-329` (OPEN, by design).
 
+**L20 — Schema/contract fields pass verbatim — including registered secrets.** On
+`/v1/messages`, a tool's `input_schema` is never walked (masking schema constraints
+would break the model's tool-call validation — `walk.rs:178-181`). On the
+OpenAI-compatible wires the skip is broader: entire subtrees under contract keys
+(`model`, `tools`, `tool_choice`, `response_format`, `json_schema`, `schema`,
+`input_schema`, `parameters`, `guided_*`, and on Responses also `text`/`format` and
+the file/call ID fields) are skipped before the engine runs
+(`openai_chat.rs:402-417`, `openai_responses.rs:431-455`). Because the skip lives in
+the proxy walker — upstream of the engine — G1's unconditional-secret masking does not
+apply here: a registered secret embedded in a tool schema or contract subtree egresses
+in plaintext. This is the one carve-out from G1. Do not put sensitive values in tool
+schemas or sampling-contract fields (OPEN, by design — masking schema constraints
+corrupts tool-call validation).
+
+**L21 — The `>>…<<` user-message bypass sends its contents with detection skipped.**
+Text wrapped in `>>…<<` inside a user message is a deliberate one-shot escape hatch:
+the wrapped span goes upstream with no PII detection and no token minting, while
+surrounding text masks normally. Registered secrets are the exception — they are still
+masked inside a bypass (the hatch is a convenience, not a secret-exfil channel; G1's
+`secret_masked_inside_user_bypass`, `lib.rs:3661`) — but detected-PII protection is
+OFF inside the markers: any PII a user (or anything that composes user-message text)
+places there egresses unmasked. Mechanism: `crates/zlauder-engine/src/lib.rs:1112-1161`,
+`user_bypass_segments` (`lib.rs:1568-1596`) (OPEN, by design — user-controlled bypass;
+cataloged here so N1 cannot be quoted as covering bypassed spans).
+
 **L9 — Protocol telemetry fields pass verbatim.** Anthropic `metadata.user_id` and the
 OpenAI top-level `user` field egress byte-for-byte (masking them corrupts
 provider-side abuse attribution). A client that puts an email address in one of these
@@ -434,13 +467,12 @@ Local values are scrubbed to handles (G17); peekable PII is not
 (`monitor/spans.rs:233`) (OPEN, by design — local-machine exposure only, out-of-scope
 adversary).
 
-**L19 — The monitor page loads fonts from Google.** `monitor.html` preconnects to and
-loads stylesheets/fonts from `fonts.googleapis.com` / `fonts.gstatic.com`
-(`crates/zlauder-proxy/src/monitor/ui/monitor.html:7-9`). No captured content is sent
-— it is a static font fetch made by the user's browser — but it is a third-party
-network request that reveals monitor usage (IP address, timing) to Google, and it is
-the one exception to §1's "no cloud component" (OPEN — the fix is bundling the fonts
-into the binary like the rest of the UI).
+**L19 — CLOSED at `bfcd794`: the monitor page no longer loads fonts from Google.**
+Earlier builds preconnected to and loaded stylesheets/fonts from
+`fonts.googleapis.com` / `fonts.gstatic.com` from `monitor.html`; commit `bfcd794`
+removed the fetch, and no `googleapis`/`gstatic` reference remains anywhere in
+`crates/` (verify by grep). The monitor UI is self-contained, and §1's "no cloud
+component, no third-party fetches" now holds without exception (CLOSED).
 
 ### 7.4 Detection-quality limitations
 
@@ -482,7 +514,8 @@ is not a guarantee, whoever is making it.
 prompts, code, and files with detected spans replaced by tokens — is sent to the LLM
 provider on every request; that is the product working, not a breach of the promise.
 Content on passthrough endpoints (L1), undetected content (N6), protocol ID fields
-(L9), and harness-side channels (L10) leave the machine unmasked. The defensible
+(L9), schema/contract fields (L20), user-bypassed `>>…<<` spans (L21), and
+harness-side channels (L10) leave the machine unmasked. The defensible
 statement is: *detected sensitive spans on masked wire surfaces reach the provider
 only in tokenized form, enforced fail-closed at the proxy.* Any absolute "never leaves
 your machine" or "never left your control" reading is wrong, and this paragraph is the
@@ -555,7 +588,7 @@ misrepresentation.
 
 ---
 
-*Verification note: line numbers reference commit `b5782ad`. The fastest way to check
-any claim: `git grep` the cited test name and run it; every guarantee in §5 except G5
-names at least one (G5 is mechanism-cited only — `broker_spawn.rs` has no unit test,
-so verify it by reading the twelve cited lines).*
+*Verification note: line numbers reference commit `b5782ad` (L19's closure references
+`bfcd794`). The fastest way to check any claim: `git grep` the cited test name and run
+it; every guarantee in §5 names at least one, except G18, whose evidence is a
+greppable absence rather than a test.*
