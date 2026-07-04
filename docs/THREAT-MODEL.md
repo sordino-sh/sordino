@@ -151,7 +151,9 @@ Evidence: `secret_masked_even_when_engine_disabled` (`lib.rs:3638`),
 assistant text, image/document URL sources — base64 payload `data` and OpenAI
 `data:`-URI image URLs pass opaque by design, see L18; tool `input_schema` and
 OpenAI-wire contract-key subtrees pass verbatim by design, see L20; unknown
-Anthropic-wire fields ride the typed `extra` sinks unmasked, see L22). The
+Anthropic-wire fields ride the typed `extra` sinks unmasked, see L22; assistant
+`thinking`/`redacted_thinking` blocks pass opaque both ways and carry only tokens,
+see L24). The
 OpenAI-compatible wire (`/v1/chat/completions`, `/v1/responses`)
 is equally a production mask-or-refuse path, not passthrough: same engine, same
 refuse-on-failure posture (`routes.rs:99-100`; `openai_chat.rs:75-87`;
@@ -302,7 +304,8 @@ not ZlauDeR, decides whether they execute. They are labeled best-effort because 
 failure mode is open, not because they are unimplemented.
 
 - **The intake gate as a whole (G7/G8).** The gate's *decision* is fail-closed, but a
-  UserPromptSubmit hook that crashes, times out (Claude Code's 30s contract), or whose
+  UserPromptSubmit hook that crashes, times out (bounded by Claude Code's hook-timeout
+  contract), or whose
   binary is missing fails OPEN — the prompt proceeds ungated. Every read on the hook
   path is bounded and non-panicking to shrink that window
   (`main.rs:5023-5034`; `zlauder-plugin/scripts/user-prompt-submit.sh:23-31`).
@@ -431,9 +434,29 @@ cataloged here so N1 cannot be quoted as covering bypassed spans).
 **L9 — Protocol telemetry fields pass verbatim.** Anthropic `metadata.user_id` and the
 OpenAI top-level `user` field egress byte-for-byte (masking them corrupts
 provider-side abuse attribution). A client that puts an email address in one of these
-fields egresses it. Mechanism: `walk.rs:184-187`; `openai_chat.rs:289-292` (OPEN, by
+fields egresses it. Mechanism: `walk.rs:194-206`; `openai_chat.rs:289-292` (OPEN, by
 design; test `metadata_user_id_is_telemetry_passthrough_other_metadata_still_masked`,
 `walk.rs:847`).
+
+**L24 — Assistant `thinking`/`redacted_thinking` blocks pass opaque on the masked
+wire, carrying only tokens.** On `/v1/messages`, model-authored `thinking` and
+`redacted_thinking` blocks (with their signatures) are skipped by the walker on the
+request path (`walk.rs:226-227`) and are equally never unmasked on the
+response/display path (`walk.rs:479-480`) — opaque both ways by design, because
+rewriting the text would invalidate the block's cryptographic signature. The two
+skips are paired and together preserve the invariant that a thinking block carries
+only tokens: because ZlauDeR never unmasks one, the local transcript stores it
+tokenized, so a thinking block round-tripped through a ZlauDeR-masked session holds
+only the masked (tokenized) form of any span ZlauDeR detected — the model only ever
+saw the token and cannot reconstruct plaintext from it. Registered secrets
+specifically are structurally unrevealable (G12) and never reach the model as
+plaintext, so — unlike L20/L22 — this is NOT a carve-out from G1. The residual is
+narrow and inherited, not new: content ZlauDeR never detected (N6) that the model
+restates in its reasoning egresses in the thinking block unmasked exactly as it would
+on any other surface, and a thinking block produced before routing was verified (L16)
+carries whatever that pre-routing session produced. Mechanism: `walk.rs:226-227`
+(request skip), `walk.rs:479-480` (response skip) (OPEN, by design — signatures
+forbid rewriting; token-only content by the opaque-both-ways invariant).
 
 ### 7.2 Harness-boundary limitations
 
@@ -558,7 +581,11 @@ Content on passthrough endpoints (L1), undetected content (N6), inline binary
 payloads (L18), protocol ID fields (L9), schema/contract fields (L20), unknown
 Anthropic-wire fields (L22), user-bypassed `>>…<<` spans (L21), harness-side channels
 (L10), and — when the user points the `http` ML backend at a remote endpoint — every
-un-cached text leaf, pre-masking (L17), leave the machine unmasked. The defensible
+un-cached text leaf, pre-masking (L17), leave the machine unmasked. Model-authored
+`thinking`/`redacted_thinking` blocks are the one surface that is neither masked nor
+unmasked — they travel tokenized and opaque end-to-end (L24), so they carry plaintext
+only for content ZlauDeR never detected (N6), not a hidden plaintext channel of their
+own. The defensible
 statement is: *detected sensitive spans on masked wire surfaces reach the provider
 only in tokenized form, enforced fail-closed at the proxy.* Any absolute "never leaves
 your machine" or "never left your control" reading is wrong, and this paragraph is the
