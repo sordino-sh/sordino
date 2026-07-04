@@ -15,6 +15,9 @@ and to license and relicense Your contributions and derivative works of them
 under any terms of the Licensor's choosing — including, without limitation,
 the Business Source License 1.1 with any parameters, the Change License it
 converts to, other open-source licenses, and proprietary or commercial terms.
+To the maximum extent permitted by applicable law, You waive, and agree not
+to assert against the Licensor or its licensees, any moral rights You may
+have in Your contributions.
 
 **Patent grant.** You grant the Licensor and all recipients of the Licensed
 Work a perpetual, worldwide, non-exclusive, royalty-free patent license to
@@ -41,7 +44,8 @@ obligation to provide support for them.
 
 ## How to agree
 
-In your first pull request, add one signature line to
-[CONTRIBUTORS.md](CONTRIBUTORS.md) in the format described there. That
-signature constitutes agreement to this document for all of your past and
-future contributions to ZlauDeR.
+In your first pull request, add one signature line yourself to
+[CONTRIBUTORS.md](CONTRIBUTORS.md) in the format described there. The pull
+request submitted from your own account adding that line is the record of
+your agreement; it constitutes agreement to this document for all of your
+past and future contributions to ZlauDeR.

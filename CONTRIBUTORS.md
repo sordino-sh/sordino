@@ -2,8 +2,10 @@
 
 A signature line below constitutes agreement to the
 [ZlauDeR Contributor License Agreement](CLA.md) for all of the signer's
-past and future contributions to this project. Add your line in your first
-pull request.
+past and future contributions to this project. Add the line yourself, in
+your own first pull request; the pull request submitted from your account
+is the record of your agreement, and maintainers do not add signature lines
+on contributors' behalf.
 
 Format:
 
