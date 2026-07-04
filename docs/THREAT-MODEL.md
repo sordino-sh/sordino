@@ -83,7 +83,9 @@ non-local endpoint creates a second, pre-masking egress channel — see L17.
    by regex recognizers plus an optional ML classifier, per the active profile.
    Protection is probabilistic: it is as good as detection, no better (§8, Non-Goal N6).
 3. **In-URL credentials** — always-on regardless of profile, including percent-encoded
-   forms (`config.rs:178-181`, `recognizers.rs:783-930`).
+   forms (`config.rs:178-181`, `recognizers.rs:783-930`). Always-on is a profile-axis
+   claim; the walked-leaf scope fences still apply (skipped contract subtrees L20,
+   bypassed `>>…<<` spans L21, master switch off L26).
 4. **The proxy's own admin key** — a `Local`-class token: revealed to the user's
    display, refused into tool inputs (`main.rs:134-142`, engine `lib.rs:1301-1312`).
 
@@ -451,8 +453,11 @@ design — an explicit operator kill switch; narrated, key-gated, secret-safe).
 OpenAI top-level `user` field egress byte-for-byte (masking them corrupts
 provider-side abuse attribution). A client that puts an email address in one of these
 fields egresses it. Request headers are the same class: the masked wires walk bodies,
-not headers, so client-sent headers pass through untouched (ZDR's credential
-strip-and-swap, G13, is the one header rewrite; evidence:
+not headers — no header value is ever masked. Transport normalization aside
+(hop-by-hop stripping, `Host` rewrite, forced `Accept-Encoding: identity` —
+`headers.rs:28-42`), client-sent headers reach the provider as sent; no
+content-bearing header is edited, and ZDR's credential strip-and-swap (G13) is the
+one credential rewrite (evidence:
 `end_to_end_mask_unmask_and_header_passthrough`, `integration.rs:280`).
 Mechanism: `walk.rs:194-206`; `openai_chat.rs:289-292` (OPEN, by
 design; test `metadata_user_id_is_telemetry_passthrough_other_metadata_still_masked`,
@@ -625,7 +630,9 @@ payloads (L18), protocol ID fields (L9), schema/contract fields (L20), unknown
 Anthropic-wire fields (L22), user-bypassed `>>…<<` spans (L21), regex recall gaps —
 context-free phone numbers and PEM private keys under regex-only detection (L25),
 harness-side channels
-(L10), infrastructure URLs/IPs/MAC addresses under the default (Balanced) profile
+(L10), traffic from a session that never reaches the proxy at all — a failed-open
+hook or an unrouted first session (L2, L16), infrastructure URLs/IPs/MAC addresses
+under the default (Balanced) profile
 (L7), everything but registered secrets while the proxy master switch is flipped off
 (L26), and — when the user points the `http` ML backend at a remote endpoint — every
 un-cached text leaf, pre-masking (L17), leave the machine unmasked. Model-authored
