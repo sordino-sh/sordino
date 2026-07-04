@@ -139,7 +139,8 @@ pub fn run_detection(
     text: &str,
     surface: Surface,
 ) -> Result<Vec<CachedDetection>, EngineError> {
-    let (mut dets, mut allowed_spans) = detect_base(analyzer, cfg, customs, secrets, text, surface);
+    let (mut dets, mut allowed_spans, today) =
+        detect_base(analyzer, cfg, customs, secrets, text, surface);
 
     // Pass 2b: the optional ML recognizer (openai/privacy-filter), if loaded. It
     // returns the same `RecognizerResult` type, so it flows through the identical
@@ -161,6 +162,7 @@ pub fn run_detection(
             &mut dets,
             &mut allowed_spans,
             Source::Ml,
+            today,
         );
     }
 
@@ -207,7 +209,7 @@ pub fn run_detection_batch(
 
     let mut out = Vec::with_capacity(leaves.len());
     for ((text, surface), ml_results) in leaves.iter().zip(ml_batch) {
-        let (mut dets, mut allowed_spans) =
+        let (mut dets, mut allowed_spans, today) =
             detect_base(analyzer, cfg, customs, secrets, text, *surface);
         ingest_results(
             ml_results,
@@ -216,6 +218,7 @@ pub fn run_detection_batch(
             &mut dets,
             &mut allowed_spans,
             Source::Ml,
+            today,
         );
         out.push(finish(dets, allowed_spans));
     }
@@ -234,12 +237,16 @@ fn detect_base(
     secrets: &[CompiledSecret],
     text: &str,
     surface: Surface,
-) -> (Vec<CachedDetection>, Vec<(usize, usize)>) {
+) -> (Vec<CachedDetection>, Vec<(usize, usize)>, i64) {
     let mut dets: Vec<CachedDetection> = Vec::new();
     // Spans of allow-listed values; any detection fully contained in one of these
     // is also suppressed (allow-listing "admin@example.com" covers its
     // "example.com" sub-domain too).
     let mut allowed_spans: Vec<(usize, usize)> = Vec::new();
+    // Computed once per leaf and reused for every date-shaped candidate below (and
+    // returned to the caller, which folds it into the cache key — see
+    // `is_near_now_date`'s doc for why the cache MUST vary by day).
+    let today = today_days();
 
     // Pass 0: registered secrets (exact-literal). Highest overlap priority and EXEMPT
     // from allow-list suppression (a registered secret is never silently passed
@@ -255,7 +262,7 @@ fn detect_base(
         }
         for m in c.re.find_iter(text) {
             let slice = &text[m.start()..m.end()];
-            if cfg.allow_list.is_allowed(slice) {
+            if is_suppressed(cfg, slice, today) {
                 allowed_spans.push((m.start(), m.end()));
                 continue;
             }
@@ -300,9 +307,95 @@ fn detect_base(
         &mut dets,
         &mut allowed_spans,
         Source::Regex,
+        today,
     );
 
-    (dets, allowed_spans)
+    (dets, allowed_spans, today)
+}
+
+/// Days since the Unix epoch, from the wall clock (UTC day boundary). Used both to
+/// evaluate [`is_near_now_date`] and — returned by [`detect_base`] up to the cache
+/// key — to bucket the detection cache by calendar day (see that type's doc: without
+/// this, a "date is near now" verdict cached today would be served, unchanged, on
+/// every future day, silently un-suppressing or over-suppressing a date once it's no
+/// longer near "now"). Falls back to epoch day 0 on a clock error (pre-1970 clock;
+/// never happens in practice) rather than panicking — worst case that request's
+/// near-now check simply never matches.
+pub(crate) fn today_days() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| (d.as_secs() / 86_400) as i64)
+        .unwrap_or(0)
+}
+
+/// Howard Hinnant's `days_from_civil`: proleptic-Gregorian (year, month, day) →
+/// days since the Unix epoch. No date/time crate dependency for the one conversion
+/// the engine needs. `month`/`day` are assumed already range-checked by the caller
+/// ([`parse_calendar_date`]) — this function does not itself validate.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400; // [0, 399]
+    let mp = (month + 9) % 12; // [0, 11]
+    let doy = (153 * mp + 2) / 5 + day - 1; // [0, 365]
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy; // [0, 146096]
+    era * 146097 + doe - 719468
+}
+
+/// Parse a detected span as an unambiguous, year-first calendar date — `YYYY-MM-DD`
+/// or `YYYY/MM/DD` only. Deliberately NOT day-first/month-first (`DD/MM/YYYY`,
+/// `MM/DD/YYYY`): those are what the DOB recognizer captures, and are ambiguous to
+/// parse without knowing the locale — misreading one as day-first when it's
+/// month-first (or vice versa) could accidentally rate a real birthdate as
+/// "near now". Returns days-since-epoch, or `None` if the slice isn't exactly this
+/// 10-byte shape or the month/day are out of range.
+fn parse_calendar_date(slice: &str) -> Option<i64> {
+    let b = slice.as_bytes();
+    if b.len() != 10 {
+        return None;
+    }
+    let sep = b[4];
+    if (sep != b'-' && sep != b'/') || b[7] != sep {
+        return None;
+    }
+    let is_digit = |c: u8| c.is_ascii_digit();
+    if !(b[0..4].iter().all(|&c| is_digit(c))
+        && b[5..7].iter().all(|&c| is_digit(c))
+        && b[8..10].iter().all(|&c| is_digit(c)))
+    {
+        return None;
+    }
+    let year: i64 = slice[0..4].parse().ok()?;
+    let month: i64 = slice[5..7].parse().ok()?;
+    let day: i64 = slice[8..10].parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(days_from_civil(year, month, day))
+}
+
+/// How many days of slack around "today" still counts as "the current date" for
+/// `preserve_current_date` (see that config field's doc). `1` covers today plus one
+/// day either side — timezone skew between the proxy host's clock and whatever
+/// clock the harness/model used when it said "today" — while still being far too
+/// narrow to accidentally cover a real near-term date (an appointment next week, a
+/// document dated last month) as a false negative on masking.
+const NEAR_NOW_WINDOW_DAYS: i64 = 1;
+
+/// Does `slice` parse as a calendar date within [`NEAR_NOW_WINDOW_DAYS`] of `today`?
+/// Entity-type-agnostic by design (mirrors `AllowList::is_allowed`, which this sits
+/// alongside): it doesn't matter WHY something detected this span as date-shaped —
+/// DOB regex, the ML `private_date` label, a custom rule — if the exact text is a
+/// calendar date near now, it's the harness's own current-date fact, not PII.
+fn is_near_now_date(slice: &str, today: i64) -> bool {
+    parse_calendar_date(slice).is_some_and(|d| (d - today).abs() <= NEAR_NOW_WINDOW_DAYS)
+}
+
+/// One suppression gate shared by the custom-rule pass and [`ingest_results`]: an
+/// allow-listed value, or (`preserve_current_date`) a near-now calendar date.
+fn is_suppressed(cfg: &EngineConfig, slice: &str, today: i64) -> bool {
+    cfg.allow_list.is_allowed(slice) || (cfg.preserve_current_date && is_near_now_date(slice, today))
 }
 
 /// Suppress detections fully contained within an allow-listed span, then resolve
@@ -365,6 +458,7 @@ fn ingest_results(
     dets: &mut Vec<CachedDetection>,
     allowed_spans: &mut Vec<(usize, usize)>,
     source: Source,
+    today: i64,
 ) {
     for r in results {
         // One predictable score floor across both sources, and the authoritative
@@ -421,7 +515,7 @@ fn ingest_results(
         {
             continue;
         }
-        if cfg.allow_list.is_allowed(slice) {
+        if is_suppressed(cfg, slice, today) {
             allowed_spans.push((r.start, r.end));
             continue;
         }
@@ -730,6 +824,138 @@ mod context_enhancer_tests {
         assert!(a.tokens.iter().any(|t| t.text == "Café"));
         assert_eq!(a.tokens.len(), a.lemmas.len(), "lemmas parallel tokens");
         assert!(a.lemmas.iter().any(|l| l == "call"));
+    }
+}
+
+#[cfg(test)]
+mod current_date_tests {
+    use super::*;
+    use crate::config::CustomReplacement;
+
+    fn analyzer() -> presidio_analyzer::AnalyzerEngine {
+        presidio_analyzer::default_analyzer("en")
+    }
+
+    /// Inverse of `days_from_civil` (Howard Hinnant's `civil_from_days`), test-only:
+    /// production code never needs to render a date, only parse one, but tests need
+    /// to build date strings relative to the ACTUAL wall clock (not a fixed literal,
+    /// which would silently stop testing "near now" the day it stops being near now).
+    fn civil_from_days(z: i64) -> (i64, u32, u32) {
+        let z = z + 719468;
+        let era = if z >= 0 { z } else { z - 146096 } / 146097;
+        let doe = z - era * 146097; // [0, 146096]
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365; // [0, 399]
+        let y = yoe + era * 400;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100); // [0, 365]
+        let mp = (5 * doy + 2) / 153; // [0, 11]
+        let d = doy - (153 * mp + 2) / 5 + 1; // [1, 31]
+        let m = if mp < 10 { mp + 3 } else { mp - 9 }; // [1, 12]
+        let y = if m <= 2 { y + 1 } else { y };
+        (y, m as u32, d as u32)
+    }
+
+    fn date_offset_from_today(offset_days: i64) -> String {
+        let (y, m, d) = civil_from_days(today_days() + offset_days);
+        format!("{y:04}-{m:02}-{d:02}")
+    }
+
+    /// A synthetic date-matching recognizer standing in for a real date detector
+    /// (DOB regex / ML `private_date`) — proves the suppression composes with ANY
+    /// recognizer, exactly like `AllowList` does, without pulling in ML plumbing.
+    fn date_custom() -> Vec<CompiledCustom> {
+        compile_customs(&[CustomReplacement {
+            pattern: r"\d{4}[-/]\d{2}[-/]\d{2}".to_string(),
+            entity_type: "TEST_DATE".to_string(),
+            is_regex: true,
+            case_sensitive: true,
+            priority: 0,
+            literal_token: false,
+            token: None,
+            apply_to_surfaces: None,
+        }])
+        .expect("test custom rule must compile")
+    }
+
+    fn test_date_hits(cfg: &EngineConfig, text: &str) -> Vec<(usize, usize)> {
+        let customs = date_custom();
+        let (dets, allowed, _today) =
+            detect_base(&analyzer(), cfg, &customs, &[], text, Surface::UserMessage);
+        finish(dets, allowed)
+            .into_iter()
+            .filter(|d| d.entity_type == "TEST_DATE")
+            .map(|d| (d.start, d.end))
+            .collect()
+    }
+
+    #[test]
+    fn parse_calendar_date_accepts_iso_and_slash_year_first_only() {
+        assert_eq!(parse_calendar_date("2026-07-04"), Some(days_from_civil(2026, 7, 4)));
+        assert_eq!(parse_calendar_date("2026/07/04"), Some(days_from_civil(2026, 7, 4)));
+        // Day/month-first (DOB shape) is NOT parsed as a calendar date here — that
+        // ambiguity is exactly what would risk misreading a real birthdate.
+        assert_eq!(parse_calendar_date("04/07/2026"), None);
+        assert_eq!(parse_calendar_date("27/03/1985"), None);
+        assert_eq!(parse_calendar_date("not-a-date-x"), None);
+        assert_eq!(parse_calendar_date("2026-13-01"), None, "month out of range");
+        assert_eq!(parse_calendar_date("2026-01-99"), None, "day out of range");
+    }
+
+    #[test]
+    fn is_near_now_date_windows_correctly() {
+        let today = 20_000i64; // arbitrary fixed epoch-day for a pure unit test
+        assert!(is_near_now_date(
+            &format!("{:04}-{:02}-{:02}", civil_from_days(today).0, civil_from_days(today).1, civil_from_days(today).2),
+            today
+        ));
+        let (y, m, d) = civil_from_days(today + 1);
+        assert!(is_near_now_date(&format!("{y:04}-{m:02}-{d:02}"), today), "1 day out is in-window");
+        let (y, m, d) = civil_from_days(today - 1);
+        assert!(is_near_now_date(&format!("{y:04}-{m:02}-{d:02}"), today), "1 day back is in-window");
+        let (y, m, d) = civil_from_days(today + 2);
+        assert!(!is_near_now_date(&format!("{y:04}-{m:02}-{d:02}"), today), "2 days out is outside the window");
+    }
+
+    #[test]
+    fn todays_date_anywhere_in_text_is_preserved() {
+        let cfg = EngineConfig::default(); // preserve_current_date: true (the default)
+        let today = date_offset_from_today(0);
+        // No harness phrase at all — content-based, not a string match on "Today's
+        // date is ...".
+        let text = format!("Reminder: {today} is the current date.");
+        assert!(test_date_hits(&cfg, &text).is_empty());
+    }
+
+    #[test]
+    fn a_date_outside_the_window_still_masks() {
+        let cfg = EngineConfig::default();
+        let far_future = date_offset_from_today(30);
+        let text = format!("The filing date on the document was {far_future}.");
+        assert_eq!(test_date_hits(&cfg, &text).len(), 1);
+    }
+
+    #[test]
+    fn near_now_date_survives_even_next_to_a_masked_far_date_in_the_same_text() {
+        let cfg = EngineConfig::default();
+        let today = date_offset_from_today(0);
+        let far_future = date_offset_from_today(30);
+        let text = format!("Today is {today}. The filing deadline is {far_future}.");
+        let hits = test_date_hits(&cfg, &text);
+        let far_start = text.find(&far_future).unwrap();
+        assert_eq!(hits, vec![(far_start, far_start + far_future.len())], "{hits:?}");
+    }
+
+    #[test]
+    fn preserve_current_date_false_masks_near_now_dates_too() {
+        let cfg = EngineConfig {
+            preserve_current_date: false,
+            ..EngineConfig::default()
+        };
+        let today = date_offset_from_today(0);
+        assert_eq!(
+            test_date_hits(&cfg, &today).len(),
+            1,
+            "opt-out must let it mask like any other date"
+        );
     }
 }
 

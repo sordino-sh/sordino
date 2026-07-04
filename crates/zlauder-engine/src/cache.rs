@@ -20,11 +20,13 @@
 //!
 //! ## Key
 //! [`CacheKey`] = `{ text_hash: blake3(text) [full 256-bit], surface, policy_fp,
-//! ml_fp }`. The FULL digest is the verification: a collision would return offsets
-//! for a *different* string → wrong-span splice → silent leak, so `Eq` over all 32
-//! bytes is load-bearing (invariant #1). `policy_fp` / `ml_fp` are fingerprints of
-//! every detection-affecting input (Bazel/Salsa-style), so any such change yields a
-//! fresh key space with nothing to hand-invalidate.
+//! ml_fp, secrets_fp, today_bucket }`. The FULL digest is the verification: a
+//! collision would return offsets for a *different* string → wrong-span splice →
+//! silent leak, so `Eq` over all 32 bytes is load-bearing (invariant #1). `policy_fp`
+//! / `ml_fp` / `secrets_fp` are fingerprints of every detection-affecting input
+//! (Bazel/Salsa-style), so any such change yields a fresh key space with nothing to
+//! hand-invalidate. `today_bucket` is the same idea applied to WALL-CLOCK time: see
+//! its field doc on [`CacheKey`].
 //!
 //! ## Disk-persistence seam (DEFERRED — documented, not built)
 //! A future `DiskBackend` would key by `HMAC(session_key, text)` (NOT a bare
@@ -107,6 +109,15 @@ pub(crate) struct CacheKey {
     /// space — stale detections (which lacked the Pass-0 secret spans) age out by
     /// LRU instead of needing a hand-flush.
     pub secrets_fp: u64,
+    /// Days-since-epoch "today" the detection was computed under (`0` when
+    /// `preserve_current_date` is off, so disabling the feature reproduces the
+    /// historical day-invariant key space exactly). `preserve_current_date`
+    /// suppresses a date span based on its distance from "now" — a fact that
+    /// changes daily for the SAME text, so without this the cache would replay a
+    /// day-N masking verdict forever (a date "near now" on day N silently stays
+    /// unmasked on day N+30, or vice versa). Bucketing by day means a cache miss
+    /// at most once per calendar day per leaf, not a correctness bug.
+    pub today_bucket: i64,
 }
 
 /// blake3 of `text` under a cache-specific domain. The full 32-byte digest is

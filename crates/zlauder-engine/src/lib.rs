@@ -63,7 +63,7 @@ use std::sync::{Arc, Mutex, RwLock};
 use cache::{CacheKey, CachedDetection, DetectionCache, hash_text};
 use detect::{
     CompiledCustom, compile_customs, resolve_operator, resolve_overlaps, run_detection,
-    run_detection_batch,
+    run_detection_batch, today_days,
 };
 use secrets::{CompiledSecret, SecretSet, compile_secrets, detect_secrets, secrets_fingerprint};
 use store::SessionStore;
@@ -797,6 +797,11 @@ impl MaskEngine {
             policy_fp: policy.policy_fp,
             ml_fp,
             secrets_fp: secrets.secrets_fp,
+            today_bucket: if policy.config.preserve_current_date {
+                today_days()
+            } else {
+                0
+            },
         };
 
         let mut stats = MaskStats {
@@ -1042,6 +1047,11 @@ impl MaskEngine {
                 policy_fp: policy.policy_fp,
                 ml_fp,
                 secrets_fp: secrets.secrets_fp,
+                today_bucket: if policy.config.preserve_current_date {
+                    today_days()
+                } else {
+                    0
+                },
             };
             if self.cache.get(&key).is_some() {
                 continue; // already detected (this turn or a prior one)

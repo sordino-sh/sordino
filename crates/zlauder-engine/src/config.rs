@@ -331,6 +331,34 @@ impl AllowList {
             al.add_exact(w);
         }
         al.add_exact_ci("localhost");
+        // Claude Code / zlauder self-reference false positives: the harness's own
+        // framing text (system prompt, tool/skill descriptions, status output) is full
+        // of vocabulary that reads as PERSON/API_KEY/URL to a generic NER or catch-all
+        // regex — "Claude Sonnet 5", "ZlauDeR", the literal token-format example
+        // `[API_KEY_a1b2c3]` — none of which is ever real user PII. The name/URL
+        // patterns are anchored to the whole detected span (detections are matched
+        // whole-slice) so they can't accidentally swallow a real name that merely
+        // contains one of these words; the token-example pattern is intentionally
+        // unanchored since its surrounding quote/bracket punctuation varies by which
+        // recognizer half-matched it.
+        al.add_exact_ci("zlauder");
+        for p in [
+            // "Claude", optionally "Sonnet"/"Opus"/"Haiku", optionally a version number
+            // ("Claude", "Claude Sonnet", "Claude Sonnet 5", "Claude Opus 4.8").
+            r"(?i)^claude(\s+(sonnet|opus|haiku))?(\s+\d+(\.\d+)*)?$",
+            // The model-name words also appear bare (no "Claude" prefix) in prose.
+            r"(?i)^(sonnet|opus|haiku)(\s+\d+(\.\d+)*)?$",
+            // Anthropic's own mail domain and product URLs.
+            r"(?i)@anthropic\.com$",
+            r"(?i)^https?://(www\.)?claude\.ai(/\S*)?$",
+            r"(?i)^https?://(www\.)?claude\.com(/\S*)?$",
+            // The literal example token handle used in zlauder's own docs/prompts.
+            // Unanchored: it shows up wrapped in varying quote/bracket combinations
+            // depending on which recognizer half-matched it (bare, `[…`, `"[…]"`).
+            r"API_KEY_a1b2c3",
+        ] {
+            al.add_pattern(regex::Regex::new(p).expect("built-in allow-list pattern must compile"));
+        }
         al
     }
 
@@ -900,6 +928,23 @@ pub struct EngineConfig {
     #[serde(default)]
     pub ml: MlConfig,
 
+    /// Don't mask a date-shaped detection that lands within 1 day of the wall clock
+    /// "now" (see `detect::is_near_now_date` / `NEAR_NOW_WINDOW_DAYS`) — regardless of
+    /// which recognizer flagged it (DOB regex, the ML `private_date` label, a custom
+    /// rule, ...). Masking today's own date hides the value the model needs for date
+    /// arithmetic (deadlines, "how many days until X", staleness checks, ...); a date
+    /// is only ever "the current date" by coincidence of timing, not by structural
+    /// harness markers, so this is content-based (a real ISO-shaped date near now),
+    /// not a match on any particular harness's wording. Only unambiguous, year-first
+    /// `YYYY-MM-DD`/`YYYY/MM/DD` spans are considered — a birthdate (day/month-first,
+    /// years in the past) or a document/appointment date outside the window still
+    /// masks normally. On by default. NOTE: because "near now" is a function of wall-
+    /// clock time, not just text content, the detection cache buckets by calendar day
+    /// while this is on (see `CacheKey::today_bucket`) — a cache miss at most once per
+    /// day per leaf, not a correctness bug.
+    #[serde(default = "default_true")]
+    pub preserve_current_date: bool,
+
     /// Display-time decoration for un-masked assistant text (see [`RevealMarker`]).
     /// On by default (printable `⟦`/`⟧` markers); a display/apply-time concern, so it is NOT
     /// part of `detection_fingerprint` (changing it does not invalidate the detection cache).
@@ -979,6 +1024,8 @@ struct EngineConfigShadow {
     custom_replacements: Vec<CustomReplacement>,
     #[serde(default)]
     ml: MlConfig,
+    #[serde(default = "default_true")]
+    preserve_current_date: bool,
     #[serde(default)]
     reveal_marker: RevealMarker,
     #[serde(default = "default_cache_cap")]
@@ -1028,6 +1075,7 @@ impl<'de> Deserialize<'de> for EngineConfig {
             allow_list: AllowList::with_common_words(),
             custom_replacements: s.custom_replacements,
             ml: s.ml,
+            preserve_current_date: s.preserve_current_date,
             reveal_marker: s.reveal_marker,
             detection_cache_cap: s.detection_cache_cap,
             detection_cache_persist: s.detection_cache_persist,
@@ -1065,6 +1113,7 @@ impl Default for EngineConfig {
             allow_list: AllowList::with_common_words(),
             custom_replacements: Vec::new(),
             ml: MlConfig::default(),
+            preserve_current_date: true,
             reveal_marker: RevealMarker::default(),
             detection_cache_cap: default_cache_cap(),
             detection_cache_persist: false,
@@ -1221,7 +1270,8 @@ impl EngineConfig {
     /// INCLUDES: the detector-version constant (audit #1 — bundled regex/custom
     /// recognizer code identity), score_threshold, language, enabled_categories, the
     /// entity_operators KEY SET (key *presence* gates detection via `entity_enabled`),
-    /// custom_replacements (the patterns ARE the detection), and the allow_list.
+    /// custom_replacements (the patterns ARE the detection), the allow_list, and
+    /// `preserve_current_date` (toggles the harness-current-date suppression pass).
     ///
     /// EXCLUDES (so these apply WITHOUT a cache miss): operator VALUES and
     /// `default_operator` (resolved at apply time), the `enabled` master switch and
@@ -1265,6 +1315,7 @@ impl EngineConfig {
         h.update(&[0xff]);
 
         fp_allow_list(&mut h, &self.allow_list);
+        h.update(&[self.preserve_current_date as u8]);
 
         let digest = h.finalize();
         u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("32-byte digest"))
@@ -1340,6 +1391,39 @@ mod tests {
 
     fn from_json(s: &str) -> EngineConfig {
         serde_json::from_str(s).expect("config should parse")
+    }
+
+    #[test]
+    fn common_words_allow_list_covers_claude_code_self_reference() {
+        let al = AllowList::with_common_words();
+        // Claude/Anthropic model-name self-reference, with and without a version.
+        for v in [
+            "Claude",
+            "Claude Sonnet",
+            "Claude Sonnet 5",
+            "Claude Opus 4.8",
+            "Sonnet",
+            "Opus",
+            "Haiku 4.5",
+        ] {
+            assert!(al.is_allowed(v), "expected allowed: {v:?}");
+        }
+        // zlauder self-reference, any case.
+        for v in ["zlauder", "ZlauDeR", "Zlauder", "ZLAUDER"] {
+            assert!(al.is_allowed(v), "expected allowed: {v:?}");
+        }
+        // Anthropic mail domain and product URLs.
+        assert!(al.is_allowed("noreply@anthropic.com"));
+        assert!(al.is_allowed("https://claude.ai/code"));
+        assert!(al.is_allowed("https://claude.com/claude-code"));
+        // The doc's literal example token handle, in each punctuation shape seen live.
+        assert!(al.is_allowed("API_KEY_a1b2c3"));
+        assert!(al.is_allowed("[API_KEY_a1b2c3"));
+        assert!(al.is_allowed("\"[API_KEY_a1b2c3]\""));
+        // Must NOT swallow a real name/word that merely shares a substring.
+        assert!(!al.is_allowed("Claudia Sonnenberg"));
+        assert!(!al.is_allowed("bob@anthropic.com.evil.example"));
+        assert!(!al.is_allowed("zlauderish"));
     }
 
     #[test]
