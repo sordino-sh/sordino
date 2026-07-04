@@ -13,12 +13,38 @@ Licensed Work:        ZlauDeR
                       The Licensed Work is (c) 2026 FailSpy.
 
 Additional Use Grant: You may make production use of the Licensed Work,
-                      provided that you do not offer the Licensed Work to
-                      third parties as a hosted or managed service that
-                      provides users with access to a substantial set of the
-                      features or functionality of the Licensed Work and that
-                      competes with the Licensor's offerings of the Licensed
-                      Work.
+                      provided that you do not use the Licensed Work to
+                      provide a ZlauDeR Service to third parties.
+
+                      A "ZlauDeR Service" is a hosted or managed service,
+                      however priced or branded (including free of charge),
+                      that allows third parties (other than your employees
+                      and contractors) to access a substantial set of the
+                      features or functionality of the Licensed Work,
+                      whether offered standalone or as a component of a
+                      larger service.
+
+                      For the avoidance of doubt:
+
+                      1. Professional services are permitted. A consultancy
+                         or managed service provider may install, configure,
+                         operate, support, and maintain the Licensed Work on
+                         behalf of a customer, on the customer's or the
+                         provider's infrastructure, provided that each
+                         deployment serves a single customer's internal use
+                         and only that customer's employees and contractors
+                         have access to it. Such operation is not a ZlauDeR
+                         Service.
+
+                      2. Bundling is permitted. You may redistribute the
+                         Licensed Work, under this License, embedded in a
+                         product with substantial functionality beyond that
+                         of the Licensed Work; such distribution is not, by
+                         itself, a ZlauDeR Service. This License, including
+                         this Additional Use Grant, continues to govern each
+                         recipient's use of the embedded Licensed Work, and
+                         hosting such a product for third parties remains
+                         subject to the definition above.
 
 Change Date:          The Change Date for each version of the Licensed Work is
                       two years after the date that version is first made
