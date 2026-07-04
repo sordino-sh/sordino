@@ -347,14 +347,18 @@ impl AllowList {
         for w in ["API_KEY_a1b2c3", "[API_KEY_a1b2c3", "\"[API_KEY_a1b2c3]\""] {
             al.add_exact(w);
         }
+        // The one fixed, non-personal Anthropic address zlauder's own commit template
+        // emits (`Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>`). Deliberately
+        // an EXACT match, not a `@anthropic\.com$`-style domain pattern: a domain pattern
+        // would also suppress a real Anthropic employee's personal work email, which is
+        // exactly the PII this allow-list must not swallow.
+        al.add_exact_ci("noreply@anthropic.com");
         for p in [
             // "Claude", optionally "Sonnet"/"Opus"/"Haiku", optionally a version number
             // ("Claude", "Claude Sonnet", "Claude Sonnet 5", "Claude Opus 4.8").
             r"(?i)^claude(\s+(sonnet|opus|haiku))?(\s+\d+(\.\d+)*)?$",
             // The model-name words also appear bare (no "Claude" prefix) in prose.
             r"(?i)^(sonnet|opus|haiku)(\s+\d+(\.\d+)*)?$",
-            // Anthropic's own mail domain and product URLs.
-            r"(?i)@anthropic\.com$",
             r"(?i)^https?://(www\.)?claude\.ai(/\S*)?$",
             r"(?i)^https?://(www\.)?claude\.com(/\S*)?$",
         ] {
@@ -1413,8 +1417,9 @@ mod tests {
         for v in ["zlauder", "ZlauDeR", "Zlauder", "ZLAUDER"] {
             assert!(al.is_allowed(v), "expected allowed: {v:?}");
         }
-        // Anthropic mail domain and product URLs.
+        // The one fixed non-personal Anthropic address, and product URLs.
         assert!(al.is_allowed("noreply@anthropic.com"));
+        assert!(al.is_allowed("NoReply@Anthropic.Com"), "case-insensitive exact");
         assert!(al.is_allowed("https://claude.ai/code"));
         assert!(al.is_allowed("https://claude.com/claude-code"));
         // The doc's literal example token handle, in each punctuation shape seen live.
@@ -1425,6 +1430,9 @@ mod tests {
         assert!(!al.is_allowed("Claudia Sonnenberg"));
         assert!(!al.is_allowed("bob@anthropic.com.evil.example"));
         assert!(!al.is_allowed("zlauderish"));
+        // A REAL Anthropic employee's personal work email is NOT swallowed by a
+        // domain-wide pattern — only the one fixed `noreply@` address is allow-listed.
+        assert!(!al.is_allowed("jane.doe@anthropic.com"));
     }
 
     #[test]
