@@ -859,14 +859,18 @@ impl UrlCredentialRecognizer {
         //    `"authorization":"Basic <b64>"` masks the credential, not the scheme word.
         //  - VALUE (group 1): to the next URL/JSON/quote delimiter. `,` is intentionally
         //    NOT a terminator (a secret with a raw comma must not leak its tail); `%` IS
-        //    allowed so a percent-encoded VALUE is captured whole on the raw pass.
+        //    allowed so a percent-encoded VALUE is captured whole on the raw pass. Minimum
+        //    2 chars: a bare context word (`session`, `sig`, `sid`, …) sits next to plenty
+        //    of non-secret single-character prose/data (a status line's "tokens this
+        //    session : 8", a truncated log column, …); no real credential is one character.
         let param = format!(
-            r#"(?i)(?:^|[^A-Za-z0-9_])(?:{names})["']?[ \t]*[=:][ \t]*["']?(?:(?:bearer|basic|digest|negotiate|ntlm)[ \t]+)?([^&#\s"'<>)}}\]]+)"#
+            r#"(?i)(?:^|[^A-Za-z0-9_])(?:{names})["']?[ \t]*[=:][ \t]*["']?(?:(?:bearer|basic|digest|negotiate|ntlm)[ \t]+)?([^&#\s"'<>)}}\]]{{2,}})"#
         );
         // `user:pass` before `@` — the `:` is required (so a bare `git@host` username is
         // not a credential), but the user MAY be empty for password-only DSNs
-        // (`redis://:pw@host`). Group 1 = the userinfo credential; host survives.
-        let userinfo = r"://([^/:@\s]*:[^/@\s]+)@";
+        // (`redis://:pw@host`). Group 1 = the userinfo credential; host survives. The
+        // password half requires 2+ chars for the same single-char-noise reason as `param`.
+        let userinfo = r"://([^/:@\s]*:[^/@\s]{2,})@";
         Self {
             entities: vec![custom(ENTITY_URL_CREDENTIAL)],
             param: Regex::new(&param).expect("URL credential param regex must compile"),
@@ -1116,6 +1120,14 @@ mod tests {
             vec!["dXNlcjpwYXNz"]
         );
         assert_eq!(urlcred_spans(r#"{"token":"Bearer letmein-jwt"}"#), vec!["letmein-jwt"]);
+        // F10 (single-char noise) — a bare context word next to a lone digit/char is NOT a
+        // credential: `/zlauder:status`'s own "tokens this session : 8" status line hit
+        // `session :` + a 1-char value and masked a benign token count as a secret.
+        assert!(urlcred_spans("tokens this session : 8\n  ml model").is_empty());
+        assert!(urlcred_spans("?sig=8").is_empty());
+        assert!(urlcred_spans("redis://:p@h").is_empty());
+        // A 2-char value is still the real floor — still caught.
+        assert_eq!(urlcred_spans("?sig=88"), vec!["88"]);
     }
 
     #[test]
