@@ -75,7 +75,9 @@ non-local endpoint creates a second, pre-masking egress channel — see L17.
 
 1. **Registered secrets** — credentials the user explicitly registers (`[[secrets]]`,
    resolved from env/dotenv/pass/sops/age). Strongest protection class: masked
-   unconditionally, structurally unrevealable on the display path, brokered to tool
+   unconditionally on every walked leaf (G1's scope fence — the schema/contract and
+   unknown-typed-wire fields the walkers never visit are the L20/L22 carve-outs),
+   structurally unrevealable on the display path, brokered to tool
    boundaries under default-deny policy.
 2. **Detected PII** — emails, phone numbers, financial identifiers, names, etc., found
    by regex recognizers plus an optional ML classifier, per the active profile.
@@ -152,8 +154,8 @@ assistant text, image/document URL sources — base64 payload `data` and OpenAI
 `data:`-URI image URLs pass opaque by design, see L18; tool `input_schema` and
 OpenAI-wire contract-key subtrees pass verbatim by design, see L20; unknown
 Anthropic-wire fields ride the typed `extra` sinks unmasked, see L22; assistant
-`thinking`/`redacted_thinking` blocks pass opaque both ways and carry only tokens,
-see L24). The
+`thinking`/`redacted_thinking` blocks pass opaque both ways and carry only tokens
+for the spans ZlauDeR detected (undetected content aside, N6), see L24). The
 OpenAI-compatible wire (`/v1/chat/completions`, `/v1/responses`)
 is equally a production mask-or-refuse path, not passthrough: same engine, same
 refuse-on-failure posture (`routes.rs:99-100`; `openai_chat.rs:75-87`;
@@ -431,6 +433,18 @@ places there egresses unmasked. Mechanism: `crates/zlauder-engine/src/lib.rs:111
 `user_bypass_segments` (`lib.rs:1568-1596`) (OPEN, by design — user-controlled bypass;
 cataloged here so N1 cannot be quoted as covering bypassed spans).
 
+**L26 — The proxy master switch, flipped off, is transparent passthrough for detected
+PII.** `POST /zlauder/disable` (key-gated on the admin key like every control-plane
+writer) calls `engine.set_enabled(false)`, and while the master switch is off the live
+proxy walks nothing for PII — detected PII egresses unmasked on every otherwise-masked
+wire surface (`admin.rs:481-497`; engine early-return `lib.rs:751`). Registered secrets
+are the exception: they still mask even with the engine disabled (G1;
+`secret_masked_even_when_engine_disabled`, `lib.rs:3638`). The state is disclosed at
+runtime — allowed prompts carry the `Off`/`Disabled` status line (§6) — but it is a
+wired-in, operator-invoked bypass, distinct from the hook-level `/zlauder:disable`
+project opt-out (L2). Mechanism: `crates/zlauder-proxy/src/admin.rs:481-497` (OPEN, by
+design — an explicit operator kill switch; narrated, key-gated, secret-safe).
+
 **L9 — Protocol telemetry fields pass verbatim.** Anthropic `metadata.user_id` and the
 OpenAI top-level `user` field egress byte-for-byte (masking them corrupts
 provider-side abuse attribution). A client that puts an email address in one of these
@@ -546,6 +560,29 @@ the user sets `required = true` (`config.rs:544-550`). F16-on-Metal recall (Appl
 Silicon GPU) is not separately recall-gated — the recall gate proved CPU-F32 and
 CUDA-BF16 only (`ml.rs:172-174`) (OPEN — tracked follow-up).
 
+**L25 — Regex/default-profile recall gaps: named entities that egress unmasked without
+ML or a context word.** Detection quality is not uniform across entity types even before
+ML enters:
+- *Context-free phone numbers.* `PHONE_NUMBER` carries a base score of `0.4`
+  (`PHONE_BASE_SCORE`, `detect.rs:79`), which sits below the default masking threshold;
+  only a nearby context word ("call", "number", "phone", …) boosts a match over the
+  line. A bare, context-free phone-shaped run stays unmasked under Balanced AND Strict
+  (`bare_phone_without_context_stays_below_threshold`, `detect.rs:729`;
+  `strict_drops_context_free_phone_tie_but_keeps_boosted`, `detect.rs:748`). This is a
+  deliberate false-positive control — it is exactly what stops an order number like
+  `Order #4021558` from masking — traded against context-free phone recall; ML or a
+  context word recovers it.
+- *PEM/private keys have no regex recognizer.* `PRIVATE_KEY` is a default Secrets-category
+  entity (`config.rs:176`), but no in-tree recognizer emits it (`recognizers.rs` defines
+  none) — so regex-only detection does not mask a raw PEM private-key block. Register
+  private keys as `[[secrets]]` (masked unconditionally, G1) or rely on the ML classifier.
+
+Not every shape has this gap: a bare SSN still masks context-free (the `US_SSN` pattern
+scores `0.5`, above all profile floors, and the phone tie-break is scoped to
+`PHONE_NUMBER` — `real_ssn_still_masks_under_strict`, `detect.rs:818`; comment
+`detect.rs:812-816`) (OPEN, by design — regex recall is a threshold/FP tradeoff and the
+private-key entity is intended for ML/secret-registration coverage).
+
 ### 7.5 ZDR limitations
 
 ZDR is Anthropic-wire-only in this build: a ZDR-pinned conversation on the
@@ -579,9 +616,12 @@ prompts, code, and files with detected spans replaced by tokens — is sent to t
 provider on every request; that is the product working, not a breach of the promise.
 Content on passthrough endpoints (L1), undetected content (N6), inline binary
 payloads (L18), protocol ID fields (L9), schema/contract fields (L20), unknown
-Anthropic-wire fields (L22), user-bypassed `>>…<<` spans (L21), harness-side channels
+Anthropic-wire fields (L22), user-bypassed `>>…<<` spans (L21), regex recall gaps —
+context-free phone numbers and PEM private keys under regex-only detection (L25),
+harness-side channels
 (L10), infrastructure URLs/IPs/MAC addresses under the default (Balanced) profile
-(L7), and — when the user points the `http` ML backend at a remote endpoint — every
+(L7), everything but registered secrets while the proxy master switch is flipped off
+(L26), and — when the user points the `http` ML backend at a remote endpoint — every
 un-cached text leaf, pre-masking (L17), leave the machine unmasked. Model-authored
 `thinking`/`redacted_thinking` blocks are the one surface that is neither masked nor
 unmasked — they travel tokenized and opaque end-to-end (L24), so they carry plaintext
