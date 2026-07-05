@@ -174,8 +174,8 @@ fn set_mode(_path: &Path, _mode: u32) {}
 
 /// Per-project auto-enable state, persisted in the user-config dir (NOT the volatile runtime
 /// state dir), so it survives reboots. SessionStart consults it to avoid re-plumbing a
-/// project the user opted out of, and `/zlauder:disable --all` uses it to sweep every
-/// plumbed project's routing before an uninstall.
+/// project the user opted out of, and `/zlauder:uninstall --all` uses it to sweep every
+/// plumbed project's routing before removing the plugin.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum PlumbState {
@@ -249,7 +249,7 @@ pub fn registry_remove(project_root: &str) -> Result<()> {
     }
 }
 
-/// Every project root currently in the `Plumbed` state (used by `/zlauder:disable --all`).
+/// Every project root currently in the `Plumbed` state (used by `/zlauder:uninstall --all`).
 pub fn registry_plumbed_roots() -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(registry_dir()) else {
         return Vec::new();

@@ -759,21 +759,35 @@ impl MaskEngine {
     /// Mask `text` as if masking were turned OFF, WITHOUT flipping the global
     /// `config.enabled`. This is the per-conversation disable: one conversation's PII
     /// passes through while the proxy-wide switch stays on for every other conversation.
-    /// Byte-for-byte the same behavior as the master-switch-off path (including the A9
-    /// registered-secret carve-out and user-bypass), so a conversation disable and the
-    /// master switch are indistinguishable at the wire.
+    /// The A9 registered-secret carve-out still applies (secrets are always masked).
+    ///
+    /// Unlike the master-switch path, a user-bypass (`>>…<<`) directive is NOT run here.
+    /// That directive means "mask everything AROUND this span" — a masking-time
+    /// instruction that is moot when masking is off, and running it would re-mask the
+    /// surrounding PII the user explicitly asked to stop masking. Instead we only STRIP
+    /// the markers (so they never egress literally) and pass the whole text through the
+    /// disabled path, so surrounding PII flows unmasked while registered secrets — scanned
+    /// across the entire text — are still masked.
     pub fn mask_when_disabled(
         &self,
         text: &str,
         surface: Surface,
     ) -> Result<MaskOutcome, EngineError> {
-        if surface == Surface::UserMessage
-            && let Some(outcome) = self.mask_user_bypass(text)?
-        {
-            return Ok(outcome);
-        }
         let policy = Arc::clone(&self.policy.read().expect("policy rwlock poisoned"));
         let secrets = Arc::clone(&self.secrets.read().expect("secrets rwlock poisoned"));
+        if surface == Surface::UserMessage
+            && let Some(segments) = user_bypass_segments(text)
+        {
+            // Reconstruct the text with the `>>`/`<<` markers removed, then run the disabled
+            // path over the whole thing (passthrough except registered secrets).
+            let stripped: String = segments
+                .iter()
+                .map(|seg| match seg {
+                    UserBypassSegment::Mask(s) | UserBypassSegment::Bypass(s) => *s,
+                })
+                .collect();
+            return self.mask_disabled_path(&stripped, surface, &policy.config, &secrets);
+        }
         self.mask_disabled_path(text, surface, &policy.config, &secrets)
     }
 
@@ -1696,6 +1710,42 @@ mod tests {
             normal.masked_text.contains("[EMAIL_ADDRESS_"),
             "normal path should mask the email: {}",
             normal.masked_text
+        );
+    }
+
+    // On the disabled path a user-bypass (`>>…<<`) directive must NOT re-mask the
+    // surrounding PII (masking is off — that's the whole point); the markers are stripped
+    // and everything passes, while a registered secret is still masked (A9).
+    #[test]
+    fn mask_when_disabled_passes_pii_around_bypass_markers_and_strips_them() {
+        let e = engine();
+        e.set_secret_rules(vec![secret_rule("api", "sk-SECRET-9", Operator::Redact)])
+            .unwrap();
+        let out = e
+            .mask_when_disabled(
+                "mail bob@example.com >>keepme<< then sk-SECRET-9",
+                Surface::UserMessage,
+            )
+            .unwrap();
+        // Surrounding PII passes through — disable means disable, even around a marker.
+        assert!(
+            out.masked_text.contains("bob@example.com"),
+            "PII around a bypass marker must pass when disabled: {}",
+            out.masked_text
+        );
+        assert!(!out.masked_text.contains("[EMAIL_ADDRESS_"));
+        // The `>>`/`<<` markers are stripped, not egressed literally.
+        assert!(
+            !out.masked_text.contains(">>") && !out.masked_text.contains("<<"),
+            "bypass markers must be stripped: {}",
+            out.masked_text
+        );
+        assert!(out.masked_text.contains("keepme"));
+        // The registered secret is STILL masked (A9 holds on the disabled path).
+        assert!(
+            !out.masked_text.contains("sk-SECRET-9"),
+            "registered secret must still be masked: {}",
+            out.masked_text
         );
     }
 

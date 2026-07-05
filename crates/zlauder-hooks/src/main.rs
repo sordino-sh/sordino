@@ -146,7 +146,7 @@ enum Cmd {
     },
     /// Patch this project's .claude/settings.local.json (gitignored) to route through (or
     /// stop routing through) the zlauder proxy. Backs auto-plumb, `/zlauder:enable`, and
-    /// `/zlauder:disable`, replacing the former shell+jq implementation so the plugin needs no `jq` on PATH
+    /// `/zlauder:uninstall`, replacing the former shell+jq implementation so the plugin needs no `jq` on PATH
     /// (a hard blocker on Windows). Exit codes are a contract — see `SettingsAction`.
     Settings {
         #[command(subcommand)]
@@ -3158,7 +3158,7 @@ fn settings_cmd(action: SettingsAction) -> Result<()> {
             // Clear any prior opt-out FIRST and REQUIRE it to persist, THEN write the route — so a
             // SUCCESSFUL enable can never leave this project in (route baked + registry=Optout).
             // That preserves the invariant SessionStart's self-heal relies on: such a state can
-            // then ONLY mean "a prior /zlauder:disable's strip didn't land" (safe to strip). If we
+            // then ONLY mean "a prior /zlauder:uninstall's strip didn't land" (safe to strip). If we
             // wrote the route first and the registry write then failed, the next session would
             // silently strip the route we just enabled — UNMASKING against the user's fresh intent.
             zlauder_state::registry_set(
@@ -3499,7 +3499,7 @@ fn settings_enable(url: &str, zport: &str, statusline: &str) -> Result<SettingsO
         && automode_note_present(&local_v);
 
     // Status-line takeover: snapshot the user's original line to the sidecar that
-    // /zlauder:disable restores from. NEVER delete the sidecar here — an OLD install routed
+    // /zlauder:uninstall restores from. NEVER delete the sidecar here — an OLD install routed
     // via committed settings.json keeps its original ONLY in the sidecar (the new write
     // target, local, is empty), so deleting it would lose the user's line on disable. When
     // there is no original to wrap we leave the (absent) sidecar alone; a re-enable whose
@@ -3512,7 +3512,7 @@ fn settings_enable(url: &str, zport: &str, statusline: &str) -> Result<SettingsO
         // (auto-plumb), whose STDOUT must be only the hook JSON. The CLI doesn't capture
         // stdout, so the user still sees these on stderr.
         eprintln!(
-            "ZlauDeR: wrapping your existing status line (saved to {}; restored on /zlauder:disable).",
+            "ZlauDeR: wrapping your existing status line (saved to {}; restored on /zlauder:uninstall).",
             sidecar.display()
         );
     }
@@ -3521,7 +3521,7 @@ fn settings_enable(url: &str, zport: &str, statusline: &str) -> Result<SettingsO
     // settings.json: strip OUR env wiring + OUR status line out of it so there is exactly
     // ONE takeover (in local) and the committed file is never the viral dead-pointer. Pass
     // `None` so migration only REMOVES our keys — it never restores into committed; the
-    // original is preserved in the sidecar and restored into local by /zlauder:disable.
+    // original is preserved in the sidecar and restored into local by /zlauder:uninstall.
     if strip_routing_from(&committed_file, None)?.0 {
         // STDERR (see note above): keeps the SessionStart hook's stdout pure JSON.
         eprintln!(
@@ -3821,7 +3821,7 @@ mod permission_rule_tests {
 /// The user's ORIGINAL status line: the highest-precedence NON-zlauder `statusLine` across
 /// local (which wins) then committed, or `None` if the effective current line is already
 /// OUR takeover (its original lives in the sidecar) or neither file has a line. Used by
-/// enable to decide what to snapshot for /zlauder:disable to restore.
+/// enable to decide what to snapshot for /zlauder:uninstall to restore.
 fn effective_user_statusline(local_v: &Value, committed_v: &Value) -> Option<Value> {
     for v in [local_v, committed_v] {
         let cmd = v
@@ -3892,7 +3892,7 @@ fn settings_disable_all() -> Result<()> {
     } else {
         println!(
             "ZlauDeR: swept {done}/{} plumbed project(s); {failed} could NOT be cleaned (see the \
-             warnings above). Do NOT uninstall yet — re-run /zlauder:disable --all (or remove the \
+             warnings above). Do NOT uninstall yet — re-run /zlauder:uninstall --all (or remove the \
              routing by hand) so no project is left pointing at a dead proxy.",
             roots.len()
         );
@@ -4010,7 +4010,7 @@ fn drain_to_newline<R: std::io::BufRead>(reader: &mut R) -> bool {
 
 /// Strip zlauder routing from one project's settings (both `settings.local.json` and the
 /// committed `settings.json`) and restore any wrapped status line. The single-project
-/// `/zlauder:disable` (current dir) and the `--all` sweep both go through here.
+/// `/zlauder:uninstall` (current dir) and the `--all` sweep both go through here.
 fn settings_disable_at(proj: &Path) -> Result<SettingsOutcome> {
     let sidecar = wrap_sidecar_path(proj);
 
@@ -4854,7 +4854,7 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
                          statusline shows '⟳ ZlauDeR: restart to mask' until it's live, then 🛡. Until \
                          then ZlauDeR blocks this session's messages so nothing sends unmasked (set \
                          ZLAUDER_NO_INTAKE_GATE=1 to send anyway). Control it with /zlauder:privacy; \
-                         remove it with /zlauder:disable. (ZLAUDER_NO_AUTO_ENABLE=1 opts out globally.)"
+                         remove routing with /zlauder:uninstall. (ZLAUDER_NO_AUTO_ENABLE=1 opts out globally.)"
                     );
                     println!(
                         "{}",
@@ -4884,7 +4884,7 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
 
         if opted_out && configured {
             // SELF-HEAL: opted out here, yet a route is STILL baked into settings.local.json (a
-            // prior /zlauder:disable's strip didn't fully land, or the file was restored). Left
+            // prior /zlauder:uninstall's strip didn't fully land, or the file was restored). Left
             // alone, this session routes to a proxy the user disabled — a hang if it's down.
             // Strip the stale route so this and future sessions stop routing; opt-out means no
             // masking intent, so reverting to a direct (unmasked) connection is exactly right
@@ -4924,7 +4924,7 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
             return Ok(());
         }
 
-        // Opted out (the user ran /zlauder:disable here), or auto-enable disabled, and not
+        // Opted out (the user ran /zlauder:uninstall here), or auto-enable disabled, and not
         // configured: stay a silent no-op.
         println!("{}", json!({}));
         return Ok(());
@@ -5026,7 +5026,7 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
 /// already routed, opted out, or the `ZLAUDER_NO_INTAKE_GATE` escape hatch.
 ///
 /// ONE prompt-shaped exception: a `/zlauder:` control-plane command always passes, even with the
-/// gate closed — it is how the user RECOVERS from the unrouted state (/zlauder:disable to opt out
+/// gate closed — it is how the user RECOVERS from the unrouted state (/zlauder:uninstall to opt out
 /// and continue, /zlauder:enable to retry, /zlauder:status/doctor/verify to inspect). Otherwise
 /// the gate is a trap: the command that would release it is itself blocked. These prompts are
 /// ZlauDeR's own command text (no user PII), and only a human keystroke reaches this hook, so the
@@ -5092,7 +5092,7 @@ fn user_prompt_submit() -> Result<()> {
     };
 
     // Block iff the gate fires AND the prompt isn't a `/zlauder:` control-plane command — the
-    // recovery levers (/zlauder:disable to opt out and continue, enable to retry,
+    // recovery levers (/zlauder:uninstall to opt out and continue, enable to retry,
     // status/doctor/verify to inspect) must never be trapped inside the gate they'd release. Those
     // prompts are ZlauDeR's own command text (no zlauder command takes a PII argument) and only a
     // human keystroke reaches this hook, so passing them widens nothing; a prompt that merely
@@ -5109,17 +5109,17 @@ fn user_prompt_submit() -> Result<()> {
              port, but the process now answering there can't be verified as ZlauDeR's proxy — it may \
              be down, replaced, or a different local process — so your message could reach the API \
              provider UNMASKED (or hang). Restart Claude Code once so ZlauDeR re-routes this session \
-             to its live proxy. Prefer to continue as-is? Run /zlauder:disable to turn masking off \
-             for this project, or set ZLAUDER_NO_INTAKE_GATE=1 to bypass the gate for now. (Only what \
-             the provider sees is affected — you always see your own plaintext.)"
+             to its live proxy. Prefer to continue as-is? Run /zlauder:uninstall to stop routing this \
+             project through the proxy (connect directly), or set ZLAUDER_NO_INTAKE_GATE=1 to bypass \
+             the gate for now. (Only what the provider sees is affected — you always see your own plaintext.)"
         } else {
             "ZlauDeR PII masking is enabled for this project, but THIS Claude Code session is not yet \
              routed through the masking proxy — so your message would reach the API provider UNMASKED \
              (real PII, not tokens). Restart Claude Code once to activate masking; every session after \
              the first picks it up automatically. Prefer to continue this session as-is? Run \
-             /zlauder:disable to turn masking off for this project, or set ZLAUDER_NO_INTAKE_GATE=1 to \
-             bypass the gate for now. (Only what the provider sees is affected — you always see your \
-             own plaintext.)"
+             /zlauder:uninstall to stop routing this project through the proxy (connect directly), or \
+             set ZLAUDER_NO_INTAKE_GATE=1 to bypass the gate for now. (Only what the provider sees is \
+             affected — you always see your own plaintext.)"
         };
         println!("{}", json!({ "decision": "block", "reason": reason }));
         return Ok(());
@@ -5200,7 +5200,7 @@ enum MaskState {
     /// This session is NOT reaching our verified proxy (route not applied, proxy down, or a
     /// stale/foreign port) — so its traffic is not being masked by us right now.
     NotReaching,
-    /// The project is opted out of ZlauDeR (`/zlauder:disable`) — a direct, unmasked connection.
+    /// The project is opted out of ZlauDeR routing (`/zlauder:uninstall`) — a direct, unmasked connection.
     Disabled,
     /// Plumbed for masking, NOT routed this session, and the user set `ZLAUDER_NO_INTAKE_GATE` —
     /// the fail-closed gate is deliberately bypassed, so this session's text egresses UNMASKED
@@ -5256,8 +5256,8 @@ fn mask_delta_message(s: &SessionStatus) -> String {
              isn't reaching the verified proxy (the route may not have applied this session, or \
              the proxy is down). Confirm with /zlauder:verify; restarting Claude Code rebinds it."
             .to_string(),
-        MaskState::Disabled => "ZlauDeR: masking has been turned off for this project \
-             (/zlauder:disable) — this session now connects directly and is not tokenized."
+        MaskState::Disabled => "ZlauDeR: routing removed for this project \
+             (/zlauder:uninstall) — this session now connects directly and is not tokenized."
             .to_string(),
         MaskState::UnmaskedBypass => "ZlauDeR: this session is sending text UNMASKED (real values, \
              not tokens) — ZLAUDER_NO_INTAKE_GATE is set and this session isn't routed to the \
@@ -6410,7 +6410,7 @@ fn wrap_sidecar_path(proj: &Path) -> PathBuf {
 /// one. Returns `None` when no sidecar exists, it isn't a `command` status line, or —
 /// defensively — the stored command is itself a zlauder status line (which would
 /// recurse). The sidecar stores the original `statusLine` object verbatim so
-/// `/zlauder:disable` can restore it.
+/// `/zlauder:uninstall` can restore it.
 fn read_wrap_original(proj: &Path) -> Option<String> {
     let txt = std::fs::read_to_string(wrap_sidecar_path(proj)).ok()?;
     let v: Value = serde_json::from_str(strip_bom(&txt)).ok()?;
