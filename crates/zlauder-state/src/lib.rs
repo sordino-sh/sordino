@@ -181,7 +181,7 @@ fn set_mode(_path: &Path, _mode: u32) {}
 pub enum PlumbState {
     /// zlauder auto-plumbed (or the user enabled) routing for this project.
     Plumbed,
-    /// The user ran `/zlauder:disable` here — never auto-plumb it again.
+    /// The user ran `/zlauder:uninstall` here — never auto-plumb it again.
     Optout,
 }
 

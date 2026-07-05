@@ -3899,7 +3899,7 @@ fn settings_disable_all() -> Result<()> {
         // Exit NON-ZERO so a scripted pre-uninstall sweep can gate on success. The full per-project
         // summary is already on stdout; exit 1 = "ran, but some projects could not be cleaned"
         // (mirrors verify/doctor's ran-but-failed=1), distinct from the exit 0 of a full sweep or an
-        // empty no-op. disable.sh forwards this via `exit $?`.
+        // empty no-op. uninstall.sh forwards this via `exit $?`.
         std::process::exit(1);
     }
     Ok(())
