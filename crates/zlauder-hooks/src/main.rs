@@ -233,6 +233,17 @@ enum Cmd {
         #[command(subcommand)]
         action: Option<ZdrAction>,
     },
+    /// Turn ZlauDeR masking OFF (backs `/zlauder:disable`). Default: THIS conversation
+    /// only (session-scoped, in-memory — lifts on the next Claude Code restart).
+    /// `--project`: the whole project's master switch. Registered secrets stay masked
+    /// either way, and the data policy (categories/profile/threshold) is untouched.
+    /// Re-enable with `/zlauder:privacy on`.
+    Disable {
+        /// Turn masking off for the WHOLE project (the master switch) instead of just
+        /// this one conversation.
+        #[arg(long)]
+        project: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -472,6 +483,7 @@ fn main() -> Result<()> {
         Cmd::Monitor => monitor_cmd(),
         Cmd::Secrets { action } => secrets_cmd(action),
         Cmd::Zdr { action } => zdr_cmd(action),
+        Cmd::Disable { project } => disable_cmd(project),
         Cmd::Scrub {
             transcript,
             values,
@@ -6763,6 +6775,20 @@ fn apply_enabled(port: u16, root: &str, scope: Scope, on: bool) -> Result<()> {
         let key =
             key_for(root).context("proxy not running; use --scope project/user to persist")?;
         let snap = admin_post(port, &key, if on { "enable" } else { "disable" })?;
+        // "On means on": turning masking back on for this session ALSO clears any
+        // per-conversation disable (`/zlauder:disable`), so masking is reliably active here
+        // regardless of which switch turned it off. Best-effort — the master enable already
+        // succeeded; a failed clear (e.g. not session-routed) just leaves the override.
+        if on && let Some(conv) = conversation_from_base_url() {
+            let url = format!(
+                "http://127.0.0.1:{port}/zlauder/session/{}/masking",
+                percent_encode(&conv)
+            );
+            let _ = blocking_client()
+                .delete(&url)
+                .header("x-zlauder-key", &key)
+                .send();
+        }
         print_applied(&snap, port, "session")?;
         return Ok(());
     }
@@ -7303,6 +7329,61 @@ fn zdr_cmd(action: Option<ZdrAction>) -> Result<()> {
     Ok(())
 }
 
+/// Backs `/zlauder:disable`. Turns masking OFF — for THIS conversation by default
+/// (in-memory, session-scoped, lifts on the next restart), or for the whole PROJECT
+/// with `--project` (the master switch, session-live). Registered secrets are still
+/// masked in both modes, and the data policy (categories/profile/threshold) is never
+/// touched. Re-enable with `/zlauder:privacy on`.
+fn disable_cmd(project: bool) -> Result<()> {
+    let root = canonical(&project_root());
+    let (port, key) = live_identity(&root)
+        .context("could not reach this project's proxy — is a `claude` session running here?")?;
+
+    if project {
+        // Project-wide master switch off (session-live — not persisted, so the data policy
+        // on disk is unchanged). Same endpoint `config off` uses.
+        let snap = admin_post(port, &key, "disable")
+            .context("turning the project master switch off")?;
+        println!(
+            "ZlauDeR masking DISABLED for this PROJECT (master switch off). Every conversation \
+             here now egresses UNMASKED — registered secrets are still masked."
+        );
+        println!(
+            "Your data policy (categories/profile/threshold) is unchanged; this is session-live \
+             and NOT persisted. Turn it back on with `/zlauder:privacy on`.\n"
+        );
+        print_applied(&snap, port, "session")?;
+        return Ok(());
+    }
+
+    // Conversation-scoped (default): needs a session-routed conversation id, exactly like
+    // ZDR — the id is read from the inherited ANTHROPIC_BASE_URL, never threaded in.
+    let conv = conversation_from_base_url().context(
+        "this session is not session-routed: ANTHROPIC_BASE_URL has no /zlauder/session/<id> \
+         segment, so masking can't be scoped to just this conversation. Run /zlauder:enable and \
+         restart Claude Code, or disable the whole project with `/zlauder:disable --project`.",
+    )?;
+    let url = format!(
+        "http://127.0.0.1:{port}/zlauder/session/{}/masking",
+        percent_encode(&conv)
+    );
+    let resp = json_or_err(
+        blocking_client()
+            .post(&url)
+            .header("x-zlauder-key", &key)
+            .send()?,
+    )
+    .context("disabling masking for this conversation")?;
+    if let Some(w) = resp.get("warning").and_then(|v| v.as_str()) {
+        println!("{w}\n");
+    }
+    println!(
+        "Masking is now OFF for THIS conversation only — other conversations in this project are \
+         unaffected. Re-enable with `/zlauder:privacy on`."
+    );
+    Ok(())
+}
+
 /// Print the per-session ZDR status from a `{active, default, configured}` payload.
 /// The chrome ALWAYS frames ZDR as the USER's assertion — never as verified.
 fn print_zdr_status(snap: &Value) {
@@ -7374,6 +7455,24 @@ fn conversation_from_url(url: &str) -> Option<String> {
         None
     } else {
         Some(id.to_string())
+    }
+}
+
+#[cfg(test)]
+mod disable_cli_tests {
+    use super::{Cli, Cmd};
+    use clap::Parser;
+
+    #[test]
+    fn disable_defaults_to_conversation_scope() {
+        let cli = Cli::try_parse_from(["zlauder-hooks", "disable"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Disable { project: false }));
+    }
+
+    #[test]
+    fn disable_project_flag_selects_project_scope() {
+        let cli = Cli::try_parse_from(["zlauder-hooks", "disable", "--project"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Disable { project: true }));
     }
 }
 
@@ -7870,6 +7969,20 @@ fn parse_snapshot(snap: &Value) -> Result<Snapshot> {
 
 fn print_status(snap: &Value, port: u16) -> Result<()> {
     print_snapshot(&parse_snapshot(snap)?, port);
+    // Per-conversation masking switch: if THIS session's conversation is disabled, call it
+    // out — the master-switch line above shows ON, so this is the only signal that THIS
+    // conversation is nonetheless passing PII through.
+    if let Some(conv) = conversation_from_base_url()
+        && snap
+            .get("masking_disabled_conversations")
+            .and_then(|v| v.as_array())
+            .is_some_and(|a| a.iter().any(|c| c.as_str() == Some(conv.as_str())))
+    {
+        println!(
+            "  this conversation : masking OFF (per-conversation `/zlauder:disable`) — \
+             `/zlauder:privacy on` to resume"
+        );
+    }
     Ok(())
 }
 

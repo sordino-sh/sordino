@@ -28,8 +28,9 @@ everyday on/off, live and with no restart. It is the real "is ZlauDeR being used
 control. Do not confuse it with **routing** (whether traffic goes through the proxy at
 all): routing is plumbed AUTOMATICALLY the first time the plugin sees a project (written
 to `.claude/settings.local.json`, gitignored) and is then effectively permanent;
-`/zlauder:enable` / `/zlauder:disable` set it explicitly (each takes effect reliably after a
-one-time restart of Claude Code — a freshly-written route is only read at startup). Because
+`/zlauder:enable` sets it explicitly and `/zlauder:uninstall` removes it (each takes effect
+reliably after a one-time restart of Claude Code — a freshly-written route is only read at
+startup). Because
 masking is policy *on top of* routing,
 flipping it off (transparent pass-through) can never strand the session. The `status`
 view shows both — proxy health, whether `ANTHROPIC_BASE_URL` is routed, and the masking

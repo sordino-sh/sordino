@@ -124,6 +124,15 @@ select {
   padding: 7px 28px 7px 11px; cursor: pointer;
 }
 select:focus { outline: none; border-color: var(--cyan-dim); box-shadow: 0 0 0 1px var(--cyan-glow); }
+/* POSTURE == DISABLED: masking is off. Colour the control like a live warning so the
+   "filter is off" state is unmistakable at a glance, and grey out the now-meaningless
+   approval-queue cap. */
+#mode.posture-off {
+  border-color: var(--bad); color: #ffd9dd;
+  background: linear-gradient(180deg, rgba(255,93,108,.16), rgba(255,93,108,.05));
+}
+#mode.posture-off:focus { box-shadow: 0 0 0 1px rgba(255,93,108,.5); }
+.queue-wrap.disabled { opacity: .4; pointer-events: none; }
 
 .btn {
   font: inherit; font-size: 11px; letter-spacing: .12em; font-weight: 500;

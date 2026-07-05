@@ -133,6 +133,9 @@ pub(crate) fn snapshot(st: &AppState) -> serde_json::Value {
             "entries": secrets.entries,
         },
         "zdr": zdr_block(st),
+        // Conversations with masking turned OFF (the per-conversation switch). Local
+        // session ids only — never any value. Empty on the common all-masked path.
+        "masking_disabled_conversations": st.masking_disabled_active(),
     })
 }
 
@@ -821,6 +824,78 @@ fn zdr_status(st: &AppState, conversation: &str) -> serde_json::Value {
         "active": st.zdr_selection(conversation).map(|s| s.target),
         "default": st.zdr_default.as_ref(),
         "configured": configured,
+    })
+}
+
+/// `GET /zlauder/session/{conversation}/masking` (x-zlauder-key) — whether masking is
+/// currently turned OFF for this conversation. Read-only.
+pub async fn masking_get(
+    State(st): State<AppState>,
+    hdrs: HeaderMap,
+    Path(conversation): Path<String>,
+) -> Response {
+    if !st.authed(&hdrs) {
+        return forbidden();
+    }
+    json_ok(&masking_status(&st, &conversation))
+}
+
+/// `POST /zlauder/session/{conversation}/masking` (x-zlauder-key) — turn masking OFF for
+/// THIS conversation only (the per-conversation counterpart of the master switch). The
+/// proxy-wide switch and every other conversation are untouched; registered secrets are
+/// still masked (engine A9). In-memory only — a proxy restart clears it (fails toward
+/// masking ON), so there is no durability contract to fail-close on.
+pub async fn masking_disable(
+    State(st): State<AppState>,
+    hdrs: HeaderMap,
+    Path(conversation): Path<String>,
+) -> Response {
+    if !st.authed(&hdrs) {
+        return forbidden();
+    }
+    let newly = st.set_masking_disabled(&conversation);
+    let mut snap = masking_status(&st, &conversation);
+    if let Some(obj) = snap.as_object_mut() {
+        obj.insert("changed".into(), json!(newly));
+        obj.insert(
+            "warning".into(),
+            json!(
+                "Masking is OFF for this conversation — its PII now egresses UNMASKED (registered \
+                 secrets are still masked). Session-scoped and NOT persisted: it lifts on the next \
+                 Claude Code restart, or turn it back on with `/zlauder:privacy on`."
+            ),
+        );
+    }
+    json_ok(&snap)
+}
+
+/// `DELETE /zlauder/session/{conversation}/masking` (x-zlauder-key) — turn masking back
+/// ON for this conversation (clear the override).
+pub async fn masking_enable(
+    State(st): State<AppState>,
+    hdrs: HeaderMap,
+    Path(conversation): Path<String>,
+) -> Response {
+    if !st.authed(&hdrs) {
+        return forbidden();
+    }
+    let was_disabled = st.clear_masking_disabled(&conversation);
+    let mut snap = masking_status(&st, &conversation);
+    if let Some(obj) = snap.as_object_mut() {
+        obj.insert("changed".into(), json!(was_disabled));
+    }
+    json_ok(&snap)
+}
+
+/// Per-conversation masking status payload shared by the masking get/disable/enable
+/// handlers. `disabled` = masking is currently off for this conversation.
+fn masking_status(st: &AppState, conversation: &str) -> serde_json::Value {
+    json!({
+        "conversation": conversation,
+        "disabled": st.is_masking_disabled(conversation),
+        // Whether the proxy-wide master switch is on, so a caller can tell a per-conversation
+        // disable apart from a project-wide one.
+        "master_enabled": st.engine.is_enabled(),
     })
 }
 

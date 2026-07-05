@@ -49,7 +49,7 @@ Installing the plugin is, in the common case, all you do — **installed = route
    `⟳ ZlauDeR: restart to mask` until then). Until this session is routed, ZlauDeR
    blocks outbound messages so nothing sends unmasked first — and every session after
    the first is masked automatically. (`/zlauder:enable` does the same write explicitly
-   — handy to re-enable after `/zlauder:disable`, or to also seed a starter
+   — handy to re-enable after `/zlauder:uninstall`, or to also seed a starter
    `zlauder.toml` — but you rarely need it. The full annotated config reference is
    shipped as `zlauder.toml.example`.)
 3. **Run `/zlauder:privacy`** anytime to confirm routing + masking, or to flip
@@ -59,8 +59,10 @@ Set `env.ZLAUDER_STATUSLINE=off` to hide the `🛡` segment (your own status lin
 shows), `shield` to show the `🛡` ONLY when masking is confirmed (nothing in any other
 state), or `min`/`verbose` to change how much it shows.
 
-To stop routing: `/zlauder:disable` (this project; stops routing reliably after a one-time
-restart, and opts the project out of auto-routing). **Before uninstalling the plugin, run `/zlauder:disable --all`** to sweep
+To quickly turn masking **off** without removing anything: `/zlauder:disable` (this
+conversation) or `/zlauder:disable --project` (the whole project). To remove routing:
+`/zlauder:uninstall` (this project; stops routing reliably after a one-time restart, and opts
+the project out of auto-routing). **Before uninstalling the plugin, run `/zlauder:uninstall --all`** to sweep
 every project the plugin plumbed, so none is left pointing at a proxy that's about to
 disappear — a dead `ANTHROPIC_BASE_URL` makes Claude Code hang for minutes then fail,
 and once the plugin is gone there's no hook left to self-heal it. (The patch lives in
@@ -126,16 +128,17 @@ git config --global url."git@github.com:".pushInsteadOf "https://github.com/"
 
 Two layers, deliberately separated. **Routing** (whether traffic goes through the proxy
 at all) is plumbing: auto-set once into `settings.local.json` on the first session, then
-effectively permanent — `/zlauder:enable` / `/zlauder:disable` set it explicitly (each
-takes effect reliably after a one-time restart of Claude Code). **Masking** (what the running proxy does to your
-text) is policy: the everyday on/off, controlled live by `/zlauder:privacy`. Masking sits
-*on top of* routing, so turning it off is transparent pass-through and never strands a
-session.
+effectively permanent — `/zlauder:enable` sets it explicitly and `/zlauder:uninstall`
+removes it (each takes effect reliably after a one-time restart of Claude Code). **Masking**
+(what the running proxy does to your text) is policy: the everyday on/off, controlled live by
+`/zlauder:privacy` (change what's masked) and `/zlauder:disable` (quickly turn masking off for
+this conversation or `--project`). Masking sits *on top of* routing, so turning it off is
+transparent pass-through and never strands a session.
 
 **Who can run what.** The model can drive only the read-and-tighten commands —
 `/zlauder:status`, `/zlauder:secrets`, `/zlauder:doctor`, `/zlauder:enable` — through its
 SlashCommand tool. The commands that can *loosen* masking or open a browser
-(`/zlauder:privacy`, `/zlauder:disable`, `/zlauder:monitor`) are **user-only**: the model
+(`/zlauder:privacy`, `/zlauder:disable`, `/zlauder:uninstall`, `/zlauder:monitor`) are **user-only**: the model
 surfaces the exact command and you run it. This is enforced by `disable-model-invocation` on
 those commands plus the `permissions.deny`/`ask` rules the plugin writes into
 `.claude/settings.local.json` (deny the model's Bash on the `zlauder-*` CLIs; force an `ask`
@@ -152,7 +155,8 @@ prompt on its edits of `zlauder.toml` / `zlauder.local.toml`).
 | Command | What it does |
 |---|---|
 | `/zlauder:enable` | Explicit per-project routing setup (usually automatic — the `SessionStart` hook does this on first sight). Writes this project's gitignored `.claude/settings.local.json` to set `ANTHROPIC_BASE_URL` (and `ZLAUDER_PORT`) at the proxy's per-project OS-assigned ephemeral port, takes over the status-line slot (wrapping any existing line as `🛡 … │ {your line}`, original saved for restore), and seeds a practical starter `zlauder.toml`. **Masking activates after a one-time restart of Claude Code** (ZlauDeR blocks the first unrouted message until then, so nothing sends unmasked). |
-| `/zlauder:disable` | Revert the routing change for this project and restore your original status line (saved at enable time; if you had none, the zlauder line is just removed) so traffic goes straight to Anthropic again — effective after a one-time restart, and it opts the project out of auto-routing. **`/zlauder:disable --all`** sweeps every plumbed project (found via its registry and a scan of Claude Code's session logs); run it **before uninstalling** so no project strands on a dead proxy. |
+| `/zlauder:disable [--project]` | **User-only.** Quickly turn **masking** off without changing your data policy or removing anything. Default: **this conversation only** (session-scoped, in-memory — lifts on restart). `--project`: the whole project's master switch (session-live, not persisted). Registered secrets stay masked in both modes. Re-enable with `/zlauder:privacy on`. |
+| `/zlauder:uninstall [--all]` | **User-only.** Revert the **routing** change for this project and restore your original status line (saved at enable time; if you had none, the zlauder line is just removed) so traffic goes straight to Anthropic again — effective after a one-time restart, and it opts the project out of auto-routing. Your `zlauder.toml` policy is left in place. **`/zlauder:uninstall --all`** sweeps every plumbed project (found via its registry and a scan of Claude Code's session logs); run it **before deleting the plugin** so no project strands on a dead proxy. |
 | `/zlauder:status` | **Read-only** (model-invocable): proxy health, whether this session is routed, and the masking state (on/off, profile, categories, ML model). Changes nothing — the model uses this to report status; to *change* anything it surfaces the `/zlauder:privacy` command for you to run. |
 | `/zlauder:privacy [args]` | **User-only.** Unified masking control. With no args (or `status`): show proxy health, whether this session is routed, and the masking state. Also: `on` / `off`, `profile <name>`, `category <name> on\|off`, `threshold <0-1>` (each takes `--scope session\|project\|user\|local`), and `reveal <token>` to decode one masked token (e.g. `[EMAIL_ADDRESS_a47n1d8s9c0f]`) via the key-gated proxy. |
 | `/zlauder:privacy model …` | The optional `openai/privacy-filter` ML recognizer (CPU) for free-text PII (names, locations). `model download [<repo>]` caches the weights (large/slow first run); `model on`/`off` toggles it (on **loads in the background** — text is not filtered through the model until `model status` shows `ready`, so masking stays regex-only meanwhile); `model status` reports `disabled\|loading\|ready\|failed`. Pair with `category personal on`. |
@@ -188,10 +192,11 @@ prompt on its edits of `zlauder.toml` / `zlauder.local.toml`).
   in this session's store (it may be from another session, or expired). "token is a broker
   secret … never revealable here" means the value is a registered secret resolved only at the
   tool boundary — by design; use `/zlauder:monitor` to inspect it locally.
-- **Every request fails right after uninstalling.** A project's `settings.local.json` still
-  points at a now-dead proxy. Run **`/zlauder:disable --all` BEFORE uninstalling** to sweep every
-  plumbed project; if you already uninstalled, run `/zlauder:disable` in the affected project (or
-  delete the `ANTHROPIC_BASE_URL` / `ZLAUDER_PORT` lines from its `.claude/settings.local.json`).
+- **Every request fails right after deleting the plugin.** A project's `settings.local.json`
+  still points at a now-dead proxy. Run **`/zlauder:uninstall --all` BEFORE deleting the plugin**
+  to sweep every plumbed project; if you already deleted it, run `/zlauder:uninstall` in the
+  affected project (or delete the `ANTHROPIC_BASE_URL` / `ZLAUDER_PORT` lines from its
+  `.claude/settings.local.json`).
 - **See what's being masked.** `/zlauder:monitor` prints a local, key-gated URL to inspect this
   project's masked traffic; `/zlauder:secrets` shows which registered `[[secrets]]` resolved.
 

@@ -244,6 +244,10 @@ impl Monitor {
         snap
     }
 
+    // Each parameter is a distinct, unrelated fact about the request (endpoint, method,
+    // conversation, masked body, manifest, upstream pin, live master-switch state); bundling
+    // them into a struct would only move the argument list to the call site.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_llm_request(
         &self,
         endpoint: &'static str,
@@ -252,6 +256,7 @@ impl Monitor {
         masked_body: &[u8],
         manifest: &UnmaskManifest,
         pinned: &PinnedMode,
+        masking_enabled: bool,
     ) -> ReviewTicket {
         // Compute everything that does NOT depend on shared state BEFORE taking the
         // lock. The masked body can be 100KB+ and `surfaces_from_body` parses it as
@@ -320,10 +325,19 @@ impl Monitor {
                 None => resolve_content_conversation(&mut inner.conversation_anchors, &anchor_seq),
             },
         };
-        let should_hold = match inner.mode {
-            MonitorMode::Off => false,
-            MonitorMode::ManualAllLlm => true,
-            MonitorMode::ManualOnDetection => !manifest.is_empty(),
+        // A disabled filter (POSTURE = DISABLED / master switch off) NEVER holds: with
+        // masking off there is nothing to review, so traffic must flow freely regardless
+        // of the hold mode. The MonitorMode is left untouched underneath, so re-enabling
+        // restores the operator's chosen posture. (Registered secrets are still masked via
+        // the engine A9 carve-out, but a masked secret is safe to release, so we don't hold.)
+        let should_hold = if !masking_enabled {
+            false
+        } else {
+            match inner.mode {
+                MonitorMode::Off => false,
+                MonitorMode::ManualAllLlm => true,
+                MonitorMode::ManualOnDetection => !manifest.is_empty(),
+            }
         };
 
         // Assign this request's 1-based turn index within its conversation.
@@ -1237,9 +1251,17 @@ mod tests {
 
     fn record(m: &Monitor, b: &[u8]) -> String {
         let manifest = UnmaskManifest::new();
-        m.record_llm_request("/v1/messages", "POST", None, b, &manifest, &PinnedMode::Normal)
-            .id()
-            .to_string()
+        m.record_llm_request(
+            "/v1/messages",
+            "POST",
+            None,
+            b,
+            &manifest,
+            &PinnedMode::Normal,
+            true, // masking enabled (the ordinary path)
+        )
+        .id()
+        .to_string()
     }
 
     fn convo_of(m: &Monitor, id: &str) -> String {
@@ -1258,6 +1280,64 @@ mod tests {
             .find(|r| r.id == id)
             .unwrap()
             .turn_index
+    }
+
+    fn decision_of(m: &Monitor, id: &str) -> RequestDecision {
+        m.snapshot()
+            .records
+            .into_iter()
+            .find(|r| r.id == id)
+            .unwrap()
+            .decision
+    }
+
+    // POSTURE = DISABLED (master switch off => masking_enabled=false) must NEVER hold a
+    // request, even under the most aggressive HOLD ALL LLM mode: a disabled filter has
+    // nothing to review, so traffic flows. With masking enabled the same mode DOES hold,
+    // and the untouched MonitorMode is what restores the posture on re-enable.
+    #[test]
+    fn disabled_filter_never_holds_even_in_hold_all_llm() {
+        let m = Monitor::new();
+        m.set_mode(MonitorMode::ManualAllLlm, None);
+        let manifest = UnmaskManifest::new();
+
+        // masking disabled -> auto-accepted (not held), despite HOLD ALL LLM.
+        let off_id = m
+            .record_llm_request(
+                "/v1/messages",
+                "POST",
+                None,
+                &body(&[("user", json!("hello"))]),
+                &manifest,
+                &PinnedMode::Normal,
+                false,
+            )
+            .id()
+            .to_string();
+        assert!(
+            matches!(decision_of(&m, &off_id), RequestDecision::AutoAccepted),
+            "a disabled filter must not hold traffic: {:?}",
+            decision_of(&m, &off_id)
+        );
+
+        // masking enabled -> the same mode holds for approval.
+        let on_id = m
+            .record_llm_request(
+                "/v1/messages",
+                "POST",
+                None,
+                &body(&[("user", json!("hello again"))]),
+                &manifest,
+                &PinnedMode::Normal,
+                true,
+            )
+            .id()
+            .to_string();
+        assert!(
+            matches!(decision_of(&m, &on_id), RequestDecision::Pending),
+            "HOLD ALL LLM with masking enabled must hold: {:?}",
+            decision_of(&m, &on_id)
+        );
     }
 
     #[test]
@@ -1338,6 +1418,7 @@ mod tests {
                 &body(&[("user", json!("hi"))]),
                 &manifest,
                 &PinnedMode::Normal,
+                true,
             )
             .id()
             .to_string();
@@ -1351,7 +1432,7 @@ mod tests {
         let manifest = UnmaskManifest::new();
         let b = serde_json::to_vec(&json!({ "metadata": { "k": "v" } })).unwrap();
         let id = m
-            .record_llm_request("/v1/messages", "POST", None, &b, &manifest, &PinnedMode::Normal)
+            .record_llm_request("/v1/messages", "POST", None, &b, &manifest, &PinnedMode::Normal, true)
             .id()
             .to_string();
         assert_eq!(convo_of(&m, &id), "unknown");
@@ -1486,7 +1567,7 @@ mod tests {
         let manifest = UnmaskManifest::new();
         let huge = "y".repeat(9000);
         let id = m
-            .record_llm_request("/v1/messages", "POST", Some(huge), &body(&[("user", json!("hi"))]), &manifest, &PinnedMode::Normal)
+            .record_llm_request("/v1/messages", "POST", Some(huge), &body(&[("user", json!("hi"))]), &manifest, &PinnedMode::Normal, true)
             .id()
             .to_string();
         let cid = convo_of(&m, &id);
@@ -1494,7 +1575,7 @@ mod tests {
         assert!(cid.len() <= 18, "bounded length: {cid}");
         // A normal explicit id still passes through verbatim and still wins over content.
         let ok = m
-            .record_llm_request("/v1/messages", "POST", Some("session-xyz".to_string()), &body(&[("user", json!("hi"))]), &manifest, &PinnedMode::Normal)
+            .record_llm_request("/v1/messages", "POST", Some("session-xyz".to_string()), &body(&[("user", json!("hi"))]), &manifest, &PinnedMode::Normal, true)
             .id()
             .to_string();
         assert_eq!(convo_of(&m, &ok), "session-xyz");
@@ -1681,7 +1762,7 @@ mod tests {
         let m = Monitor::new();
         let manifest = manifest_cvv_and_email();
         let id = m
-            .record_llm_request("/v1/messages", "POST", None, &body(&[("user", json!("go"))]), &manifest, &PinnedMode::Normal)
+            .record_llm_request("/v1/messages", "POST", None, &body(&[("user", json!("go"))]), &manifest, &PinnedMode::Normal, true)
             .id()
             .to_string();
         m.record_dispatched(&id);
@@ -1702,7 +1783,7 @@ mod tests {
         let m = Monitor::new();
         let manifest = manifest_cvv_and_email();
         let id = m
-            .record_llm_request("/v1/messages", "POST", None, &body(&[("user", json!("go"))]), &manifest, &PinnedMode::Normal)
+            .record_llm_request("/v1/messages", "POST", None, &body(&[("user", json!("go"))]), &manifest, &PinnedMode::Normal, true)
             .id()
             .to_string();
         m.record_dispatched(&id);
@@ -1733,7 +1814,7 @@ mod tests {
         // The turn's request carries NO local plaintext → empty manifest (the gap condition).
         let manifest = UnmaskManifest::new();
         let id = m
-            .record_llm_request("/v1/messages", "POST", None, &body(&[("user", json!("show the url"))]), &manifest, &PinnedMode::Normal)
+            .record_llm_request("/v1/messages", "POST", None, &body(&[("user", json!("show the url"))]), &manifest, &PinnedMode::Normal, true)
             .id()
             .to_string();
         m.record_dispatched(&id);
@@ -1780,12 +1861,12 @@ mod tests {
         let m = Monitor::new();
         // A request masking a distinct value seeds the ledger.
         let early = manifest_with("[EMAIL_0001]", "alice@example.com");
-        m.record_llm_request("/v1/messages", "POST", None, &body(&[("user", json!("hi"))]), &early, &PinnedMode::Normal);
+        m.record_llm_request("/v1/messages", "POST", None, &body(&[("user", json!("hi"))]), &early, &PinnedMode::Normal, true);
 
         // Flood the 500-record ring so the seeding record is evicted.
         for i in 0..(MAX_RECORDS + 5) {
             let b = body(&[("user", json!(format!("turn {i}")))]);
-            m.record_llm_request("/v1/messages", "POST", Some(format!("c{i}")), &b, &UnmaskManifest::new(), &PinnedMode::Normal);
+            m.record_llm_request("/v1/messages", "POST", Some(format!("c{i}")), &b, &UnmaskManifest::new(), &PinnedMode::Normal, true);
         }
 
         let snap = m.snapshot();
@@ -2115,7 +2196,7 @@ mod tests {
     }
 
     fn record_with(m: &Monitor, b: &[u8], manifest: &UnmaskManifest) -> String {
-        m.record_llm_request("/v1/messages", "POST", None, b, manifest, &PinnedMode::Normal)
+        m.record_llm_request("/v1/messages", "POST", None, b, manifest, &PinnedMode::Normal, true)
             .id()
             .to_string()
     }

@@ -728,6 +728,55 @@ impl MaskEngine {
     /// assistant-authored history, which the local transcript stores as
     /// plaintext) and unmasks every inbound field. Determinism makes the
     /// round-trip reproduce the original token form exactly.
+    /// The "masking disabled" fast path, shared by the master-switch early return in
+    /// [`Self::mask`] and the per-conversation [`Self::mask_when_disabled`]. Transparent
+    /// passthrough EXCEPT registered secrets, which are still masked (A9): a known secret
+    /// value can never egress in plaintext just because masking was turned off.
+    fn mask_disabled_path(
+        &self,
+        text: &str,
+        surface: Surface,
+        config: &EngineConfig,
+        secrets: &SecretSet,
+    ) -> Result<MaskOutcome, EngineError> {
+        if secrets.compiled.is_empty() {
+            return Ok(MaskOutcome::passthrough(text, MaskStats::disabled()));
+        }
+        // Resolve overlaps among registered secrets (two secrets can match overlapping
+        // spans) so `apply()` never splices overlapping ranges.
+        let dets = resolve_overlaps(detect_secrets(&secrets.compiled, text, surface));
+        if dets.is_empty() {
+            return Ok(MaskOutcome::passthrough(text, MaskStats::disabled()));
+        }
+        let (out, manifest) = self.apply(text, surface, config, &dets)?;
+        Ok(MaskOutcome {
+            masked_text: out,
+            manifest,
+            stats: MaskStats::disabled(),
+        })
+    }
+
+    /// Mask `text` as if masking were turned OFF, WITHOUT flipping the global
+    /// `config.enabled`. This is the per-conversation disable: one conversation's PII
+    /// passes through while the proxy-wide switch stays on for every other conversation.
+    /// Byte-for-byte the same behavior as the master-switch-off path (including the A9
+    /// registered-secret carve-out and user-bypass), so a conversation disable and the
+    /// master switch are indistinguishable at the wire.
+    pub fn mask_when_disabled(
+        &self,
+        text: &str,
+        surface: Surface,
+    ) -> Result<MaskOutcome, EngineError> {
+        if surface == Surface::UserMessage
+            && let Some(outcome) = self.mask_user_bypass(text)?
+        {
+            return Ok(outcome);
+        }
+        let policy = Arc::clone(&self.policy.read().expect("policy rwlock poisoned"));
+        let secrets = Arc::clone(&self.secrets.read().expect("secrets rwlock poisoned"));
+        self.mask_disabled_path(text, surface, &policy.config, &secrets)
+    }
+
     pub fn mask(&self, text: &str, surface: Surface) -> Result<MaskOutcome, EngineError> {
         if surface == Surface::UserMessage
             && let Some(outcome) = self.mask_user_bypass(text)?
@@ -749,21 +798,7 @@ impl MaskEngine {
         // convenience disable — it is still masked even on a disabled surface, so a
         // known secret value can never egress in plaintext via the fast path.
         if !policy.config.enabled || !policy.config.surface_enabled(surface) {
-            if secrets.compiled.is_empty() {
-                return Ok(MaskOutcome::passthrough(text, MaskStats::disabled()));
-            }
-            // Resolve overlaps among registered secrets (two secrets can match
-            // overlapping spans) so `apply()` never splices overlapping ranges.
-            let dets = resolve_overlaps(detect_secrets(&secrets.compiled, text, surface));
-            if dets.is_empty() {
-                return Ok(MaskOutcome::passthrough(text, MaskStats::disabled()));
-            }
-            let (out, manifest) = self.apply(text, surface, &policy.config, &dets)?;
-            return Ok(MaskOutcome {
-                masked_text: out,
-                manifest,
-                stats: MaskStats::disabled(),
-            });
+            return self.mask_disabled_path(text, surface, &policy.config, &secrets);
         }
 
         // Peel a prior turn's reveal-marker decoration off re-sent assistant history
@@ -1619,6 +1654,49 @@ mod tests {
         assert!(outcome.masked_text.contains("[EMAIL_ADDRESS_"));
         let back = e.unmask(&outcome.masked_text, &outcome.manifest).unwrap();
         assert_eq!(back, original);
+    }
+
+    // Per-conversation disable (`mask_when_disabled`): PII passes through UNMASKED
+    // (masking is off for that conversation) while the master switch stays on — but a
+    // registered secret is STILL masked (the A9 carve-out is not turn-off-able). This is
+    // the exact master-switch-off semantics, applied to one conversation.
+    #[test]
+    fn mask_when_disabled_passes_pii_but_still_masks_registered_secrets() {
+        let e = engine();
+        e.set_secret_rules(vec![secret_rule("api", "sk-SECRET-123", Operator::Redact)])
+            .unwrap();
+        // Master switch stays ON (default); exercise ONLY the per-conversation disabled path.
+        assert!(e.is_enabled());
+        let out = e
+            .mask_when_disabled(
+                "mail alice@example.com key sk-SECRET-123",
+                Surface::UserMessage,
+            )
+            .unwrap();
+        // PII passes through unmasked — masking is off for this conversation.
+        assert!(
+            out.masked_text.contains("alice@example.com"),
+            "PII should pass through when disabled: {}",
+            out.masked_text
+        );
+        assert!(
+            !out.masked_text.contains("[EMAIL_ADDRESS_"),
+            "email must NOT be masked on the disabled path: {}",
+            out.masked_text
+        );
+        // ...but the registered secret is STILL masked (A9): a disable can never leak it.
+        assert!(
+            !out.masked_text.contains("sk-SECRET-123"),
+            "registered secret must still be masked even when disabled: {}",
+            out.masked_text
+        );
+        // Sanity: the NORMAL path DOES mask the email, so disable is the real difference.
+        let normal = e.mask("mail alice@example.com", Surface::UserMessage).unwrap();
+        assert!(
+            normal.masked_text.contains("[EMAIL_ADDRESS_"),
+            "normal path should mask the email: {}",
+            normal.masked_text
+        );
     }
 
     // T2 — determinism / cache stability.

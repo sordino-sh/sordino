@@ -858,10 +858,34 @@ function renderTraffic(flashId) {
   }).join('') : `<div class="empty-note" style="padding:14px">No ${decisionFilter === 'all' ? '' : decisionFilter + ' '}traffic${channelFilter ? ' in this conversation.' : '.'}</div>`;
 }
 
+/* The POSTURE control fuses two axes the operator experiences as one dropdown:
+     - the master switch  (committedPolicy.enabled)  -> the DISABLED sentinel option
+     - the review-hold mode (snapshot .mode)         -> OBSERVE / HOLD ON DETECTION / HOLD ALL LLM
+   DISABLED wins the display whenever masking is off, so the dropdown, the protection-status
+   line and the CLI/`/privacy` master switch can never disagree. `DISABLED` is a UI-only
+   sentinel — it is NEVER a real MonitorMode; saveMode() maps it to the /disable endpoint.
+   Pre-load (no policy/snapshot yet) it defaults to OBSERVE, so the control never flashes a
+   false "masking off" before the real state arrives. */
+function syncPostureSelect() {
+  const sel = $('mode');
+  if (!sel) return;
+  const masterOff = !!(committedPolicy && committedPolicy.enabled === false);
+  sel.value = masterOff ? 'disabled'
+            : (lastSnap && lastSnap.mode) ? lastSnap.mode
+            : 'off';
+  sel.classList.toggle('posture-off', masterOff);
+  // The approval-queue cap is meaningless while the filter is off — grey it out and
+  // stop it committing edits (which would otherwise re-fire saveMode on the sentinel).
+  const qw = document.querySelector('.queue-wrap');
+  if (qw) qw.classList.toggle('disabled', masterOff);
+  const capInput = $('queueCap');
+  if (capInput) capInput.disabled = masterOff;
+}
+
 /* ---------- header ---------- */
 function renderHeader(snap) {
   if (snap) {
-    $('mode').value = snap.mode;
+    syncPostureSelect();
     const max = snap.max_pending_approvals || 0;
     const pend = snap.pending_count || 0;
     const capInput = $('queueCap');
@@ -1348,10 +1372,31 @@ $('mode').addEventListener('change', saveMode);
 $('queueCap').addEventListener('change', saveMode);
 $('queueCap').addEventListener('keydown', e => { if (e.key === 'Enter') { e.preventDefault(); saveMode(); } });
 function saveMode() {
-  const body = { mode: $('mode').value };
+  const val = $('mode').value;
+  // DISABLED is a POSTURE-only sentinel (never a real MonitorMode): it flips the runtime
+  // master switch OFF. That is session-scoped and NEVER persisted, so the data policy —
+  // profile / threshold / categories / operators / ML / custom masks — is left EXACTLY as
+  // configured. This is a quick, temporary "filter off", not a policy edit; registered
+  // secrets still mask (engine A9 carve-out). `apiWrite` tags the write so this tab's own
+  // resulting `policy` SSE echo is recognised and doesn't raise a spurious "policy changed".
+  if (val === 'disabled') {
+    apiWrite('/zlauder/disable', { method: 'POST' })
+      .then(r => r.ok ? toast('filter DISABLED &middot; masking OFF — data policy unchanged', 'bad')
+                      : toast('disable failed', 'bad'))
+      .then(load);
+    return;
+  }
+  // A real posture selected. If the filter is currently DISABLED, clear the master switch
+  // back ON FIRST (ordering matters — the mode POST must land on a live filter), then set
+  // the hold mode. When already enabled this is a plain mode change (no enable round-trip).
+  const body = { mode: val };
   const cap = parseInt($('queueCap').value, 10);
   if (Number.isFinite(cap) && cap >= 0) body.max_pending_approvals = cap;
-  api('/zlauder/monitor/mode', { method: 'POST', body: JSON.stringify(body) })
+  const ensureOn = (committedPolicy && committedPolicy.enabled === false)
+    ? apiWrite('/zlauder/enable', { method: 'POST' })
+    : Promise.resolve({ ok: true });
+  ensureOn
+    .then(() => api('/zlauder/monitor/mode', { method: 'POST', body: JSON.stringify(body) }))
     .then(r => r.ok ? toast('posture set: ' + body.mode + (body.max_pending_approvals != null ? ` &middot; cap ${body.max_pending_approvals}` : ''), 'good')
                     : toast('mode change failed', 'bad'))
     .then(load);
@@ -1803,8 +1848,12 @@ function applyPolicyConfig(snap) {
   $('polMlModel').textContent = ml.model ? `model: ${ml.model}${ml.error ? ' — ' + ml.error : ''}` : '';
 
   refreshPersonalTier();
-  // The protection-status line reads enabled_categories + ml status, so re-render it
-  // whenever the live policy moves (the drawer is closed most of the time).
+  // The master switch rides the policy snapshot (`enabled`), so a policy frame that flips
+  // it — this window, another tab, or the CLI/`/privacy` — must re-sync the POSTURE
+  // dropdown to DISABLED (or back), even with no accompanying monitor frame.
+  syncPostureSelect();
+  // The protection-status line reads enabled + enabled_categories + ml status, so
+  // re-render it whenever the live policy moves (the drawer is closed most of the time).
   renderProtectionStatus();
 }
 

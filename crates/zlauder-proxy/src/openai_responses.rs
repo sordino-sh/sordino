@@ -67,13 +67,17 @@ async fn responses_inner(st: AppState, req: Request, conversation: Option<String
         }
         Err(resp) => return resp,
     }
+    // Per-conversation masking switch (same URL-path id the pin trusts).
+    let force_disabled = conversation
+        .as_deref()
+        .is_some_and(|c| st.is_masking_disabled(c));
     let (parts, body) = req.into_parts();
     let body_bytes = match to_bytes(body, MAX_BODY).await {
         Ok(b) => b,
         Err(_) => return routes::err(StatusCode::BAD_REQUEST, "failed to read request body"),
     };
 
-    let (masked, manifest) = match mask_body(&st, &body_bytes).await {
+    let (masked, manifest) = match mask_body(&st, &body_bytes, force_disabled).await {
         Ok(x) => x,
         Err(resp) => return resp,
     };
@@ -87,6 +91,8 @@ async fn responses_inner(st: AppState, req: Request, conversation: Option<String
         // The OpenAI-compat handler 501-refuses a Zdr pin above, so the captured mode here
         // is always Normal → record "anthropic".
         &PinnedMode::Normal,
+        // Effective filter state: master switch off OR this conversation disabled → never hold.
+        st.engine.is_enabled() && !force_disabled,
     );
     let record_id = ticket.id().to_string();
     if let Err(resp) = monitor::maybe_approve(&st, ticket).await {
@@ -150,11 +156,21 @@ async fn responses_inner(st: AppState, req: Request, conversation: Option<String
 }
 
 #[allow(clippy::result_large_err)]
-async fn mask_body(st: &AppState, body: &[u8]) -> Result<(Vec<u8>, UnmaskManifest), Response> {
+async fn mask_body(
+    st: &AppState,
+    body: &[u8],
+    force_disabled: bool,
+) -> Result<(Vec<u8>, UnmaskManifest), Response> {
+    type Masker = fn(&MaskEngine, &[u8]) -> Result<(Vec<u8>, UnmaskManifest), MaskError>;
+    let masker: Masker = if force_disabled {
+        mask_request_disabled
+    } else {
+        mask_request
+    };
     let result = if st.engine.ml_should_offload() {
         let engine = st.engine.clone();
         let body = body.to_vec();
-        match tokio::task::spawn_blocking(move || mask_request(engine.as_ref(), &body)).await {
+        match tokio::task::spawn_blocking(move || masker(engine.as_ref(), &body)).await {
             Ok(r) => r,
             Err(join) => {
                 return Err(routes::err(
@@ -164,7 +180,7 @@ async fn mask_body(st: &AppState, body: &[u8]) -> Result<(Vec<u8>, UnmaskManifes
             }
         }
     } else {
-        mask_request(st.engine.as_ref(), body)
+        masker(st.engine.as_ref(), body)
     };
 
     match result {
@@ -184,18 +200,40 @@ pub fn mask_request(
     engine: &MaskEngine,
     body: &[u8],
 ) -> Result<(Vec<u8>, UnmaskManifest), MaskError> {
+    mask_request_inner(engine, body, false)
+}
+
+/// Responses counterpart of [`crate::walk::mask_request_disabled`]: mask this request
+/// as if masking were OFF for its conversation (passthrough except the A9
+/// registered-secret carve-out).
+pub fn mask_request_disabled(
+    engine: &MaskEngine,
+    body: &[u8],
+) -> Result<(Vec<u8>, UnmaskManifest), MaskError> {
+    mask_request_inner(engine, body, true)
+}
+
+fn mask_request_inner(
+    engine: &MaskEngine,
+    body: &[u8],
+    force_disabled: bool,
+) -> Result<(Vec<u8>, UnmaskManifest), MaskError> {
     let mut req: ResponsesRequest = serde_json::from_slice(body).map_err(MaskError::Json)?;
     let mut manifest = UnmaskManifest::new();
     // Phase 1 (ML-active only): collect every leaf and batch-prewarm the detection
     // cache so the mask pass below pays ONE batched inference, not N per-leaf ones.
-    // No-op (and zero extra cost) when ML is off — byte-identical to before.
-    prewarm_request(engine, &mut req);
+    // No-op (and zero extra cost) when ML is off — byte-identical to before. Skipped
+    // when force-disabled: masking is off, so there is no detection to warm.
+    if !force_disabled {
+        prewarm_request(engine, &mut req);
+    }
     let stats = {
         let mut w = MaskWalker {
             engine,
             manifest: &mut manifest,
             stats: MaskStats::default(),
             collect: None,
+            force_disabled,
         };
         w.request(&mut req).map_err(MaskError::Engine)?;
         w.stats
@@ -219,6 +257,7 @@ fn prewarm_request(engine: &MaskEngine, req: &mut ResponsesRequest) {
         manifest: &mut throwaway,
         stats: MaskStats::default(),
         collect: Some(Vec::new()),
+        force_disabled: false, // collect mode never masks; the flag is moot here
     };
     if collector.request(req).is_err() {
         return;
@@ -261,6 +300,9 @@ struct MaskWalker<'a> {
     /// surface) and nothing is masked, so the prewarm pass can gather all leaves over
     /// the SAME traversal the mask pass uses. See `prewarm_request`.
     collect: Option<Vec<(String, Surface)>>,
+    /// When `true`, this conversation's masking is OFF — route leaves through
+    /// [`MaskEngine::mask_when_disabled`] instead of [`MaskEngine::mask`].
+    force_disabled: bool,
 }
 
 impl MaskWalker<'_> {
@@ -384,7 +426,11 @@ impl MaskWalker<'_> {
             leaves.push((text.clone(), surface));
             return Ok(());
         }
-        let outcome = self.engine.mask(text, surface)?;
+        let outcome = if self.force_disabled {
+            self.engine.mask_when_disabled(text, surface)?
+        } else {
+            self.engine.mask(text, surface)?
+        };
         *text = outcome.masked_text;
         self.manifest.merge(outcome.manifest);
         self.stats.merge(&outcome.stats);

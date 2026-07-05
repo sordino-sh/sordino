@@ -32,6 +32,25 @@ pub fn mask_request(
     engine: &MaskEngine,
     body: &[u8],
 ) -> Result<(Vec<u8>, UnmaskManifest), MaskError> {
+    mask_request_inner(engine, body, false)
+}
+
+/// Same as [`mask_request`] but for a conversation whose masking is turned OFF: every
+/// leaf routes through [`MaskEngine::mask_when_disabled`] (transparent passthrough
+/// except the A9 registered-secret carve-out) instead of [`MaskEngine::mask`]. The
+/// per-conversation counterpart of the master switch — see [`crate::state::AppState::is_masking_disabled`].
+pub fn mask_request_disabled(
+    engine: &MaskEngine,
+    body: &[u8],
+) -> Result<(Vec<u8>, UnmaskManifest), MaskError> {
+    mask_request_inner(engine, body, true)
+}
+
+fn mask_request_inner(
+    engine: &MaskEngine,
+    body: &[u8],
+    force_disabled: bool,
+) -> Result<(Vec<u8>, UnmaskManifest), MaskError> {
     let mut manifest = UnmaskManifest::new();
     match serde_json::from_slice::<ApiRequest>(body) {
         Ok(mut req) => {
@@ -39,14 +58,18 @@ pub fn mask_request(
             // pass and batch-prewarm the detection cache, so the mask pass below pays
             // ONE batched inference instead of N serialized per-leaf ones. Gated on a
             // live model: with ML off there is nothing expensive to batch, so we skip
-            // straight to the mask pass — byte-identical to before this change.
-            prewarm_request(engine, &mut req);
+            // straight to the mask pass — byte-identical to before this change. Skipped
+            // when force-disabled: masking is off, so there is no detection to warm.
+            if !force_disabled {
+                prewarm_request(engine, &mut req);
+            }
             let stats = {
                 let mut w = MaskWalker {
                     engine,
                     manifest: &mut manifest,
                     stats: MaskStats::default(),
                     collect: None,
+                    force_disabled,
                 };
                 w.request(&mut req).map_err(MaskError::Engine)?;
                 w.stats
@@ -64,6 +87,7 @@ pub fn mask_request(
                     manifest: &mut manifest,
                     stats: MaskStats::default(),
                     collect: None,
+                    force_disabled,
                 };
                 w.value_safe(&mut value, Surface::UserMessage)
                     .map_err(MaskError::Engine)?;
@@ -97,6 +121,7 @@ fn prewarm_request(engine: &MaskEngine, req: &mut ApiRequest) {
         manifest: &mut throwaway,
         stats: MaskStats::default(),
         collect: Some(Vec::new()),
+        force_disabled: false, // collect mode never masks; the flag is moot here
     };
     // COLLECT mode masks nothing and never calls the engine, so `request` cannot
     // error here; if it somehow did, just skip the prewarm (the mask pass is correct
@@ -150,6 +175,10 @@ struct MaskWalker<'a> {
     /// SAME traversal serves both phases, so collect can never visit a different
     /// leaf set than mask (zero divergence).
     collect: Option<Vec<(String, Surface)>>,
+    /// When `true`, this conversation's masking is OFF: every leaf routes through
+    /// [`MaskEngine::mask_when_disabled`] (passthrough except registered secrets)
+    /// instead of [`MaskEngine::mask`]. Ignored in COLLECT mode (which never masks).
+    force_disabled: bool,
 }
 
 impl MaskWalker<'_> {
@@ -281,7 +310,11 @@ impl MaskWalker<'_> {
             leaves.push((text.clone(), surface));
             return Ok(());
         }
-        let outcome = self.engine.mask(text, surface)?;
+        let outcome = if self.force_disabled {
+            self.engine.mask_when_disabled(text, surface)?
+        } else {
+            self.engine.mask(text, surface)?
+        };
         *text = outcome.masked_text;
         self.manifest.merge(outcome.manifest);
         self.stats.merge(&outcome.stats);

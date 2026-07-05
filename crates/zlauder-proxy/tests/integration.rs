@@ -59,6 +59,7 @@ fn mk_state(engine: MaskEngine, upstream_base: String, admin_key: &str) -> AppSt
         zdr_targets: Arc::new(std::collections::HashMap::new()),
         zdr_default: Arc::new(None),
         zdr_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        masking_disabled: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
     }
 }
 
@@ -840,6 +841,91 @@ async fn config_endpoints_gated_and_toggle_masking() {
     assert!(body_on.contains("[EMAIL_ADDRESS_"));
 }
 
+// The POSTURE=DISABLED contract: flipping the master switch off is a quick, temporary
+// "filter off" that must NOT touch the data policy (profile / threshold / categories /
+// operators). The monitor UI's DISABLED option drives exactly these enable/disable
+// endpoints, so this pins the property the feature promises: toggle masking without
+// disturbing the configured policy, and get the SAME policy back on re-enable.
+#[tokio::test]
+async fn master_switch_toggle_preserves_data_policy() {
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, "http://127.0.0.1:1".into(), "secret-key");
+    let proxy_addr = spawn(proxy_router(state)).await;
+    let client = reqwest::Client::new();
+
+    // Establish a distinctive, hand-tuned data policy via the live control plane.
+    let put = client
+        .put(format!("http://{proxy_addr}/zlauder/config"))
+        .header("x-zlauder-key", "secret-key")
+        .json(&serde_json::json!({
+            "score_threshold": 0.73,
+            "enabled_categories": ["secrets", "financial"],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(put.status(), 200, "policy PUT should apply");
+
+    // Snapshot the policy fields that DISABLED must never disturb.
+    let get_policy = |client: reqwest::Client, addr: String| async move {
+        client
+            .get(format!("http://{addr}/zlauder/config"))
+            .header("x-zlauder-key", "secret-key")
+            .send()
+            .await
+            .unwrap()
+            .json::<serde_json::Value>()
+            .await
+            .unwrap()
+    };
+    let before = get_policy(client.clone(), proxy_addr.to_string()).await;
+    assert_eq!(before["enabled"], serde_json::json!(true));
+    // Capture the live values as the baseline (score_threshold is stored f32 and widens on
+    // serialize, so compare against THIS baseline, not a decimal literal — the property under
+    // test is preservation across the toggle, not the exact float rendering).
+    let thresh_before = before["config"]["score_threshold"].clone();
+    let cats_before = before["config"]["enabled_categories"].clone();
+    assert!(
+        (thresh_before.as_f64().unwrap() - 0.73).abs() < 1e-6,
+        "PUT should have set the threshold: {thresh_before}"
+    );
+
+    // DISABLE (the master switch the DISABLED posture drives).
+    let off: serde_json::Value = client
+        .post(format!("http://{proxy_addr}/zlauder/disable"))
+        .header("x-zlauder-key", "secret-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(off["enabled"], serde_json::json!(false), "master switch off");
+    // The crux: the data policy is UNTOUCHED while masking is off.
+    assert_eq!(
+        off["config"]["score_threshold"], thresh_before,
+        "threshold must survive a DISABLED toggle"
+    );
+    assert_eq!(
+        off["config"]["enabled_categories"], cats_before,
+        "categories must survive a DISABLED toggle"
+    );
+
+    // RE-ENABLE → masking back on, and the exact same policy is restored.
+    let on: serde_json::Value = client
+        .post(format!("http://{proxy_addr}/zlauder/enable"))
+        .header("x-zlauder-key", "secret-key")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(on["enabled"], serde_json::json!(true), "master switch on");
+    assert_eq!(on["config"]["score_threshold"], thresh_before);
+    assert_eq!(on["config"]["enabled_categories"], cats_before);
+}
+
 // The ML control plane: the snapshot exposes an `ml` block (so the status line /
 // `model status` can read it), the endpoints are key-gated, and `ml/disable` is a
 // safe no-network operation. We deliberately do NOT exercise `ml/enable` with the
@@ -1303,6 +1389,122 @@ async fn monitor_session_prefixed_route_groups_by_conversation() {
     assert_eq!(snap["records"][0]["conversation_id"], "convo-123");
 }
 
+// Per-conversation masking switch: turning masking OFF for ONE conversation lets that
+// conversation's PII egress unmasked, WITHOUT affecting any other conversation or the
+// project master switch — and re-enabling resumes masking. The endpoint is key-gated.
+#[tokio::test]
+async fn per_conversation_disable_isolates_to_that_conversation() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, format!("http://{up_addr}"), "mkey");
+    let proxy_addr = spawn(proxy_router(state)).await;
+    let client = reqwest::Client::new();
+
+    // Helper: send one user message on a conversation's session route, return the exact
+    // bytes the (fake) upstream received.
+    async fn send(client: &reqwest::Client, addr: SocketAddr, conv: &str, text: &str) -> () {
+        let r = client
+            .post(format!("http://{addr}/zlauder/session/{conv}/v1/messages"))
+            .json(&serde_json::json!({
+                "model": "m", "max_tokens": 10,
+                "messages": [{"role":"user","content":[{"type":"text","text": text}]}]
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(r.status(), 200);
+    }
+
+    // Baseline: conversation "alpha" masks its email.
+    send(&client, proxy_addr, "alpha", "mail alpha1@example.com").await;
+    let b = cap.body.lock().unwrap().clone();
+    assert!(b.contains("[EMAIL_ADDRESS_"), "baseline should mask: {b}");
+    assert!(!b.contains("alpha1@example.com"));
+
+    // The masking endpoint is key-gated.
+    let unauth = client
+        .post(format!("http://{proxy_addr}/zlauder/session/alpha/masking"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(unauth.status(), 403, "masking control must be key-gated");
+
+    // Disable masking for "alpha" only.
+    let off: serde_json::Value = client
+        .post(format!("http://{proxy_addr}/zlauder/session/alpha/masking"))
+        .header("x-zlauder-key", "mkey")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(off["disabled"], serde_json::json!(true));
+    assert_eq!(off["changed"], serde_json::json!(true));
+    assert_eq!(
+        off["master_enabled"],
+        serde_json::json!(true),
+        "the project master switch stays ON"
+    );
+
+    // Now alpha's PII egresses UNMASKED.
+    send(&client, proxy_addr, "alpha", "mail alpha2@example.com").await;
+    let b = cap.body.lock().unwrap().clone();
+    assert!(
+        b.contains("alpha2@example.com"),
+        "disabled conversation should pass through: {b}"
+    );
+    assert!(!b.contains("[EMAIL_ADDRESS_"));
+
+    // A DIFFERENT conversation is unaffected — still masks.
+    send(&client, proxy_addr, "beta", "mail beta@example.com").await;
+    let b = cap.body.lock().unwrap().clone();
+    assert!(
+        b.contains("[EMAIL_ADDRESS_") && !b.contains("beta@example.com"),
+        "other conversations must still mask: {b}"
+    );
+
+    // The config snapshot lists alpha (and only alpha) as masking-disabled.
+    let cfg: serde_json::Value = client
+        .get(format!("http://{proxy_addr}/zlauder/config"))
+        .header("x-zlauder-key", "mkey")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        cfg["masking_disabled_conversations"],
+        serde_json::json!(["alpha"])
+    );
+
+    // Re-enable alpha → masking resumes.
+    let on: serde_json::Value = client
+        .delete(format!("http://{proxy_addr}/zlauder/session/alpha/masking"))
+        .header("x-zlauder-key", "mkey")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(on["disabled"], serde_json::json!(false));
+    assert_eq!(on["changed"], serde_json::json!(true), "was disabled → re-enabled");
+
+    send(&client, proxy_addr, "alpha", "mail alpha3@example.com").await;
+    let b = cap.body.lock().unwrap().clone();
+    assert!(
+        b.contains("[EMAIL_ADDRESS_") && !b.contains("alpha3@example.com"),
+        "re-enabled conversation must mask again: {b}"
+    );
+}
+
 async fn wait_for_pending(client: &reqwest::Client, proxy_addr: SocketAddr, key: &str) -> String {
     for _ in 0..50 {
         let snap: serde_json::Value = client
@@ -1356,6 +1558,7 @@ fn mk_state_in(
         zdr_targets: Arc::new(std::collections::HashMap::new()),
         zdr_default: Arc::new(None),
         zdr_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        masking_disabled: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
     }
 }
 

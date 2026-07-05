@@ -81,7 +81,7 @@ are kept tokenized end-to-end (never unmasked), so signatures stay valid.
 |---|---|
 | `zlauder-engine` | masking engine: detection (presidio) + deterministic tokens + AES-GCM reversible store + hot-swappable config (profiles/categories/operators/allow-list/custom rules). Runtime-free. |
 | `zlauder-proxy` | axum reverse proxy: request mask walk, per-call manifest, upstream relay, JSON + streaming-SSE unmask, and a key-gated privacy control plane (live enable/disable/profile/reload) that backs `/zlauder:privacy`. |
-| `zlauder-hooks` | Claude Code control plane: `session-start` (auto-plumb routing on first sight, launch/recycle the proxy, learn its bound port), `statusline`, `config` (backs `/zlauder:privacy`), `reveal`, `settings` (backs `/zlauder:enable` / `/zlauder:disable`). Per-project routing is auto-plumbed by `session-start`; `/zlauder:enable` is the explicit redo. |
+| `zlauder-hooks` | Claude Code control plane: `session-start` (auto-plumb routing on first sight, launch/recycle the proxy, learn its bound port), `statusline`, `config` (backs `/zlauder:privacy`), `disable` (backs `/zlauder:disable` — masking off, per-conversation or `--project`), `reveal`, `settings` (backs `/zlauder:enable` / `/zlauder:uninstall`). Per-project routing is auto-plumbed by `session-start`; `/zlauder:enable` is the explicit redo. |
 | `zlauder-state` | shared on-disk session state — the project-keyed **rendezvous** record (bound port/key/salt/pid/nonce) + the launch-lock and bind-error primitives; the single source of truth both binaries read. |
 
 ## Build
@@ -152,9 +152,9 @@ After install, masking activates with a **one-time restart**:
 > masking is active. Restarting re-routes to the fresh port.
 
 You rarely run anything by hand. `/zlauder:enable` does the same write explicitly (and
-seeds a starter `zlauder.toml`) — useful to re-enable after `/zlauder:disable`.
+seeds a starter `zlauder.toml`) — useful to re-enable after `/zlauder:uninstall`.
 
-> **⚠ Before removing zlauder, run `/zlauder:disable --all` first.** The routing patch
+> **⚠ Before removing zlauder, run `/zlauder:uninstall --all` first.** The routing patch
 > lives in each project's `.claude/settings.local.json`, not in the plugin, so removing
 > the plugin does not remove it. Uninstall (or switch it off in the `/plugin` UI)
 > *without* disabling first and that project's `ANTHROPIC_BASE_URL` keeps pointing at a
@@ -235,8 +235,8 @@ Rebuild after editing engine/proxy/hooks code; restart the session (or re-run
 
 Inside a `claude` session, change masking settings live with the slash command
 (or `zlauder-hooks config …` from a shell). It affects **only this project's**
-proxy. This is the **masking** layer; `/zlauder:enable` / `/zlauder:disable` are
-the separate **routing** layer.
+proxy. This is the **masking** layer (turn it off quickly with `/zlauder:disable`);
+`/zlauder:enable` / `/zlauder:uninstall` are the separate **routing** layer.
 
 ```
 /zlauder:privacy                        # status: health, routing, on/off, profile, categories

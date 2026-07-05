@@ -23,5 +23,6 @@ locally** at all times — masking only changes what the **model and the API pro
 
 To **change** anything — turn masking on/off, switch profile/category/threshold, manage the
 ML model, reveal a token, or scrub a transcript — the user runs `/zlauder:privacy …`
-themselves (and `/zlauder:enable` / `/zlauder:disable` for routing). You may **suggest the
+themselves (`/zlauder:disable` to quickly turn masking off; `/zlauder:enable` /
+`/zlauder:uninstall` for routing). You may **suggest the
 exact command**, but only the user can run it. Never print or echo the session/control key.

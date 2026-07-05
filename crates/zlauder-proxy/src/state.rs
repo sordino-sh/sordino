@@ -1,6 +1,6 @@
 //! Shared proxy state.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -168,6 +168,18 @@ pub struct AppState {
     /// conversation id the session route carries (`/zlauder/session/{id}`). A missing
     /// entry = no ZDR (the default). Mutated only by the key-gated control endpoint.
     pub zdr_sessions: Arc<std::sync::Mutex<HashMap<String, ZdrSelection>>>,
+    /// Conversations whose masking is temporarily turned OFF (the per-conversation
+    /// counterpart of the project-wide master switch). Keyed by the same conversation id
+    /// the session route carries (`/zlauder/session/{id}`); membership = masking disabled
+    /// for that conversation. Mutated only by the key-gated control endpoint.
+    ///
+    /// **In-memory ONLY, by design** — unlike ZDR selections this is never persisted. It
+    /// mirrors the master switch (`config.enabled`, also runtime-only) and, crucially,
+    /// fails toward masking-ON: a proxy recycle drops the set, so a forgotten disable can
+    /// never silently keep a conversation unmasked across restarts. A registered secret is
+    /// still masked for a disabled conversation (the engine's A9 carve-out via
+    /// [`MaskEngine::mask_when_disabled`]).
+    pub masking_disabled: Arc<std::sync::Mutex<HashSet<String>>>,
 }
 
 impl AppState {
@@ -189,6 +201,48 @@ impl AppState {
     /// Look up a resolved ZDR target by name (cloning the `Arc`, not the target).
     pub fn zdr_target(&self, name: &str) -> Option<Arc<ZdrTarget>> {
         self.zdr_targets.get(name).cloned()
+    }
+
+    /// Whether masking is currently turned OFF for this conversation. A cheap set
+    /// membership read; the guard is dropped before the caller does any `.await`.
+    pub fn is_masking_disabled(&self, conversation: &str) -> bool {
+        self.masking_disabled
+            .lock()
+            .expect("masking_disabled mutex poisoned")
+            .contains(conversation)
+    }
+
+    /// Turn masking OFF for this conversation (idempotent). Returns `true` if this was a
+    /// new disable, `false` if it was already off. In-memory only — nothing to persist,
+    /// so there is no fail-closed rollback path (contrast [`Self::set_zdr_selection`]).
+    pub fn set_masking_disabled(&self, conversation: &str) -> bool {
+        self.masking_disabled
+            .lock()
+            .expect("masking_disabled mutex poisoned")
+            .insert(conversation.to_string())
+    }
+
+    /// Turn masking back ON for this conversation (clear the override). Returns whether
+    /// the conversation was disabled (so the caller can report a no-op honestly).
+    pub fn clear_masking_disabled(&self, conversation: &str) -> bool {
+        self.masking_disabled
+            .lock()
+            .expect("masking_disabled mutex poisoned")
+            .remove(conversation)
+    }
+
+    /// The conversations currently masking-disabled, for the admin snapshot / statusline.
+    /// Sorted so the snapshot is stable across reads.
+    pub fn masking_disabled_active(&self) -> Vec<String> {
+        let mut v: Vec<String> = self
+            .masking_disabled
+            .lock()
+            .expect("masking_disabled mutex poisoned")
+            .iter()
+            .cloned()
+            .collect();
+        v.sort();
+        v
     }
 
     /// The ZDR posture a conversation is pinned to, if any. Clones out from under the

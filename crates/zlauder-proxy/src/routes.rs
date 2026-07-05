@@ -68,6 +68,15 @@ pub fn router(state: AppState) -> Router {
                 .post(admin::zdr_set)
                 .delete(admin::zdr_clear),
         )
+        // Per-conversation masking switch (the conversation-scoped counterpart of the
+        // project-wide master switch): GET status, POST to turn masking OFF for this
+        // conversation, DELETE to turn it back ON. All key-gated; in-memory only.
+        .route(
+            "/zlauder/session/{conversation}/masking",
+            get(admin::masking_get)
+                .post(admin::masking_disable)
+                .delete(admin::masking_enable),
+        )
         .route(
             "/zlauder/session/{conversation}/v1/messages",
             post(messages_session),
@@ -220,13 +229,20 @@ async fn messages_inner(st: AppState, req: Request, conversation: Option<String>
         Ok(p) => p,
         Err(resp) => return resp,
     };
+    // Per-conversation masking switch, resolved from the SAME URL-path id the pin trusts
+    // (known before masking). When this conversation is disabled, masking passes through
+    // (except registered secrets, A9). A bare/header-only id isn't resolved until after
+    // masking, so it can't disable here — that fails safe toward masking ON.
+    let force_disabled = conversation
+        .as_deref()
+        .is_some_and(|c| st.is_masking_disabled(c));
     let (parts, body) = req.into_parts();
     let body_bytes = match to_bytes(body, MAX_BODY).await {
         Ok(b) => b,
         Err(_) => return err(StatusCode::BAD_REQUEST, "failed to read request body"),
     };
 
-    let (masked, manifest) = match mask_body(&st, &body_bytes).await {
+    let (masked, manifest) = match mask_body(&st, &body_bytes, force_disabled).await {
         Ok(x) => x,
         Err(resp) => return resp,
     };
@@ -238,6 +254,11 @@ async fn messages_inner(st: AppState, req: Request, conversation: Option<String>
         &masked,
         &manifest,
         &pinned,
+        // Whether the filter is live for THIS request. A disabled posture — the master
+        // switch off (`!is_enabled`) OR this conversation turned off (`force_disabled`) —
+        // must never hold traffic for approval; pass the effective state so the monitor
+        // honours it regardless of the configured hold mode.
+        st.engine.is_enabled() && !force_disabled,
     );
     let record_id = ticket.id().to_string();
     if let Err(resp) = monitor::maybe_approve(&st, ticket).await {
@@ -327,12 +348,17 @@ async fn count_tokens_inner(st: AppState, req: Request, conversation: Option<Str
         Ok(p) => p,
         Err(resp) => return resp,
     };
+    // Honour this conversation's masking switch (same URL-path id as the pin), so a
+    // disabled conversation's token counts reflect the unmasked text it will actually send.
+    let force_disabled = conversation
+        .as_deref()
+        .is_some_and(|c| st.is_masking_disabled(c));
     let (parts, body) = req.into_parts();
     let body_bytes = match to_bytes(body, MAX_BODY).await {
         Ok(b) => b,
         Err(_) => return err(StatusCode::BAD_REQUEST, "failed to read request body"),
     };
-    let (masked, manifest) = match mask_body(&st, &body_bytes).await {
+    let (masked, manifest) = match mask_body(&st, &body_bytes, force_disabled).await {
         Ok(x) => x,
         Err(resp) => return resp,
     };
@@ -599,7 +625,20 @@ pub(crate) fn bare_path_zdr_guard(
 // The `Err` variant is an axum `Response` (an early-return short-circuit), which
 // is intentionally large; boxing it would just add an allocation on the error path.
 #[allow(clippy::result_large_err)]
-async fn mask_body(st: &AppState, body: &[u8]) -> Result<(Vec<u8>, UnmaskManifest), Response> {
+async fn mask_body(
+    st: &AppState,
+    body: &[u8],
+    force_disabled: bool,
+) -> Result<(Vec<u8>, UnmaskManifest), Response> {
+    // Pick the walker: `force_disabled` (this conversation's masking is off) routes every
+    // leaf through the passthrough-except-secrets path; otherwise the normal masker. Both
+    // share one signature, so the offload closure is identical apart from this pointer.
+    type Masker = fn(&zlauder_engine::MaskEngine, &[u8]) -> Result<(Vec<u8>, UnmaskManifest), walk::MaskError>;
+    let masker: Masker = if force_disabled {
+        walk::mask_request_disabled
+    } else {
+        walk::mask_request
+    };
     // When a model is Ready OR Loading, offload the whole request walk to a blocking
     // thread. This upholds the engine invariant that ML inference ONLY ever runs on a
     // `spawn_blocking` thread, so the engine's per-inference `ml_gate` (a std mutex)
@@ -618,7 +657,7 @@ async fn mask_body(st: &AppState, body: &[u8]) -> Result<(Vec<u8>, UnmaskManifes
     let result = if st.engine.ml_should_offload() {
         let engine = st.engine.clone();
         let body = body.to_vec();
-        match tokio::task::spawn_blocking(move || walk::mask_request(engine.as_ref(), &body)).await
+        match tokio::task::spawn_blocking(move || masker(engine.as_ref(), &body)).await
         {
             Ok(r) => r,
             Err(join) => {
@@ -629,7 +668,7 @@ async fn mask_body(st: &AppState, body: &[u8]) -> Result<(Vec<u8>, UnmaskManifes
             }
         }
     } else {
-        walk::mask_request(st.engine.as_ref(), body)
+        masker(st.engine.as_ref(), body)
     };
     match result {
         Ok(x) => Ok(x),

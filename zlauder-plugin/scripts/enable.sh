@@ -18,7 +18,7 @@ set -euo pipefail
 # prepend our segment. Before doing so we save the user's original `statusLine` object
 # verbatim to `.claude/zlauder-statusline.json`; at render time `zlauder-hooks
 # statusline` runs that original (forwarding stdin) and prints `🛡 … │ {their line}`,
-# and `/zlauder:disable` restores it from the sidecar. If the slot was empty, our
+# and `/zlauder:uninstall` restores it from the sidecar. If the slot was empty, our
 # segment stands alone. Set `env.ZLAUDER_STATUSLINE=off` to hide our segment (the
 # wrapped line still shows); `shield` shows the 🛡 ONLY when masking is confirmed and
 # nothing in any other state; `min`/`verbose` change how much it shows.
@@ -75,12 +75,12 @@ base_url="http://127.0.0.1:${port}"
 # when zlauder-hooks lives in the plugin data dir (off the user's PATH); fall back to
 # a bare name when the binary is already on PATH. We always own the slot (wrapping any
 # existing line — see below); re-running /zlauder:enable refreshes a stale path, and
-# /zlauder:disable restores the user's original line from the sidecar.
+# /zlauder:uninstall restores the user's original line from the sidecar.
 if [ -n "${ZLAUDER_BIN_DIR:-}" ]; then
   # Single-quote ONLY the directory so an install path with spaces survives Claude
   # Code's shell splitting it into argv. The binary name stays outside the quotes so
   # `zlauder-hooks statusline` remains contiguous for the ownership regex in this
-  # script and disable.sh ("zlauder-hooks(\.exe)? statusline").
+  # script and uninstall.sh ("zlauder-hooks(\.exe)? statusline").
   statusline_cmd="'${ZLAUDER_BIN_DIR}'/${ZLAUDER_HOOKS_BIN} statusline"
 else
   statusline_cmd="${ZLAUDER_HOOKS_BIN} statusline"
@@ -147,7 +147,8 @@ cat >&2 <<'EOF'
   until you run /zlauder:enable in each.
 
   Watch live masking activity with /zlauder:monitor (opens a local web view of
-  what's being masked for this project). Toggle masking anytime with
-  /zlauder:privacy; remove routing with /zlauder:disable.
+  what's being masked for this project). Turn masking off anytime with
+  /zlauder:disable (this conversation, or --project); remove routing with
+  /zlauder:uninstall.
 ================================================================================
 EOF

@@ -165,6 +165,9 @@ async fn main() -> anyhow::Result<()> {
         // selections (or, on a corrupt/perm-denied file, leaves it empty with a visible
         // global revert) before we ever serve a request.
         zdr_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        // Per-conversation masking-off overrides. In-memory only (never persisted) — a
+        // recycle intentionally clears them, so masking fails back ON.
+        masking_disabled: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
     };
 
     // Reload + re-validate the per-conversation ZDR selections that survived the last
