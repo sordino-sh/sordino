@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
-# ZlauDeR e2e — Atomic 1 (remote-control readiness plan, 2026-07-02).
+# Sordino e2e — Atomic 1 (remote-control readiness plan, 2026-07-02).
 #
 # Falsifies: "the standalone remote-control daemon's --print --sdk-url stream-json
-# worker invocation shape is already covered by ZlauDeR's fail-closed UserPromptSubmit
+# worker invocation shape is already covered by Sordino's fail-closed UserPromptSubmit
 # intake gate, exactly like a fresh interactive session is."
 #
 # --sdk-url itself can't be driven directly here (Claude Code rejects any --sdk-url host
@@ -14,9 +14,9 @@
 # proxy for that invocation shape.
 #
 # Scenario: a FRESH project (.claude/ does not exist yet — the "first-ever session"
-# state ZlauDeR's own intake gate was built to catch) is driven via
+# state Sordino's own intake gate was built to catch) is driven via
 # `claude --print --input-format stream-json --output-format stream-json`, loading the
-# REAL zlauder-plugin (via --plugin-dir, so SessionStart + UserPromptSubmit + PreToolUse
+# REAL sordino-plugin (via --plugin-dir, so SessionStart + UserPromptSubmit + PreToolUse
 # all register — NOT the hand-rolled SessionStart-only settings.json run-e2e.sh uses).
 # One canary-PII user turn is fed on stdin. PASS = the canary NEVER reaches the fake
 # upstream (the gate blocked the turn before any model query); FAIL = the canary is
@@ -28,12 +28,12 @@ HERE="$PWD"
 REPO="$(cd "$HERE/.." && pwd)"
 BIN="$REPO/target/debug"
 
-WORK="$(mktemp -d /tmp/zlauder-e2e-first-contact.XXXXXX)"
+WORK="$(mktemp -d /tmp/sordino-e2e-first-contact.XXXXXX)"
 FRESH_PROJ="$WORK/fresh-project"
 mkdir -p "$FRESH_PROJ"
-export ZLAUDER_STATE_DIR="$WORK/state"
+export SORDINO_STATE_DIR="$WORK/state"
 export CLAUDE_CONFIG_DIR="$WORK/claude-config"
-mkdir -p "$ZLAUDER_STATE_DIR" "$CLAUDE_CONFIG_DIR"
+mkdir -p "$SORDINO_STATE_DIR" "$CLAUDE_CONFIG_DIR"
 
 CAP="$WORK/upstream-capture.txt"; : > "$CAP"
 OUT="$WORK/evidence.txt"; : > "$OUT"
@@ -48,10 +48,10 @@ python3 "$HERE/fake_anthropic.py" "$UPSTREAM_PORT" "$CAP" > "$WORK/fake.log" 2>&
 FAKE=$!
 sleep 1
 
-# The FRESH project's own zlauder.toml (session-start.sh's config_path() prefers
-# $CLAUDE_PROJECT_DIR/zlauder.toml over the plugin's bundled default) — points the
+# The FRESH project's own sordino.toml (session-start.sh's config_path() prefers
+# $CLAUDE_PROJECT_DIR/sordino.toml over the plugin's bundled default) — points the
 # soon-to-be-auto-plumbed proxy at the local fake, never the real API.
-cat > "$FRESH_PROJ/zlauder.toml" <<EOF
+cat > "$FRESH_PROJ/sordino.toml" <<EOF
 [proxy]
 port = ${PROXY_PORT}
 bind = "127.0.0.1"
@@ -75,14 +75,14 @@ printf '%s\n' "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":[{\
 CLAUDE_OUT="$WORK/claude-out.jsonl"
 CLAUDE_ERR="$WORK/claude-err.txt"
 
-# ZLAUDER_WORKSPACE lets _resolve-bins.sh find the in-repo target/debug build via
+# SORDINO_WORKSPACE lets _resolve-bins.sh find the in-repo target/debug build via
 # --plugin-dir's derived CLAUDE_PLUGIN_ROOT (this is the in-repo dev fallback path, tier 5).
 (
   cd "$FRESH_PROJ" || exit 9
-  export ZLAUDER_WORKSPACE="$REPO"
+  export SORDINO_WORKSPACE="$REPO"
   timeout 60 claude --print --input-format stream-json --output-format stream-json --verbose \
     --include-hook-events \
-    --plugin-dir "$REPO/zlauder-plugin" \
+    --plugin-dir "$REPO/sordino-plugin" \
     < "$STDIN_JSON" > "$CLAUDE_OUT" 2> "$CLAUDE_ERR"
   echo $? > "$WORK/claude-exit.txt"
 )
@@ -90,7 +90,7 @@ CLAUDE_ERR="$WORK/claude-err.txt"
 kill "$FAKE" 2>/dev/null
 # The proxy, if auto-plumb launched one, is state-dir-scoped and orphaned on purpose —
 # clean it up so repeat runs don't accumulate.
-pkill -f "zlauder-proxy.*${PROXY_PORT}" 2>/dev/null
+pkill -f "sordino-proxy.*${PROXY_PORT}" 2>/dev/null
 
 CLAUDE_EXIT="$(cat "$WORK/claude-exit.txt" 2>/dev/null || echo '?')"
 log "claude_exit=$CLAUDE_EXIT"
@@ -99,7 +99,7 @@ CAPTURE_BYTES="$(wc -c < "$CAP")"
 log "canary_in_upstream_capture=$CANARY_IN_CAPTURE"
 log "capture_file_bytes=$CAPTURE_BYTES"
 # Positive evidence the gate itself fired (not just "nothing happened to reach it"):
-# a UserPromptSubmit hook_response carrying zlauder-hooks' block JSON, AND no assistant
+# a UserPromptSubmit hook_response carrying sordino-hooks' block JSON, AND no assistant
 # turn anywhere in the transcript (the block must happen before any model query).
 UPS_BLOCKED="$(grep -c '"hook_event":"UserPromptSubmit"' "$CLAUDE_OUT")"
 ASSISTANT_TURNS="$(grep -c '"type":"assistant"' "$CLAUDE_OUT")"

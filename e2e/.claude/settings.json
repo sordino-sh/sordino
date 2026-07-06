@@ -1,8 +1,8 @@
 {
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:18820",
-    "ZLAUDER_PORT": "18820",
-    "ZLAUDER_STATE_DIR": "/home/failspy/Projects/zlauder/e2e/state"
+    "SORDINO_PORT": "18820",
+    "SORDINO_STATE_DIR": "/home/failspy/Projects/sordino/e2e/state"
   },
   "hooks": {
     "SessionStart": [
@@ -11,7 +11,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "/home/failspy/Projects/zlauder/target/debug/zlauder-hooks session-start --proxy-bin /home/failspy/Projects/zlauder/target/debug/zlauder-proxy --config /home/failspy/Projects/zlauder/e2e/zlauder.toml"
+            "command": "/home/failspy/Projects/sordino/target/debug/sordino-hooks session-start --proxy-bin /home/failspy/Projects/sordino/target/debug/sordino-proxy --config /home/failspy/Projects/sordino/e2e/sordino.toml"
           }
         ]
       }
@@ -19,6 +19,6 @@
   },
   "statusLine": {
     "type": "command",
-    "command": "/home/failspy/Projects/zlauder/target/debug/zlauder-hooks statusline"
+    "command": "/home/failspy/Projects/sordino/target/debug/sordino-hooks statusline"
   }
 }

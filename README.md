@@ -1,4 +1,4 @@
-# ZlauDeR
+# Sordino
 
 A local **PII masking proxy for Claude Code**. It sits between Claude Code and
 the Anthropic Messages API, masks personal data on the way *out*, and unmasks it
@@ -11,14 +11,14 @@ Run these **inside a `claude` session** — they are Claude Code slash commands,
 shell commands:
 
 ```
-/plugin marketplace add FailSpy/zlauder
-/plugin install zlauder
+/plugin marketplace add FailSpy/sordino
+/plugin install sordino
 [restart Claude Code]
 ```
 
 That's it. The plugin ships prebuilt binaries (no compile, no download) and
 auto-routes each project the first time it sees it. After the one-time restart,
-masking is live — run `/zlauder:status` to confirm. Details, scoping options, and
+masking is live — run `/sordino:status` to confirm. Details, scoping options, and
 the standalone proxy are below.
 
 Detection is done by [`presidio-rs`](../jcc/presidio-rs) (offline regex
@@ -28,11 +28,11 @@ session-salted tokens (blake3) backed by a reversible AES-256-GCM session store.
 
 ## How it works
 
-zlauder is a **hybrid**: a reverse proxy is the data plane, and thin Claude Code
+sordino is a **hybrid**: a reverse proxy is the data plane, and thin Claude Code
 hooks are the control plane.
 
 ```
-Claude Code  ──ANTHROPIC_BASE_URL=http://127.0.0.1:<project-port>──►  zlauder-proxy  ──TLS──►  api.anthropic.com
+Claude Code  ──ANTHROPIC_BASE_URL=http://127.0.0.1:<project-port>──►  sordino-proxy  ──TLS──►  api.anthropic.com
    (sees plaintext)                                                   (masks/unmasks)        (sees only tokens)
 ```
 
@@ -42,9 +42,9 @@ keyed by the project's path — so its key, token store, and config are fully is
 two projects can never collide on a port (the birthday problem). Concurrent `claude`
 sessions in *different* projects never interfere or correlate; two windows in the *same*
 project share one proxy. The plugin writes the bound port into the project's gitignored
-`.claude/settings.local.json` on the first session (or explicitly via `/zlauder:enable`).
+`.claude/settings.local.json` on the first session (or explicitly via `/sordino:enable`).
 The port is **sticky** (reused across proxy restarts when free), so it rarely changes; set
-`[proxy] port = N` in `zlauder.toml` to pin a static port instead.
+`[proxy] port = N` in `sordino.toml` to pin a static port instead.
 
 This is **not** a TLS-intercepting MITM — Claude Code natively supports
 `ANTHROPIC_BASE_URL`, so you simply point it at the local proxy, which
@@ -79,19 +79,19 @@ are kept tokenized end-to-end (never unmasked), so signatures stay valid.
 
 | crate | role |
 |---|---|
-| `zlauder-engine` | masking engine: detection (presidio) + deterministic tokens + AES-GCM reversible store + hot-swappable config (profiles/categories/operators/allow-list/custom rules). Runtime-free. |
-| `zlauder-proxy` | axum reverse proxy: request mask walk, per-call manifest, upstream relay, JSON + streaming-SSE unmask, and a key-gated privacy control plane (live enable/disable/profile/reload) that backs `/zlauder:privacy`. |
-| `zlauder-hooks` | Claude Code control plane: `session-start` (auto-plumb routing on first sight, launch/recycle the proxy, learn its bound port), `statusline`, `config` (backs `/zlauder:privacy`), `disable` (backs `/zlauder:disable` — masking off, per-conversation or `--project`), `reveal`, `settings` (backs `/zlauder:enable` / `/zlauder:uninstall`). Per-project routing is auto-plumbed by `session-start`; `/zlauder:enable` is the explicit redo. |
-| `zlauder-state` | shared on-disk session state — the project-keyed **rendezvous** record (bound port/key/salt/pid/nonce) + the launch-lock and bind-error primitives; the single source of truth both binaries read. |
+| `sordino-engine` | masking engine: detection (presidio) + deterministic tokens + AES-GCM reversible store + hot-swappable config (profiles/categories/operators/allow-list/custom rules). Runtime-free. |
+| `sordino-proxy` | axum reverse proxy: request mask walk, per-call manifest, upstream relay, JSON + streaming-SSE unmask, and a key-gated privacy control plane (live enable/disable/profile/reload) that backs `/sordino:privacy`. |
+| `sordino-hooks` | Claude Code control plane: `session-start` (auto-plumb routing on first sight, launch/recycle the proxy, learn its bound port), `statusline`, `config` (backs `/sordino:privacy`), `disable` (backs `/sordino:disable` — masking off, per-conversation or `--project`), `reveal`, `settings` (backs `/sordino:enable` / `/sordino:uninstall`). Per-project routing is auto-plumbed by `session-start`; `/sordino:enable` is the explicit redo. |
+| `sordino-state` | shared on-disk session state — the project-keyed **rendezvous** record (bound port/key/salt/pid/nonce) + the launch-lock and bind-error primitives; the single source of truth both binaries read. |
 
 ## Build
 
 ```sh
 cargo build --release --workspace
-# binaries: target/release/zlauder-proxy, target/release/zlauder-hooks
+# binaries: target/release/sordino-proxy, target/release/sordino-hooks
 
 # HTTP-only ML (thin client; skips the local Candle backend entirely):
-cargo build --release -p zlauder-proxy -p zlauder-hooks --no-default-features --features ml-http
+cargo build --release -p sordino-proxy -p sordino-hooks --no-default-features --features ml-http
 ```
 
 The thin-client build compiles no Candle stack and downloads no model weights —
@@ -101,7 +101,7 @@ Requires Rust ≥ 1.91 (the `anthropic-wire` dependency is edition 2024).
 
 ## License
 
-ZlauDeR is licensed under the Business Source License 1.1
+Sordino is licensed under the Business Source License 1.1
 (`BUSL-1.1`). See [LICENSE](LICENSE).
 
 Contributions require agreement to a short
@@ -110,27 +110,27 @@ Contributions require agreement to a short
 
 ## Install into Claude Code
 
-zlauder installs as a **Claude Code plugin** — that is the only supported
+sordino installs as a **Claude Code plugin** — that is the only supported
 interface. The [Quick start](#quick-start-claude-code) above is the entire
 install; this section explains what those three lines actually do.
 
 **Installed = routed.** The plugin's `SessionStart` hook
 auto-plumbs each project the first time it sees it: it resolves the binaries (shipped
 prebuilt, below), launches a proxy on an OS-assigned ephemeral port, and writes
-`.claude/settings.local.json` (`ANTHROPIC_BASE_URL` + `ZLAUDER_PORT` + a `🛡` status
-line that wraps any existing one as `🛡 … │ {your line}`; `ZLAUDER_STATUSLINE=off|shield|min|verbose`
+`.claude/settings.local.json` (`ANTHROPIC_BASE_URL` + `SORDINO_PORT` + a `🛡` status
+line that wraps any existing one as `🛡 … │ {your line}`; `SORDINO_STATUSLINE=off|shield|min|verbose`
 tunes or hides the `🛡` segment — `shield` shows it ONLY when masking is confirmed and
 nothing otherwise). The plugin also writes a `.claude/.gitignore` for that
 file, so the machine-specific `http://127.0.0.1:<port>` can't be committed.
 
-By default `/plugin install` lands the plugin at **user scope**, so its `/zlauder:*`
+By default `/plugin install` lands the plugin at **user scope**, so its `/sordino:*`
 commands and `SessionStart` hook are available in *every* project — and the hook then
 auto-plumbs each project the first time it sees it.
 
 > **Thin-slice to a single project.** Prefer to scope the *whole plugin* to one
 > repo instead of every project? Claude Code asks the install scope
 > (`user` / `project` / `local`) during `/plugin install` — choose `project` and
-> only that repo ever loads zlauder (and only it is auto-plumbed).
+> only that repo ever loads sordino (and only it is auto-plumbed).
 
 After install, masking activates with a **one-time restart**:
 
@@ -138,11 +138,11 @@ After install, masking activates with a **one-time restart**:
    `settings.local.json` and launches the proxy eagerly, but Claude Code applies a route
    written *during* SessionStart to the current session only unreliably — every
    session *after* the first reads it at startup, which always works. The statusline shows
-   `⟳ ZlauDeR: restart to mask` until it's live, then `🛡`. Until this session is
-   routed, ZlauDeR's intake gate **blocks** its messages so nothing sends unmasked
-   first (set `ZLAUDER_NO_INTAKE_GATE=1` to send anyway without masking).
-2. **`/zlauder:privacy`** — confirm routing + masking, or flip masking on/off live.
-3. **`/zlauder:doctor`** — if masking won't come on, this preflight catches the usual causes
+   `⟳ Sordino: restart to mask` until it's live, then `🛡`. Until this session is
+   routed, Sordino's intake gate **blocks** its messages so nothing sends unmasked
+   first (set `SORDINO_NO_INTAKE_GATE=1` to send anyway without masking).
+2. **`/sordino:privacy`** — confirm routing + masking, or flip masking on/off live.
+3. **`/sordino:doctor`** — if masking won't come on, this preflight catches the usual causes
    (a local firewall/AV intercepting `127.0.0.1`, a busy static port).
 
 > **Stale-port edge.** If the proxy dies *and* another process grabs its exact port before a
@@ -151,10 +151,10 @@ After install, masking activates with a **one-time restart**:
 > The hook detects this and tells you to **Ctrl-C + restart**; it never silently claims
 > masking is active. Restarting re-routes to the fresh port.
 
-You rarely run anything by hand. `/zlauder:enable` does the same write explicitly (and
-seeds a starter `zlauder.toml`) — useful to re-enable after `/zlauder:uninstall`.
+You rarely run anything by hand. `/sordino:enable` does the same write explicitly (and
+seeds a starter `sordino.toml`) — useful to re-enable after `/sordino:uninstall`.
 
-> **⚠ Before removing zlauder, run `/zlauder:uninstall --all` first.** The routing patch
+> **⚠ Before removing sordino, run `/sordino:uninstall --all` first.** The routing patch
 > lives in each project's `.claude/settings.local.json`, not in the plugin, so removing
 > the plugin does not remove it. Uninstall (or switch it off in the `/plugin` UI)
 > *without* disabling first and that project's `ANTHROPIC_BASE_URL` keeps pointing at a
@@ -163,27 +163,27 @@ seeds a starter `zlauder.toml`) — useful to re-enable after `/zlauder:uninstal
 > `--all` sweep reverts the routing patch (and restores your status line) across every
 > plumbed project; once the plugin is gone there is no hook left to self-heal it.
 
-`zlauder-proxy` / `zlauder-hooks` are **shipped prebuilt per-platform** with the plugin
+`sordino-proxy` / `sordino-hooks` are **shipped prebuilt per-platform** with the plugin
 (precedence: PATH → shipped `bin/<triple>` → cached/in-repo build), so a marketplace
 install needs **no compile and no download** — see [docs/RELEASING.md](./docs/RELEASING.md).
 Shipped targets are `x86_64-unknown-linux-gnu`, `aarch64-unknown-linux-gnu`,
 `x86_64-apple-darwin`, `aarch64-apple-darwin`, and `x86_64-pc-windows-msvc`. Release
-assets use `zlauder-<triple>.tar.gz` for Linux/macOS and
-`zlauder-x86_64-pc-windows-msvc.zip` for Windows.
+assets use `sordino-<triple>.tar.gz` for Linux/macOS and
+`sordino-x86_64-pc-windows-msvc.zip` for Windows.
 
 A plugin cannot set `ANTHROPIC_BASE_URL` itself (only `agent`/`subagentStatusLine` are
 honored from a plugin's settings.json, and there is no install-time hook), which is why
 routing goes through a real settings source — written to the gitignored
 `settings.local.json` and read at startup — the first install needs a one-time restart to
 activate (every session after reads it reliably). See
-[`zlauder-plugin/`](./zlauder-plugin/) for the full rationale and command reference.
+[`sordino-plugin/`](./sordino-plugin/) for the full rationale and command reference.
 On Windows, plugin runtime support assumes Claude Code can run the plugin's existing
 bash scripts; native PowerShell/cmd wrappers are not included.
 
 The proxy can also be run standalone (no Claude Code, no per-project derivation):
 
 ```sh
-zlauder-proxy --port 8787 --config zlauder.toml
+sordino-proxy --port 8787 --config sordino.toml
 ANTHROPIC_BASE_URL=http://127.0.0.1:8787 claude   # any client honoring the base URL
 ```
 
@@ -194,14 +194,14 @@ can iterate locally while end users keep the zero-build GitHub flow:
 
 | | end users | local dev |
 |---|---|---|
-| marketplace | `/plugin marketplace add FailSpy/zlauder` → the plugin's `source` is the orphan **`plugin-dist`** branch | not used (see below) |
-| plugin files | shipped on `plugin-dist` | this repo's [`zlauder-plugin/`](./zlauder-plugin/), live |
+| marketplace | `/plugin marketplace add FailSpy/sordino` → the plugin's `source` is the orphan **`plugin-dist`** branch | not used (see below) |
+| plugin files | shipped on `plugin-dist` | this repo's [`sordino-plugin/`](./sordino-plugin/), live |
 | binaries | prebuilt `bin/<triple>/`, picked by host triple — **no compile, no download** | your `cargo build --release --workspace` output |
 
-Both paths share one resolver ([`_resolve-bins.sh`](./zlauder-plugin/scripts/_resolve-bins.sh),
+Both paths share one resolver ([`_resolve-bins.sh`](./sordino-plugin/scripts/_resolve-bins.sh),
 precedence: PATH → shipped `bin/<triple>` → cached build → **`<workspace>/target/release`** →
 in-repo `cargo build`). The published marketplace is deliberately left pointing at
-`plugin-dist`; **do not** repoint it at `./zlauder-plugin` — a marketplace install
+`plugin-dist`; **do not** repoint it at `./sordino-plugin` — a marketplace install
 *caches a copy* of the plugin detached from the cargo workspace, so the resolver
 could not find your built binaries, and a GitHub fetch of a relative source carries
 no `bin/`.
@@ -211,7 +211,7 @@ the workspace and the resolver finds `target/release`:
 
 ```sh
 cargo build --release --workspace            # build proxy + hooks once
-claude --plugin-dir ./zlauder-plugin         # load the live plugin from this folder
+claude --plugin-dir ./sordino-plugin         # load the live plugin from this folder
 ```
 
 For an already-installed (cached) plugin or for the **Codex** plugin, point the
@@ -219,36 +219,36 @@ resolver at your checkout instead — it then uses that tree's `target/release`
 (building it on first run if needed):
 
 ```sh
-export ZLAUDER_WORKSPACE=/abs/path/to/zlauder
+export SORDINO_WORKSPACE=/abs/path/to/sordino
 cargo build --release --workspace
 ```
 
 Rebuild after editing engine/proxy/hooks code; restart the session (or re-run
-`/zlauder:enable`) to pick up new binaries. Plugin command/hook/script edits under
-`zlauder-plugin/` are live under `--plugin-dir`. Release packaging
+`/sordino:enable`) to pick up new binaries. Plugin command/hook/script edits under
+`sordino-plugin/` are live under `--plugin-dir`. Release packaging
 (`cargo build --release --workspace` per target → `plugin-dist` + `codex-plugin-dist`
 + Release assets) is driven by [`.github/workflows/release.yml`](./.github/workflows/release.yml).
 
 ## Configuration
 
-### The `/zlauder:privacy` command
+### The `/sordino:privacy` command
 
 Inside a `claude` session, change masking settings live with the slash command
-(or `zlauder-hooks config …` from a shell). It affects **only this project's**
-proxy. This is the **masking** layer (turn it off quickly with `/zlauder:disable`);
-`/zlauder:enable` / `/zlauder:uninstall` are the separate **routing** layer.
+(or `sordino-hooks config …` from a shell). It affects **only this project's**
+proxy. This is the **masking** layer (turn it off quickly with `/sordino:disable`);
+`/sordino:enable` / `/sordino:uninstall` are the separate **routing** layer.
 
 ```
-/zlauder:privacy                        # status: health, routing, on/off, profile, categories
-/zlauder:privacy off                    # transparent passthrough (this session, live)
-/zlauder:privacy on
-/zlauder:privacy profile strict         # threshold + categories + default operator preset
-/zlauder:privacy category contact off   # toggle one category
-/zlauder:privacy threshold 0.3
-/zlauder:privacy model download         # fetch the openai/privacy-filter model (once)
-/zlauder:privacy model on               # turn the ML recognizer on (loads in background)
-/zlauder:privacy model status           # disabled | loading | ready | failed
-/zlauder:privacy reveal '[EMAIL_ADDRESS_a47n1d8s9c0f]'   # decode one token (local debug/audit)
+/sordino:privacy                        # status: health, routing, on/off, profile, categories
+/sordino:privacy off                    # transparent passthrough (this session, live)
+/sordino:privacy on
+/sordino:privacy profile strict         # threshold + categories + default operator preset
+/sordino:privacy category contact off   # toggle one category
+/sordino:privacy threshold 0.3
+/sordino:privacy model download         # fetch the openai/privacy-filter model (once)
+/sordino:privacy model on               # turn the ML recognizer on (loads in background)
+/sordino:privacy model status           # disabled | loading | ready | failed
+/sordino:privacy reveal '[EMAIL_ADDRESS_a47n1d8s9c0f]'   # decode one token (local debug/audit)
 ```
 
 Each change takes a `--scope` (default `session`):
@@ -256,29 +256,29 @@ Each change takes a `--scope` (default `session`):
 | scope | persists to | applies |
 |---|---|---|
 | `session` | nothing (live only) | this project's running proxy; lost on restart |
-| `project` | `./zlauder.toml` (committed) | now (reload) + every future session |
-| `local` | `./zlauder.local.toml` (gitignored) | now + future sessions, just for you |
-| `user` | `~/.config/zlauder/config.toml` | now + every project you own |
+| `project` | `./sordino.toml` (committed) | now (reload) + every future session |
+| `local` | `./sordino.local.toml` (gitignored) | now + future sessions, just for you |
+| `user` | `~/.config/sordino/config.toml` | now + every project you own |
 
 At startup the proxy merges these layers (user < project < local). Because each
 project has its own proxy, a live change here is isolated — it never affects a
 `claude` running in another project.
 
-> The control endpoints are gated by the session key (`x-zlauder-key`, from the
-> `0600` state file), so a blind tool-driven `curl …/zlauder/disable` (e.g. via
+> The control endpoints are gated by the session key (`x-sordino-key`, from the
+> `0600` state file), so a blind tool-driven `curl …/sordino/disable` (e.g. via
 > prompt injection) can't silently turn masking off.
 >
 > `reveal <token>` is mainly a local debug/audit escape hatch for tokens found in
 > logs, captured masked payloads, or test output. Normal assistant responses are
 > un-masked automatically.
 
-### `zlauder.toml`
+### `sordino.toml`
 
-[`zlauder.toml`](./zlauder.toml) is the practical default config. For an
+[`sordino.toml`](./sordino.toml) is the practical default config. For an
 annotated reference that enumerates optional and advanced fields, see
-[`zlauder.toml.example`](./zlauder.toml.example). Highlights:
+[`sordino.toml.example`](./sordino.toml.example). Highlights:
 
-- `enabled` — master switch (`/zlauder:privacy on`/`off`).
+- `enabled` — master switch (`/sordino:privacy on`/`off`).
 - `profile` / `score_threshold` / `enabled_categories` — what to detect. The
   presets are `strict` (0.4, all 5 categories), `balanced` (0.5, secrets +
   financial + identity + contact — the default), `minimal` (0.6, secrets +
@@ -305,16 +305,16 @@ annotated reference that enumerates optional and advanced fields, see
 ### Optional: `openai/privacy-filter` on CPU
 
 The regex recognizers can't find free-text PII — **names, locations,
-organizations** (the `personal` category, off by default). For that, zlauder can
+organizations** (the `personal` category, off by default). For that, sordino can
 run the [`openai/privacy-filter`](https://huggingface.co/openai/privacy-filter)
 token classifier in-process via `presidio-classifier`'s native-Rust **Candle CPU**
 backend (no Python, no network at inference time). It is **always compiled in**,
 but **off by default** and runs only after you download the model:
 
 ```
-/zlauder:privacy model download     # cache the weights (large/slow on the first run)
-/zlauder:privacy model on           # turn it on
-/zlauder:privacy category personal on   # so PERSON/LOCATION actually mask
+/sordino:privacy model download     # cache the weights (large/slow on the first run)
+/sordino:privacy model on           # turn it on
+/sordino:privacy category personal on   # so PERSON/LOCATION actually mask
 ```
 
 - **Hot-load.** `model on` loads the model in the **background**; the status goes
@@ -385,7 +385,7 @@ endpoint = "http://10.0.0.5:3007/detect"
 
 ### Highlighting un-masked values (`[engine.reveal_marker]`)
 
-When an un-masked value is restored into the assistant's reply, ZlauDeR wraps it with
+When an un-masked value is restored into the assistant's reply, Sordino wraps it with
 a marker so you can see locally which spans came back from a token. It is **on by
 default** with the printable brackets `⟦`/`⟧`; tune or disable it via
 `[engine.reveal_marker]`:
@@ -419,7 +419,7 @@ suffix = "⟧"
 - **Guarantee:** masked PII (per the configured categories) does not reach the
   Anthropic API over the wire. The proxy masks the actual request bytes.
 - **Out of scope:** a model with local shell access is a different threat tier —
-  it can read local files and run the trusted CLI just like you can. zlauder
+  it can read local files and run the trusted CLI just like you can. sordino
   protects the *egress to the provider*, not against a local jailbreak. (The state
   file holds a control token + salt, not the AES key, so it isn't an offline
   decryption oracle — but a shell can still drive the CLI.)
@@ -436,7 +436,7 @@ suffix = "⟧"
   Anthropic's prompt-cache prefix is preserved. Verified: two identical requests
   produce byte-identical masked output. The salt is reused across proxy restarts
   for a project (keyed by the rendezvous, stable even if the port changes), so cross-turn
-  consistency survives a crash. A live `/zlauder:privacy` config
+  consistency survives a crash. A live `/sordino:privacy` config
   change keeps the store (and salt), so determinism survives reconfiguration too.
 - **Multi-session / multi-project:** each project runs its **own** proxy on a
   project-keyed ephemeral port — separate key, salt, store, and config. Concurrent

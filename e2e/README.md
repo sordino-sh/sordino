@@ -1,7 +1,7 @@
-# zlauder end-to-end test
+# sordino end-to-end test
 
 A self-contained subfolder with its own `.claude/` config that drives a **real
-`claude` CLI** through zlauder and verifies masking/unmasking on actual Claude
+`claude` CLI** through sordino and verifies masking/unmasking on actual Claude
 Code traffic.
 
 ## Layout
@@ -9,7 +9,7 @@ Code traffic.
 - `.claude/settings.json` — points Claude Code at the proxy
   (`ANTHROPIC_BASE_URL=http://127.0.0.1:18820`), wires the `SessionStart` hook
   that launches the proxy, and a status line.
-- `zlauder.toml` — proxy config; upstream is the local fake (`127.0.0.1:18821`).
+- `sordino.toml` — proxy config; upstream is the local fake (`127.0.0.1:18821`).
 - `fake_anthropic.py` — a stand-in Anthropic endpoint that **captures** the
   (masked) request the proxy forwards and returns a valid SSE response that
   echoes back the tokens it saw (so the proxy can unmask them).

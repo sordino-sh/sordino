@@ -24,7 +24,7 @@
 # `--dangerously-bypass-hook-trust` is passed because this is automation over THIS repo's OWN plugin
 # hooks (already vetted) — never use it against untrusted hook sources.
 #
-# Run after `cargo build -p zlauder-proxy -p zlauder-hooks`:  bash e2e/codex/run-codex-assertions.sh
+# Run after `cargo build -p sordino-proxy -p sordino-hooks`:  bash e2e/codex/run-codex-assertions.sh
 
 set -uo pipefail
 
@@ -44,10 +44,10 @@ trap cle_teardown EXIT
 # Preconditions: the proxy/hooks binaries MUST exist (build them first). Their absence is fatal —
 # nothing here can run without the real binaries.
 if ! cle_have_bins; then
-  cle__die "zlauder-proxy / zlauder-hooks not found under $CLE_BIN_DIR — run 'cargo build -p zlauder-proxy -p zlauder-hooks' first (or set ZLAUDER_BIN_DIR)."
+  cle__die "sordino-proxy / sordino-hooks not found under $CLE_BIN_DIR — run 'cargo build -p sordino-proxy -p sordino-hooks' first (or set SORDINO_BIN_DIR)."
 fi
 if [ -z "$CLE_PLUGIN_ROOT" ] || [ ! -d "$CLE_PLUGIN_ROOT/scripts" ]; then
-  cle__die "codex-zlauder-plugin/scripts not found at '$CLE_PLUGIN_ROOT' — cannot wire the plugin hooks."
+  cle__die "codex-sordino-plugin/scripts not found at '$CLE_PLUGIN_ROOT' — cannot wire the plugin hooks."
 fi
 
 HOOK_CODEX=0
@@ -79,8 +79,8 @@ assert_route_applied() {
   local rc; cle_enable_routing; rc=$?
   if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then bad "assert-route-applied: codex-config enable rc=$rc (expected 0/3)"; return; fi
   # Confirm the WRITTEN config actually selects our loopback provider (not an inline -c).
-  if ! grep -q 'model_provider = "zlauder"' "$CASE_CONFIG"; then
-    bad "assert-route-applied: written config.toml does not select the zlauder provider"; return
+  if ! grep -q 'model_provider = "sordino"' "$CASE_CONFIG"; then
+    bad "assert-route-applied: written config.toml does not select the sordino provider"; return
   fi
   cle_backdate_config  # so the routed session passes the launch-generation guard
 
@@ -140,7 +140,7 @@ assert_hook_parses() {
   #         must STILL parse + reach the upstream request body (the hook runs in every state).
   cle_new_case hook-parses-unrouted
   cle_start_fake
-  # Unrouted: config selects a NON-zlauder provider pointing straight at the fake, hooks wired.
+  # Unrouted: config selects a NON-sordino provider pointing straight at the fake, hooks wired.
   cle_write_hooks_only "$CLE_PLUGIN_ROOT/scripts" "$(cat <<EOF
 model_provider = "plain"
 [model_providers.plain]
@@ -152,9 +152,9 @@ requires_openai_auth = false
 EOF
 )"
   cle_backdate_config
-  # UserPromptSubmit would BLOCK an unrouted PII prompt; use a /zlauder: passthrough so the turn
+  # UserPromptSubmit would BLOCK an unrouted PII prompt; use a /sordino: passthrough so the turn
   # completes and the SessionStart additionalContext (already injected) reaches the upstream.
-  cle_run_codex "/zlauder:status please proceed"
+  cle_run_codex "/sordino:status please proceed"
   local warn_unrouted; warn_unrouted="$(cle_count_f "NOT routed through the masking proxy" "$CASE_CAP")"
   if cle_hook_completed SessionStart "$CASE_ERR" && [ "$warn_unrouted" -ge 1 ]; then
     ok "assert-hook-parses[unrouted]: SessionStart NotRouted warn additionalContext DELIVERED (upstream count=$warn_unrouted)"
@@ -235,7 +235,7 @@ EOF
 
 # ===========================================================================================
 # 3. assert-fail-closed-unrouted — the REAL UserPromptSubmit intake gate (A7) BLOCKs.
-#    U1: an UNCONFIGURED session (no zlauder provider) submitting a non-/zlauder: PII prompt must be
+#    U1: an UNCONFIGURED session (no sordino provider) submitting a non-/sordino: PII prompt must be
 #        BLOCKED — observed as zero upstream POSTs (the PII never egressed) + `hook: UserPromptSubmit
 #        Blocked`. KILL: if U1 ALLOWs, A7 reused the Claude `plumbed`-gated predicate (fail-OPEN).
 #    U4: config routes but was written AFTER the session launched (mid-session enable) → the
@@ -249,10 +249,10 @@ assert_fail_closed_unrouted() {
     return
   fi
 
-  # --- U1: unconfigured (no zlauder provider) + REAL hooks; a non-/zlauder: PII prompt must BLOCK.
+  # --- U1: unconfigured (no sordino provider) + REAL hooks; a non-/sordino: PII prompt must BLOCK.
   cle_new_case failclosed-u1
   cle_start_fake
-  # NO zlauder provider — a plain provider straight to the fake (the unconfigured/unrouted case).
+  # NO sordino provider — a plain provider straight to the fake (the unconfigured/unrouted case).
   cle_write_hooks_only "$CLE_PLUGIN_ROOT/scripts" "$(cat <<EOF
 model_provider = "plain"
 [model_providers.plain]
@@ -292,7 +292,7 @@ EOF
 # ===========================================================================================
 # 4. assert-auth-refusal — ChatGPT-mode auth is refused at enable AND warned at SessionStart.
 #    enable half (any codex): with OPENAI_API_KEY unset and a ChatGPT-style auth.json present,
-#    `zlauder-hooks codex-config enable` via enable.sh runs the codex-auth-check preflight, which
+#    `sordino-hooks codex-config enable` via enable.sh runs the codex-auth-check preflight, which
 #    exits non-zero → enable.sh writes NOTHING to config.toml and prints the refusal.
 #    hook half (hook-firing codex): a SessionStart hook on a routed-but-no-key session emits the
 #    warn-only AUTH variant (NEVER a masking claim).
@@ -310,15 +310,15 @@ assert_auth_refusal() {
 EOF
   : > "$CASE_CONFIG"   # start empty so we can assert NOTHING was written
   local cfg_before; cfg_before="$(md5sum "$CASE_CONFIG" 2>/dev/null | cut -d' ' -f1)"
-  local enable_sh="$CLE_PLUGIN_ROOT/skills/zlauder-openai/scripts/enable.sh"
+  local enable_sh="$CLE_PLUGIN_ROOT/skills/sordino-openai/scripts/enable.sh"
   # OPENAI_API_KEY MUST be UNSET for the refusal; pass the proxy port via ensure-up's discovery
   # (enable.sh calls ensure-up --print-url, which finds our live proxy via the rendezvous).
   env -u OPENAI_API_KEY \
-    CODEX_HOME="$CASE_CODEX_HOME" ZLAUDER_STATE_DIR="$CASE_STATE" \
+    CODEX_HOME="$CASE_CODEX_HOME" SORDINO_STATE_DIR="$CASE_STATE" \
     CODEX_PLUGIN_ROOT="$CLE_PLUGIN_ROOT" PATH="$CLE_BIN_DIR:$PATH" \
     bash "$enable_sh" > "$CASE_DIR/enable.out" 2> "$CASE_DIR/enable.err"
   local enable_rc=$?
-  local wrote_provider; wrote_provider="$(cle_count_f 'zlauder_managed' "$CASE_CONFIG")"
+  local wrote_provider; wrote_provider="$(cle_count_f 'sordino_managed' "$CASE_CONFIG")"
   local cfg_after; cfg_after="$(md5sum "$CASE_CONFIG" 2>/dev/null | cut -d' ' -f1)"
   # grep -E (not -ci) + wc -l: always a single clean integer (0 on no-match/missing file). Avoids
   # the `grep -ci ... || printf 0` double-zero ("0\n0" → `[: integer expected`) the lib forbids.
@@ -349,10 +349,10 @@ EOF
   local rc; cle_enable_routing; rc=$?
   if [ "$rc" -ne 0 ] && [ "$rc" -ne 3 ]; then bad "assert-auth-refusal[hook]: enable rc=$rc"; return; fi
   cle_backdate_config
-  # A /zlauder: passthrough avoids the intake BLOCK so the SessionStart additionalContext can reach the
+  # A /sordino: passthrough avoids the intake BLOCK so the SessionStart additionalContext can reach the
   # upstream; requires_openai_auth=false lets codex construct with the (unusable-for-real) bearer and
   # the turn completes against the fake, firing the hooks.
-  CASE_OPENAI_API_KEY="not-an-sk-key" cle_run_codex "/zlauder:status"
+  CASE_OPENAI_API_KEY="not-an-sk-key" cle_run_codex "/sordino:status"
   local authwarn; authwarn="$(cle_count_f "no usable OpenAI API key is exported" "$CASE_CAP")"
   local maskclaim; maskclaim="$(cle_count_f "real values are restored locally" "$CASE_CAP")"
   if cle_hook_completed SessionStart "$CASE_ERR" && [ "$authwarn" -ge 1 ] && [ "$maskclaim" -eq 0 ]; then
@@ -364,7 +364,7 @@ EOF
 
 # ===========================================================================================
 # 5. assert-override-detected-and-warned — S2 best-effort override warn (needs A8).
-#    Config selects the zlauder proxy + the proxy is live, but codex is launched with a -c override
+#    Config selects the sordino proxy + the proxy is live, but codex is launched with a -c override
 #    pointing the provider's base_url at a SECOND fake (the override target). Send TWO PII prompts:
 #      (a) the A7 gate ALLOWs BOTH (config+identity+launch-gen pass; a BLOCK here is NOT the design),
 #      (b) the FIRST prompt emits NO override-warn (first-turn discriminator — A8 always shows no
@@ -398,7 +398,7 @@ assert_override_detected_and_warned() {
   # Real-codex leg: confirm the gate ALLOWs (no BLOCK) and the override target got the REAL PII (it
   # egressed unmasked past the proxy — the accepted opt-out). This is the genuine end-to-end S2 shape.
   cle_run_codex "My email is $CLE_EMAIL — echo it." \
-    -c "model_providers.zlauder.base_url=http://127.0.0.1:$override_port/v1"
+    -c "model_providers.sordino.base_url=http://127.0.0.1:$override_port/v1"
   local allowed; if cle_hook_blocked UserPromptSubmit "$CASE_ERR"; then allowed=0; else allowed=1; fi
   local target_pii; target_pii="$(cle_count_f "$CLE_EMAIL" "$override_cap")"
   local proxy_pii;  proxy_pii="$(cle_count_f "$CLE_EMAIL" "$CASE_CAP")"

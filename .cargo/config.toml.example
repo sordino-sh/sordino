@@ -1,4 +1,4 @@
-# Local co-development override for zlauder.
+# Local co-development override for sordino.
 #
 # Copy this to `.cargo/config.toml` (gitignored) to build the workspace against
 # local checkouts of the git dependencies instead of fetching them from GitHub:

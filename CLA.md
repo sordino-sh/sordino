@@ -1,9 +1,9 @@
-# ZlauDeR Contributor License Agreement (v1.0)
+# Sordino Contributor License Agreement (v1.0)
 
 By submitting a contribution — any original work of authorship (code,
 documentation, or other material) intentionally submitted for inclusion in
-ZlauDeR — you ("You") agree to the following terms for Your past, present,
-and future contributions to ZlauDeR.
+Sordino — you ("You") agree to the following terms for Your past, present,
+and future contributions to Sordino.
 
 **License grant.** You retain copyright to Your contributions. You grant
 FailSpy (the "Licensor" identified in [LICENSE](LICENSE), including
@@ -48,4 +48,4 @@ In your first pull request, add one signature line yourself to
 [CONTRIBUTORS.md](CONTRIBUTORS.md) in the format described there. The pull
 request submitted from your own account adding that line is the record of
 your agreement; it constitutes agreement to this document for all of your
-past, present, and future contributions to ZlauDeR.
+past, present, and future contributions to Sordino.

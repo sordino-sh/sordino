@@ -2,13 +2,13 @@
 # codex-e2e-lib.sh — shared setup/teardown for the A6 phase-gating Codex assertions.
 #
 # Sourced by run-codex-assertions.sh. Provides: binary/codex resolution, a per-case
-# sandbox builder (isolated $CODEX_HOME + $ZLAUDER_STATE_DIR + project root + fake
+# sandbox builder (isolated $CODEX_HOME + $SORDINO_STATE_DIR + project root + fake
 # upstream + masking proxy), the WRITTEN-config plumbing (via the plugin's
-# `zlauder-hooks codex-config enable`), a real `codex exec` driver, and capture helpers.
+# `sordino-hooks codex-config enable`), a real `codex exec` driver, and capture helpers.
 #
 # Design notes that make these assertions NON-STUBBABLE against a real codex:
 #   * The masking proxy is launched DIRECTLY (fixed loopback port) with --project-root,
-#     ZLAUDER_LAUNCH_NONCE and ZLAUDER_STATE_DIR, so it publishes the project-keyed
+#     SORDINO_LAUNCH_NONCE and SORDINO_STATE_DIR, so it publishes the project-keyed
 #     rendezvous record (port + nonce + admin_key) the REAL hooks read to identity-verify
 #     it (verified_proxy_rec / intake_identity_ok / the A8 authed read). No stub stands in
 #     for the proxy identity.
@@ -30,13 +30,13 @@ set -uo pipefail
 # --- resolved once -----------------------------------------------------------------------
 # The proxy/hooks binaries live in the SHARED target the buildCmd populates (the worktree's
 # own ./target is empty). Reference them by ABSOLUTE path.
-CLE_BIN_DIR="${ZLAUDER_BIN_DIR:-/home/failspy/Projects/zlauder/target/debug}"
-CLE_PROXY_BIN="$CLE_BIN_DIR/zlauder-proxy"
-CLE_HOOKS_BIN="$CLE_BIN_DIR/zlauder-hooks"
+CLE_BIN_DIR="${SORDINO_BIN_DIR:-/home/failspy/Projects/sordino/target/debug}"
+CLE_PROXY_BIN="$CLE_BIN_DIR/sordino-proxy"
+CLE_HOOKS_BIN="$CLE_BIN_DIR/sordino-hooks"
 
 # The plugin under test (its scripts/ dir holds the hook wrappers; codex-config installs them).
 CLE_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
-CLE_PLUGIN_ROOT="$(cd "$CLE_LIB_DIR/../../codex-zlauder-plugin" 2>/dev/null && pwd || true)"
+CLE_PLUGIN_ROOT="$(cd "$CLE_LIB_DIR/../../codex-sordino-plugin" 2>/dev/null && pwd || true)"
 
 # The HOOK-FIRING codex. Installed /usr/bin/codex (0.140) does NOT fire SessionStart/
 # UserPromptSubmit hooks (the turn-loop hook wiring landed after the 0.140 cut), so the
@@ -59,7 +59,7 @@ CLE_EMAIL="zoe.quine@example.com"
 CLE_IP="10.55.66.77"
 
 # Per-run port base (each case bumps off this to avoid collisions inside one run).
-CLE_PORT_BASE="${ZLAUDER_E2E_PORT_BASE:-18960}"
+CLE_PORT_BASE="${SORDINO_E2E_PORT_BASE:-18960}"
 CLE_PORT_CURSOR="$CLE_PORT_BASE"
 
 # A run-wide scratch root (cleaned at exit).
@@ -124,7 +124,7 @@ cle_new_case() {
   CASE_CAP="$CASE_DIR/cap.txt"
 }
 
-# Write a zlauder.toml for this case's proxy (balanced masking, fake upstream).
+# Write a sordino.toml for this case's proxy (balanced masking, fake upstream).
 cle__write_proxy_config() {
   local proxy_port="$1" fake_port="$2" out="$3"
   cat > "$out" <<EOF
@@ -179,16 +179,16 @@ cle_start_second_fake() {
 }
 
 # Launch THIS case's masking proxy directly (fixed port) against CASE_ROOT. The launch nonce +
-# --project-root + ZLAUDER_STATE_DIR make it publish the project-keyed rendezvous the REAL hooks
+# --project-root + SORDINO_STATE_DIR make it publish the project-keyed rendezvous the REAL hooks
 # read to identity-verify it. Sets CASE_PROXY_PORT. Waits for /healthz to echo the nonce.
 cle_start_proxy() {
   CASE_PROXY_PORT="$(cle_next_port)"
-  local cfg="$CASE_DIR/zlauder.toml"
+  local cfg="$CASE_DIR/sordino.toml"
   cle__write_proxy_config "$CASE_PROXY_PORT" "$CASE_FAKE_PORT" "$cfg"
   local nonce; nonce="$(printf '%016x' "$RANDOM$RANDOM")"
-  ZLAUDER_STATE_DIR="$CASE_STATE" \
-  ZLAUDER_LAUNCH_NONCE="$nonce" \
-  ZLAUDER_SESSION_SALT="$(printf '%032x' 7)" \
+  SORDINO_STATE_DIR="$CASE_STATE" \
+  SORDINO_LAUNCH_NONCE="$nonce" \
+  SORDINO_SESSION_SALT="$(printf '%032x' 7)" \
     "$CLE_PROXY_BIN" --project-root "$CASE_ROOT" --config "$cfg" \
     > "$CASE_DIR/proxy.log" 2>&1 &
   local pid=$!
@@ -198,7 +198,7 @@ cle_start_proxy() {
   local i nonce_hdr=""
   for i in $(seq 1 30); do
     nonce_hdr="$(curl -sS -m 2 -D - "http://127.0.0.1:$CASE_PROXY_PORT/healthz" -o /dev/null 2>/dev/null \
-      | tr -d '\r' | awk -F': ' 'tolower($1)=="x-zlauder-nonce"{print $2}')"
+      | tr -d '\r' | awk -F': ' 'tolower($1)=="x-sordino-nonce"{print $2}')"
     [ -n "$nonce_hdr" ] && break
     sleep 0.2
   done
@@ -213,7 +213,7 @@ cle_start_proxy() {
 # (0 changed / 3 no-op / non-zero error). url defaults to this case's proxy /v1 root.
 cle_enable_routing() {
   local url="${1:-http://127.0.0.1:$CASE_PROXY_PORT/v1}"
-  CODEX_HOME="$CASE_CODEX_HOME" ZLAUDER_STATE_DIR="$CASE_STATE" PATH="$CLE_BIN_DIR:$PATH" \
+  CODEX_HOME="$CASE_CODEX_HOME" SORDINO_STATE_DIR="$CASE_STATE" PATH="$CLE_BIN_DIR:$PATH" \
     "$CLE_HOOKS_BIN" codex-config enable --url "$url" --hooks-dir "$CLE_PLUGIN_ROOT/scripts" \
     > "$CASE_DIR/enable.out" 2> "$CASE_DIR/enable.err"
 }
@@ -271,9 +271,9 @@ cle_run_codex() {
     *)          subcmd=(exec) ;; # `codex exec ...`
   esac
   CODEX_HOME="$CASE_CODEX_HOME" \
-  ZLAUDER_STATE_DIR="$CASE_STATE" \
+  SORDINO_STATE_DIR="$CASE_STATE" \
   CODEX_PLUGIN_ROOT="$CLE_PLUGIN_ROOT" \
-  OPENAI_API_KEY="${CASE_OPENAI_API_KEY:-sk-zlauder-a6-e2e}" \
+  OPENAI_API_KEY="${CASE_OPENAI_API_KEY:-sk-sordino-a6-e2e}" \
   PATH="$CLE_BIN_DIR:$PATH" \
     timeout 120 "$codex_bin" "${subcmd[@]}" \
       -c model="gpt-5.5" \
@@ -306,14 +306,14 @@ cle_count_f() {
 }
 
 # Seed A8's per-session `last_seen` for <session_id> on THIS case's proxy by routing one real
-# masked request through the proxy's session-scoped URL (/zlauder/session/<sid>/v1/responses). After
-# this, A8's GET /zlauder/session/<sid>/routed reports routed_recently=true — the exact "this session
+# masked request through the proxy's session-scoped URL (/sordino/session/<sid>/v1/responses). After
+# this, A8's GET /sordino/session/<sid>/routed reports routed_recently=true — the exact "this session
 # reached the proxy" signal the override-warn first-turn discriminator keys off. Use an alnum sid so
 # the proxy's id-binding is a no-op (the seeded key == the A8 lookup key). Returns curl's rc.
 cle_seed_a8_session() {
   local sid="$1"
   curl -sS -m 5 -X POST \
-    "http://127.0.0.1:$CASE_PROXY_PORT/zlauder/session/$sid/v1/responses" \
+    "http://127.0.0.1:$CASE_PROXY_PORT/sordino/session/$sid/v1/responses" \
     -H 'content-type: application/json' \
     -d '{"model":"gpt-5.5","input":"seed","stream":true}' \
     -o /dev/null 2>/dev/null
@@ -323,8 +323,8 @@ cle_seed_a8_session() {
 # (the hook JSON). Args: <session_id> <transcript_path> <prompt>
 cle_run_ups_subcmd() {
   local sid="$1" roll="$2" prompt="$3"
-  CODEX_HOME="$CASE_CODEX_HOME" ZLAUDER_STATE_DIR="$CASE_STATE" PATH="$CLE_BIN_DIR:$PATH" \
-    OPENAI_API_KEY="sk-zlauder-a6-e2e" "$CLE_HOOKS_BIN" codex-user-prompt-submit \
+  CODEX_HOME="$CASE_CODEX_HOME" SORDINO_STATE_DIR="$CASE_STATE" PATH="$CLE_BIN_DIR:$PATH" \
+    OPENAI_API_KEY="sk-sordino-a6-e2e" "$CLE_HOOKS_BIN" codex-user-prompt-submit \
     <<<"{\"prompt\":\"$prompt\",\"session_id\":\"$sid\",\"transcript_path\":\"$roll\",\"cwd\":\"$CASE_ROOT\"}" \
     2>/dev/null
 }

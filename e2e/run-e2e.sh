@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # End-to-end test: a real `claude` CLI, spawned from this folder, routes through
-# zlauder (via .claude/settings.json -> ANTHROPIC_BASE_URL) to a local fake
+# sordino (via .claude/settings.json -> ANTHROPIC_BASE_URL) to a local fake
 # Anthropic upstream that captures what the proxy forwarded. Verifies that PII is
 # masked on egress and unmasked on the way back.
 #
@@ -9,7 +9,7 @@ set +e
 cd "$(dirname "$0")" || exit 9
 HERE="$PWD"
 BIN="$HERE/../target/debug"
-export ZLAUDER_STATE_DIR="$HERE/state"
+export SORDINO_STATE_DIR="$HERE/state"
 rm -rf state; mkdir -p state
 CAP="$HERE/state/upstream-capture.txt"; : > "$CAP"
 OUT="$HERE/state/evidence.txt"; : > "$OUT"
@@ -26,8 +26,8 @@ sleep 1
 #    fresh and never persisted — only the salt drives token determinism).
 #    In production the SessionStart hook launches this; here we launch it directly
 #    so the test is deterministic. Claude's own hook reuses it if already healthy.
-ZLAUDER_SESSION_SALT=$(printf '%032x' 2) \
-  "$BIN/zlauder-proxy" --port 18820 --project-root "$HERE" --config "$HERE/zlauder.toml" > state/proxy.log 2>&1 &
+SORDINO_SESSION_SALT=$(printf '%032x' 2) \
+  "$BIN/sordino-proxy" --port 18820 --project-root "$HERE" --config "$HERE/sordino.toml" > state/proxy.log 2>&1 &
 PROX=$!
 sleep 1.2
 log "proxy_healthz=$(curl -sS -m 3 http://127.0.0.1:18820/healthz)"
@@ -36,14 +36,14 @@ log "proxy_healthz=$(curl -sS -m 3 http://127.0.0.1:18820/healthz)"
 #     KEY is the proxy's session key (admin_key) from the project-keyed rendezvous record
 #     it published (state/proxy/<hash>.json — the one file in this isolated state dir).
 KEY=$(grep -oE '"admin_key": "[0-9a-f]+"' state/proxy/*.json | grep -oE '[0-9a-f]{64}')
-log "config_show=$("$BIN/zlauder-hooks" config show --port 18820 2>&1 | head -1)"
+log "config_show=$("$BIN/sordino-hooks" config show --port 18820 2>&1 | head -1)"
 # Unauthenticated disable must be refused (the prompt-injection defense).
-log "unauth_disable_code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18820/zlauder/disable)"
+log "unauth_disable_code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18820/sordino/disable)"
 # Authenticated off → on round-trip via the CLI.
-"$BIN/zlauder-hooks" config off --port 18820 >/dev/null 2>&1
-log "after_off_enabled=$(curl -sS -H "x-zlauder-key: $KEY" http://127.0.0.1:18820/zlauder/config | grep -oE '\"enabled\":(true|false)' | head -1)"
-"$BIN/zlauder-hooks" config on --port 18820 >/dev/null 2>&1
-log "after_on_enabled=$(curl -sS -H "x-zlauder-key: $KEY" http://127.0.0.1:18820/zlauder/config | grep -oE '\"enabled\":(true|false)' | head -1)"
+"$BIN/sordino-hooks" config off --port 18820 >/dev/null 2>&1
+log "after_off_enabled=$(curl -sS -H "x-sordino-key: $KEY" http://127.0.0.1:18820/sordino/config | grep -oE '\"enabled\":(true|false)' | head -1)"
+"$BIN/sordino-hooks" config on --port 18820 >/dev/null 2>&1
+log "after_on_enabled=$(curl -sS -H "x-sordino-key: $KEY" http://127.0.0.1:18820/sordino/config | grep -oE '\"enabled\":(true|false)' | head -1)"
 
 # 3) REAL claude, spawned here; routing comes entirely from .claude/settings.json
 timeout 110 claude -p "My personal email is zoe.quine@example.com and my home server is 10.55.66.77 . Acknowledge in one short sentence." \

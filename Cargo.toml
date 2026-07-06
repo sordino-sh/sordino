@@ -1,11 +1,11 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/zlauder-state",
-    "crates/zlauder-engine",
-    "crates/zlauder-secrets",
-    "crates/zlauder-proxy",
-    "crates/zlauder-hooks",
+    "crates/sordino-state",
+    "crates/sordino-engine",
+    "crates/sordino-secrets",
+    "crates/sordino-proxy",
+    "crates/sordino-hooks",
 ]
 
 [workspace.package]
@@ -27,7 +27,7 @@ authors = ["failspy <failspy@exonull.com>"]
 presidio-core       = { git = "https://github.com/FailSpy/presidio-rs.git", branch = "main", version = "0.1.0" }
 presidio-analyzer   = { git = "https://github.com/FailSpy/presidio-rs.git", branch = "main", version = "0.1.0" }
 # Optional ML recognizer (openai/privacy-filter on a native-Rust Candle CPU
-# backend). Pulled in only by zlauder-engine's `ml` feature.
+# backend). Pulled in only by sordino-engine's `ml` feature.
 presidio-classifier = { git = "https://github.com/FailSpy/presidio-rs.git", branch = "main", version = "0.1.0" }
 
 anthropic-wire = { git = "https://github.com/FailSpy/llm-wires.git", branch = "main", version = "0.1.0" }

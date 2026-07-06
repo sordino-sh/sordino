@@ -45,13 +45,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test "$(jq -r .name codex-zlauder-plugin/.codex-plugin/plugin.json)" = "zlauder-openai"
-          jq -e '.version | test("^[0-9]+\\.[0-9]+\\.[0-9]+$")' codex-zlauder-plugin/.codex-plugin/plugin.json >/dev/null
-          jq -e '.hooks.SessionStart[0].hooks[0].command == "./scripts/session-start.sh"' codex-zlauder-plugin/hooks/hooks.json >/dev/null
-          bash -n codex-zlauder-plugin/scripts/_resolve-bins.sh
-          bash -n codex-zlauder-plugin/scripts/session-start.sh
-          test -f codex-zlauder-plugin/zlauder.toml
-          test -f codex-zlauder-plugin/skills/zlauder-openai/SKILL.md
+          test "$(jq -r .name codex-sordino-plugin/.codex-plugin/plugin.json)" = "sordino-openai"
+          jq -e '.version | test("^[0-9]+\\.[0-9]+\\.[0-9]+$")' codex-sordino-plugin/.codex-plugin/plugin.json >/dev/null
+          jq -e '.hooks.SessionStart[0].hooks[0].command == "./scripts/session-start.sh"' codex-sordino-plugin/hooks/hooks.json >/dev/null
+          bash -n codex-sordino-plugin/scripts/_resolve-bins.sh
+          bash -n codex-sordino-plugin/scripts/session-start.sh
+          test -f codex-sordino-plugin/sordino.toml
+          test -f codex-sordino-plugin/skills/sordino-openai/SKILL.md
 
   # The macOS-ARM Metal code path (presidio-classifier `metal` feature ->
   # candle-core/metal -> candle-metal-kernels -> objc2) is compiled on NO other
@@ -71,4 +71,4 @@ jobs:
           target: aarch64-apple-darwin
           deps-token: ${{ secrets.DEPS_TOKEN }}
       - name: Build aarch64-apple-darwin (default features -> Metal compiled in)
-        run: cargo build --release --locked --target aarch64-apple-darwin --bin zlauder-proxy --bin zlauder-hooks
+        run: cargo build --release --locked --target aarch64-apple-darwin --bin sordino-proxy --bin sordino-hooks

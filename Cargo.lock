@@ -3251,6 +3251,107 @@ dependencies = [
 ]
 
 [[package]]
+name = "sordino-engine"
+version = "0.13.0"
+dependencies = [
+ "aes-gcm",
+ "aho-corasick",
+ "blake3",
+ "globset",
+ "lru",
+ "presidio-analyzer",
+ "presidio-classifier",
+ "presidio-core",
+ "rand 0.8.6",
+ "regex",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "shlex 1.3.0",
+ "smallvec",
+ "thiserror 2.0.18",
+ "toml",
+ "tracing",
+ "url",
+ "uuid",
+ "zeroize",
+]
+
+[[package]]
+name = "sordino-hooks"
+version = "0.13.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "clap",
+ "libc",
+ "rand 0.8.6",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sordino-engine",
+ "sordino-state",
+ "toml_edit",
+]
+
+[[package]]
+name = "sordino-proxy"
+version = "0.13.0"
+dependencies = [
+ "anthropic-wire",
+ "anyhow",
+ "axum",
+ "blake3",
+ "bytes",
+ "clap",
+ "futures",
+ "http",
+ "openai-wire",
+ "presidio-core",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sordino-engine",
+ "sordino-secrets",
+ "sordino-state",
+ "sse-core",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "toml_edit",
+ "tower-http",
+ "tracing",
+ "tracing-subscriber",
+ "url",
+ "uuid",
+]
+
+[[package]]
+name = "sordino-secrets"
+version = "0.13.0"
+dependencies = [
+ "async-trait",
+ "dotenvy",
+ "regex",
+ "serde_json",
+ "sordino-engine",
+ "thiserror 2.0.18",
+ "tokio",
+ "zeroize",
+]
+
+[[package]]
+name = "sordino-state"
+version = "0.13.0"
+dependencies = [
+ "anyhow",
+ "blake3",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "spin"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4580,107 +4681,6 @@ dependencies = [
  "indexmap",
  "memchr",
  "typed-path",
-]
-
-[[package]]
-name = "zlauder-engine"
-version = "0.13.0"
-dependencies = [
- "aes-gcm",
- "aho-corasick",
- "blake3",
- "globset",
- "lru",
- "presidio-analyzer",
- "presidio-classifier",
- "presidio-core",
- "rand 0.8.6",
- "regex",
- "secrecy",
- "serde",
- "serde_json",
- "shlex 1.3.0",
- "smallvec",
- "thiserror 2.0.18",
- "toml",
- "tracing",
- "url",
- "uuid",
- "zeroize",
-]
-
-[[package]]
-name = "zlauder-hooks"
-version = "0.13.0"
-dependencies = [
- "anyhow",
- "blake3",
- "clap",
- "libc",
- "rand 0.8.6",
- "reqwest",
- "serde",
- "serde_json",
- "toml_edit",
- "zlauder-engine",
- "zlauder-state",
-]
-
-[[package]]
-name = "zlauder-proxy"
-version = "0.13.0"
-dependencies = [
- "anthropic-wire",
- "anyhow",
- "axum",
- "blake3",
- "bytes",
- "clap",
- "futures",
- "http",
- "openai-wire",
- "presidio-core",
- "reqwest",
- "serde",
- "serde_json",
- "sse-core",
- "thiserror 2.0.18",
- "tokio",
- "toml",
- "toml_edit",
- "tower-http",
- "tracing",
- "tracing-subscriber",
- "url",
- "uuid",
- "zlauder-engine",
- "zlauder-secrets",
- "zlauder-state",
-]
-
-[[package]]
-name = "zlauder-secrets"
-version = "0.13.0"
-dependencies = [
- "async-trait",
- "dotenvy",
- "regex",
- "serde_json",
- "thiserror 2.0.18",
- "tokio",
- "zeroize",
- "zlauder-engine",
-]
-
-[[package]]
-name = "zlauder-state"
-version = "0.13.0"
-dependencies = [
- "anyhow",
- "blake3",
- "libc",
- "serde",
- "serde_json",
 ]
 
 [[package]]

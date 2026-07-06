@@ -1,6 +1,6 @@
 name: release
 
-# Cuts a ZlauDeR release: builds zlauder-proxy/zlauder-hooks for every supported
+# Cuts a Sordino release: builds sordino-proxy/sordino-hooks for every supported
 # platform, then ships them three ways —
 #   1. force-pushes the `plugin-dist` branch (the Claude Code plugin + a
 #      bin/<triple>/ dir per platform) so a `/plugin install` lands a ready-to-run
@@ -56,22 +56,22 @@ jobs:
           set -euo pipefail
           tag='${{ github.event.inputs.tag || github.ref_name }}'
           case "$tag" in v*) ;; *) echo "::error::expected a v* tag, got '$tag'"; exit 1 ;; esac
-          ver="$(jq -r .version zlauder-plugin/.claude-plugin/plugin.json)"
+          ver="$(jq -r .version sordino-plugin/.claude-plugin/plugin.json)"
           if [ "$tag" != "v$ver" ]; then
-            echo "::error::tag '$tag' != plugin.json version 'v$ver'. Bump zlauder-plugin/.claude-plugin/plugin.json (and the marketplace entry + Cargo version) to match the tag before releasing." >&2
+            echo "::error::tag '$tag' != plugin.json version 'v$ver'. Bump sordino-plugin/.claude-plugin/plugin.json (and the marketplace entry + Cargo version) to match the tag before releasing." >&2
             exit 1
           fi
-          codex_ver="$(jq -r .version codex-zlauder-plugin/.codex-plugin/plugin.json)"
+          codex_ver="$(jq -r .version codex-sordino-plugin/.codex-plugin/plugin.json)"
           if [ "$tag" != "v$codex_ver" ]; then
-            echo "::error::tag '$tag' != Codex plugin version 'v$codex_ver'. Bump codex-zlauder-plugin/.codex-plugin/plugin.json to match the tag before releasing." >&2
+            echo "::error::tag '$tag' != Codex plugin version 'v$codex_ver'. Bump codex-sordino-plugin/.codex-plugin/plugin.json to match the tag before releasing." >&2
             exit 1
           fi
           # Cargo workspace version — the SINGLE source of truth. Parsed with sed
           # (this job has no setup-rust, so `cargo metadata` is unavailable).
           cargo_ver="$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
           [ "$tag" = "v$cargo_ver" ] || { echo "::error::tag '$tag' != Cargo.toml version 'v$cargo_ver'"; exit 1; }
-          # marketplace.json entry for the zlauder plugin must track the tag too.
-          mkt_ver="$(jq -r '.plugins[]|select(.name=="zlauder").version' .claude-plugin/marketplace.json)"
+          # marketplace.json entry for the sordino plugin must track the tag too.
+          mkt_ver="$(jq -r '.plugins[]|select(.name=="sordino").version' .claude-plugin/marketplace.json)"
           [ "$tag" = "v$mkt_ver" ] || { echo "::error::tag '$tag' != marketplace.json version 'v$mkt_ver'"; exit 1; }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "ver=$ver" >> "$GITHUB_OUTPUT"
@@ -118,7 +118,7 @@ jobs:
           target: ${{ matrix.target }}
           deps-token: ${{ secrets.DEPS_TOKEN }}
       - name: Build release binaries (default features)
-        run: cargo build --release --locked --target ${{ matrix.target }} --bin zlauder-proxy --bin zlauder-hooks
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin sordino-proxy --bin sordino-hooks
       - name: Stage artifacts (flat, triple-named)
         shell: bash
         run: |
@@ -127,19 +127,19 @@ jobs:
           rel="target/$t/release"
           mkdir -p out
           exe=""
-          archive="zlauder-$t.tar.gz"
+          archive="sordino-$t.tar.gz"
           if [[ "$t" == *-windows-msvc ]]; then
             exe=".exe"
-            archive="zlauder-$t.zip"
+            archive="sordino-$t.zip"
           fi
           # loose binaries -> assembled into plugin-dist bin/<triple>/ by `publish`
-          cp "$rel/zlauder-proxy$exe" "out/zlauder-proxy-$t$exe"
-          cp "$rel/zlauder-hooks$exe" "out/zlauder-hooks-$t$exe"
+          cp "$rel/sordino-proxy$exe" "out/sordino-proxy-$t$exe"
+          cp "$rel/sordino-hooks$exe" "out/sordino-hooks-$t$exe"
           # archive + checksum -> Release assets (mode preserved from the +x source)
           if [ -n "$exe" ]; then
-            ( cd "$rel" && 7z a "$GITHUB_WORKSPACE/out/$archive" "zlauder-proxy$exe" "zlauder-hooks$exe" )
+            ( cd "$rel" && 7z a "$GITHUB_WORKSPACE/out/$archive" "sordino-proxy$exe" "sordino-hooks$exe" )
           else
-            tar -C "$rel" -czf "out/$archive" zlauder-proxy zlauder-hooks
+            tar -C "$rel" -czf "out/$archive" sordino-proxy sordino-hooks
           fi
           ( cd out
             if command -v sha256sum >/dev/null 2>&1; then
@@ -187,32 +187,32 @@ jobs:
           rm -rf pkg pkg-codex
           mkdir pkg pkg-codex
           # plugin files: manifest, hooks, scripts, configs, docs, skills/commands
-          cp -a zlauder-plugin/. pkg/
-          cp -a codex-zlauder-plugin/. pkg-codex/
-          # per-platform binaries: stage/zlauder-{proxy,hooks}-<triple> -> payload/bin/<triple>/
+          cp -a sordino-plugin/. pkg/
+          cp -a codex-sordino-plugin/. pkg-codex/
+          # per-platform binaries: stage/sordino-{proxy,hooks}-<triple> -> payload/bin/<triple>/
           shopt -s nullglob
           found=0
-          for proxy in stage/zlauder-proxy-*; do
+          for proxy in stage/sordino-proxy-*; do
             found=1
             name="$(basename "$proxy")"
-            t="${name#zlauder-proxy-}"
+            t="${name#sordino-proxy-}"
             exe=""
             case "$t" in
               *.exe) t="${t%.exe}"; exe=".exe" ;;
             esac
             mkdir -p "pkg/bin/$t"
-            cp "stage/zlauder-proxy-$t$exe" "pkg/bin/$t/zlauder-proxy$exe"
-            cp "stage/zlauder-hooks-$t$exe"  "pkg/bin/$t/zlauder-hooks$exe"
-            chmod +x "pkg/bin/$t/zlauder-proxy$exe" "pkg/bin/$t/zlauder-hooks$exe"
+            cp "stage/sordino-proxy-$t$exe" "pkg/bin/$t/sordino-proxy$exe"
+            cp "stage/sordino-hooks-$t$exe"  "pkg/bin/$t/sordino-hooks$exe"
+            chmod +x "pkg/bin/$t/sordino-proxy$exe" "pkg/bin/$t/sordino-hooks$exe"
             mkdir -p "pkg-codex/bin/$t"
-            cp "stage/zlauder-proxy-$t$exe" "pkg-codex/bin/$t/zlauder-proxy$exe"
-            cp "stage/zlauder-hooks-$t$exe"  "pkg-codex/bin/$t/zlauder-hooks$exe"
-            chmod +x "pkg-codex/bin/$t/zlauder-proxy$exe" "pkg-codex/bin/$t/zlauder-hooks$exe"
+            cp "stage/sordino-proxy-$t$exe" "pkg-codex/bin/$t/sordino-proxy$exe"
+            cp "stage/sordino-hooks-$t$exe"  "pkg-codex/bin/$t/sordino-hooks$exe"
+            chmod +x "pkg-codex/bin/$t/sordino-proxy$exe" "pkg-codex/bin/$t/sordino-hooks$exe"
           done
           [ "$found" = 1 ] || { echo "::error::no staged binaries found"; exit 1; }
           # stamp the release tag + keep the shipped plugin.json versions aligned to it
-          printf '%s\n' "$tag" > pkg/.zlauder-release
-          printf '%s\n' "$tag" > pkg-codex/.zlauder-release
+          printf '%s\n' "$tag" > pkg/.sordino-release
+          printf '%s\n' "$tag" > pkg-codex/.sordino-release
           tmp="$(mktemp)"
           jq --arg v '${{ needs.verify.outputs.ver }}' '.version=$v' pkg/.claude-plugin/plugin.json > "$tmp"
           mv "$tmp" pkg/.claude-plugin/plugin.json
@@ -227,12 +227,12 @@ jobs:
         run: |
           set -euo pipefail
           tag='${{ needs.verify.outputs.tag }}'
-          tar -C pkg-codex -czf "stage/zlauder-openai-codex-plugin-$tag.tar.gz" .
+          tar -C pkg-codex -czf "stage/sordino-openai-codex-plugin-$tag.tar.gz" .
           ( cd stage
             if command -v sha256sum >/dev/null 2>&1; then
-              sha256sum "zlauder-openai-codex-plugin-$tag.tar.gz" > "zlauder-openai-codex-plugin-$tag.tar.gz.sha256"
+              sha256sum "sordino-openai-codex-plugin-$tag.tar.gz" > "sordino-openai-codex-plugin-$tag.tar.gz.sha256"
             else
-              shasum -a 256 "zlauder-openai-codex-plugin-$tag.tar.gz" > "zlauder-openai-codex-plugin-$tag.tar.gz.sha256"
+              shasum -a 256 "sordino-openai-codex-plugin-$tag.tar.gz" > "sordino-openai-codex-plugin-$tag.tar.gz.sha256"
             fi )
 
       - name: Force-push plugin dist branches

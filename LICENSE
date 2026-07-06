@@ -9,14 +9,14 @@ Parameters
 
 Licensor:             FailSpy
 
-Licensed Work:        ZlauDeR
+Licensed Work:        Sordino
                       The Licensed Work is (c) 2026 FailSpy.
 
 Additional Use Grant: You may make production use of the Licensed Work,
                       provided that you do not use the Licensed Work to
-                      provide a ZlauDeR Service to third parties.
+                      provide a Sordino Service to third parties.
 
-                      A "ZlauDeR Service" is a hosted or managed service,
+                      A "Sordino Service" is a hosted or managed service,
                       however priced or branded (including free of charge),
                       that offers third parties the functionality of the
                       Licensed Work, in whole or in part, whether standalone
@@ -26,7 +26,7 @@ Additional Use Grant: You may make production use of the Licensed Work,
                       Licensed Work, directly or through an interface
                       provided for that purpose. Using the Licensed Work as
                       internal infrastructure of your own products and
-                      services is permitted production use, not a ZlauDeR
+                      services is permitted production use, not a Sordino
                       Service, provided that the parties whose data it
                       processes cannot themselves operate, configure, or
                       invoke the Licensed Work, directly or through an
@@ -56,16 +56,16 @@ Additional Use Grant: You may make production use of the Licensed Work,
                          may access such a deployment on the customer's
                          behalf. An offering whose primary purpose is
                          providing the Licensed Work itself remains a
-                         ZlauDeR Service no matter how it is divided into
+                         Sordino Service no matter how it is divided into
                          separate deployments or dedicated instances.
 
                       2. Bundling. Nothing in this Additional Use Grant
                          limits the rights granted in the Terms below,
                          including redistribution. Distributing the Licensed
                          Work, under this License, embedded in another
-                         product is not, by itself, providing a ZlauDeR
+                         product is not, by itself, providing a Sordino
                          Service; whether hosting or operating that product
-                         for third parties is a ZlauDeR Service is
+                         for third parties is a Sordino Service is
                          determined by the definition above.
 
 Change Date:          The Change Date for each version of the Licensed Work is
@@ -78,7 +78,7 @@ Change License:       GNU Affero General Public License, version 3 or later
 
 For information about alternative licensing arrangements for the Licensed Work,
 please contact the Licensor via the Licensed Work's repository,
-https://github.com/FailSpy/ZlauDeR.
+https://github.com/FailSpy/Sordino.
 
 -----------------------------------------------------------------------------
 

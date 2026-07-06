@@ -1,0 +1,72 @@
+[package]
+name = "sordino-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "Local reverse proxy: masks PII in Anthropic Messages API requests and unmasks streamed/non-streamed responses on the wire."
+
+[[bin]]
+name = "sordino-proxy"
+path = "src/main.rs"
+
+[features]
+# Default = both backends, so a plain `cargo build` is byte-for-byte
+# behavior-identical to before the backend split (local Candle ML + remote
+# http). Thin clients that only ever point `[engine.ml] backend` at a remote
+# endpoint can skip the whole Candle stack:
+#   cargo build --release -p sordino-proxy --no-default-features --features ml-http
+# At least one backend must be on — a backend-less proxy is rejected in main.rs
+# (it could never honor `[engine.ml] enabled = true`).
+default = ["ml", "ml-http"]
+ml = ["sordino-engine/ml"]
+ml-http = ["sordino-engine/ml-http"]
+# Out-of-process burn-wgpu GPU sidecar backend (`[engine.ml] backend = "sidecar"`).
+# GPU-free in THIS binary — it pulls only the engine's supervision core; the GPU
+# lives in the separately-shipped `presidio-classifier-burn-server` child. Opt-in,
+# not in `default`, until the GPU verification matrix runs (the child binary is
+# packaged as a separate release asset).
+ml-sidecar = ["sordino-engine/ml-sidecar"]
+
+[dependencies]
+# Backend selection now flows through THIS crate's own `ml` / `ml-http` features
+# (above) into the engine's matching features — so a `--no-default-features
+# --features ml-http` proxy pulls a Candle-free engine. We take the engine with
+# `default-features = false` and re-enable backends explicitly via the passthrough
+# features; the default build still ends up with both, exactly as before.
+sordino-engine = { path = "../sordino-engine", default-features = false }
+sordino-state  = { path = "../sordino-state" }
+sordino-secrets = { path = "../sordino-secrets" }
+
+anthropic-wire = { workspace = true }
+openai-wire    = { workspace = true }
+sse-core       = { workspace = true }
+
+axum       = { workspace = true }
+tower-http = { workspace = true }
+tokio      = { workspace = true }
+reqwest    = { workspace = true }
+http       = { workspace = true }
+bytes      = { workspace = true }
+futures    = { workspace = true }
+
+serde      = { workspace = true }
+serde_json = { workspace = true }
+blake3     = { workspace = true }
+thiserror  = { workspace = true }
+toml       = { workspace = true }
+url        = { workspace = true }
+toml_edit  = "0.22"
+clap       = { workspace = true }
+anyhow     = { workspace = true }
+tracing    = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid       = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+serde_json = { workspace = true }
+# Test-only: lets walker tests inject a mock `Recognizer` via `MaskEngine::ml_set_ready`
+# to exercise the ML-active prewarm path without loading the real model.
+presidio-core = { workspace = true }

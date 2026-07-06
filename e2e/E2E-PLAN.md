@@ -1,4 +1,4 @@
-# ZlauDeR plugin — end-to-end test plan
+# Sordino plugin — end-to-end test plan
 
 Drives a **real `claude` CLI** through the **hook-launched** proxy (not a manually-started
 one) against a **stub upstream we can read**, so every masking/leak claim is *falsifiable* by
@@ -8,18 +8,18 @@ foreign server); **(2)** ConnectionRefused / hangs on fresh sessions.
 
 ## Harness invariants (every scenario)
 - **Isolated config:** `CLAUDE_CONFIG_DIR=<tmp copy of ~/.claude>` — never touch the real one.
-- **Isolated state:** `ZLAUDER_STATE_DIR=<tmp>` per scenario — so the hook's build-recycle /
-  port logic can NEVER kill or adopt a real proxy. (Default is `$XDG_RUNTIME_DIR/zlauder`,
+- **Isolated state:** `SORDINO_STATE_DIR=<tmp>` per scenario — so the hook's build-recycle /
+  port logic can NEVER kill or adopt a real proxy. (Default is `$XDG_RUNTIME_DIR/sordino`,
   shared — using it would be the footgun.)
-- **Known binaries:** the plugin MUST resolve `…/zlauder/target/release/{zlauder-proxy,
-  zlauder-hooks}` of the CURRENT build. Verify: no other `zlauder-proxy` on `PATH`
+- **Known binaries:** the plugin MUST resolve `…/sordino/target/release/{sordino-proxy,
+  sordino-hooks}` of the CURRENT build. Verify: no other `sordino-proxy` on `PATH`
   (`command -v`), and the launched proxy's `/healthz` body == `git rev-parse --short=12 HEAD`
-  (the embedded `ZLAUDER_BUILD`). FALSIFIES "I tested the wrong binary."
+  (the embedded `SORDINO_BUILD`). FALSIFIES "I tested the wrong binary."
 - **Visible upstream:** a stub (`fake_anthropic.py`) that appends every request body to a
-  capture file and echoes the tokens it saw; the project's `zlauder.toml`
+  capture file and echoes the tokens it saw; the project's `sordino.toml`
   `upstream_base_url` points at it. Auth is a dummy `ANTHROPIC_API_KEY` (the real token never
   leaves the box).
-- **No `--bare`** (it skips hooks/plugins); load via `--plugin-dir …/zlauder-plugin`.
+- **No `--bare`** (it skips hooks/plugins); load via `--plugin-dir …/sordino-plugin`.
 
 ## A. Egress masking — NO LEAK (falsifiable on the capture file)
 - **A1** Prompt with email + IPv4 + an API-key-shaped secret. On a *routed* session the
@@ -39,11 +39,11 @@ foreign server); **(2)** ConnectionRefused / hangs on fresh sessions.
   🛡. The capture file MAY contain plaintext here (unrouted) — and that's the HONEST state, so
   the test asserts the *messaging* matches the *reality* (no false shield). **FALSIFIES a
   false "active".**
-- **C2 Foreign-server adoption (the nonce leak):** put a non-zlauder 200-on-`/healthz` server
+- **C2 Foreign-server adoption (the nonce leak):** put a non-sordino 200-on-`/healthz` server
   on the port a stale rendezvous names (simulate PID-reuse+port-steal); the hook MUST NOT
   adopt it (no route through it). Assert ensure_up relaunches a real proxy on a fresh port.
   **FALSIFIES the Codex-found MED leak.**
-- **C3 Masking OFF:** with `/zlauder:privacy off`, a routed session passes plaintext upstream
+- **C3 Masking OFF:** with `/sordino:privacy off`, a routed session passes plaintext upstream
   (expected) AND the statusline shows OFF, never 🛡.
 
 ## D. ConnectionRefused / hangs on fresh sessions
@@ -66,11 +66,11 @@ foreign server); **(2)** ConnectionRefused / hangs on fresh sessions.
   clear conflict error and publishes nothing (no misleading record).
 - **E4 Cross-project isolation:** project A and B simultaneously → distinct ports, distinct
   rendezvous; A's capture never shows B's canary and vice-versa.
-- **E5 Non-loopback guard:** `ZLAUDER_BIND=0.0.0.0` without ack → proxy refuses to start
-  (no LAN-exposed control plane); with `ZLAUDER_ALLOW_NON_LOOPBACK_BIND=1` → starts + warns.
-- **E6 Binary identity:** `/healthz` build id == current `ZLAUDER_BUILD`; a stale-build proxy
+- **E5 Non-loopback guard:** `SORDINO_BIND=0.0.0.0` without ack → proxy refuses to start
+  (no LAN-exposed control plane); with `SORDINO_ALLOW_NON_LOOPBACK_BIND=1` → starts + warns.
+- **E6 Binary identity:** `/healthz` build id == current `SORDINO_BUILD`; a stale-build proxy
   on the rendezvous is recycled (and ONLY because nonce+build confirm it's ours).
-- **E7 Doctor (Phase 4):** `/zlauder:doctor` all-PASS on a healthy host; FAILs loud on a
+- **E7 Doctor (Phase 4):** `/sordino:doctor` all-PASS on a healthy host; FAILs loud on a
   blocked loopback / busy static port.
 
 ## F. Secrets / broker (if configured)

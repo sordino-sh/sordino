@@ -1,0 +1,113 @@
+[package]
+name = "sordino-engine"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "PII masking/unmasking engine: deterministic blake3 session tokens + AES-256-GCM reversible store, wrapping presidio-rs for detection."
+
+[dependencies]
+presidio-core     = { workspace = true }
+presidio-analyzer = { workspace = true }
+# ML recognizer (openai/privacy-filter). Optional, but ON by default (the `ml` /
+# `ml-http` features are in `default`) so normal builds are "ML-capable". The
+# concrete backend is selected by feature: `ml` -> `backend-candle` (in-process
+# Candle, built through presidio-classifier's `select()` API but pinned to the
+# candle substrate — cuda > metal > cpu — via the `Candle` trapdoor; candle is
+# freely re-buildable, so it survives sordino's ML reload lifecycle. The auto
+# ladder's burn-wgpu rung is deliberately NOT pulled in — cubecl allows only ONE
+# wgpu init per process, which would break a reload on a wgpu-GPU host; see
+# `backend_choice` in ml.rs. The NVIDIA candle-CUDA perf tier is opt-in via
+# `ml-cuda` below). `ml-http` -> `backend-http` (remote HF-token-classification
+# endpoint, a small reqwest::blocking client living UPSTREAM — sordino carries no
+# bespoke HTTP client). `sordino-hooks` opts OUT with `default-features = false`
+# to stay lean (neither backend, so presidio-classifier is not compiled at all).
+presidio-classifier = { workspace = true, optional = true }
+
+blake3   = { workspace = true }
+aes-gcm  = { workspace = true }
+rand     = { workspace = true }
+regex    = { workspace = true }
+smallvec = { workspace = true }
+uuid     = { workspace = true }
+lru      = { workspace = true }
+aho-corasick = { workspace = true }
+zeroize  = { workspace = true }
+globset  = { workspace = true }
+url      = { workspace = true }
+shlex    = { workspace = true }
+# Only the http backend (`ml-http`) needs it — wraps the resolved bearer token.
+secrecy  = { workspace = true, optional = true }
+
+serde     = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing   = { workspace = true }
+
+# Apple-Silicon Metal acceleration. presidio-classifier already pulls candle-*/metal
+# on macOS (its own `cfg(target_os = "macos")` table); the one missing switch is its
+# own `metal` feature, which gates the `select_device` Metal arm. Turning it on lets
+# a `prefer_gpu = true` proxy resolve the integrated GPU on Apple Silicon (Metal > CPU);
+# `prefer_gpu = false` still pins CPU (no silent GPU). macOS-ARM ONLY by necessity: the
+# `metal` feature compiles a candle `Device::new_metal` call that does not exist without
+# candle/metal, so it would fail to build on Linux/Windows — but `resolver = 2` ignores
+# this table off-target, keeping Linux/Windows/`--all-features` objc2-free. We ship
+# per-platform binaries, so the macOS-ARM artifact compiles Metal in while the others
+# don't. Precision note: Metal's `Auto` dtype resolves to F16 (not the bf16/F32 the
+# recall gate proved) — acceptable as an explicit `prefer_gpu` opt-in; a recall pass on
+# F16-on-Metal is a tracked follow-up. Side effect: `metal = ["backend-candle"]`, so on
+# macOS-ARM even a slim `--features ml-http`-only build pulls Candle here (Cargo has no
+# target-conditional *feature*); the shipped binary carries `ml` anyway, so it's moot.
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+presidio-classifier = { workspace = true, optional = true, features = ["metal"] }
+
+[features]
+# `ml` is ON by default so a normal `cargo build` is ML-capable ("always compiled
+# in"). The candle-touching code lives behind `cfg(feature = "ml")` in `ml.rs`;
+# the rest of the engine (the MlRuntime slot, detection wiring) is candle-free, so
+# a `--no-default-features` build is a lean regex-only engine that still parses the
+# `[engine.ml]` config (it just never loads a model).
+default = ["ml", "ml-http"]
+ml = ["dep:presidio-classifier", "presidio-classifier/backend-candle"]
+# Remote-inference backend (`[engine.ml] backend = "http"`): no Candle, no
+# weights — the upstream `presidio-classifier/backend-http` recognizer backend
+# (a reqwest::blocking client + HF/TEI/custom wire decode, all reviewed upstream).
+# Independent of `ml`, so a slim regex+http build
+# (`--no-default-features --features ml-http`) skips the whole Candle stack.
+ml-http = ["dep:presidio-classifier", "presidio-classifier/backend-http", "dep:secrecy"]
+# Out-of-process burn-wgpu GPU sidecar (`[engine.ml] backend = "sidecar"`). This
+# crate links NO burn/wgpu/cubecl: `backend-sidecar` is just the supervision core
+# (`dep:serde_json`, GPU-free). The GPU lives in the SEPARATE
+# `presidio-classifier-burn-server` child binary (built upstream with
+# `backend-burn`), which the engine spawns by path. Reload-safe by construction —
+# a fresh child = a fresh cubecl global, sidestepping the in-process single-init
+# brick. Independent of `ml`/`ml-http`; opt-in (NOT default) until the GPU
+# verification matrix runs on the target platforms.
+ml-sidecar = ["dep:presidio-classifier", "presidio-classifier/backend-sidecar"]
+# Opt-in NVIDIA build: enables candle-CUDA (the `ml`/`select()` candle path then
+# resolves cuda > metal > cpu). SEPARATE artifact — the binary gains a hard
+# libcuda.so launch dependency (won't start on a non-NVIDIA host) and the build
+# host needs the CUDA toolkit (+ the cudarc version pin). presidio-classifier's
+# `cuda` feature exists on presidio-rs `main` (re-pin Cargo.lock when bumping), so
+# this passthrough resolves; cf. the R1 `mkl` note below for why the upstream
+# feature MUST be on the pinned manifest first.
+ml-cuda = ["ml", "presidio-classifier/cuda"]
+# NOTE (R1, gemm-vs-MKL lever): an opt-in `mkl` passthrough feature was attempted
+# here (`mkl = ["ml", "presidio-classifier/mkl"]`) but it CANNOT be wired without
+# breaking the default build. presidio-classifier is consumed as a git dependency
+# (pinned in Cargo.lock); the `.cargo/config.toml` `[paths]` override substitutes
+# the local source for compilation but cargo still resolves the FEATURE GRAPH
+# against the git-pinned manifest, which has no `mkl` feature. Declaring a
+# passthrough to a non-existent upstream feature makes cargo fail resolution for
+# EVERY build (even ones that don't enable `mkl`), exit 101:
+#   "depends on `presidio-classifier` with feature `mkl` but ... does not have it"
+# Enabling MKL therefore requires committing+pushing the `mkl` feature to the
+# presidio-rs `main` branch and re-pinning Cargo.lock — a change to the default
+# build's inputs for all consumers. R1 is STOPPED here per the lever's guard
+# ("if wiring mkl cross-crate is infeasible without breaking the default build,
+# report that and STOP"). gemm remains the documented x86 default; see AUDIT notes.
+
+[dev-dependencies]
+serde_json = { workspace = true }
+toml       = { workspace = true }

@@ -4,8 +4,8 @@ e2e/state/
 e2e/state-*/
 *.log
 # per-developer local-scope privacy overrides (`/privacy … --scope local`)
-zlauder.local.toml
-**/zlauder.local.toml
+sordino.local.toml
+**/sordino.local.toml
 
 # pair/agent worktrees (harness artifacts; symlinks point outside the repo)
 .claude/worktrees/
@@ -19,4 +19,4 @@ zlauder.local.toml
 /stage/
 # prebuilt plugin binaries are shipped on the plugin-dist branch, never on main;
 # a locally-dropped bin/ (for testing the resolver) stays untracked
-zlauder-plugin/bin/
+sordino-plugin/bin/

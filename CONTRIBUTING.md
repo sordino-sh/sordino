@@ -1,10 +1,10 @@
-# Contributing to ZlauDeR
+# Contributing to Sordino
 
 Thanks for your interest in contributing.
 
 ## Contributor License Agreement (required)
 
-ZlauDeR is licensed under the Business Source License 1.1, which converts to
+Sordino is licensed under the Business Source License 1.1, which converts to
 AGPL-3.0-or-later on the schedule set in [LICENSE](LICENSE). Issuing under
 BUSL and honoring that conversion requires the Licensor to hold sufficient
 rights over the whole codebase, so every contribution requires agreement to

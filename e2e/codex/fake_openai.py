@@ -2,7 +2,7 @@ import http.server, socketserver, re, sys, json, datetime
 
 # Local fake OpenAI upstream for the Codex e2e. Captures whatever the proxy
 # forwarded (so we can assert PII was masked on egress) and returns a valid
-# Responses-API SSE stream that echoes back any zlauder tokens it saw (so the
+# Responses-API SSE stream that echoes back any sordino tokens it saw (so the
 # proxy's unmask-on-ingress path is exercised end to end).
 #
 # Codex (>=0.140) only speaks the Responses wire API and aborts unless the
