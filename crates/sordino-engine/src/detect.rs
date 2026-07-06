@@ -58,7 +58,12 @@ use crate::surface::Surface;
 // (`is_near_now_date`/`is_suppressed`, wired into both the custom-rule pass and
 // `ingest_results`) and extended `AllowList::with_common_words()`. All three change
 // detection output for unchanged (text, config) — bump to abandon stale cache entries.
-pub const DETECTOR_VERSION: u64 = 9;
+// v10: upstream presidio-analyzer now ships a dedicated whole-block PrivateKeyRecognizer
+// (native EntityType::PrivateKey → "PRIVATE_KEY", in Category::Secrets/always-on),
+// registered in its default recognizer set. A full `-----BEGIN … PRIVATE KEY-----`…
+// `-----END-----` block now masks ENTIRELY (base64 body included) instead of only the
+// marker line matching as API_KEY. Changes detection output for unchanged text — bump.
+pub const DETECTOR_VERSION: u64 = 10;
 
 /// Score the [`LemmaContextAwareEnhancer`] adds when a recognizer's context word
 /// is found near a match (mirrors `LemmaContextAwareEnhancer::new`'s

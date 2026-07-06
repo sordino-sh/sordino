@@ -69,7 +69,7 @@ fn code_constructs_pass_through_at_balanced() {
 #[test]
 fn real_secrets_and_pii_still_mask_at_balanced() {
     let e = engine();
-    let cases: [(&str, &str); 7] = [
+    let cases: [(&str, &str); 8] = [
         ("aws key AKIAIOSFODNN7EXAMPLE rotate it", "AKIAIOSFODNN7EXAMPLE"),
         (
             "jwt eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N here",
@@ -84,10 +84,15 @@ fn real_secrets_and_pii_still_mask_at_balanced() {
         ("card 4111111111111111 charged", "4111111111111111"),
         ("iban GB82WEST12345698765432 transfer", "GB82WEST12345698765432"),
         ("call https://h/p?token=letmein-opaque now", "letmein-opaque"),
-        // NOTE: a full multi-line PEM PRIVATE KEY block is deliberately NOT asserted
-        // here — at Balanced only the `-----BEGIN … KEY-----` marker masks (as API_KEY)
-        // while the base64 body relies on the entropy catch-all; private-key *block*
-        // recall is a separate, pre-existing concern out of scope for this corpus.
+        // A full multi-line PEM PRIVATE KEY block now masks ENTIRELY (marker lines +
+        // base64 body) via the upstream whole-block PrivateKeyRecognizer → native
+        // PRIVATE_KEY (Secrets, always-on); the body no longer leaks past the marker.
+        (
+            "-----BEGIN PRIVATE KEY-----\n\
+             MIIBVwIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA\n\
+             -----END PRIVATE KEY-----",
+            "MIIBVwIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA",
+        ),
     ];
     for (t, secret) in cases {
         let out = mask(&e, t);
@@ -97,7 +102,7 @@ fn real_secrets_and_pii_still_mask_at_balanced() {
 
 /// KNOWN PRECISION GAPS — characterization of CURRENT Balanced behavior that is not
 /// ideal, kept VISIBLE/tracked rather than silently omitted (ship-gate chunk-3 finding).
-/// All but PEM are over-masking FALSE POSITIVES: safe-but-confusing (tokens resolve on
+/// These are all over-masking FALSE POSITIVES: safe-but-confusing (tokens resolve on
 /// the wire, so correctness holds; the cost is model-context noise). When a gap is fixed
 /// the relevant assertion flips and this test must be updated.
 #[test]
@@ -131,13 +136,11 @@ fn known_precision_gaps_current_behavior() {
     );
 }
 
-/// KNOWN RECALL GAP (PEM): a full PRIVATE KEY block should mask entirely, but at Balanced
-/// only the `-----BEGIN … KEY-----` marker masks while the base64 body relies on the
-/// entropy catch-all (which misses short/structured bodies). Ignored so it does not fail
-/// CI; un-ignore when private-key *block* recall lands. Tracked outside the precision
-/// corpus per the chunk-3 review.
+/// PEM private-key block recall (CLOSED): a full PRIVATE KEY block masks entirely at the
+/// Balanced default. The upstream whole-block `PrivateKeyRecognizer` (presidio-analyzer)
+/// emits native `PRIVATE_KEY` (Category::Secrets, always-on) over the BEGIN..END armor, so
+/// the base64 body masks with the marker lines instead of relying on the entropy catch-all.
 #[test]
-#[ignore = "known gap: PEM private-key block body not fully masked at Balanced"]
 fn pem_private_key_block_fully_masks() {
     let e = engine();
     let pem = "-----BEGIN PRIVATE KEY-----\n\
