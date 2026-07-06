@@ -245,6 +245,12 @@ fn compute_ml_fp(rt: &MlRuntime) -> u64 {
                     // never wrong; the alternative (out-of-sync) silently breaks the
                     // `fp <=> same_model_params` invariant the module relies on.
                     h.update(&d.http_timeout_secs.to_le_bytes());
+                    // `allow_remote_ml_endpoint` is in `same_model_params`'s http
+                    // identity (it gates backend construction — the non-loopback
+                    // refuse-check), so it MUST move the fingerprint in lockstep or
+                    // the `fp <=> same_model_params` invariant breaks and a live
+                    // true->false flip reports "unchanged" (the fail-open this closes).
+                    h.update(&[d.allow_remote_ml_endpoint as u8]);
                 }
                 crate::config::MlBackend::Sidecar => {
                     // MUST mirror `same_model_params`'s Sidecar identity (same
@@ -2585,6 +2591,31 @@ mod tests {
             http_fp(30, false),
             http_fp(30, true),
             "required is refusal policy, not identity; ml_fp must not move"
+        );
+
+        // `allow_remote_ml_endpoint` IS http identity (it gates backend construction
+        // — the non-loopback refuse-check), so ml_fp must move with it, mirroring the
+        // http_timeout_secs guard. Without this, a live true->false flip reports
+        // "unchanged" → no reload → the remote backend keeps receiving pre-mask leaves.
+        fn http_fp_allow(allow: bool) -> u64 {
+            let rt = MlRuntime {
+                status: MlStatus::Ready,
+                recognizer: Some(Arc::new(InfallibleMl(Arc::new(MockPerson::new("X"))))),
+                desired: Some(MlConfig {
+                    enabled: true,
+                    backend: MlBackend::Http,
+                    endpoint: Some("https://remote.invalid/detect".into()),
+                    allow_remote_ml_endpoint: allow,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            compute_ml_fp(&rt)
+        }
+        assert_ne!(
+            http_fp_allow(false),
+            http_fp_allow(true),
+            "allow_remote_ml_endpoint is http recognizer identity; ml_fp must move with it"
         );
     }
 

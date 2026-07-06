@@ -563,6 +563,16 @@ pub struct MlConfig {
     /// Privacy: every un-cached leaf's raw text is sent to this endpoint.
     #[serde(default)]
     pub endpoint: Option<String>,
+    /// `backend = "http"` only: opt IN to a non-loopback ML `endpoint`. A `http`
+    /// endpoint whose host is NOT loopback (`127.0.0.1`/`::1`/`localhost`) is
+    /// REFUSED at backend construction unless this is `true`, because every
+    /// un-cached text leaf is POSTed to that endpoint PRE-masking — a raw-PII
+    /// egress the operator must acknowledge explicitly (threat model L17). A
+    /// self-hosted inference server on another host is a legitimate deployment, so
+    /// this is a config field (not an env var), but it defaults `false` (fail
+    /// closed): a loopback endpoint always loads; a remote one requires this flag.
+    #[serde(default)]
+    pub allow_remote_ml_endpoint: bool,
     /// `backend = "http"` only: env var name for the bearer token. The token
     /// itself never lives in config files.
     #[serde(default)]
@@ -814,6 +824,7 @@ impl Default for MlConfig {
             backend: MlBackend::Local,
             model: default_ml_model(),
             endpoint: None,
+            allow_remote_ml_endpoint: false,
             auth_token_env: None,
             http_timeout_secs: default_ml_http_timeout_secs(),
             sidecar_path: None,
@@ -879,6 +890,13 @@ impl MlConfig {
                     && self.endpoint == other.endpoint
                     && self.auth_token_env == other.auth_token_env
                     && self.http_timeout_secs == other.http_timeout_secs
+                    // `allow_remote_ml_endpoint` gates backend CONSTRUCTION (the
+                    // non-loopback refuse-check in `ml::http_config`), so flipping it
+                    // must force a reload that re-runs that gate — otherwise a
+                    // true->false live-reload reports "unchanged", never reloads, and
+                    // the already-loaded remote backend keeps receiving pre-mask
+                    // leaves (fail-open). Must move `compute_ml_fp` in lockstep.
+                    && self.allow_remote_ml_endpoint == other.allow_remote_ml_endpoint
             }
             MlBackend::Sidecar => {
                 // The burn child receives model/revision/banded-attention as argv
@@ -1490,6 +1508,18 @@ mod tests {
         assert!(
             http.same_model_params(&http_local_knob_changed),
             "http identity should ignore local-only Candle knobs"
+        );
+
+        // `allow_remote_ml_endpoint` is http-backend identity: flipping it must count
+        // as a different recognizer, so a live true->false reload re-runs the
+        // construction-time non-loopback refuse-check (the fail-open guard).
+        let http_allow_flipped = MlConfig {
+            allow_remote_ml_endpoint: !http.allow_remote_ml_endpoint,
+            ..http.clone()
+        };
+        assert!(
+            !http.same_model_params(&http_allow_flipped),
+            "an allow_remote_ml_endpoint flip requires a new recognizer (re-run the refuse-check)"
         );
 
         let http_other_endpoint = MlConfig {

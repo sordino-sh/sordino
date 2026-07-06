@@ -10,6 +10,10 @@ description = "PII masking/unmasking engine: deterministic blake3 session tokens
 [dependencies]
 presidio-core     = { workspace = true }
 presidio-analyzer = { workspace = true }
+# Loopback classifier (`is_loopback_bind`) shared with the proxy/hooks. Cycle-safe:
+# sordino-state depends only on serde/serde_json/anyhow/blake3/libc — never back on
+# this crate. Used by the http ML backend's non-loopback endpoint refuse-check.
+sordino-state     = { path = "../sordino-state" }
 # ML recognizer (openai/privacy-filter). Optional, but ON by default (the `ml` /
 # `ml-http` features are in `default`) so normal builds are "ML-capable". The
 # concrete backend is selected by feature: `ml` -> `backend-candle` (in-process
