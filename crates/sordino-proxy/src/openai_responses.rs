@@ -23,7 +23,7 @@ use sordino_engine::{
 };
 
 use crate::zdr::PinnedMode;
-use crate::{headers, monitor, routes, sse, state::AppState, walk};
+use crate::{headers, monitor, routes, sse, state::AppState, tripwire, walk};
 
 const MAX_BODY: usize = 64 * 1024 * 1024;
 
@@ -189,6 +189,15 @@ async fn mask_body(
             StatusCode::BAD_REQUEST,
             &format!("unparseable request body, refusing to forward: {e}"),
         )),
+        // A2b: registered secret in a never-masked schema/contract subtree → 409 CONFLICT,
+        // naming the secret but never its value. MUST precede the generic Engine → 500 arm.
+        Err(MaskError::Engine(EngineError::RegisteredSecretInCarveOut(name))) => Err(routes::err(
+            StatusCode::CONFLICT,
+            &format!(
+                "registered secret {name:?} found in a never-masked schema/contract subtree — \
+                 refusing rather than forwarding it in plaintext"
+            ),
+        )),
         Err(MaskError::Engine(e)) => Err(routes::err(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("masking error, request refused: {e}"),
@@ -316,6 +325,35 @@ impl MaskWalker<'_> {
         // `metadata` is developer free-form key-values (not telemetry) → still masked.
         if let Some(metadata) = req.metadata.as_mut() {
             self.value_safe(metadata, Surface::UserMessage)?;
+        }
+        // Tool definitions are a never-rewritten contract subtree on this wire — `tools` is a
+        // TYPED field so it never reaches `map_safe`'s contract-key leg. A registered secret's
+        // exact value anywhere in a tool def would forward in plaintext → DETECT and refuse
+        // (A2b). Scan-only: the tools are never rewritten.
+        if let Some(tools) = req.tools.as_ref() {
+            for tool in tools {
+                if let Some(name) = tripwire::scan_value(self.engine, tool, 0) {
+                    return Err(EngineError::RegisteredSecretInCarveOut(name));
+                }
+            }
+        }
+        // `text` / `response_format` / `tool_choice` / `reasoning` are TYPED never-rewritten
+        // contract fields on this wire — the walker masks none of them, and being typed they
+        // never reach the fallback `value_safe` contract-key leg. A registered secret's exact
+        // value in any of them (e.g. a `text.format.schema` JSON schema `const`) would forward in
+        // plaintext → DETECT and refuse (A2b), exactly as `tools` is scanned above. Scan-only.
+        for field in [
+            req.text.as_ref(),
+            req.response_format.as_ref(),
+            req.tool_choice.as_ref(),
+            req.reasoning.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(name) = tripwire::scan_value(self.engine, field, 0) {
+                return Err(EngineError::RegisteredSecretInCarveOut(name));
+            }
         }
         // The top-level `user` field is API-protocol TELEMETRY (OpenAI's abuse-correlation
         // identifier), contractually opaque — the direct analog of Anthropic's
@@ -448,7 +486,17 @@ impl MaskWalker<'_> {
             Value::Object(o) => {
                 let is_base64 = o.get("type").and_then(Value::as_str) == Some("base64");
                 for (k, val) in o {
-                    if (is_base64 && k == "data") || preserves_contract_key(k) {
+                    // SPLIT the two carve-outs: the base64 `data` leg is the L18 binary
+                    // carve-out (never scanned — a base64 coincidence is not a leak), while
+                    // the contract-key leg is a never-rewritten schema/contract subtree that
+                    // must be SCANNED (A2b: refuse a registered secret rather than forward it).
+                    if is_base64 && k == "data" {
+                        continue;
+                    }
+                    if preserves_contract_key(k) {
+                        if let Some(name) = tripwire::scan_value(self.engine, val, 0) {
+                            return Err(EngineError::RegisteredSecretInCarveOut(name));
+                        }
                         continue;
                     }
                     self.value_safe(val, surface)?;
@@ -466,6 +514,10 @@ impl MaskWalker<'_> {
     ) -> Result<(), EngineError> {
         for (k, val) in m {
             if preserves_contract_key(k) {
+                // Never-rewritten contract key: scan-and-refuse rather than mask (A2b).
+                if let Some(name) = tripwire::scan_value(self.engine, val, 0) {
+                    return Err(EngineError::RegisteredSecretInCarveOut(name));
+                }
                 continue;
             }
             self.value_safe(val, surface)?;

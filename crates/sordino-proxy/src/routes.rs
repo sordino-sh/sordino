@@ -8,7 +8,7 @@ use axum::extract::{Path, Request, State};
 use axum::response::Response;
 use axum::routing::{get, post};
 use http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
-use sordino_engine::{RevealAudit, UnmaskManifest};
+use sordino_engine::{EngineError, RevealAudit, UnmaskManifest};
 
 use crate::wire_adapter::{AnthropicNative, WireAdapter};
 use crate::zdr::PinnedMode;
@@ -677,6 +677,17 @@ async fn mask_body(
         Err(walk::MaskError::Json(e)) => Err(err(
             StatusCode::BAD_REQUEST,
             &format!("unparseable request body, refusing to forward: {e}"),
+        )),
+        // A2b: a registered secret's exact value surfaced in a never-masked schema/contract
+        // subtree (tool.input_schema, a contract-key subtree, or an `extra` flatten sink).
+        // Refuse 409 CONFLICT (mirroring the ZDR/broker refusal idiom), naming the secret but
+        // NEVER its value. MUST precede the generic Engine → 500 arm below (order matters).
+        Err(walk::MaskError::Engine(EngineError::RegisteredSecretInCarveOut(name))) => Err(err(
+            StatusCode::CONFLICT,
+            &format!(
+                "registered secret {name:?} found in a never-masked schema/contract subtree — \
+                 refusing rather than forwarding it in plaintext"
+            ),
         )),
         // The engine refused to mask (detection error, or an encryption failure).
         // Either way we do NOT forward — refusing is the safe outcome.

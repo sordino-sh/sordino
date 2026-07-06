@@ -16,6 +16,8 @@ use anthropic_wire::{
 use serde_json::{Map, Value};
 use sordino_engine::{EngineError, MaskEngine, MaskStats, Surface, UnmaskManifest};
 
+use crate::tripwire;
+
 // ---------------------------------------------------------------------------
 // Request — mask
 // ---------------------------------------------------------------------------
@@ -189,7 +191,7 @@ impl MaskWalker<'_> {
                 SystemContent::Blocks(blocks) => {
                     for b in blocks.iter_mut() {
                         self.str(&mut b.text, Surface::SystemPrompt)?;
-                        warn_unknown_map(&b.extra, "system block");
+                        check_unknown_map(self.engine, &b.extra, "system block")?;
                     }
                 }
                 _ => {}
@@ -200,15 +202,31 @@ impl MaskWalker<'_> {
             for block in msg.content.iter_mut() {
                 self.block(block, &role)?;
             }
-            warn_unknown_map(&msg.extra, "message");
+            check_unknown_map(self.engine, &msg.extra, "message")?;
         }
         if let Some(tools) = req.tools.as_mut() {
             for tool in tools.iter_mut() {
                 self.str(&mut tool.description, Surface::SystemPrompt)?;
                 // input_schema is left verbatim: masking schema constraints could
-                // break the model's tool-call validation.
-                warn_unknown_map(&tool.extra, "tool");
+                // break the model's tool-call validation. But a registered secret's
+                // EXACT value appearing here would forward in plaintext — DETECT and
+                // refuse (A2b) rather than mask (the no-mask-schema invariant holds).
+                if let Some(name) = tripwire::scan_value(self.engine, &tool.input_schema, 0) {
+                    return Err(EngineError::RegisteredSecretInCarveOut(name));
+                }
+                check_unknown_map(self.engine, &tool.extra, "tool")?;
             }
+        }
+        // `output_config` (structured-output format / effort) is a TYPED never-rewritten
+        // contract field: the walker masks none of it, and being typed it never reaches the
+        // fallback `value_safe` contract-key leg. A registered secret's exact value in the
+        // schema (e.g. `output_config.format.schema`) would forward in plaintext → DETECT and
+        // refuse (A2b), mirroring the `tool.input_schema` scan above. Scan-only: never rewritten.
+        if let Some(oc) = req.output_config.as_ref()
+            && let Ok(v) = serde_json::to_value(oc)
+            && let Some(name) = tripwire::scan_value(self.engine, &v, 0)
+        {
+            return Err(EngineError::RegisteredSecretInCarveOut(name));
         }
         // `metadata.user_id` is API-protocol TELEMETRY, not natural-language content:
         // Anthropic populates it (Claude Code sets it to an opaque account/session
@@ -236,7 +254,7 @@ impl MaskWalker<'_> {
         if let Some(ctx) = req.context_management.as_mut() {
             self.context_management(ctx)?;
         }
-        warn_unknown_map(&req.extra, "request");
+        check_unknown_map(self.engine, &req.extra, "request")?;
         Ok(())
     }
 
@@ -390,6 +408,13 @@ impl MaskWalker<'_> {
                     } else if k == "tools" {
                         self.tools_value_safe(val)?;
                     } else if preserves_contract_key(k) {
+                        // Never-rewritten contract subtree (schema/json_schema/signature/
+                        // data/…): still not masked, but a registered secret's exact value
+                        // hiding here would forward in plaintext — DETECT and refuse (A2b).
+                        // NOT the `is_base64 && k=="data"` leg above (L18 binary carve-out).
+                        if let Some(name) = tripwire::scan_value(self.engine, val, 0) {
+                            return Err(EngineError::RegisteredSecretInCarveOut(name));
+                        }
                         continue;
                     } else {
                         self.value_safe(val, surface)?;
@@ -419,8 +444,23 @@ impl MaskWalker<'_> {
                 for (k, val) in o.iter_mut() {
                     match k.as_str() {
                         "description" => self.value_safe(val, Surface::SystemPrompt)?,
-                        "input_schema" | "cache_control" | "name" | "type" => {}
-                        _ if preserves_contract_key(k) => {}
+                        // input_schema gets its OWN arm ABOVE the preserves_contract_key
+                        // guard: the guard also matches "input_schema", so a scan added
+                        // only there would NEVER run for it (this arm consumes it first).
+                        // Left verbatim (never masked) but DETECT-and-refuse on a hit (A2b).
+                        "input_schema" => {
+                            if let Some(name) = tripwire::scan_value(self.engine, val, 0) {
+                                return Err(EngineError::RegisteredSecretInCarveOut(name));
+                            }
+                        }
+                        "cache_control" | "name" | "type" => {}
+                        _ if preserves_contract_key(k) => {
+                            // Other never-rewritten contract keys (schema/json_schema/
+                            // signature/…) reaching a tool via the fallback walk: scan too.
+                            if let Some(name) = tripwire::scan_value(self.engine, val, 0) {
+                                return Err(EngineError::RegisteredSecretInCarveOut(name));
+                            }
+                        }
                         _ => self.value_safe(val, Surface::SystemPrompt)?,
                     }
                 }
@@ -461,9 +501,17 @@ fn is_context_management_protocol_key(key: &str) -> bool {
     )
 }
 
-fn warn_unknown_map(m: &Map<String, Value>, location: &'static str) {
+/// An unknown-field `extra` flatten sink is preserved verbatim (never masked). Warn (as
+/// before) AND scan it for a registered secret's exact value — a hit here would forward in
+/// plaintext, so refuse (A2b) rather than pass it through. DETECT-only: the map is never
+/// rewritten.
+fn check_unknown_map(
+    engine: &MaskEngine,
+    m: &Map<String, Value>,
+    location: &'static str,
+) -> Result<(), EngineError> {
     if m.is_empty() {
-        return;
+        return Ok(());
     }
     let keys = m.keys().map(String::as_str).collect::<Vec<_>>().join(",");
     tracing::warn!(
@@ -471,6 +519,10 @@ fn warn_unknown_map(m: &Map<String, Value>, location: &'static str) {
         keys = %keys,
         "preserving unknown Anthropic request fields without masking"
     );
+    if let Some(name) = tripwire::scan_map(engine, m) {
+        return Err(EngineError::RegisteredSecretInCarveOut(name));
+    }
+    Ok(())
 }
 
 fn surface_for_role(role: &str) -> Surface {

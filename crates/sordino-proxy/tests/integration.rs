@@ -3849,3 +3849,635 @@ async fn bare_path_no_header_is_masked_normal() {
         "header-absent bare request is masked-Normal (masked token, never plaintext): {body}"
     );
 }
+
+// ===========================================================================
+// A2b — registered-secret tripwire (GAP-CLOSURE G1/L20).
+//
+// When a registered secret's EXACT value appears in a never-rewritten
+// schema/contract subtree (tool.input_schema, an OpenAI contract-key subtree,
+// or an `extra` flatten sink), the proxy REFUSES with 409 and ZERO bytes
+// upstream instead of forwarding it verbatim. Detect-then-refuse: the subtree
+// is still never masked (the no-mask-schema invariant is untouched).
+// ===========================================================================
+
+/// A distinctive registered-secret value used across the tripwire tests.
+const A2B_SECRET_VAL: &str = "S3cr3tRegisteredValue";
+/// The secret's registered NAME — appears in the 409 body; its value never does.
+const A2B_SECRET_NAME: &str = "prod_api_key";
+
+/// Engine with one registered secret (`Hash` operator; A2b is detect-only so the
+/// operator is immaterial). `disabled`/`no_secrets` variants exercise the invariant that
+/// `registered_secret_hit` reads the live secret set unconditionally.
+fn a2b_engine_with_secret() -> MaskEngine {
+    let e = MaskEngine::new(EngineConfig::default()).unwrap();
+    e.set_secret_rules(vec![sordino_engine::SecretRule {
+        name: A2B_SECRET_NAME.into(),
+        value: sordino_engine::SecretValue::new(A2B_SECRET_VAL),
+        operator: sordino_engine::Operator::Hash,
+        case_sensitive: true,
+        apply_to_surfaces: None,
+    }])
+    .unwrap();
+    e
+}
+
+// --- Test 1a: Anthropic tool.input_schema → 409, zero upstream bytes. -------
+#[tokio::test]
+async fn a2b_anthropic_input_schema_secret_refuses_409_zero_bytes() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-test", "max_tokens": 10, "messages": [],
+            "tools": [{
+                "name": "send", "description": "d",
+                "input_schema": {"type": "object", "properties": {
+                    "default_key": {"const": A2B_SECRET_VAL}
+                }}
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(A2B_SECRET_NAME), "409 body names the secret: {body}");
+    assert!(!body.contains(A2B_SECRET_VAL), "409 body must NEVER echo the value: {body}");
+    assert!(cap.body.lock().unwrap().is_empty(), "zero bytes upstream");
+    assert!(cap.bodies.lock().unwrap().is_empty(), "fake upstream never hit");
+}
+
+// --- Test 1b: OpenAI-chat tools[].function.parameters → 409, zero bytes. ----
+#[tokio::test]
+async fn a2b_openai_chat_tool_parameters_secret_refuses_409_zero_bytes() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/chat/completions", post(fake_openai_chat_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {
+                "name": "send",
+                "parameters": {"type": "object", "properties": {
+                    "default_key": {"const": A2B_SECRET_VAL}
+                }}
+            }}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(A2B_SECRET_NAME), "409 body names the secret: {body}");
+    assert!(!body.contains(A2B_SECRET_VAL), "409 body must NEVER echo the value: {body}");
+    assert!(cap.body.lock().unwrap().is_empty(), "zero bytes upstream");
+    assert!(cap.bodies.lock().unwrap().is_empty(), "fake upstream never hit");
+}
+
+// --- Test 1c: OpenAI-responses input_schema (extra sink) → 409, zero bytes. -
+#[tokio::test]
+async fn a2b_openai_responses_input_schema_secret_refuses_409_zero_bytes() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/responses", post(fake_responses_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&serde_json::json!({
+            "model": "gpt-test", "input": "hi",
+            "input_schema": {"type": "object", "properties": {
+                "default_key": {"const": A2B_SECRET_VAL}
+            }}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(A2B_SECRET_NAME), "409 body names the secret: {body}");
+    assert!(!body.contains(A2B_SECRET_VAL), "409 body must NEVER echo the value: {body}");
+    assert!(cap.body.lock().unwrap().is_empty(), "zero bytes upstream");
+    assert!(cap.bodies.lock().unwrap().is_empty(), "fake upstream never hit");
+}
+
+// --- Test 2: FAIL-SAFE — malformed top-level field fails the typed ApiRequest
+// parse, so the fallback value-walk runs; a secret in tools[].input_schema must
+// STILL 409 (proves tool_value_safe's OWN input_schema arm scans — the
+// match-arm-ordering trap where the guard never sees input_schema). -----------
+#[tokio::test]
+async fn a2b_failsafe_fallback_walk_input_schema_secret_refuses_409() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    // `max_tokens` as a STRING fails the typed `u32` parse (but is valid JSON), so the
+    // Anthropic path falls to the structure-agnostic value_safe walk.
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-test", "max_tokens": "not_a_number", "messages": [],
+            "tools": [{
+                "name": "send", "description": "d",
+                "input_schema": {"type": "object", "properties": {
+                    "default_key": {"const": A2B_SECRET_VAL}
+                }}
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(cap.body.lock().unwrap().is_empty(), "zero bytes upstream");
+    assert!(cap.bodies.lock().unwrap().is_empty(), "fake upstream never hit");
+}
+
+// --- Test 3: OBJECT-KEY — the secret value used as a JSON object KEY
+// (`properties.<SECRET>`) → 409 (proves keys are scanned, not just values). ----
+#[tokio::test]
+async fn a2b_object_key_secret_refuses_409() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    // The secret sits as a `properties` KEY — build the JSON as a raw string so the key
+    // is a dynamic value. (No JSON-special chars in the secret, so it needs no escaping.)
+    let raw = format!(
+        r#"{{"model":"claude-test","max_tokens":10,"messages":[],"tools":[{{"name":"send","description":"d","input_schema":{{"type":"object","properties":{{"{A2B_SECRET_VAL}":{{"type":"string"}}}}}}}}]}}"#
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header(CONTENT_TYPE, "application/json")
+        .body(raw)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(cap.body.lock().unwrap().is_empty(), "zero bytes upstream");
+    assert!(cap.bodies.lock().unwrap().is_empty(), "fake upstream never hit");
+}
+
+// --- Test 4a: BASE64-COINCIDENCE (Anthropic) — the secret's literal bytes
+// inside a base64 image `data` field must NOT be refused (L18 binary boundary). -
+#[tokio::test]
+async fn a2b_base64_coincidence_anthropic_not_refused_200() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let data = format!("QUJD{A2B_SECRET_VAL}WFla");
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-test", "max_tokens": 10,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}}
+            ]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "base64 coincidence must not 409");
+    let up = cap.body.lock().unwrap().clone();
+    assert!(up.contains(A2B_SECRET_VAL), "base64 data passes through verbatim (never scanned): {up}");
+}
+
+// --- Test 4b: BASE64-COINCIDENCE (OpenAI-chat) — secret bytes in a base64
+// `data` field carried through `extra` must NOT be refused. -------------------
+#[tokio::test]
+async fn a2b_base64_coincidence_openai_chat_not_refused_200() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/chat/completions", post(fake_openai_chat_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let data = format!("QUJD{A2B_SECRET_VAL}");
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "x_blob": {"type": "base64", "data": data}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "base64 coincidence must not 409");
+    let up = cap.body.lock().unwrap().clone();
+    assert!(up.contains(A2B_SECRET_VAL), "base64 data passes through verbatim: {up}");
+}
+
+// --- Test 4c: BASE64-COINCIDENCE (OpenAI-responses) — must NOT be refused.
+// This specifically proves the responses `value_safe` combined `if` was SPLIT:
+// were the base64-data and contract-key legs still fused with a scan attached,
+// the base64 `data` would 409. -----------------------------------------------
+#[tokio::test]
+async fn a2b_base64_coincidence_openai_responses_not_refused_200() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/responses", post(fake_responses_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let data = format!("QUJD{A2B_SECRET_VAL}");
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&serde_json::json!({
+            "model": "gpt-test", "input": "hi",
+            "x_blob": {"type": "base64", "data": data}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "base64 coincidence must not 409");
+    let up = cap.body.lock().unwrap().clone();
+    assert!(up.contains(A2B_SECRET_VAL), "base64 data passes through verbatim: {up}");
+}
+
+// --- Test 5: SUBSTRING — the secret as a substring of a larger string leaf →
+// 409 (registered_secret_hit is a substring/Aho-Corasick match, not whole-leaf). -
+#[tokio::test]
+async fn a2b_substring_secret_refuses_409() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let embedded = format!("prefix-{A2B_SECRET_VAL}-suffix");
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-test", "max_tokens": 10, "messages": [],
+            "tools": [{
+                "name": "send", "description": "d",
+                "input_schema": {"type": "object", "properties": {
+                    "default_key": {"const": embedded}
+                }}
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(cap.body.lock().unwrap().is_empty(), "zero bytes upstream");
+}
+
+// --- Test 6: ENGINE-DISABLED — with masking turned OFF the secret in
+// input_schema must STILL 409 (registered_secret_hit reads the live secret set
+// unconditionally). -----------------------------------------------------------
+#[tokio::test]
+async fn a2b_engine_disabled_still_refuses_409() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let engine = a2b_engine_with_secret();
+    engine.set_enabled(false); // master masking switch OFF
+    assert!(!engine.is_enabled());
+    let state = mk_state(engine, format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-test", "max_tokens": 10, "messages": [],
+            "tools": [{
+                "name": "send", "description": "d",
+                "input_schema": {"type": "object", "properties": {
+                    "default_key": {"const": A2B_SECRET_VAL}
+                }}
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(cap.body.lock().unwrap().is_empty(), "zero bytes upstream");
+}
+
+// --- Test 7: NO SECRETS registered — identical body forwards normally (200),
+// zero behavior change. -------------------------------------------------------
+#[tokio::test]
+async fn a2b_no_secrets_registered_forwards_200() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    // Default engine — NO registered secrets.
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-test", "max_tokens": 10, "messages": [],
+            "tools": [{
+                "name": "send", "description": "d",
+                "input_schema": {"type": "object", "properties": {
+                    "default_key": {"const": A2B_SECRET_VAL}
+                }}
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let up = cap.body.lock().unwrap().clone();
+    assert!(
+        up.contains(A2B_SECRET_VAL),
+        "with no secrets the input_schema const forwards verbatim: {up}"
+    );
+}
+
+// --- Test 8: DEPTH-129 — a programmatically-nested body (129 nested objects)
+// with the secret deep inside is REFUSED with zero upstream bytes because
+// serde_json's 128-depth parse limit rejects the body BEFORE any walker runs.
+// KILL-CONDITION: a 200 with the body forwarded would mean an unparseable-body
+// passthrough exists (the walker is bypassable by deep nesting) — a
+// FOUNDATION-level finding, not something to paper over. --------------------
+#[tokio::test]
+async fn a2b_depth_129_body_refused_zero_bytes() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    // 129 nested `{"properties": …}` objects around the secret leaf → deeper than
+    // serde_json's 128 recursion limit, so BOTH the typed and the fallback Value parse
+    // fail before any walker runs.
+    let mut deep = format!("\"{A2B_SECRET_VAL}\"");
+    for _ in 0..129 {
+        deep = format!("{{\"properties\":{deep}}}");
+    }
+    let raw = format!(
+        r#"{{"model":"claude-test","max_tokens":10,"messages":[],"tools":[{{"name":"x","description":"d","input_schema":{deep}}}]}}"#
+    );
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header(CONTENT_TYPE, "application/json")
+        .body(raw)
+        .send()
+        .await
+        .unwrap();
+
+    assert_ne!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "KILL-CONDITION: a 129-deep body must be REFUSED (serde depth cap), not forwarded"
+    );
+    assert!(resp.status().is_client_error(), "refused as a 4xx: {}", resp.status());
+    assert!(
+        cap.body.lock().unwrap().is_empty() && cap.bodies.lock().unwrap().is_empty(),
+        "KILL-CONDITION: ZERO bytes upstream for an unparseable deep body"
+    );
+}
+
+// ===========================================================================
+// A2b FIX ROUND — sibling TYPED never-rewritten contract/structured-output
+// fields (not just `tools`). A registered secret's exact value in these fields
+// previously forwarded UPSTREAM in plaintext (200); it must now REFUSE 409 with
+// ZERO bytes upstream, exactly like the `tools` carve-out. One test per wire per
+// field family; each proves the field is scanned in the walker's request().
+// ===========================================================================
+
+// --- Anthropic `output_config.format.schema` → 409, zero upstream bytes. ----
+#[tokio::test]
+async fn a2b_anthropic_output_config_schema_secret_refuses_409_zero_bytes() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-test", "max_tokens": 10, "messages": [],
+            "output_config": {
+                "format": {"type": "json_schema", "schema": {"const": A2B_SECRET_VAL}}
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(A2B_SECRET_NAME), "409 body names the secret: {body}");
+    assert!(!body.contains(A2B_SECRET_VAL), "409 body must NEVER echo the value: {body}");
+    assert!(cap.body.lock().unwrap().is_empty(), "zero bytes upstream");
+    assert!(cap.bodies.lock().unwrap().is_empty(), "fake upstream never hit");
+}
+
+// --- OpenAI-chat `response_format` schema → 409, zero upstream bytes. --------
+#[tokio::test]
+async fn a2b_openai_chat_response_format_secret_refuses_409_zero_bytes() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/chat/completions", post(fake_openai_chat_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": {"properties": {"k": {"const": A2B_SECRET_VAL}}}}
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(A2B_SECRET_NAME), "409 body names the secret: {body}");
+    assert!(!body.contains(A2B_SECRET_VAL), "409 body must NEVER echo the value: {body}");
+    assert!(cap.body.lock().unwrap().is_empty(), "zero bytes upstream");
+    assert!(cap.bodies.lock().unwrap().is_empty(), "fake upstream never hit");
+}
+
+// --- OpenAI-chat `guided_choice` (Vec<String> contract field) → 409. --------
+// Proves the typed String/Vec guided-decoding fields are scanned, not just the
+// `Value` ones.
+#[tokio::test]
+async fn a2b_openai_chat_guided_choice_secret_refuses_409_zero_bytes() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/chat/completions", post(fake_openai_chat_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "guided_choice": ["alpha", A2B_SECRET_VAL, "omega"]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(A2B_SECRET_NAME), "409 body names the secret: {body}");
+    assert!(!body.contains(A2B_SECRET_VAL), "409 body must NEVER echo the value: {body}");
+    assert!(cap.body.lock().unwrap().is_empty(), "zero bytes upstream");
+    assert!(cap.bodies.lock().unwrap().is_empty(), "fake upstream never hit");
+}
+
+// --- OpenAI-responses `text` (structured-output) → 409, zero upstream bytes. -
+#[tokio::test]
+async fn a2b_openai_responses_text_secret_refuses_409_zero_bytes() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/responses", post(fake_responses_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&serde_json::json!({
+            "model": "gpt-test", "input": "hi",
+            "text": {"format": {"type": "json_schema", "schema": {"const": A2B_SECRET_VAL}}}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(A2B_SECRET_NAME), "409 body names the secret: {body}");
+    assert!(!body.contains(A2B_SECRET_VAL), "409 body must NEVER echo the value: {body}");
+    assert!(cap.body.lock().unwrap().is_empty(), "zero bytes upstream");
+    assert!(cap.bodies.lock().unwrap().is_empty(), "fake upstream never hit");
+}
+
+// --- OpenAI-responses `tool_choice` → 409, zero upstream bytes. -------------
+#[tokio::test]
+async fn a2b_openai_responses_tool_choice_secret_refuses_409_zero_bytes() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/responses", post(fake_responses_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&serde_json::json!({
+            "model": "gpt-test", "input": "hi",
+            "tool_choice": {"type": "function", "name": A2B_SECRET_VAL}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(A2B_SECRET_NAME), "409 body names the secret: {body}");
+    assert!(!body.contains(A2B_SECRET_VAL), "409 body must NEVER echo the value: {body}");
+    assert!(cap.body.lock().unwrap().is_empty(), "zero bytes upstream");
+    assert!(cap.bodies.lock().unwrap().is_empty(), "fake upstream never hit");
+}
+
+// --- Negative: a NON-secret value in these sibling fields still forwards 200
+// (the scan is detect-then-refuse, never a blanket block of contract fields). -
+#[tokio::test]
+async fn a2b_output_config_without_secret_forwards_200() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-test", "max_tokens": 10, "messages": [],
+            "output_config": {
+                "format": {"type": "json_schema", "schema": {"const": "not-a-secret"}}
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let up = cap.body.lock().unwrap().clone();
+    assert!(
+        up.contains("not-a-secret"),
+        "a non-secret output_config schema forwards verbatim: {up}"
+    );
+}

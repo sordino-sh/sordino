@@ -21,7 +21,7 @@ use sordino_engine::{
 };
 
 use crate::zdr::PinnedMode;
-use crate::{headers, monitor, routes, sse, state::AppState, walk};
+use crate::{headers, monitor, routes, sse, state::AppState, tripwire, walk};
 
 const MAX_BODY: usize = 64 * 1024 * 1024;
 
@@ -197,6 +197,16 @@ async fn mask_body(
             StatusCode::BAD_REQUEST,
             &format!("unparseable request body, refusing to forward: {e}"),
         )),
+        // A2b: a registered secret's exact value in a never-masked schema/contract subtree
+        // → 409 CONFLICT (mirrors the ZDR/broker refusal idiom), naming the secret but
+        // NEVER its value. MUST precede the generic Engine → 500 arm below.
+        Err(MaskError::Engine(EngineError::RegisteredSecretInCarveOut(name))) => Err(routes::err(
+            StatusCode::CONFLICT,
+            &format!(
+                "registered secret {name:?} found in a never-masked schema/contract subtree — \
+                 refusing rather than forwarding it in plaintext"
+            ),
+        )),
         Err(MaskError::Engine(e)) => Err(routes::err(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("masking error, request refused: {e}"),
@@ -328,6 +338,52 @@ impl MaskWalker<'_> {
         for msg in req.messages.iter_mut() {
             self.message(msg)?;
         }
+        // Tool definitions are a never-rewritten contract subtree on this wire — the walker
+        // masks none of them, and `tools` is a TYPED field so it never reaches `map_safe`'s
+        // contract-key leg. A registered secret's exact value anywhere in a tool def (e.g.
+        // `tools[].function.parameters.properties.<x>.const`) would forward in plaintext, so
+        // DETECT and refuse (A2b). Scan-only: the tools are never rewritten.
+        if let Some(tools) = req.tools.as_ref() {
+            for tool in tools {
+                if let Ok(v) = serde_json::to_value(tool)
+                    && let Some(name) = tripwire::scan_value(self.engine, &v, 0)
+                {
+                    return Err(EngineError::RegisteredSecretInCarveOut(name));
+                }
+            }
+        }
+        // Structured-output / guided-decoding constraints are TYPED never-rewritten contract
+        // fields on this wire — the walker masks none of them, and being typed they never reach
+        // `map_safe`'s contract-key leg. A registered secret's exact value in any of them (e.g. a
+        // `response_format` JSON schema `const`) would forward in plaintext → DETECT and refuse
+        // (A2b), exactly as `tools` is scanned above. Scan-only: none of these are ever rewritten.
+        if let Some(rf) = req.response_format.as_ref()
+            && let Some(name) = tripwire::scan_value(self.engine, rf, 0)
+        {
+            return Err(EngineError::RegisteredSecretInCarveOut(name));
+        }
+        if let Some(tc) = req.tool_choice.as_ref()
+            && let Some(name) = tripwire::scan_value(self.engine, tc, 0)
+        {
+            return Err(EngineError::RegisteredSecretInCarveOut(name));
+        }
+        if let Some(re) = req.guided_regex.as_ref()
+            && let Some(name) = self.engine.registered_secret_hit(re)
+        {
+            return Err(EngineError::RegisteredSecretInCarveOut(name));
+        }
+        if let Some(g) = req.guided_grammar.as_ref()
+            && let Some(name) = self.engine.registered_secret_hit(g)
+        {
+            return Err(EngineError::RegisteredSecretInCarveOut(name));
+        }
+        if let Some(choices) = req.guided_choice.as_ref()
+            && let Some(name) = choices
+                .iter()
+                .find_map(|c| self.engine.registered_secret_hit(c))
+        {
+            return Err(EngineError::RegisteredSecretInCarveOut(name));
+        }
         // The top-level `user` field is API-protocol TELEMETRY (OpenAI's abuse-correlation
         // identifier), contractually opaque, not natural-language content — the direct
         // analog of Anthropic's `metadata.user_id` (see walk.rs). Pass it through VERBATIM:
@@ -417,9 +473,16 @@ impl MaskWalker<'_> {
                 let is_base64 = o.get("type").and_then(Value::as_str) == Some("base64");
                 for (k, val) in o.iter_mut() {
                     if is_base64 && k == "data" {
+                        // L18 binary carve-out: never scanned (base64 coincidence != leak).
                         continue;
                     }
                     if preserves_contract_key(k) {
+                        // Never-rewritten contract subtree (tools/parameters/schema/…):
+                        // still not masked, but a registered secret's exact value here
+                        // would forward in plaintext — DETECT and refuse (A2b).
+                        if let Some(name) = tripwire::scan_value(self.engine, val, 0) {
+                            return Err(EngineError::RegisteredSecretInCarveOut(name));
+                        }
                         continue;
                     }
                     self.value_safe(val, surface)?;
@@ -437,6 +500,10 @@ impl MaskWalker<'_> {
     ) -> Result<(), EngineError> {
         for (k, val) in m.iter_mut() {
             if preserves_contract_key(k) {
+                // Never-rewritten contract key: scan-and-refuse rather than mask (A2b).
+                if let Some(name) = tripwire::scan_value(self.engine, val, 0) {
+                    return Err(EngineError::RegisteredSecretInCarveOut(name));
+                }
                 continue;
             }
             self.value_safe(val, surface)?;
