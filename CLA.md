@@ -6,7 +6,7 @@ Sordino — you ("You") agree to the following terms for Your past, present,
 and future contributions to Sordino.
 
 **License grant.** You retain copyright to Your contributions. You grant
-FailSpy (the "Licensor" identified in [LICENSE](LICENSE), including
+Illative LLC (the "Licensor" identified in [LICENSE](LICENSE), including
 successors and assigns) a perpetual, worldwide, non-exclusive, irrevocable,
 royalty-free, transferable copyright license, with the right to sublicense
 through multiple tiers, to use, reproduce, modify, prepare derivative works
