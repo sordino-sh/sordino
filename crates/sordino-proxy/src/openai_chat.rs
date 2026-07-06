@@ -568,7 +568,8 @@ fn unmask_message(engine: &MaskEngine, manifest: &UnmaskManifest, msg: &mut Open
     }
     if let Some(calls) = msg.tool_calls.as_mut() {
         for call in calls.iter_mut() {
-            walk::unmask_str(engine, manifest, &mut call.function.arguments);
+            // Genuine tool-execution destination: gate so a detected-PII token stays a TOKEN (A4b).
+            walk::unmask_str_tool_input(engine, manifest, &mut call.function.arguments);
         }
     }
     unmask_map(engine, manifest, &mut msg.extra);
@@ -779,8 +780,9 @@ impl OpenAISseUnmasker {
         };
         let (safe, held) = split_safe(&buf);
         self.tool_carry.insert(key, held.to_string());
+        // Streamed tool args are a genuine tool-execution destination: gate (A4b).
         let emitted = engine
-            .unmask(safe, manifest)
+            .unmask_tool_input(safe, manifest)
             .unwrap_or_else(|_| safe.to_string());
         if emitted.is_empty() {
             None
@@ -826,9 +828,10 @@ fn flush_held(st: &mut StreamState) {
         }
     }
     for ((choice, call), held) in tool {
+        // Held tool-arg tail is a genuine tool-execution destination: gate (A4b).
         let emitted = st
             .engine
-            .unmask(&held, st.manifest.as_ref())
+            .unmask_tool_input(&held, st.manifest.as_ref())
             .unwrap_or(held);
         if emitted.is_empty() {
             continue;
@@ -1128,6 +1131,8 @@ mod tests {
         );
     }
 
+    // Assistant content is decorated on display; tool_calls arguments route through the
+    // tool-egress gate (A4b), so their detected-PII token stays a verbatim TOKEN.
     #[test]
     fn unmask_response_decorates_content_not_tool_arguments() {
         let e = engine_marked();
@@ -1166,9 +1171,10 @@ mod tests {
             v["choices"][0]["message"]["content"],
             "ok <bob@example.com>"
         );
+        // Tool args: GATED — the token stays verbatim (never resolves to the real email).
         assert_eq!(
             v["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
-            "{\"email\":\"bob@example.com\"}"
+            format!("{{\"email\":\"{token}\"}}")
         );
     }
 

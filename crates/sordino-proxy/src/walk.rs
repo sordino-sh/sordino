@@ -557,9 +557,11 @@ fn unmask_block(engine: &MaskEngine, manifest: &UnmaskManifest, block: &mut ApiC
         // Assistant prose → display: the ONLY place the reveal marker decorates, so
         // the operator can see which spans were un-masked.
         ApiContentBlock::Text { text, .. } => unmask_str_assistant(engine, manifest, text),
-        // Tool input is consumed verbatim by a tool (could be written to a file): no
-        // decoration, ever. Same for compaction (machine context that is re-sent).
-        ApiContentBlock::ToolUse { input, .. } => unmask_value(engine, manifest, input),
+        // Tool input is a GENUINE tool-execution destination (could be written to a file /
+        // executed on): route it through the tool-egress gate so a detected-PII token stays a
+        // verbatim TOKEN instead of resolving to plaintext the tool would act on (A4b). Same
+        // token in the assistant Text block above STILL resolves — the gate is destination-scoped.
+        ApiContentBlock::ToolUse { input, .. } => unmask_value_tool_input(engine, manifest, input),
         ApiContentBlock::Compaction { content, .. } => unmask_str(engine, manifest, content),
         // Opaque: leave thinking/redacted tokenized so signatures stay valid.
         _ => {}
@@ -608,6 +610,55 @@ fn unmask_map(engine: &MaskEngine, manifest: &UnmaskManifest, m: &mut Map<String
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tool-egress gate variants (A4b, GAP-CLOSURE L6)
+// ---------------------------------------------------------------------------
+//
+// Sibling helpers of `unmask_str` / `unmask_value` / `unmask_map` that route a leaf
+// through [`MaskEngine::unmask_tool_input`] instead of [`MaskEngine::unmask`], so a
+// detected-PII / custom-literal token bound for a GENUINE tool-execution destination is
+// left MASKED (verbatim token) rather than resolved to plaintext a tool would act on.
+// Called ONLY from genuine tool-execution destinations (ToolUse.input, tool_calls
+// arguments, function_call arguments, the Responses `Other` fallthroughs, function_call
+// `extra`, and streaming equivalents). Display / compaction / echo paths keep the plain
+// `unmask*` variants above.
+
+/// Unmask a single string in place through the tool-egress gate (no decoration).
+pub fn unmask_str_tool_input(engine: &MaskEngine, manifest: &UnmaskManifest, text: &mut String) {
+    if let Ok(out) = engine.unmask_tool_input(text, manifest) {
+        *text = out;
+    }
+}
+
+/// Recursively unmask every string leaf of `v` through the tool-egress gate.
+pub fn unmask_value_tool_input(engine: &MaskEngine, manifest: &UnmaskManifest, v: &mut Value) {
+    match v {
+        Value::String(s) => {
+            if let Ok(out) = engine.unmask_tool_input(s, manifest) {
+                *s = out;
+            }
+        }
+        Value::Array(a) => a
+            .iter_mut()
+            .for_each(|i| unmask_value_tool_input(engine, manifest, i)),
+        Value::Object(o) => o
+            .values_mut()
+            .for_each(|v| unmask_value_tool_input(engine, manifest, v)),
+        _ => {}
+    }
+}
+
+/// Unmask every value of a map through the tool-egress gate (e.g. `FunctionCall.extra`).
+pub fn unmask_map_tool_input(
+    engine: &MaskEngine,
+    manifest: &UnmaskManifest,
+    m: &mut Map<String, Value>,
+) {
+    for (_k, val) in m.iter_mut() {
+        unmask_value_tool_input(engine, manifest, val);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -638,8 +689,9 @@ mod tests {
         MaskEngine::new(cfg).unwrap()
     }
 
-    // The reveal marker decorates the assistant `text` block but MUST leave a
-    // `tool_use` input untouched (it may be written verbatim into a file/tool).
+    // The reveal marker decorates the assistant `text` block; a `tool_use` input now routes
+    // through the tool-egress gate (A4b), so a detected-PII token there stays a verbatim TOKEN
+    // (never resolved, never decorated) — the file would otherwise get the real value.
     #[test]
     fn reveal_marker_decorates_text_block_not_tool_input() {
         let e = engine_marked();
@@ -672,11 +724,11 @@ mod tests {
             v["content"][0]["text"].as_str().unwrap(),
             "I'll write to «bob@example.com» now"
         );
-        // Tool input: un-masked but NOT decorated — the file would otherwise get the
-        // marker bytes baked in.
+        // Tool input: GATED — the detected-PII token stays verbatim (never resolves to the
+        // real email a tool would write to disk / act on), never decorated.
         assert_eq!(
             v["content"][1]["input"]["contents"].as_str().unwrap(),
-            "addr=bob@example.com"
+            format!("addr={token}")
         );
     }
 

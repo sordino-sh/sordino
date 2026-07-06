@@ -11,12 +11,14 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Json};
 use axum::routing::post;
 use http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
-use sordino_engine::{EngineConfig, MaskEngine, token_regex};
+use sordino_engine::{EngineConfig, MaskEngine, Surface, token_regex};
 use sordino_proxy::{
     config::ConfigLayers,
     monitor::Monitor,
+    openai_chat, openai_responses,
     routes::router as proxy_router,
     state::AppState,
+    walk,
     zdr::{TrustBasis, ZdrSelection, ZdrTarget},
 };
 
@@ -376,17 +378,20 @@ async fn openai_chat_completions_mask_unmask_and_header_passthrough() {
         Some("Bearer sk-secret-123")
     );
 
+    // Assistant CONTENT is a display surface → resolves to plaintext.
     assert!(
         client_text.contains("dana@example.com"),
-        "response not unmasked: {client_text}"
+        "content not unmasked: {client_text}"
+    );
+    // tool_calls arguments are a GENUINE tool-execution destination → GATED (A4b): the
+    // detected-PII token stays verbatim, the real email never resolves into the tool call.
+    assert!(
+        client_text.contains("[EMAIL_ADDRESS_"),
+        "tool args must keep the token: {client_text}"
     );
     assert!(
-        !client_text.contains("[EMAIL_ADDRESS_"),
-        "token leaked to client: {client_text}"
-    );
-    assert!(
-        client_text.contains("{\\\"email\\\":\\\"dana@example.com\\\"}"),
-        "tool arguments were not unmasked without markers: {client_text}"
+        !client_text.contains("{\\\"email\\\":\\\"dana@example.com\\\"}"),
+        "tool arguments must NOT resolve to the real email (tool-egress gate): {client_text}"
     );
 }
 
@@ -589,14 +594,17 @@ async fn openai_responses_mask_unmask_json_response() {
         "plaintext leaked upstream: {up_body}"
     );
     assert!(up_body.contains("[EMAIL_ADDRESS_"));
+    // Message output_text + top-level output_text are display surfaces → resolve to plaintext.
     assert!(out.contains("response@example.com"), "not unmasked: {out}");
+    // FunctionCall.arguments is a GENUINE tool-execution destination → GATED (A4b): the token
+    // stays verbatim, the real email never resolves into the executable function call.
     assert!(
-        !out.contains("[EMAIL_ADDRESS_"),
-        "token leaked to client: {out}"
+        out.contains("[EMAIL_ADDRESS_"),
+        "function_call args must keep the token: {out}"
     );
     assert!(
-        out.contains("{\\\"email\\\":\\\"response@example.com\\\"}"),
-        "function call arguments were not unmasked: {out}"
+        !out.contains("{\\\"email\\\":\\\"response@example.com\\\"}"),
+        "function_call arguments must NOT resolve to the real email (tool-egress gate): {out}"
     );
 }
 
@@ -4480,4 +4488,409 @@ async fn a2b_output_config_without_secret_forwards_200() {
         up.contains("not-a-secret"),
         "a non-secret output_config schema forwards verbatim: {up}"
     );
+}
+
+// ===========================================================================
+// A4b — tool-egress gate: genuine tool-execution destinations keep the TOKEN
+// (never resolve to plaintext a tool would act on), while display / compaction /
+// echo surfaces STILL resolve. Each test asserts the CLIENT-VISIBLE payload.
+//
+// Non-streaming cases call the exact `unmask_response` the proxy uses on the
+// non-SSE path (its output IS the client body); streaming cases go end-to-end
+// (the OpenAI SSE unmaskers are not public, so HTTP is the only client-visible
+// path). All tokens are minted via `engine.mask`, so under the OLD (plain-unmask)
+// behavior they WOULD resolve — a retained token / absent plaintext proves the gate.
+// ===========================================================================
+
+/// Marker-OFF engine so display surfaces resolve to BARE plaintext (crisp assertions).
+fn a4b_engine() -> MaskEngine {
+    let cfg = EngineConfig {
+        reveal_marker: sordino_engine::RevealMarker {
+            enabled: false,
+            ..Default::default()
+        },
+        ..EngineConfig::default()
+    };
+    MaskEngine::new(cfg).unwrap()
+}
+
+// --- 1(a) Anthropic non-stream ToolUse.input --------------------------------
+#[test]
+fn a4b_anthropic_nonstream_tooluse_input_gated() {
+    let e = a4b_engine();
+    let m = e.mask("bob@example.com", Surface::UserMessage).unwrap();
+    let token = m.manifest.entries[0].token_handle.clone();
+    let resp = serde_json::json!({
+        "content": [
+            {"type": "text", "text": format!("writing to {token}")},
+            {"type": "tool_use", "id": "t1", "name": "write_file",
+             "input": {"body": format!("addr={token}")}}
+        ],
+        "model": "claude-test"
+    });
+    let out = walk::unmask_response(&e, &m.manifest, resp.to_string().as_bytes()).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    // Assistant Text (display) resolves; ToolUse.input is GATED (token retained verbatim).
+    assert_eq!(v["content"][0]["text"], "writing to bob@example.com");
+    assert_eq!(v["content"][1]["input"]["body"], format!("addr={token}"));
+}
+
+// --- 1(c) OpenAI-chat NON-streamed tool_calls[].function.arguments ----------
+#[test]
+fn a4b_openai_chat_nonstream_tool_args_gated() {
+    let e = a4b_engine();
+    let m = e.mask("bob@example.com", Surface::UserMessage).unwrap();
+    let token = m.manifest.entries[0].token_handle.clone();
+    let resp = serde_json::json!({
+        "id": "c", "object": "chat.completion", "model": "gpt-test",
+        "choices": [{"index": 0, "message": {
+            "role": "assistant",
+            "content": format!("ok {token}"),
+            "tool_calls": [{"id": "call_1", "type": "function",
+                "function": {"name": "send", "arguments": format!("{{\"email\":\"{token}\"}}")}}]
+        }, "finish_reason": "tool_calls"}]
+    });
+    let out = openai_chat::unmask_response(&e, &m.manifest, resp.to_string().as_bytes()).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], "ok bob@example.com");
+    assert_eq!(
+        v["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+        format!("{{\"email\":\"{token}\"}}")
+    );
+}
+
+// --- 1(e) Responses NON-streamed FunctionCall.arguments ---------------------
+#[test]
+fn a4b_responses_nonstream_function_call_args_gated() {
+    let e = a4b_engine();
+    let m = e.mask("bob@example.com", Surface::UserMessage).unwrap();
+    let token = m.manifest.entries[0].token_handle.clone();
+    let resp = serde_json::json!({
+        "id": "r", "object": "response", "model": "gpt-test",
+        "output": [
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": format!("ok {token}")}]},
+            {"type": "function_call", "call_id": "c1", "name": "send",
+             "arguments": format!("{{\"email\":\"{token}\"}}")}
+        ],
+        "output_text": format!("done {token}")
+    });
+    let out =
+        openai_responses::unmask_response(&e, &m.manifest, resp.to_string().as_bytes()).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    // Display surfaces resolve; FunctionCall.arguments GATED.
+    assert_eq!(v["output"][0]["content"][0]["text"], "ok bob@example.com");
+    assert_eq!(v["output_text"], "done bob@example.com");
+    assert_eq!(v["output"][1]["arguments"], format!("{{\"email\":\"{token}\"}}"));
+}
+
+// --- 2(a) Responses unmodeled OUTPUT ITEM (ResponseOutputItem::Other) -------
+// A local_shell_call-shaped item we have no typed arm for: its nested token is gated.
+#[test]
+fn a4b_responses_output_item_other_gated() {
+    let e = a4b_engine();
+    let m = e.mask("bob@example.com", Surface::UserMessage).unwrap();
+    let token = m.manifest.entries[0].token_handle.clone();
+    let resp = serde_json::json!({
+        "id": "r", "object": "response", "model": "gpt-test",
+        "output": [
+            {"type": "local_shell_call", "call_id": "s1",
+             "action": {"type": "exec", "command": format!("mail {token}")}}
+        ]
+    });
+    let out =
+        openai_responses::unmask_response(&e, &m.manifest, resp.to_string().as_bytes()).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["output"][0]["action"]["command"], format!("mail {token}"));
+}
+
+// --- 2(c) Responses message content ARRAY with unmodeled part (ContentPart::Other)
+#[test]
+fn a4b_responses_content_part_other_gated() {
+    let e = a4b_engine();
+    let m = e.mask("bob@example.com", Surface::UserMessage).unwrap();
+    let token = m.manifest.entries[0].token_handle.clone();
+    let resp = serde_json::json!({
+        "id": "r", "object": "response", "model": "gpt-test",
+        "output": [
+            {"type": "message", "role": "assistant", "content": [
+                {"type": "custom_tool_reasoning", "payload": format!("do {token}")}
+            ]}
+        ]
+    });
+    let out =
+        openai_responses::unmask_response(&e, &m.manifest, resp.to_string().as_bytes()).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["output"][0]["content"][0]["payload"], format!("do {token}"));
+}
+
+// --- 2(d) Responses message content NON-STRING/NON-ARRAY (MessageContent::Other)
+// An object-valued content is the ONLY shape that reaches ResponseMessageContent::Other
+// (any array deserializes into Parts and hits ContentPart::Other instead).
+#[test]
+fn a4b_responses_message_content_other_gated() {
+    let e = a4b_engine();
+    let m = e.mask("bob@example.com", Surface::UserMessage).unwrap();
+    let token = m.manifest.entries[0].token_handle.clone();
+    let resp = serde_json::json!({
+        "id": "r", "object": "response", "model": "gpt-test",
+        "output": [
+            {"type": "message", "role": "assistant",
+             "content": {"type": "vendor_blob", "payload": format!("x {token}")}}
+        ]
+    });
+    let out =
+        openai_responses::unmask_response(&e, &m.manifest, resp.to_string().as_bytes()).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["output"][0]["content"]["payload"], format!("x {token}"));
+}
+
+// --- 3 FunctionCall.extra: a token on an unknown field of a function_call item
+#[test]
+fn a4b_responses_function_call_extra_gated() {
+    let e = a4b_engine();
+    let m = e.mask("bob@example.com", Surface::UserMessage).unwrap();
+    let token = m.manifest.entries[0].token_handle.clone();
+    let resp = serde_json::json!({
+        "id": "r", "object": "response", "model": "gpt-test",
+        "output": [
+            {"type": "function_call", "call_id": "c1", "name": "send", "arguments": "{}",
+             "x_vendor_meta": format!("note {token}")}
+        ]
+    });
+    let out =
+        openai_responses::unmask_response(&e, &m.manifest, resp.to_string().as_bytes()).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["output"][0]["x_vendor_meta"], format!("note {token}"));
+}
+
+// --- 4 Display-regression guards: these MUST still resolve to plaintext ------
+#[test]
+fn a4b_display_and_echo_surfaces_still_resolve() {
+    let e = a4b_engine();
+    let m = e.mask("bob@example.com", Surface::UserMessage).unwrap();
+    let token = m.manifest.entries[0].token_handle.clone();
+
+    // Anthropic: assistant Text block AND a Compaction block must resolve.
+    let anth = serde_json::json!({
+        "content": [
+            {"type": "text", "text": format!("see {token}")},
+            {"type": "compaction", "content": format!("ctx {token}")}
+        ],
+        "model": "claude-test"
+    });
+    let out = walk::unmask_response(&e, &m.manifest, anth.to_string().as_bytes()).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["content"][0]["text"], "see bob@example.com");
+    assert_eq!(v["content"][1]["content"], "ctx bob@example.com");
+
+    // Responses: FunctionCallOutput.output (already-executed echo) AND a vendor display
+    // field on msg.extra (reasoning-content-shaped) must resolve.
+    let resp = serde_json::json!({
+        "id": "r", "object": "response", "model": "gpt-test",
+        "output": [
+            {"type": "function_call_output", "call_id": "c1", "output": format!("tool said {token}")},
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "hi"}],
+             "reasoning_content": format!("reason {token}")}
+        ]
+    });
+    let out2 =
+        openai_responses::unmask_response(&e, &m.manifest, resp.to_string().as_bytes()).unwrap();
+    let v2: serde_json::Value = serde_json::from_slice(&out2).unwrap();
+    assert_eq!(v2["output"][0]["output"], "tool said bob@example.com");
+    assert_eq!(v2["output"][1]["reasoning_content"], "reason bob@example.com");
+}
+
+// ---- Streaming (end-to-end HTTP) fake upstreams for the four SSE gate cases --
+
+/// Anthropic SSE emitting a tool_use block whose `input.body` carries the minted token
+/// SPLIT across two `input_json_delta` chunks — the relay must reassemble then gate ONCE.
+async fn fake_anthropic_stream_tooluse_upstream(
+    State(cap): State<Captured>,
+    req: axum::extract::Request,
+) -> impl IntoResponse {
+    let body = axum::body::to_bytes(req.into_body(), usize::MAX).await.unwrap();
+    let s = String::from_utf8_lossy(&body).to_string();
+    *cap.body.lock().unwrap() = s.clone();
+    let tok = token_regex().find(&s).map(|m| m.as_str().to_string()).unwrap_or_default();
+    let (a, b) = tok.split_at(tok.len() / 2);
+    let start = serde_json::json!({"type": "content_block_start", "index": 0,
+        "content_block": {"type": "tool_use", "id": "tu1", "name": "write_file", "input": {}}});
+    let d1 = serde_json::json!({"type": "content_block_delta", "index": 0,
+        "delta": {"type": "input_json_delta", "partial_json": format!("{{\"body\":\"{a}")}});
+    let d2 = serde_json::json!({"type": "content_block_delta", "index": 0,
+        "delta": {"type": "input_json_delta", "partial_json": format!("{b}\"}}")}});
+    let stop = serde_json::json!({"type": "content_block_stop", "index": 0});
+    let mstop = serde_json::json!({"type": "message_stop"});
+    let body = format!(
+        "event: content_block_start\ndata: {start}\n\nevent: content_block_delta\ndata: {d1}\n\nevent: content_block_delta\ndata: {d2}\n\nevent: content_block_stop\ndata: {stop}\n\nevent: message_stop\ndata: {mstop}\n\n"
+    );
+    (StatusCode::OK, [(CONTENT_TYPE, "text/event-stream")], body)
+}
+
+/// OpenAI-chat SSE streaming tool_calls args, token split across two arg deltas.
+async fn fake_openai_chat_stream_tool_args_upstream(
+    State(cap): State<Captured>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let s = String::from_utf8_lossy(&body).to_string();
+    *cap.body.lock().unwrap() = s.clone();
+    let tok = token_regex().find(&s).map(|m| m.as_str().to_string()).unwrap_or_default();
+    let (a, b) = tok.split_at(tok.len() / 2);
+    let d1 = serde_json::json!({"id": "cs", "object": "chat.completion.chunk", "model": "gpt-test",
+        "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_1",
+            "type": "function", "function": {"name": "send", "arguments": format!("{{\"email\":\"{a}")}}]},
+            "finish_reason": null}]});
+    let d2 = serde_json::json!({"id": "cs", "object": "chat.completion.chunk", "model": "gpt-test",
+        "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0,
+            "function": {"arguments": format!("{b}\"}}")}}]}, "finish_reason": null}]});
+    let d3 = serde_json::json!({"id": "cs", "object": "chat.completion.chunk", "model": "gpt-test",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]});
+    let body = format!("data: {d1}\n\ndata: {d2}\n\ndata: {d3}\n\ndata: [DONE]\n\n");
+    (StatusCode::OK, [(CONTENT_TYPE, "text/event-stream")], body)
+}
+
+/// Responses SSE streaming function_call args, token split across two arg deltas.
+async fn fake_responses_stream_function_args_upstream(
+    State(cap): State<Captured>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let s = String::from_utf8_lossy(&body).to_string();
+    *cap.body.lock().unwrap() = s.clone();
+    let tok = token_regex().find(&s).map(|m| m.as_str().to_string()).unwrap_or_default();
+    let (a, b) = tok.split_at(tok.len() / 2);
+    let d1 = serde_json::json!({"type": "response.function_call_arguments.delta",
+        "sequence_number": 1, "item_id": "call_1", "output_index": 0,
+        "delta": format!("{{\"email\":\"{a}")});
+    let d2 = serde_json::json!({"type": "response.function_call_arguments.delta",
+        "sequence_number": 2, "item_id": "call_1", "output_index": 0,
+        "delta": format!("{b}\"}}")});
+    let d3 = serde_json::json!({"type": "response.completed", "sequence_number": 3,
+        "response": {"id": "r", "object": "response", "model": "gpt-test", "output": []}});
+    let body = format!(
+        "event: response.function_call_arguments.delta\ndata: {d1}\n\nevent: response.function_call_arguments.delta\ndata: {d2}\n\nevent: response.completed\ndata: {d3}\n\n"
+    );
+    (StatusCode::OK, [(CONTENT_TYPE, "text/event-stream")], body)
+}
+
+/// Responses SSE emitting an UNMODELED event (response.custom_tool_call.arguments.delta-shaped)
+/// carrying the minted token — must route through ResponseStreamEvent::Other's gate.
+async fn fake_responses_stream_other_event_upstream(
+    State(cap): State<Captured>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let s = String::from_utf8_lossy(&body).to_string();
+    *cap.body.lock().unwrap() = s.clone();
+    let tok = token_regex().find(&s).map(|m| m.as_str().to_string()).unwrap_or_default();
+    let d1 = serde_json::json!({"type": "response.custom_tool_call.arguments.delta",
+        "sequence_number": 1, "item_id": "ct1", "delta": format!("run {tok}")});
+    let d2 = serde_json::json!({"type": "response.completed", "sequence_number": 2,
+        "response": {"id": "r", "object": "response", "model": "gpt-test", "output": []}});
+    let body = format!(
+        "event: response.custom_tool_call.arguments.delta\ndata: {d1}\n\nevent: response.completed\ndata: {d2}\n\n"
+    );
+    (StatusCode::OK, [(CONTENT_TYPE, "text/event-stream")], body)
+}
+
+/// Assert the client-visible stream KEPT the token (gated) and never resolved the plaintext.
+fn assert_stream_gated(text: &str) {
+    assert!(
+        !text.contains("bob@example.com"),
+        "gated tool destination resolved plaintext into the stream: {text}"
+    );
+    assert!(
+        text.contains("[EMAIL_ADDRESS_"),
+        "gated tool destination did not keep the token: {text}"
+    );
+}
+
+// --- 1(b) Anthropic SSE InputJsonDelta, token split across a chunk boundary --
+#[tokio::test]
+async fn a4b_anthropic_stream_input_json_split_gated() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_anthropic_stream_tooluse_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let text = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-test", "max_tokens": 10, "stream": true,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "write to bob@example.com"}
+            ]}]
+        }))
+        .send().await.unwrap().text().await.unwrap();
+    assert_stream_gated(&text);
+}
+
+// --- 1(d) OpenAI-chat streamed tool args ------------------------------------
+#[tokio::test]
+async fn a4b_openai_chat_stream_tool_args_gated() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/chat/completions", post(fake_openai_chat_stream_tool_args_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let text = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "gpt-test", "stream": true,
+            "messages": [{"role": "user", "content": "write to bob@example.com"}]
+        }))
+        .send().await.unwrap().text().await.unwrap();
+    assert_stream_gated(&text);
+}
+
+// --- 1(f) Responses streamed function-call args -----------------------------
+#[tokio::test]
+async fn a4b_responses_stream_function_call_args_gated() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/responses", post(fake_responses_stream_function_args_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let text = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&serde_json::json!({
+            "model": "gpt-test", "stream": true,
+            "input": "write to bob@example.com"
+        }))
+        .send().await.unwrap().text().await.unwrap();
+    assert_stream_gated(&text);
+}
+
+// --- 2(b) Responses streamed UNMODELED event (ResponseStreamEvent::Other) ----
+#[tokio::test]
+async fn a4b_responses_stream_other_event_gated() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/responses", post(fake_responses_stream_other_event_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let text = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&serde_json::json!({
+            "model": "gpt-test", "stream": true,
+            "input": "shell out bob@example.com"
+        }))
+        .send().await.unwrap().text().await.unwrap();
+    assert_stream_gated(&text);
 }
