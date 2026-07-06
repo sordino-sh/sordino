@@ -4777,6 +4777,15 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
     let conversation = conversation_id_from_hook_payload(&stdin);
 
     let root = canonical(&project_root());
+
+    // L10 mitigation: warn (stderr, every session, both routed and unrouted paths) if Claude Code's
+    // own OTel content-logging is live — it exports UNMASKED tool/prompt content on a channel this
+    // proxy does not sit on. Fires here, before the routed/unrouted split, so it never depends on
+    // our route. stderr only: never route dynamic env-derived text through the model-context channel.
+    if let Some(w) = otel_content_flag_warning(|k| std::env::var(k).ok()) {
+        eprintln!("{w}");
+    }
+
     // Is THIS session routed through OUR proxy? The SessionStart hook fires in every project
     // (the plugin is installed globally), but we only act where Claude Code has applied our
     // route to the live session — at which point this hook subprocess inherits it. The route
@@ -5172,6 +5181,49 @@ fn intake_should_block_verified(
 /// be flipped off by a `=0` a user meant as "keep it on".
 fn is_truthy_flag(v: &str) -> bool {
     matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
+/// Detect Claude Code's OTel content-logging env vars and, if any are live, return a human-facing
+/// warning string (stderr, push-based, every SessionStart). This mitigates threat-model limitation
+/// L10: Claude Code's OWN OTel pipeline can export UNMASKED tool/prompt content on a channel the
+/// masking proxy does not sit on — Sordino cannot see or mask it.
+///
+/// Verified against the live-running Claude Code binary this session; re-verify these names on a
+/// major CC version bump (see the threat model's L10 — an upstream-owned surface). The master gate
+/// `CLAUDE_CODE_ENABLE_TELEMETRY` is REQUIRED: with it off, CC constructs no exporter, so a lone
+/// content flag exports nothing and this must stay silent. `OTEL_LOG_RAW_API_BODIES` is NOT
+/// boolean-only: a value starting with `file:` also enables it (raw bodies to disk) and is
+/// recognized here. NOTE residual tunable: `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA` is deliberately
+/// NOT required as a third gate (unconfirmed which content flags it further restricts; over-warning
+/// is strictly safer than silent under-detection).
+fn otel_content_flag_warning(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let truthy = |v: &str| is_truthy_flag(v);
+    if !lookup("CLAUDE_CODE_ENABLE_TELEMETRY").is_some_and(|v| truthy(&v)) {
+        return None;
+    }
+    let mut flagged: Vec<&str> = Vec::new();
+    for name in ["OTEL_LOG_TOOL_DETAILS", "OTEL_LOG_TOOL_CONTENT", "OTEL_LOG_USER_PROMPTS"] {
+        if lookup(name).is_some_and(|v| truthy(&v)) {
+            flagged.push(name);
+        }
+    }
+    if let Some(v) = lookup("OTEL_LOG_RAW_API_BODIES")
+        && (v.starts_with("file:") || truthy(&v))
+    {
+        flagged.push("OTEL_LOG_RAW_API_BODIES");
+    }
+    if flagged.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Sordino: Claude Code telemetry content flag(s) are ENABLED in this environment \
+         ({}) with CLAUDE_CODE_ENABLE_TELEMETRY on — these export UNMASKED tool/prompt \
+         content (including PII Sordino restores on the display path) through Claude \
+         Code's own OTel pipeline, a channel Sordino does not sit on and cannot mask \
+         (threat model L10). Unset them, or point your OTel collector at infrastructure \
+         you trust with the same content this proxy protects.",
+        flagged.join(", ")
+    ))
 }
 
 /// Is this submitted prompt an invocation of a Sordino control-plane command (pure — for
@@ -8853,6 +8905,73 @@ mod route_gate_tests {
         for f in ["0", "false", "", "off", "no", "2", "enabled"] {
             assert!(!is_truthy_flag(f), "{f:?} should NOT be truthy");
         }
+    }
+
+    // L10 / A3: OTel content-flag warning. Pure — a HashMap-backed lookup closure, no real env
+    // mutation and no test serialization required.
+    fn otel_lookup(pairs: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> =
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        move |k: &str| map.get(k).cloned()
+    }
+
+    #[test]
+    fn otel_warn_empty_env_is_silent() {
+        // Clean session: no false-positive nag.
+        assert_eq!(otel_content_flag_warning(otel_lookup(&[])), None);
+    }
+
+    #[test]
+    fn otel_warn_master_gate_only_is_silent() {
+        // Telemetry master gate on but no content flag => nothing exports content => silent.
+        assert_eq!(
+            otel_content_flag_warning(otel_lookup(&[("CLAUDE_CODE_ENABLE_TELEMETRY", "1")])),
+            None
+        );
+    }
+
+    #[test]
+    fn otel_warn_tool_details_flags() {
+        let w = otel_content_flag_warning(otel_lookup(&[
+            ("CLAUDE_CODE_ENABLE_TELEMETRY", "true"),
+            ("OTEL_LOG_TOOL_DETAILS", "yes"),
+        ]))
+        .expect("content flag with master gate on must warn");
+        assert!(w.contains("OTEL_LOG_TOOL_DETAILS"), "warning names the flag: {w}");
+    }
+
+    #[test]
+    fn otel_warn_raw_api_bodies_file_mode() {
+        // `file:` prefix enables raw-body-to-disk even though it isn't boolean-truthy.
+        let w = otel_content_flag_warning(otel_lookup(&[
+            ("CLAUDE_CODE_ENABLE_TELEMETRY", "on"),
+            ("OTEL_LOG_RAW_API_BODIES", "file:/tmp/otel"),
+        ]))
+        .expect("file: raw-body mode must warn");
+        assert!(w.contains("OTEL_LOG_RAW_API_BODIES"), "warning names the flag: {w}");
+    }
+
+    #[test]
+    fn otel_warn_master_gate_off_is_inert() {
+        // Master gate off => no exporter constructed => an inert leftover content flag stays silent.
+        assert_eq!(
+            otel_content_flag_warning(otel_lookup(&[
+                ("CLAUDE_CODE_ENABLE_TELEMETRY", "0"),
+                ("OTEL_LOG_USER_PROMPTS", "1"),
+            ])),
+            None
+        );
+    }
+
+    #[test]
+    fn otel_warn_mixed_case_reuses_truthy_parse() {
+        // Mixed-case values must parse via is_truthy_flag (case-insensitive, trimmed).
+        let w = otel_content_flag_warning(otel_lookup(&[
+            ("CLAUDE_CODE_ENABLE_TELEMETRY", "TRUE"),
+            ("OTEL_LOG_USER_PROMPTS", "On"),
+        ]))
+        .expect("mixed-case truthy content flag must warn");
+        assert!(w.contains("OTEL_LOG_USER_PROMPTS"), "warning names the flag: {w}");
     }
 }
 
