@@ -203,6 +203,32 @@ pub fn detect_secrets(
     dets
 }
 
+/// Like [`detect_secrets`] but IGNORES each secret's `apply_to_surfaces` scoping.
+/// Used where the scanned text sits on no well-defined surface (the schema/contract
+/// carve-out subtrees the proxy never rewrites, and the `>>…<<` user-bypass span):
+/// an operator's surface-scoping must not silently reopen those exfil channels. Every
+/// registered secret is matched regardless of its surfaces; matches are otherwise
+/// identical to [`detect_secrets`] (`Source::Secret`, `score 1.0`, `secret_op` set,
+/// registered name as `entity_type`, tier-0 exact-literal).
+pub fn detect_secrets_unscoped(compiled: &[CompiledSecret], text: &str) -> Vec<CachedDetection> {
+    let mut dets = Vec::new();
+    for c in compiled {
+        for m in c.matcher.find_iter(text) {
+            dets.push(CachedDetection {
+                start: m.start(),
+                end: m.end(),
+                entity_type: c.name.clone(),
+                score: 1.0,
+                source: Source::Secret,
+                literal: false,
+                fixed_token: None,
+                secret_op: Some(c.operator),
+            });
+        }
+    }
+    dets
+}
+
 fn operator_tag(op: Operator) -> u8 {
     match op {
         Operator::Token => 0,

@@ -504,6 +504,25 @@ impl MaskEngine {
             .len()
     }
 
+    /// Scan-only tripwire: return the NAME of the first registered secret whose exact
+    /// value appears in `text`, or `None`. NEVER returns the value itself (audit-safety,
+    /// mirrors G3). Reads the LIVE secret set unconditionally — engine-disabled /
+    /// profile-minimal / surface-disabled all still trip it (like `mask()`'s
+    /// disabled-surface fast path) — and ignores each secret's `apply_to_surfaces`
+    /// scoping (via [`secrets::detect_secrets_unscoped`]), because the schema/contract
+    /// carve-out subtrees the proxy (A2b) refuses on sit on no well-defined surface.
+    /// DETECT-ONLY: this never rewrites anything; A2b maps a hit to a 409.
+    pub fn registered_secret_hit(&self, text: &str) -> Option<String> {
+        let secrets = Arc::clone(&self.secrets.read().expect("secrets rwlock poisoned"));
+        if secrets.compiled.is_empty() {
+            return None;
+        }
+        secrets::detect_secrets_unscoped(&secrets.compiled, text)
+            .into_iter()
+            .next()
+            .map(|d| d.entity_type)
+    }
+
     /// Install (hot-swap) the broker policy (default-deny base + allow rules).
     pub fn set_broker_policy(&self, policy: BrokerPolicy) {
         let mut slot = self
@@ -1189,7 +1208,12 @@ impl MaskEngine {
                     let dets = if secrets.compiled.is_empty() {
                         Vec::new()
                     } else {
-                        resolve_overlaps(detect_secrets(&secrets.compiled, s, Surface::UserMessage))
+                        // Unscoped: a registered secret inside a `>>…<<` bypass span must
+                        // trip regardless of its `apply_to_surfaces` scoping (third-G1 fix).
+                        // A ToolResult-scoped secret pasted into a UserMessage bypass would
+                        // otherwise egress unmasked. Still masked in place — the bypass
+                        // tolerates masking (never a 409).
+                        resolve_overlaps(secrets::detect_secrets_unscoped(&secrets.compiled, s))
                     };
                     if dets.is_empty() {
                         masked_text.push_str(s);
@@ -3796,6 +3820,62 @@ mod tests {
         assert!(
             !out.masked_text.contains("LEAKME123"),
             "bypass must not leak a known secret: {}",
+            out.masked_text
+        );
+        assert!(
+            out.masked_text.contains("and hi"),
+            "non-secret bypass text stays verbatim: {}",
+            out.masked_text
+        );
+    }
+
+    // A2a: the scan-only tripwire returns the secret NAME (never the value).
+    #[test]
+    fn registered_secret_hit_returns_name_not_value() {
+        let e = engine();
+        e.set_secret_rules(vec![secret_rule("db_pw", "S3cretPlaintext!", Operator::Hash)])
+            .unwrap();
+        let hit = e.registered_secret_hit("connect with S3cretPlaintext! now");
+        assert_eq!(
+            hit.as_deref(),
+            Some("db_pw"),
+            "returns the registered NAME on a hit"
+        );
+        let name = hit.unwrap();
+        assert!(
+            !name.contains("S3cretPlaintext!"),
+            "must NEVER return the secret value: {name}"
+        );
+        assert_eq!(
+            e.registered_secret_hit("nothing sensitive here"),
+            None,
+            "no hit ⇒ None"
+        );
+    }
+
+    // A2a SCOPED-BYPASS REGRESSION (third-G1 fix): a registered secret scoped to
+    // ToolResult ONLY (excluding UserMessage) that is pasted inside a `>>…<<` bypass
+    // span of a UserMessage must STILL be masked. Before the unscoped-scan fix this
+    // leaked, because the bypass scan was surface-scoped to UserMessage and the secret
+    // was not scoped there. The all-surfaces `secret_masked_inside_user_bypass` above
+    // must still pass.
+    #[test]
+    fn scoped_secret_masked_inside_user_bypass() {
+        let e = engine();
+        e.set_secret_rules(vec![SecretRule {
+            name: "tok".into(),
+            value: SecretValue::new("LEAKME123"),
+            operator: Operator::Hash,
+            case_sensitive: true,
+            apply_to_surfaces: Some(std::collections::HashSet::from([Surface::ToolResult])),
+        }])
+        .unwrap();
+        let out = e
+            .mask("send >>LEAKME123 and hi<<", Surface::UserMessage)
+            .unwrap();
+        assert!(
+            !out.masked_text.contains("LEAKME123"),
+            "ToolResult-scoped secret in a UserMessage bypass must not leak: {}",
             out.masked_text
         );
         assert!(
