@@ -20,14 +20,15 @@ to assert against the Licensor or its licensees, any moral rights You may
 have in Your contributions.
 
 **Patent grant.** You grant the Licensor and all recipients of the Licensed
-Work a perpetual, worldwide, non-exclusive, royalty-free patent license to
-make, have made, use, offer to sell, sell, import, and otherwise transfer
-Your contribution, applying only to those patent claims licensable by You
-that are necessarily infringed by Your contribution alone or in combination
-with the work it was submitted to. If any entity institutes patent
-litigation alleging that Your contribution or the work constitutes patent
-infringement, all patent licenses granted to that entity under this
-agreement terminate as of the date such litigation is filed.
+Work (as defined in [LICENSE](LICENSE)) a perpetual, worldwide, non-exclusive,
+royalty-free patent license to make, have made, use, offer to sell, sell,
+import, and otherwise transfer Your contribution, applying only to those
+patent claims licensable by You that are necessarily infringed by Your
+contribution alone or in combination with the work it was submitted to. If
+any entity institutes patent litigation alleging that Your contribution or
+the work constitutes patent infringement, all patent licenses granted to
+that entity under this agreement terminate as of the date such litigation is
+filed.
 
 **Representations.** You represent that each of Your contributions is Your
 original creation and that You are legally entitled to grant the above
