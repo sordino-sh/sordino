@@ -1,4 +1,4 @@
-# Releasing ZlauDeR
+# Releasing Sordino
 
 A release is cut by pushing a `vX.Y.Z` tag, which triggers
 [`.github/workflows/release.yml`](../.github/workflows/release.yml). The first
@@ -25,18 +25,18 @@ desynced on every bump.)
 Three plugin manifests still carry their own copy of the version (they are not
 Cargo crates), and the release gate asserts all three match the tag:
 
-- `zlauder-plugin/.claude-plugin/plugin.json` — the Claude Code plugin manifest.
-- `.claude-plugin/marketplace.json` — the `zlauder` entry's `version` field.
-- `codex-zlauder-plugin/.codex-plugin/plugin.json` — the Codex plugin manifest.
+- `sordino-plugin/.claude-plugin/plugin.json` — the Claude Code plugin manifest.
+- `.claude-plugin/marketplace.json` — the `sordino` entry's `version` field.
+- `codex-sordino-plugin/.codex-plugin/plugin.json` — the Codex plugin manifest.
 
 ## Release steps
 
 1. **Bump the version** in `Cargo.toml` `[workspace.package] version` — the
    single source of truth.
 2. **Match the plugin manifests** to the new version (all three the gate checks):
-   - `zlauder-plugin/.claude-plugin/plugin.json` (`.version`)
-   - `.claude-plugin/marketplace.json` (the `zlauder` plugin entry's `.version`)
-   - `codex-zlauder-plugin/.codex-plugin/plugin.json` (`.version`)
+   - `sordino-plugin/.claude-plugin/plugin.json` (`.version`)
+   - `.claude-plugin/marketplace.json` (the `sordino` plugin entry's `.version`)
+   - `codex-sordino-plugin/.codex-plugin/plugin.json` (`.version`)
 3. **Regenerate the lockfile** so `Cargo.lock` reflects the bumped workspace
    version:
 
@@ -60,9 +60,9 @@ The `verify` job asserts the tag matches every tracked version:
 
 ```
 tag == Cargo.toml [workspace.package] version
-    == zlauder-plugin/.claude-plugin/plugin.json version
-    == .claude-plugin/marketplace.json (zlauder entry) version
-    == codex-zlauder-plugin/.codex-plugin/plugin.json version
+    == sordino-plugin/.claude-plugin/plugin.json version
+    == .claude-plugin/marketplace.json (sordino entry) version
+    == codex-sordino-plugin/.codex-plugin/plugin.json version
 ```
 
 Any mismatch fails the release with a `::error::` annotation naming the offending
