@@ -36,6 +36,18 @@ fn engage_in_memory(state: &AppState, conversation: &str, target: &str) {
     );
 }
 
+/// The `x-sordino-project` value a control-plane request must present now that the
+/// handlers gate on `authed_for_project`: the project-identity hash of the proxy's
+/// `project_root`, identical to what `AppState::project_key` computes server-side. An
+/// honest same-project caller derives the same value from the same canonical root.
+fn project_hdr(root: &str) -> String {
+    sordino_state::project_key(root)
+}
+
+/// The root `mk_state` binds as `AppState::project_root`, so `project_hdr(TEST_PROJECT_ROOT)`
+/// is the project header every `mk_state`-based control-plane request must send.
+const TEST_PROJECT_ROOT: &str = "/tmp/sordino-test-project";
+
 /// Build an `AppState` for tests (no real config files; reload points at a
 /// nonexistent user layer so it's a deterministic no-op).
 fn mk_state(engine: MaskEngine, upstream_base: String, admin_key: &str) -> AppState {
@@ -482,6 +494,7 @@ async fn openai_chat_stream_held_tail_reaches_client_and_monitor() {
     // And it is captured onto the monitor record — the reply is not truncated.
     let snap: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/monitor/snapshot"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "tail-key")
         .send()
         .await
@@ -544,6 +557,7 @@ async fn openai_chat_stream_content_and_finish_in_one_chunk_orders_correctly() {
     // The captured reply preserves the correct order (wire == capture).
     let snap: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/monitor/snapshot"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "combo-key")
         .send()
         .await
@@ -661,6 +675,7 @@ async fn openai_responses_streaming_unmasks_and_preserves_sse_events() {
     // CompletionGuard::complete() already finalized the record.
     let snap: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/monitor/snapshot"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "test-key")
         .send()
         .await
@@ -769,6 +784,7 @@ async fn config_endpoints_gated_and_toggle_masking() {
     // With the key → 200 and `enabled: true`.
     let cfg: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/config"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "secret-key")
         .send()
         .await
@@ -790,6 +806,7 @@ async fn config_endpoints_gated_and_toggle_masking() {
     // disable WITH the key → masking off.
     let off: serde_json::Value = client
         .post(format!("http://{proxy_addr}/sordino/disable"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "secret-key")
         .send()
         .await
@@ -821,6 +838,7 @@ async fn config_endpoints_gated_and_toggle_masking() {
     // Re-enable and masking resumes.
     let on: serde_json::Value = client
         .post(format!("http://{proxy_addr}/sordino/enable"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "secret-key")
         .send()
         .await
@@ -864,6 +882,7 @@ async fn master_switch_toggle_preserves_data_policy() {
     // Establish a distinctive, hand-tuned data policy via the live control plane.
     let put = client
         .put(format!("http://{proxy_addr}/sordino/config"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "secret-key")
         .json(&serde_json::json!({
             "score_threshold": 0.73,
@@ -878,6 +897,7 @@ async fn master_switch_toggle_preserves_data_policy() {
     let get_policy = |client: reqwest::Client, addr: String| async move {
         client
             .get(format!("http://{addr}/sordino/config"))
+            .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
             .header("x-sordino-key", "secret-key")
             .send()
             .await
@@ -901,6 +921,7 @@ async fn master_switch_toggle_preserves_data_policy() {
     // DISABLE (the master switch the DISABLED posture drives).
     let off: serde_json::Value = client
         .post(format!("http://{proxy_addr}/sordino/disable"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "secret-key")
         .send()
         .await
@@ -922,6 +943,7 @@ async fn master_switch_toggle_preserves_data_policy() {
     // RE-ENABLE → masking back on, and the exact same policy is restored.
     let on: serde_json::Value = client
         .post(format!("http://{proxy_addr}/sordino/enable"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "secret-key")
         .send()
         .await
@@ -948,6 +970,7 @@ async fn ml_endpoints_gated_and_snapshot_shape() {
     // Snapshot carries the ml block: off + default model + status "disabled".
     let cfg: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/config"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "mlkey")
         .send()
         .await
@@ -973,6 +996,7 @@ async fn ml_endpoints_gated_and_snapshot_shape() {
     // Disable with the key is a safe no-network op → 200, still "disabled".
     let off: serde_json::Value = client
         .post(format!("http://{proxy_addr}/sordino/ml/disable"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "mlkey")
         .send()
         .await
@@ -997,6 +1021,7 @@ async fn put_config_cannot_flip_ml_enabled() {
 
     let mut cfg: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/config"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "k2")
         .send()
         .await
@@ -1009,6 +1034,7 @@ async fn put_config_cannot_flip_ml_enabled() {
     wire["ml"]["enabled"] = serde_json::json!(true);
     let put: serde_json::Value = client
         .put(format!("http://{proxy_addr}/sordino/config"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "k2")
         .json(&wire)
         .send()
@@ -1039,6 +1065,7 @@ async fn put_config_replaces_live_policy() {
     // Pull the current config, set EMAIL_ADDRESS -> redact, PUT it back.
     let mut cfg: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/config"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "kk")
         .send()
         .await
@@ -1051,6 +1078,7 @@ async fn put_config_replaces_live_policy() {
     wire["entity_operators"]["EMAIL_ADDRESS"] = serde_json::json!({"kind": "redact"});
     let put = client
         .put(format!("http://{proxy_addr}/sordino/config"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "kk")
         .json(&wire)
         .send()
@@ -1108,6 +1136,7 @@ async fn monitor_default_observes_without_blocking() {
 
     let snap: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/monitor/snapshot"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "mon")
         .send()
         .await
@@ -1155,6 +1184,7 @@ async fn monitor_backpressure_rejects_when_pending_queue_is_full() {
 
     let mode = client
         .post(format!("http://{proxy_addr}/sordino/monitor/mode"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "bp-key")
         .json(&serde_json::json!({
             "mode": "manual_all_llm",
@@ -1192,6 +1222,7 @@ async fn monitor_backpressure_rejects_when_pending_queue_is_full() {
 
     let snap: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/monitor/snapshot"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "bp-key")
         .send()
         .await
@@ -1213,6 +1244,7 @@ async fn monitor_backpressure_rejects_when_pending_queue_is_full() {
         .post(format!(
             "http://{proxy_addr}/sordino/monitor/requests/{id}/approve"
         ))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "bp-key")
         .send()
         .await
@@ -1237,6 +1269,7 @@ async fn monitor_manual_reject_never_reaches_upstream() {
 
     let mode = client
         .post(format!("http://{proxy_addr}/sordino/monitor/mode"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "reject-key")
         .json(&serde_json::json!({"mode":"manual_all_llm"}))
         .send()
@@ -1261,6 +1294,7 @@ async fn monitor_manual_reject_never_reaches_upstream() {
         .post(format!(
             "http://{proxy_addr}/sordino/monitor/requests/{id}/reject"
         ))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "reject-key")
         .json(&serde_json::json!({"reason":"test reject"}))
         .send()
@@ -1287,6 +1321,7 @@ async fn monitor_manual_approve_releases_request() {
 
     client
         .post(format!("http://{proxy_addr}/sordino/monitor/mode"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "approve-key")
         .json(&serde_json::json!({"mode":"manual_all_llm"}))
         .send()
@@ -1310,6 +1345,7 @@ async fn monitor_manual_approve_releases_request() {
         .post(format!(
             "http://{proxy_addr}/sordino/monitor/requests/{id}/approve"
         ))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "approve-key")
         .send()
         .await
@@ -1335,6 +1371,7 @@ async fn monitor_custom_mask_applies_to_future_requests() {
 
     let resp = client
         .post(format!("http://{proxy_addr}/sordino/monitor/custom-mask"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "custom-key")
         .json(&serde_json::json!({"pattern":"ACME-ALPHA"}))
         .send()
@@ -1387,6 +1424,7 @@ async fn monitor_session_prefixed_route_groups_by_conversation() {
 
     let snap: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/monitor/snapshot"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "session-key")
         .send()
         .await
@@ -1445,6 +1483,7 @@ async fn per_conversation_disable_isolates_to_that_conversation() {
     // Disable masking for "alpha" only.
     let off: serde_json::Value = client
         .post(format!("http://{proxy_addr}/sordino/session/alpha/masking"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "mkey")
         .send()
         .await
@@ -1480,6 +1519,7 @@ async fn per_conversation_disable_isolates_to_that_conversation() {
     // The config snapshot lists alpha (and only alpha) as masking-disabled.
     let cfg: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/config"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "mkey")
         .send()
         .await
@@ -1495,6 +1535,7 @@ async fn per_conversation_disable_isolates_to_that_conversation() {
     // Re-enable alpha → masking resumes.
     let on: serde_json::Value = client
         .delete(format!("http://{proxy_addr}/sordino/session/alpha/masking"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "mkey")
         .send()
         .await
@@ -1517,6 +1558,7 @@ async fn wait_for_pending(client: &reqwest::Client, proxy_addr: SocketAddr, key:
     for _ in 0..50 {
         let snap: serde_json::Value = client
             .get(format!("http://{proxy_addr}/sordino/monitor/snapshot"))
+            .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
             .header("x-sordino-key", key)
             .send()
             .await
@@ -1590,6 +1632,7 @@ async fn profile_endpoint_applies_and_persists() {
         .post(format!(
             "http://{proxy_addr}/sordino/profile/strict?scope=local"
         ))
+        .header("x-sordino-project", project_hdr(&dir.to_string_lossy()))
         .header("x-sordino-key", "pk")
         .send()
         .await
@@ -1615,6 +1658,7 @@ async fn profile_endpoint_applies_and_persists() {
         .post(format!(
             "http://{proxy_addr}/sordino/profile/development_safe?scope=session"
         ))
+        .header("x-sordino-project", project_hdr(&dir.to_string_lossy()))
         .header("x-sordino-key", "pk")
         .send()
         .await
@@ -1628,6 +1672,7 @@ async fn profile_endpoint_applies_and_persists() {
     // An unknown profile is a 400.
     let bad = client
         .post(format!("http://{proxy_addr}/sordino/profile/bogus"))
+        .header("x-sordino-project", project_hdr(&dir.to_string_lossy()))
         .header("x-sordino-key", "pk")
         .send()
         .await
@@ -1651,6 +1696,7 @@ async fn put_config_merges_partial_body() {
     // PUT ONLY a new threshold.
     let put: serde_json::Value = client
         .put(format!("http://{proxy_addr}/sordino/config"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "mp")
         .json(&serde_json::json!({ "score_threshold": 0.77 }))
         .send()
@@ -1677,6 +1723,7 @@ async fn put_config_rejects_unknown_entity_operator_key() {
 
     let bad = client
         .put(format!("http://{proxy_addr}/sordino/config"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "uk")
         .json(&serde_json::json!({ "entity_operators": { "EMIAL": { "kind": "redact" } } }))
         .send()
@@ -1703,6 +1750,7 @@ async fn custom_mask_persist_list_remove() {
 
     let add: serde_json::Value = client
         .post(format!("http://{proxy_addr}/sordino/monitor/custom-mask"))
+        .header("x-sordino-project", project_hdr(&dir.to_string_lossy()))
         .header("x-sordino-key", "cm")
         .json(&serde_json::json!({"pattern":"ACME-XYZ"}))
         .send()
@@ -1719,6 +1767,7 @@ async fn custom_mask_persist_list_remove() {
     // List shows it.
     let list: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/monitor/custom-mask"))
+        .header("x-sordino-project", project_hdr(&dir.to_string_lossy()))
         .header("x-sordino-key", "cm")
         .send()
         .await
@@ -1735,6 +1784,7 @@ async fn custom_mask_persist_list_remove() {
             reqwest::Method::DELETE,
             format!("http://{proxy_addr}/sordino/monitor/custom-mask"),
         )
+        .header("x-sordino-project", project_hdr(&dir.to_string_lossy()))
         .header("x-sordino-key", "cm")
         .json(&serde_json::json!({"pattern":"ACME-XYZ"}))
         .send()
@@ -1766,6 +1816,7 @@ async fn reveal_then_remask_keyphrase_roundtrip() {
     // Seed a custom keyphrase, then reveal it to the model.
     client
         .post(format!("http://{proxy_addr}/sordino/monitor/custom-mask"))
+        .header("x-sordino-project", project_hdr(&dir.to_string_lossy()))
         .header("x-sordino-key", "rv")
         .json(&serde_json::json!({"pattern":"SEKRET-1"}))
         .send()
@@ -1774,6 +1825,7 @@ async fn reveal_then_remask_keyphrase_roundtrip() {
 
     let rev: serde_json::Value = client
         .post(format!("http://{proxy_addr}/sordino/monitor/reveal"))
+        .header("x-sordino-project", project_hdr(&dir.to_string_lossy()))
         .header("x-sordino-key", "rv")
         .json(&serde_json::json!({"value":"SEKRET-1","pattern":"SEKRET-1","entity_type":"CUSTOM_KEYWORD"}))
         .send()
@@ -1796,6 +1848,7 @@ async fn reveal_then_remask_keyphrase_roundtrip() {
     // The live config endpoint confirms the value egresses plaintext now.
     let cfg: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/config"))
+        .header("x-sordino-project", project_hdr(&dir.to_string_lossy()))
         .header("x-sordino-key", "rv")
         .send()
         .await
@@ -1812,6 +1865,7 @@ async fn reveal_then_remask_keyphrase_roundtrip() {
             reqwest::Method::DELETE,
             format!("http://{proxy_addr}/sordino/monitor/reveal"),
         )
+        .header("x-sordino-project", project_hdr(&dir.to_string_lossy()))
         .header("x-sordino-key", "rv")
         .json(&serde_json::json!({"value":"SEKRET-1"}))
         .send()
@@ -1862,6 +1916,7 @@ async fn session_routed_reflects_inbound_and_is_gated() {
     // 1) No inbound yet for this id → routed_recently:false, last_seen_ms:null.
     let before: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/session/{sid}/routed"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "obs-key")
         .send()
         .await
@@ -1896,6 +1951,7 @@ async fn session_routed_reflects_inbound_and_is_gated() {
     // 3) The endpoint now attributes that inbound to the session id.
     let after: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/session/{sid}/routed"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "obs-key")
         .send()
         .await
@@ -1916,6 +1972,7 @@ async fn session_routed_reflects_inbound_and_is_gated() {
     // A different, never-seen id is still not routed (no false positive on liveness).
     let other: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/session/never-seen-id/routed"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "obs-key")
         .send()
         .await
@@ -2368,6 +2425,7 @@ async fn zdr_control_endpoint_engage_status_and_refuse() {
     // Engage a verified config.
     let ok = client
         .post(format!("http://{proxy_addr}/sordino/session/c/zdr"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "test-key")
         .json(&serde_json::json!({"config":"trusted"}))
         .send()
@@ -2384,6 +2442,7 @@ async fn zdr_control_endpoint_engage_status_and_refuse() {
     // GET status reflects the active selection.
     let st = client
         .get(format!("http://{proxy_addr}/sordino/session/c/zdr"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "test-key")
         .send()
         .await
@@ -2394,6 +2453,7 @@ async fn zdr_control_endpoint_engage_status_and_refuse() {
     // Engaging an unverified config → 400.
     let unv = client
         .post(format!("http://{proxy_addr}/sordino/session/c2/zdr"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "test-key")
         .json(&serde_json::json!({"config":"raw"}))
         .send()
@@ -2404,6 +2464,7 @@ async fn zdr_control_endpoint_engage_status_and_refuse() {
     // Engaging an unknown config → 404.
     let unk = client
         .post(format!("http://{proxy_addr}/sordino/session/c3/zdr"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "test-key")
         .json(&serde_json::json!({"config":"nope"}))
         .send()
@@ -2414,6 +2475,7 @@ async fn zdr_control_endpoint_engage_status_and_refuse() {
     // DELETE disengages.
     let del = client
         .delete(format!("http://{proxy_addr}/sordino/session/c/zdr"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "test-key")
         .send()
         .await
@@ -3364,6 +3426,7 @@ mod zdr_persist {
         let client = reqwest::Client::new();
         let resp = client
             .post(format!("http://{proxy_addr}/sordino/session/cx/zdr"))
+            .header("x-sordino-project", project_hdr("/proj/set-5xx"))
             .header("x-sordino-key", "test-key")
             .json(&serde_json::json!({"config":"box"}))
             .send()
@@ -4893,4 +4956,92 @@ async fn a4b_responses_stream_other_event_gated() {
         }))
         .send().await.unwrap().text().await.unwrap();
     assert_stream_gated(&text);
+}
+
+// -- A5-server (GAP-CLOSURE G19): control-plane handlers bind THIS proxy's project ---
+// identity. Beyond the bearer admin key, a data-bearing control-plane call must ALSO
+// present this instance's `x-sordino-project` hash — closing the residual where a
+// caller holding a valid (port,key) pair resolved for the WRONG live instance (a
+// collided/recycled-port race) is accepted.
+
+#[tokio::test]
+async fn control_plane_requires_matching_project_header() {
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, "http://127.0.0.1:1".into(), "proj-key");
+    let proxy_addr = spawn(proxy_router(state)).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{proxy_addr}/sordino/monitor/snapshot");
+
+    // correct key + correct project -> 200 (a no-op for the honest same-project caller).
+    let ok = client
+        .get(&url)
+        .header("x-sordino-key", "proj-key")
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK, "correct key + correct project must pass");
+
+    // correct key + WRONG project -> 403 (the collided-instance case).
+    let wrong = client
+        .get(&url)
+        .header("x-sordino-key", "proj-key")
+        .header("x-sordino-project", "not-this-projects-hash")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        wrong.status(),
+        StatusCode::FORBIDDEN,
+        "correct key + WRONG project must 403"
+    );
+
+    // correct key + MISSING project -> 403 (the project header is required).
+    let missing = client
+        .get(&url)
+        .header("x-sordino-key", "proj-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        missing.status(),
+        StatusCode::FORBIDDEN,
+        "correct key + MISSING project must 403"
+    );
+}
+
+#[tokio::test]
+async fn sse_events_requires_project_on_query_fallback() {
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, "http://127.0.0.1:1".into(), "sse-key");
+    let proxy_addr = spawn(proxy_router(state)).await;
+    let client = reqwest::Client::new();
+    let proj = project_hdr(TEST_PROJECT_ROOT);
+
+    // valid key via query, but NO project query param -> 403 (project required on the
+    // EventSource query fallback too, not just the header path).
+    let no_proj = client
+        .get(format!("http://{proxy_addr}/sordino/monitor/events?key=sse-key"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        no_proj.status(),
+        StatusCode::FORBIDDEN,
+        "SSE must require the project on the query fallback"
+    );
+
+    // valid key + correct project via query -> 200.
+    let ok = client
+        .get(format!(
+            "http://{proxy_addr}/sordino/monitor/events?key=sse-key&project={proj}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        ok.status(),
+        StatusCode::OK,
+        "SSE with correct key + correct project query must pass"
+    );
 }

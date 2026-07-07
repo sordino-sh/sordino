@@ -24,10 +24,15 @@
 /* ---------- key handling (x-zlauder-key + EventSource ?key=) ---------- */
 let key = new URLSearchParams(location.search).get('key')
        || localStorage.getItem('zlauderKey') || '';
+// This proxy instance's project identity, required (alongside the key) on every
+// control-plane call. EventSource cannot set headers, so it also rides the query.
+let project = new URLSearchParams(location.search).get('project')
+       || localStorage.getItem('sordinoProject') || '';
+if (project) { localStorage.setItem('sordinoProject', project); }
 if (key) { localStorage.setItem('zlauderKey', key); history.replaceState(null, '', location.pathname); }
 if (!key) { key = (prompt('x-zlauder-key') || '').trim(); if (key) localStorage.setItem('zlauderKey', key); }
 
-const hdr = { 'x-zlauder-key': key, 'content-type': 'application/json' };
+const hdr = { 'x-zlauder-key': key, 'x-sordino-project': project, 'content-type': 'application/json' };
 function api(path, opts = {}) { opts.headers = { ...(opts.headers || {}), ...hdr }; return fetch(path, opts); }
 
 /* ---------- state ---------- */
@@ -1530,7 +1535,7 @@ load().then(refreshLedgerSources);
 // controls AND raises its confirming toast, instead of being silently absorbed as a seed.
 loadPolicy();
 
-const es = new EventSource(`/zlauder/monitor/events?key=${encodeURIComponent(key)}`);
+const es = new EventSource(`/zlauder/monitor/events?key=${encodeURIComponent(key)}&project=${encodeURIComponent(project)}`);
 es.onopen = () => setLink(true);
 es.onerror = () => setLink(false);
 es.onmessage = e => {

@@ -42,7 +42,7 @@ pub async fn maybe_approve(st: &AppState, ticket: ReviewTicket) -> Result<(), Re
 }
 
 pub async fn snapshot(State(st): State<AppState>, hdrs: HeaderMap) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
     json_response(&st.monitor.snapshot())
@@ -53,7 +53,7 @@ pub async fn set_mode(
     hdrs: HeaderMap,
     axum::Json(req): axum::Json<ModeRequest>,
 ) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
     json_response(&st.monitor.set_mode(req.mode, req.max_pending_approvals))
@@ -64,7 +64,7 @@ pub async fn approve(
     hdrs: HeaderMap,
     Path(id): Path<String>,
 ) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
     match st.monitor.decide(&id, ApprovalDecision::Approve) {
@@ -79,7 +79,7 @@ pub async fn reject(
     Path(id): Path<String>,
     axum::Json(req): axum::Json<RejectRequest>,
 ) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
     let reason = if req.reason.trim().is_empty() {
@@ -99,7 +99,7 @@ pub async fn tags(
     Path(id): Path<String>,
     axum::Json(req): axum::Json<TagsRequest>,
 ) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
     match st.monitor.update_tags(&id, req.tags) {
@@ -113,7 +113,7 @@ pub async fn custom_mask(
     hdrs: HeaderMap,
     axum::Json(req): axum::Json<CustomMaskRequest>,
 ) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
     let pattern = req.pattern.trim();
@@ -168,7 +168,7 @@ pub async fn custom_mask(
 /// the UI's manage view. Reads the live config snapshot (the authoritative set,
 /// including session-only additions not yet — or never — persisted).
 pub async fn custom_masks_list(State(st): State<AppState>, hdrs: HeaderMap) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
     let cfg = st.engine.config_snapshot();
@@ -196,7 +196,7 @@ pub async fn custom_masks_remove(
     hdrs: HeaderMap,
     axum::Json(req): axum::Json<super::model::CustomMaskRemoveRequest>,
 ) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
     let pattern = req.pattern.trim().to_string();
@@ -288,7 +288,7 @@ pub async fn reveal_keyphrase(
     hdrs: HeaderMap,
     axum::Json(req): axum::Json<RevealRequest>,
 ) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
     let value = req.value.trim().to_string();
@@ -361,7 +361,7 @@ pub async fn remask_keyphrase(
     hdrs: HeaderMap,
     axum::Json(req): axum::Json<RemaskRequest>,
 ) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
     let value = req.value.trim().to_string();
@@ -397,7 +397,13 @@ pub async fn events(
     hdrs: HeaderMap,
     Query(query): Query<HashMap<String, String>>,
 ) -> Response {
-    if !st.authed(&hdrs) && query.get("key") != Some(st.admin_key.as_ref()) {
+    // EventSource clients cannot set custom headers, so BOTH the admin key and the
+    // project identity accept a query-param fallback (mirroring the header path).
+    let key_ok = st.authed(&hdrs) || query.get("key") == Some(st.admin_key.as_ref());
+    let project_ok = st
+        .project_header_matches(hdrs.get("x-sordino-project").and_then(|v| v.to_str().ok()))
+        || st.project_header_matches(query.get("project").map(String::as_str));
+    if !key_ok || !project_ok {
         return forbidden();
     }
     let snapshot = st.monitor.snapshot();

@@ -143,7 +143,7 @@ async fn reveal(
     hdrs: HeaderMap,
     Path(token): Path<String>,
 ) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return err(StatusCode::FORBIDDEN, "missing or invalid x-sordino-key");
     }
     // Class-aware: distinguish an UNKNOWN handle (404) from one that EXISTS but is not

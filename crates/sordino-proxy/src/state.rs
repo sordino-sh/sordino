@@ -803,6 +803,28 @@ impl AppState {
         // not a co-located timing attacker (who can already read the 0600 file).
         !provided.is_empty() && provided == self.admin_key.as_str()
     }
+
+    /// This proxy instance's project-identity hash (a pure `blake3` of the canonical
+    /// project root — no I/O). Callers on the SAME project compute the identical value,
+    /// so requiring it is a no-op for honest same-project clients while rejecting a
+    /// caller that resolved a valid `(port,key)` pair for the WRONG live instance
+    /// (a collided/recycled-port race).
+    pub fn project_key(&self) -> String {
+        sordino_state::project_key(&self.project_root)
+    }
+
+    /// True iff `provided` is present AND equals this proxy's project key.
+    pub fn project_header_matches(&self, provided: Option<&str>) -> bool {
+        provided.is_some_and(|p| p == self.project_key())
+    }
+
+    /// Control-plane authorization: the bearer admin key AND this instance's project
+    /// identity (`x-sordino-project`). Closes the residual where a valid-shaped
+    /// `(port,key)` pair accepted for a collided/recycled-port live instance.
+    pub fn authed_for_project(&self, hdrs: &http::HeaderMap) -> bool {
+        self.authed(hdrs)
+            && self.project_header_matches(hdrs.get("x-sordino-project").and_then(|v| v.to_str().ok()))
+    }
 }
 
 // -- file helpers for ZDR selection persistence (A4/H1/D1) ----------------------
@@ -903,4 +925,81 @@ fn now_nanos() -> u64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod project_binding_tests {
+    //! A5-server (GAP-CLOSURE G19): control-plane authorization binds THIS proxy's
+    //! project identity (`x-sordino-project`) on top of the bearer admin key.
+    use super::*;
+    use sordino_engine::{EngineConfig, MaskEngine};
+    use std::sync::atomic::AtomicBool;
+
+    const ROOT: &str = "/tmp/sordino-state-test-project";
+    const KEY: &str = "unit-admin-key";
+
+    /// Minimal `AppState` bound to a fixed `project_root`/`admin_key` (mirrors the
+    /// integration `mk_state` fixture; only the auth-relevant fields matter here).
+    fn mk_state() -> AppState {
+        AppState {
+            engine: Arc::new(MaskEngine::new(EngineConfig::default()).unwrap()),
+            http: reqwest::Client::new(),
+            upstream_base: Arc::new("http://127.0.0.1:1".into()),
+            admin_key: Arc::new(KEY.into()),
+            layers: Arc::new(ConfigLayers {
+                user: PathBuf::from("/nonexistent/sordino/config.toml"),
+                project: None,
+                local: None,
+            }),
+            project_root: Arc::new(ROOT.into()),
+            port: 0,
+            monitor: Monitor::new(),
+            ml_control: Arc::new(std::sync::Mutex::new(())),
+            config_control: Arc::new(std::sync::Mutex::new(())),
+            secrets_ready: Arc::new(AtomicBool::new(true)),
+            secrets_status: Arc::new(std::sync::RwLock::new(SecretsStatus::default())),
+            zdr_targets: Arc::new(HashMap::new()),
+            zdr_default: Arc::new(None),
+            zdr_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            masking_disabled: Arc::new(std::sync::Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// Build a header map with the given admin key and optional project header.
+    fn hdrs(key: Option<&str>, project: Option<&str>) -> http::HeaderMap {
+        let mut h = http::HeaderMap::new();
+        if let Some(k) = key {
+            h.insert("x-sordino-key", k.parse().unwrap());
+        }
+        if let Some(p) = project {
+            h.insert("x-sordino-project", p.parse().unwrap());
+        }
+        h
+    }
+
+    #[test]
+    fn project_header_matches_truth_table() {
+        let st = mk_state();
+        let correct = st.project_key();
+        // correct project -> true
+        assert!(st.project_header_matches(Some(correct.as_str())));
+        // wrong project -> false
+        assert!(!st.project_header_matches(Some("not-this-projects-hash")));
+        // missing project -> false
+        assert!(!st.project_header_matches(None));
+    }
+
+    #[test]
+    fn authed_for_project_truth_table() {
+        let st = mk_state();
+        let correct = st.project_key();
+        // correct key + correct project -> true
+        assert!(st.authed_for_project(&hdrs(Some(KEY), Some(correct.as_str()))));
+        // correct key + wrong project -> false
+        assert!(!st.authed_for_project(&hdrs(Some(KEY), Some("wrong-project"))));
+        // correct key + missing project -> false
+        assert!(!st.authed_for_project(&hdrs(Some(KEY), None)));
+        // wrong key + correct project -> false (bearer key still required)
+        assert!(!st.authed_for_project(&hdrs(Some("wrong-key"), Some(correct.as_str()))));
+    }
 }
