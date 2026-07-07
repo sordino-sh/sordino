@@ -83,7 +83,11 @@ use crate::surface::Surface;
 // structural identifier, not a user URL, and is suppressed under Network regardless of the
 // F7 standards-host allow-list. Also an ingest-juncture entity-gated pre-check, sibling of
 // F5, never the shared `is_suppressed`. Changes output for unchanged text — bump.
-pub const DETECTOR_VERSION: u64 = 14;
+// v15: tightened the F8 namespace-key match — the `schemaLocation` clause was `ends_with`, which
+// over-matched a contrived key (e.g. `dataschemaLocation`) and UNDER-MASKED a real user URL; it
+// now matches only the real `schemaLocation` / `<ns>:schemaLocation` forms. A URL under such a
+// non-namespace key now MASKS instead of being suppressed — changes output, so bump.
+pub const DETECTOR_VERSION: u64 = 15;
 
 /// Score the [`LemmaContextAwareEnhancer`] adds when a recognizer's context word
 /// is found near a match (mirrors `LemmaContextAwareEnhancer::new`'s
@@ -510,7 +514,12 @@ fn preceding_key_is_namespace(text: &str, start: usize) -> bool {
         || key == "$id"
         || key == "$ref"
         || key == "targetNamespace"
-        || key.ends_with("schemaLocation")
+        // v15: tightened from `key.ends_with("schemaLocation")` — the bare suffix over-matched a
+        // contrived key like `dataschemaLocation` and would UNDER-MASK a real user URL. Only the
+        // bare `schemaLocation` and namespaced `<ns>:schemaLocation` (e.g. `xsi:schemaLocation`)
+        // forms are genuine namespace-declaring keys.
+        || key == "schemaLocation"
+        || key.ends_with(":schemaLocation")
 }
 
 /// Suppress detections fully contained within an allow-listed span, then resolve
@@ -1311,6 +1320,40 @@ mod net_precision_ingest_tests {
         );
     }
 
+    // v15 regression: the F8 `schemaLocation` clause used to be `ends_with`, so a contrived key
+    // like `dataschemaLocation` matched and SUPPRESSED a real user URL — an UNDER-MASK (a leak).
+    // After the tightening, only bare `schemaLocation` / `<ns>:schemaLocation` suppress; a URL
+    // under `dataschemaLocation` must MASK again. The genuine forms must still be suppressed.
+    #[test]
+    fn f8_schema_location_tightened_to_real_namespace_forms() {
+        let cfg = network_on();
+        // Hosts here use example.com (a TLD presidio DOES parse: score-0.6 Quoted URL) so both
+        // directions are load-bearing — a `.example` host would go undetected and prove nothing.
+        assert!(
+            !cfg.allow_list.is_allowed("https://example.com/x"),
+            "precondition: the host must NOT be allow-listed, so suppression proves F8"
+        );
+        // Regression: key merely ENDS WITH the substring but is not a namespace attr -> masks.
+        // Before the v15 tightening this leaked (`ends_with("schemaLocation")` suppressed it).
+        assert_eq!(
+            dets_of(&cfg, &[], r#"dataschemaLocation="https://example.com/x""#, "URL").len(),
+            1,
+            "a URL under `dataschemaLocation` (not a real namespace attr) must MASK, not be suppressed"
+        );
+        // No regression to the real forms: bare + namespaced schemaLocation still suppressed.
+        // The URL sits directly after the key's opening quote so the backward scan lands on the
+        // schemaLocation key itself (a leading namespace token would shift the preceding key).
+        for text in [
+            r#"schemaLocation="https://example.com/x""#,       // bare -> key == "schemaLocation"
+            r#"xsi:schemaLocation="https://example.com/x""#,   // namespaced -> ends_with(":schemaLocation")
+        ] {
+            assert!(
+                dets_of(&cfg, &[], text, "URL").is_empty(),
+                "genuine schemaLocation form must still be suppressed by F8: {text:?}"
+            );
+        }
+    }
+
     // Also honor the literal acceptance strings (some hosts presidio can't even parse, e.g.
     // `internal.example`'s invalid TLD — those are suppressed regardless; still assert it).
     #[test]
@@ -1353,7 +1396,8 @@ mod net_precision_ingest_tests {
             (r#"targetNamespace="x"#, "targetNamespace"),
             (r#"xmlns="x"#, "xmlns"),
             (r#"xmlns:custom="x"#, "xmlns: compound"),
-            (r#"xsi:schemaLocation="x"#, "schemaLocation suffix"),
+            (r#"xsi:schemaLocation="x"#, "namespaced schemaLocation"),
+            (r#"schemaLocation="x"#, "bare schemaLocation"),
             ("é$schema=\"x", "multibyte-prefixed $schema"),
         ] {
             let start = text.rfind('"').expect("value quote") + 1;
@@ -1363,7 +1407,14 @@ mod net_precision_ingest_tests {
             );
         }
         // Negatives — ordinary keys, and a boundary at position 0.
-        for text in [r#"{"url":"x"#, r#"{"href":"x"#, r#"name="x"#, r#"{"schema_version":"x"#] {
+        // v15: `dataschemaLocation` merely ends with the substring — NOT a real namespace attr.
+        for text in [
+            r#"{"url":"x"#,
+            r#"{"href":"x"#,
+            r#"name="x"#,
+            r#"{"schema_version":"x"#,
+            r#"dataschemaLocation="x"#,
+        ] {
             let start = text.rfind('"').expect("value quote") + 1;
             assert!(
                 !preceding_key_is_namespace(text, start),
