@@ -71,7 +71,19 @@ use crate::surface::Surface;
 // (w3.org/schema.org/…), so bare references to those hosts under Network no longer mask
 // as URLs. Content is already folded into detection_fingerprint via fp_allow_list, but
 // bump per the one-vN-per-detection-output-change convention.
-pub const DETECTOR_VERSION: u64 = 12;
+// v13: reserved/non-routable IP suppression (F5) — an IP_ADDRESS whose literal is a
+// loopback/private/link-local/unspecified (IPv4) or loopback/unspecified/fe80::/10/
+// 2001:db8::/32 (IPv6) address, tolerating a trailing `/<prefix>` or `%<zone>`, is
+// infra noise, not PII, and is dropped in place under Network. An entity-gated
+// ingest-juncture pre-check (a sibling of the API_KEY precision gate, NOT the shared
+// `is_suppressed` which the custom-rule pass also calls) so a deliberate custom rule over
+// such an IP still masks. Changes detection output for unchanged text.
+// v14: namespace-URL suppression (F8) — a URL that is the VALUE of a namespace-declaring
+// key (xmlns / xmlns:* / $schema / $id / $ref / targetNamespace / *schemaLocation) is a
+// structural identifier, not a user URL, and is suppressed under Network regardless of the
+// F7 standards-host allow-list. Also an ingest-juncture entity-gated pre-check, sibling of
+// F5, never the shared `is_suppressed`. Changes output for unchanged text — bump.
+pub const DETECTOR_VERSION: u64 = 14;
 
 /// Score the [`LemmaContextAwareEnhancer`] adds when a recognizer's context word
 /// is found near a match (mirrors `LemmaContextAwareEnhancer::new`'s
@@ -436,6 +448,71 @@ fn is_suppressed(cfg: &EngineConfig, slice: &str, today: i64) -> bool {
     cfg.allow_list.is_allowed(slice) || (cfg.preserve_current_date && is_near_now_date(slice, today))
 }
 
+/// F5: is `slice` a reserved / non-routable IP literal — infra noise, not PII?
+///
+/// Tolerates a trailing `/<prefix>` (CIDR) and/or `%<zone>` (IPv6 scope-id) suffix by
+/// stripping them (in that order) before parsing. Covers IPv4 loopback (127/8), private
+/// (10/8, 172.16/12, 192.168/16), link-local (169.254/16) and unspecified (0.0.0.0); and
+/// IPv6 loopback (::1), unspecified (::), link-local (fe80::/10) and documentation
+/// (2001:db8::/32). A public/routable address (e.g. 8.8.8.8) returns false and still masks
+/// under Network. Called ONLY at the IP_ADDRESS ingest branch — never from the shared
+/// `is_suppressed` (which the custom-rule pass also calls), so a deliberate custom rule
+/// over a reserved IP is unaffected.
+fn is_reserved_net_id(slice: &str) -> bool {
+    // Strip a CIDR prefix, then an IPv6 zone id, before parsing.
+    let s = slice.split('/').next().unwrap_or(slice);
+    let s = s.split('%').next().unwrap_or(s);
+    match s.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+        }
+        Ok(std::net::IpAddr::V6(v6)) => {
+            // `is_unicast_link_local` / `is_documentation` are unstable on stable Rust, so
+            // check the fe80::/10 and 2001:db8::/32 prefixes directly on the segments.
+            let seg = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (seg[0] & 0xffc0) == 0xfe80
+                || (seg[0] == 0x2001 && seg[1] == 0x0db8)
+        }
+        Err(_) => false,
+    }
+}
+
+/// F8: does the key IMMEDIATELY preceding the value at byte offset `start` declare a
+/// namespace/schema (xmlns, xmlns:*, $schema, $id, $ref, targetNamespace, *schemaLocation)?
+///
+/// Such a URL value is a structural identifier, not a user URL. Context tokens are not
+/// threaded into `ingest_results`, so this is a direct backward scan of `text[..start]`:
+/// trim the separator zone (whitespace, `"`, `'`, `:`, `=`) off the end, then take the
+/// maximal trailing key-char run (`[A-Za-z0-9_$:-]`) and match it. All scanning is
+/// char-based (`trim_end_matches` + `char_indices`), so a multibyte char immediately before
+/// the value (e.g. `é$schema=…`) can never split a boundary or panic.
+fn preceding_key_is_namespace(text: &str, start: usize) -> bool {
+    let head = &text[..start];
+    // Separator zone between a key and its value: attribute/JSON punctuation.
+    let trimmed = head.trim_end_matches(|c: char| {
+        c.is_whitespace() || matches!(c, '"' | '\'' | ':' | '=')
+    });
+    let is_key_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | ':' | '-');
+    // Byte index where the maximal trailing key-char run begins (char-boundary safe).
+    let run_start = trimmed
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| is_key_char(*c))
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(trimmed.len());
+    let key = &trimmed[run_start..];
+    key == "xmlns"
+        || key.starts_with("xmlns:")
+        || key == "$schema"
+        || key == "$id"
+        || key == "$ref"
+        || key == "targetNamespace"
+        || key.ends_with("schemaLocation")
+}
+
 /// Suppress detections fully contained within an allow-listed span, then resolve
 /// overlaps into the final sorted, non-overlapping list. Shared tail of
 /// [`run_detection`] and [`run_detection_batch`].
@@ -554,6 +631,24 @@ fn ingest_results(
             && r.recognition_metadata.pattern_name.as_deref() == Some(GENERIC_ENTROPY_PATTERN)
             && !plausible_generic_secret(slice)
         {
+            continue;
+        }
+        // F5: a reserved/non-routable IP literal is infra noise, not PII. A sibling of
+        // the API_KEY precision gate above — it DROPS the presidio detection in place
+        // (does NOT record an allow span). This matters: it is applied ONLY here, at the
+        // IP_ADDRESS ingest branch, and NEVER in the shared `is_suppressed` (which the
+        // custom-rule pass also calls) — so a deliberate custom rule over a reserved IP
+        // still masks. Recording an allow span instead would defeat that, because
+        // `finish`'s allow-span containment would then swallow the custom det (presidio
+        // also detects the same IP at the same span, so the span is allowed regardless of
+        // where this check sits). Dropping keeps the custom rule authoritative.
+        if entity_type == "IP_ADDRESS" && is_reserved_net_id(slice) {
+            continue;
+        }
+        // F8: a URL that is the VALUE of a namespace-declaring key is a structural
+        // identifier, not a user URL. Sibling of F5 — entity-gated to URL, ingest-juncture
+        // only, and a plain drop (no allow span) for the same custom-rule reason.
+        if entity_type == "URL" && preceding_key_is_namespace(text, r.start) {
             continue;
         }
         if is_suppressed(cfg, slice, today) {
@@ -1052,6 +1147,230 @@ mod precision_tests {
         ] {
             assert!(plausible_generic_secret(s), "should keep secret: {s:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod net_precision_ingest_tests {
+    use super::*;
+    use crate::config::{Category, CustomReplacement, EngineConfig};
+
+    fn analyzer() -> presidio_analyzer::AnalyzerEngine {
+        // The Network category is default-OFF (Balanced), so URL/IP/MAC only mask when
+        // it is explicitly enabled — every test here does exactly that.
+        presidio_analyzer::default_analyzer("en")
+            .with_context_enhancer(presidio_analyzer::LemmaContextAwareEnhancer::new())
+    }
+
+    /// Balanced default with Network ON — the config under which F5/F8 apply.
+    fn network_on() -> EngineConfig {
+        let mut cfg = EngineConfig::default();
+        cfg.enabled_categories.insert(Category::Network);
+        cfg
+    }
+
+    /// Full RUN of the non-ML detection path (`detect_base` + `finish`) for one text,
+    /// returning the surviving detections of `entity` with their spans. Non-stubbable:
+    /// this drives the same code path production uses.
+    fn dets_of(cfg: &EngineConfig, customs: &[CompiledCustom], text: &str, entity: &str) -> Vec<(usize, usize)> {
+        let (dets, allowed, _today) =
+            detect_base(&analyzer(), cfg, customs, &[], text, Surface::UserMessage);
+        finish(dets, allowed)
+            .into_iter()
+            .filter(|d| d.entity_type == entity)
+            .map(|d| (d.start, d.end))
+            .collect()
+    }
+
+    // ---- F5: reserved / non-routable IP suppression -----------------------------------
+
+    // Direct unit: the predicate covers loopback/private/link-local/unspecified (v4) and
+    // loopback/unspecified/fe80::/10/2001:db8::/32 (v6), tolerating a trailing `/<prefix>`
+    // and/or `%<zone>` — and rejects public / non-IP input.
+    #[test]
+    fn f5_is_reserved_net_id_covers_reserved_and_rejects_public() {
+        for s in [
+            "10.0.0.5",         // private 10/8
+            "172.16.5.5",       // private 172.16/12
+            "192.168.1.1",      // private 192.168/16
+            "192.168.1.1/24",   // /-strip (CIDR)
+            "127.0.0.1",        // loopback v4
+            "169.254.10.10",    // link-local v4
+            "0.0.0.0",          // unspecified v4
+            "::1",              // loopback v6
+            "::",               // unspecified v6
+            "fe80::1",          // link-local v6
+            "fe80::1%eth0",     // %-strip (zone id)
+            "fe80::1%eth0/10",  // both suffixes
+            "2001:db8::1",      // documentation v6 (doc-range)
+            "2001:db8::1/64",   // doc-range + /-strip
+        ] {
+            assert!(is_reserved_net_id(s), "should be reserved: {s:?}");
+        }
+        for s in [
+            "8.8.8.8",          // public
+            "1.1.1.1",          // public
+            "2606:4700::1111",  // public v6 (Cloudflare)
+            "203.0.113.5",      // TEST-NET-3 doc range is NOT in scope for v4 here
+            "not-an-ip",
+            "example.com",
+            "999.1.1.1",        // out of range
+            "",
+        ] {
+            assert!(!is_reserved_net_id(s), "should NOT be reserved: {s:?}");
+        }
+    }
+
+    // e2e: a reserved IP is suppressed by the F5 GATE (not the allow-list — 10.0.0.5 is
+    // not an allow-list entry), while a public IP still masks under Network.
+    #[test]
+    fn f5_reserved_ip_suppressed_public_ip_masks() {
+        let cfg = network_on();
+        assert!(
+            !cfg.allow_list.is_allowed("10.0.0.5"),
+            "precondition: 10.0.0.5 must NOT be allow-listed, so suppression proves the gate"
+        );
+        assert!(
+            dets_of(&cfg, &[], "connect to 10.0.0.5 now", "IP_ADDRESS").is_empty(),
+            "reserved IP must be suppressed under Network by the F5 gate"
+        );
+        assert_eq!(
+            dets_of(&cfg, &[], "reach 8.8.8.8 today", "IP_ADDRESS").len(),
+            1,
+            "a public IP must still mask under Network"
+        );
+    }
+
+    // WIRING falsifier: a custom_replacement matching exactly 10.0.0.5 STILL masks. This
+    // proves the F5 check lives at the IP_ADDRESS ingest branch (regex/ML pass) and NOT in
+    // the shared `is_suppressed` — which the custom-rule pass also calls, and which would
+    // otherwise silently defeat a deliberate custom rule. (It also proves F5 is a plain
+    // drop, not an allow-span: an allow-span would let `finish`'s containment swallow the
+    // custom det at the same coordinates.)
+    #[test]
+    fn f5_custom_rule_over_reserved_ip_still_masks() {
+        let cfg = network_on();
+        let customs = compile_customs(&[CustomReplacement {
+            pattern: r"10\.0\.0\.5".to_string(),
+            entity_type: "MY_IP".to_string(),
+            is_regex: true,
+            case_sensitive: true,
+            priority: 0,
+            literal_token: false,
+            token: None,
+            apply_to_surfaces: None,
+        }])
+        .expect("custom rule compiles");
+        let hits = dets_of(&cfg, &customs, "connect to 10.0.0.5 now", "MY_IP");
+        assert_eq!(
+            hits.len(),
+            1,
+            "a custom rule over a reserved IP must still mask (F5 is at the IP ingest branch, not shared is_suppressed), got {hits:?}"
+        );
+    }
+
+    // ---- F8: namespace-declaring-key URL suppression ----------------------------------
+
+    // e2e: a URL that is the VALUE of a namespace-declaring key is suppressed under Network,
+    // even though its host is NOT in the F7 standards-host allow-list — proving the
+    // STRUCTURAL mechanism, not the allow-list. Each positive case is a URL presidio DOES
+    // detect (verified: score-0.6 Quoted URL), so F8 is load-bearing, not trivially unseen.
+    #[test]
+    fn f8_namespace_key_url_suppressed() {
+        let cfg = network_on();
+        assert!(
+            !cfg.allow_list.is_allowed("https://example.com/my/schema.json"),
+            "precondition: the host must NOT be allow-listed, so suppression proves F8"
+        );
+        for text in [
+            r#"{"$schema":"https://example.com/my/schema.json"}"#, // $schema
+            r#"{"$id":"https://example.com/x"}"#,                  // $id
+            r#"{"$ref":"https://example.com/x"}"#,                 // $ref
+            r#"targetNamespace="https://example.com/x""#,          // targetNamespace
+            r#"xsi:schemaLocation="https://example.com/x""#,       // *schemaLocation
+            r#"xmlns="https://example.com/x""#,                    // bare xmlns
+            r#"<svg xmlns:custom="https://example.com/x">"#,       // xmlns: compound
+        ] {
+            assert!(
+                dets_of(&cfg, &[], text, "URL").is_empty(),
+                "namespace-key URL must be suppressed by F8: {text:?}"
+            );
+        }
+    }
+
+    // Negative control (the differential that proves F8 does the work): the IDENTICAL URL
+    // under a NON-namespace key (`url`) still masks. Presidio detects both identically, so
+    // the only reason `$schema` is suppressed and `url` is not is the F8 key check.
+    #[test]
+    fn f8_non_namespace_key_url_still_masks() {
+        let cfg = network_on();
+        assert_eq!(
+            dets_of(&cfg, &[], r#"{"url":"https://example.com/x"}"#, "URL").len(),
+            1,
+            "a URL under a non-namespace key must still mask"
+        );
+    }
+
+    // Also honor the literal acceptance strings (some hosts presidio can't even parse, e.g.
+    // `internal.example`'s invalid TLD — those are suppressed regardless; still assert it).
+    #[test]
+    fn f8_literal_acceptance_cases_suppressed() {
+        let cfg = network_on();
+        for text in [
+            r#"<svg xmlns:custom="https://internal.example/ns">"#,
+            r#"{"$schema":"https://example.com/my/schema.json"}"#,
+        ] {
+            assert!(
+                dets_of(&cfg, &[], text, "URL").is_empty(),
+                "literal acceptance case must be suppressed: {text:?}"
+            );
+        }
+    }
+
+    // UTF-8 falsifier: a multibyte char immediately before the key/value (`é$schema="…"`)
+    // must NOT panic (the backward scan is char-boundary safe) AND the URL is suppressed.
+    #[test]
+    fn f8_utf8_before_key_no_panic_and_suppressed() {
+        let cfg = network_on();
+        let text = "é$schema=\"https://example.com/s.json\"";
+        assert!(
+            dets_of(&cfg, &[], text, "URL").is_empty(),
+            "namespace URL preceded by a multibyte char must be suppressed without panic"
+        );
+    }
+
+    // Direct-unit for the key predicate: exercises the separator-zone trim, the maximal
+    // key-char run, the compound `xmlns:` prefix, and a multibyte prefix — independent of
+    // presidio. `start` is the byte offset of the value (as presidio reports: the opening
+    // quote of a quoted URL).
+    #[test]
+    fn f8_preceding_key_predicate_unit() {
+        // Positives — `start` points just past the trailing `"` (the value's opening quote).
+        for (text, val) in [
+            (r#"{"$schema":"x"#, "$schema"),
+            (r#"{"$id":"x"#, "$id"),
+            (r#"{"$ref":"x"#, "$ref"),
+            (r#"targetNamespace="x"#, "targetNamespace"),
+            (r#"xmlns="x"#, "xmlns"),
+            (r#"xmlns:custom="x"#, "xmlns: compound"),
+            (r#"xsi:schemaLocation="x"#, "schemaLocation suffix"),
+            ("é$schema=\"x", "multibyte-prefixed $schema"),
+        ] {
+            let start = text.rfind('"').expect("value quote") + 1;
+            assert!(
+                preceding_key_is_namespace(text, start),
+                "should be a namespace key ({val}): {text:?}"
+            );
+        }
+        // Negatives — ordinary keys, and a boundary at position 0.
+        for text in [r#"{"url":"x"#, r#"{"href":"x"#, r#"name="x"#, r#"{"schema_version":"x"#] {
+            let start = text.rfind('"').expect("value quote") + 1;
+            assert!(
+                !preceding_key_is_namespace(text, start),
+                "should NOT be a namespace key: {text:?}"
+            );
+        }
+        assert!(!preceding_key_is_namespace("https://x", 0), "start==0 must not panic or match");
     }
 }
 
