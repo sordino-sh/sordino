@@ -245,9 +245,10 @@ impl Category {
             // URL relies on presidio's strict `UrlRecognizer` (the default since
             // its strict-mode change), which drops scheme-less `file.ext`/`opts.la`
             // false positives while keeping real URLs (scheme / www. / path).
-            // DOMAIN stays OFF: its recognizer is still aggressive on filenames;
-            // re-enable per-deployment via `entity_operators` if wanted.
-            Category::Network => &["IP_ADDRESS", "URL", "MAC_ADDRESS"],
+            // DOMAIN is enabled here too, but the ingest juncture in `detect.rs`
+            // suppresses its bare-filename false positives (`is_filename_shaped_domain`)
+            // so `utils.py`/`README.md`/`opts.la` don't mask while real domains do.
+            Category::Network => &["IP_ADDRESS", "URL", "MAC_ADDRESS", "DOMAIN"],
             Category::Personal => &["PERSON", "LOCATION", "ORGANIZATION"],
         }
     }
@@ -1185,11 +1186,10 @@ impl EngineConfig {
     /// Why the full Display set, not [`Category::canonical_entity_types`]: a key is a
     /// valid, functional `entity_operators` lever as long as it names a real canonical
     /// `EntityType` Display string, even if that type is deliberately in NO category.
-    /// Two such types are documented opt-in levers driven exactly through this map:
+    /// One such type is a documented opt-in lever driven exactly through this map:
     /// `DATE_TIME` (re-enabled per deployment via an explicit `entity_operators` entry
-    /// — proven by `date_time_unmapped_by_default_but_opt_in` in lib.rs) and `DOMAIN`
-    /// (re-enable per deployment if wanted). Validating against category membership
-    /// wrongly flagged both as unknown, 400-ing valid configs.
+    /// — proven by `date_time_unmapped_by_default_but_opt_in` in lib.rs). Validating
+    /// against category membership wrongly flagged it as unknown, 400-ing valid configs.
     ///
     /// Detection of typos vs aliases: resolve each key with
     /// [`presidio_core::EntityType::from_str`] (infallible — an unknown label becomes
@@ -1894,11 +1894,11 @@ mod tests {
 
     #[test]
     fn entity_operators_opt_in_levers_not_flagged() {
-        // DATE_TIME and DOMAIN are real canonical `EntityType` Display names that are
-        // DELIBERATELY in NO category — they are the documented opt-in levers driven
-        // through `entity_operators`. They must NOT be flagged as unknown even though
-        // they appear in no `Category::entity_types()` list. (Validating against
-        // category membership instead of the full Display set was the bug.)
+        // Both are real canonical `EntityType` Display names that must NOT be flagged
+        // as unknown. `DATE_TIME` is DELIBERATELY in NO category (the documented opt-in
+        // lever driven through `entity_operators`); `DOMAIN` is now a `Network` member,
+        // but either way validation is against the full Display set — not category
+        // membership (validating against membership instead was the bug).
         let mut cfg = EngineConfig::default();
         cfg.entity_operators
             .insert("DATE_TIME".into(), Operator::Redact);

@@ -87,7 +87,13 @@ use crate::surface::Surface;
 // over-matched a contrived key (e.g. `dataschemaLocation`) and UNDER-MASKED a real user URL; it
 // now matches only the real `schemaLocation` / `<ns>:schemaLocation` forms. A URL under such a
 // non-namespace key now MASKS instead of being suppressed — changes output, so bump.
-pub const DETECTOR_VERSION: u64 = 15;
+// v16: DOMAIN enabled under Network (F12) — presidio's DomainRecognizer now feeds detections, but
+// a bare filename-shaped domain (`utils.py` / `main.rs` / `README.md` / `opts.la`: no `/`, no `:`,
+// not `www.`-prefixed, rightmost dot-label in the frozen FILE_EXTENSIONS set) is a file reference,
+// not a host, and is DROPPED in place at the ingest juncture (a sibling of F5/F8, never the shared
+// `is_suppressed`, so a deliberate custom rule over such a filename still masks). Real domains
+// (`example.com`, `www.example.io`) still mask. Changes detection output for unchanged text — bump.
+pub const DETECTOR_VERSION: u64 = 16;
 
 /// Score the [`LemmaContextAwareEnhancer`] adds when a recognizer's context word
 /// is found near a match (mirrors `LemmaContextAwareEnhancer::new`'s
@@ -522,6 +528,43 @@ fn preceding_key_is_namespace(text: &str, start: usize) -> bool {
         || key.ends_with(":schemaLocation")
 }
 
+/// FROZEN set of file-name suffixes that presidio's `DomainRecognizer` would otherwise
+/// mask as a domain because they collide with a real TLD (`la` = Laos, `rs` = Serbia,
+/// `md` = Moldova, `sh` = Saint Helena, `cc` = Cocos, `pl` = Poland, `ml` = Mali,
+/// `so` = Somalia). A bare `opts.la` / `main.rs` in code or prose is a file, not a host.
+///
+/// LOAD-BEARING invariants (do NOT edit casually — both are pinned by tests):
+///   - `la` MUST be present: `opts.la` in the committed `strict_url_skips_filenames_keeps_real_urls`
+///     test would otherwise mask once DOMAIN is enabled.
+///   - popular real gTLDs a user would actually type as a website (`io`, `ai`, `app`, `dev`,
+///     `co`, `com`, `net`, `org`, `me`, `tv`) are DELIBERATELY EXCLUDED so real domains
+///     (`example.com`, `www.example.io`) still mask.
+///
+/// Kept sorted for `binary_search`; membership is on the lowercased rightmost dot-label.
+static FILE_EXTENSIONS: &[&str] = &[
+    "cc", "go", "la", "md", "ml", "pl", "py", "rb", "rs", "sh", "so",
+];
+
+/// F12: is `slice` a bare, filename-shaped domain rather than a real host? True when it
+/// has no path/scheme punctuation (`/`, `:`), is not a `www.`-prefixed hostname, and its
+/// rightmost dot-label (lowercased) is in the frozen [`FILE_EXTENSIONS`] set. Called ONLY
+/// at the DOMAIN ingest branch — never from the shared `is_suppressed` (which the
+/// custom-rule pass also calls), so a deliberate custom rule over such a filename still
+/// masks.
+fn is_filename_shaped_domain(slice: &str) -> bool {
+    if slice.contains('/') || slice.contains(':') {
+        return false;
+    }
+    if slice.starts_with("www.") {
+        return false;
+    }
+    let Some(label) = slice.rsplit('.').next() else {
+        return false;
+    };
+    let ext = label.to_ascii_lowercase();
+    FILE_EXTENSIONS.binary_search(&ext.as_str()).is_ok()
+}
+
 /// Suppress detections fully contained within an allow-listed span, then resolve
 /// overlaps into the final sorted, non-overlapping list. Shared tail of
 /// [`run_detection`] and [`run_detection_batch`].
@@ -658,6 +701,15 @@ fn ingest_results(
         // identifier, not a user URL. Sibling of F5 — entity-gated to URL, ingest-juncture
         // only, and a plain drop (no allow span) for the same custom-rule reason.
         if entity_type == "URL" && preceding_key_is_namespace(text, r.start) {
+            continue;
+        }
+        // F12: a bare filename-shaped domain (`utils.py`, `main.rs`, `opts.la`) is a file
+        // reference, not a host — presidio's DomainRecognizer validates its TLD (`la`/`rs`/…
+        // are real ccTLDs) and would mask it. Sibling of F5/F8: entity-gated to DOMAIN,
+        // ingest-juncture only, and a plain DROP (no allow span) — so a deliberate custom rule
+        // over the same filename still masks (an allow span would swallow it in `finish`).
+        // Real domains (`example.com`, `www.example.io`) fail the filename shape and still mask.
+        if entity_type == "DOMAIN" && is_filename_shaped_domain(slice) {
             continue;
         }
         if is_suppressed(cfg, slice, today) {
@@ -1422,6 +1474,130 @@ mod net_precision_ingest_tests {
             );
         }
         assert!(!preceding_key_is_namespace("https://x", 0), "start==0 must not panic or match");
+    }
+
+    // ---- F12: DOMAIN enabled under Network, filename-shaped false positives suppressed ---
+
+    // The detector output identity MUST bump when DOMAIN enters the detection path (v16),
+    // or stale cache entries computed before DOMAIN was enabled would be served verbatim.
+    #[test]
+    fn f12_detector_version_bumped_for_domain() {
+        assert_eq!(DETECTOR_VERSION, 16, "DOMAIN enable (F12) must bump the detector version");
+    }
+
+    // FROZEN-set invariants: `la` load-bearing (opts.la gate), `io` (and other popular
+    // real gTLDs) excluded so real domains still mask, and the set stays sorted for the
+    // binary_search membership test.
+    #[test]
+    fn f12_file_extensions_frozen_invariants() {
+        assert!(FILE_EXTENSIONS.binary_search(&"la").is_ok(), "`la` is load-bearing (opts.la gate)");
+        for real_gtld in ["io", "ai", "app", "dev", "co", "com", "net", "org", "me", "tv"] {
+            assert!(
+                FILE_EXTENSIONS.binary_search(&real_gtld).is_err(),
+                "popular real gTLD `{real_gtld}` must NOT be in FILE_EXTENSIONS (real domains must still mask)"
+            );
+        }
+        let mut sorted = FILE_EXTENSIONS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(FILE_EXTENSIONS, sorted.as_slice(), "FILE_EXTENSIONS must stay sorted for binary_search");
+        // Every acceptance-test filename extension is present.
+        for ext in ["py", "rs", "md", "sh", "cc", "go", "la"] {
+            assert!(FILE_EXTENSIONS.binary_search(&ext).is_ok(), "acceptance ext `{ext}` must be present");
+        }
+    }
+
+    // Direct unit for the predicate: filename-shaped domains (no `/`, no `:`, not `www.`,
+    // rightmost dot-label a known file extension) are true; real hosts, www.-prefixed
+    // hosts, and path/scheme/port forms are false.
+    #[test]
+    fn f12_is_filename_shaped_domain_unit() {
+        for f in ["utils.py", "main.rs", "README.md", "script.sh", "lib.cc", "pkg.go", "opts.la", "Utils.PY"] {
+            assert!(is_filename_shaped_domain(f), "should be filename-shaped: {f:?}");
+        }
+        for d in [
+            "example.com",          // real gTLD
+            "www.example.io",       // www.-prefixed AND io excluded
+            "example.io",           // io is a real gTLD (excluded)
+            "corp.example.com",     // multi-label real domain
+            "path/main.rs",         // has `/`
+            "host:80.rs",           // has `:`
+            "www.foo.rs",           // www.-prefixed guard beats the extension
+        ] {
+            assert!(!is_filename_shaped_domain(d), "should NOT be filename-shaped: {d:?}");
+        }
+    }
+
+    // e2e (Strict / Network-on): each bare filename-shaped domain presidio would mask as a
+    // DOMAIN is suppressed (dropped) at the ingest juncture — no DOMAIN detection survives.
+    #[test]
+    fn f12_filename_shaped_domains_suppressed() {
+        let cfg = network_on();
+        for text in ["utils.py", "main.rs", "README.md", "script.sh", "lib.cc", "pkg.go", "opts.la"] {
+            assert!(
+                dets_of(&cfg, &[], text, "DOMAIN").is_empty(),
+                "filename-shaped domain must be suppressed under Network: {text:?}"
+            );
+        }
+    }
+
+    // e2e differential: a REAL domain is NOT filename-shaped, so it still masks as DOMAIN.
+    // This is the load-bearing negative that proves the suppression is targeted, not blanket.
+    #[test]
+    fn f12_real_domain_still_masks() {
+        let cfg = network_on();
+        assert_eq!(
+            dets_of(&cfg, &[], "reach example.com now", "DOMAIN").len(),
+            1,
+            "a real domain (example.com) must still mask as DOMAIN under Network"
+        );
+        // www.example.io: the www. guard + io exclusion keep it out of the filename set, so it
+        // still masks (as DOMAIN or, via the www. signal, URL) — assert it is not suppressed.
+        let masked = !dets_of(&cfg, &[], "visit www.example.io today", "DOMAIN").is_empty()
+            || !dets_of(&cfg, &[], "visit www.example.io today", "URL").is_empty();
+        assert!(masked, "www.example.io must still mask (www. guard + io excluded)");
+    }
+
+    // WIRING falsifier: a custom rule matching exactly `main.rs` STILL masks. This proves the
+    // F12 check lives at the DOMAIN ingest branch (regex pass) as a plain DROP — NOT an
+    // allow-span (which `finish`'s containment would use to swallow the custom det at the same
+    // coordinates) and NOT the shared `is_suppressed` (which the custom-rule pass also calls).
+    #[test]
+    fn f12_custom_rule_over_filename_domain_still_masks() {
+        let cfg = network_on();
+        let customs = compile_customs(&[CustomReplacement {
+            pattern: r"main\.rs".to_string(),
+            entity_type: "MY_FILE".to_string(),
+            is_regex: true,
+            case_sensitive: true,
+            priority: 0,
+            literal_token: false,
+            token: None,
+            apply_to_surfaces: None,
+        }])
+        .expect("custom rule compiles");
+        let hits = dets_of(&cfg, &customs, "open main.rs please", "MY_FILE");
+        assert_eq!(
+            hits.len(),
+            1,
+            "a custom rule over a filename-shaped domain must still mask (F12 is a plain drop at the DOMAIN ingest branch), got {hits:?}"
+        );
+    }
+
+    // NESTED-DOMAIN-OVERLAP guard: the committed strict_url text has `corp.example.com`
+    // inside a URL span and `example.com` inside an email span. presidio's DomainRecognizer
+    // rejects `://`- and `@`-preceded matches, so NO DOMAIN detection leaks there and the
+    // URL + EMAIL detections stand. (If a future presidio scored a nested DOMAIN that won
+    // overlap resolution, this would go RED — the signal to add resolve_overlaps tiering.)
+    #[test]
+    fn f12_nested_domains_lose_to_url_and_email() {
+        let cfg = network_on();
+        let text = "edit CLAUDE.md and opts.la then open https://corp.example.com/secret and mail bob@example.com";
+        assert!(
+            dets_of(&cfg, &[], text, "DOMAIN").is_empty(),
+            "no nested DOMAIN det may survive inside the URL/email spans"
+        );
+        assert_eq!(dets_of(&cfg, &[], text, "URL").len(), 1, "the real URL must still mask");
+        assert_eq!(dets_of(&cfg, &[], text, "EMAIL_ADDRESS").len(), 1, "the email must still mask");
     }
 }
 
