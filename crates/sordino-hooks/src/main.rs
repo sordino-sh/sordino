@@ -27,6 +27,8 @@
 
 use std::io::Read;
 use std::net::TcpListener;
+use std::collections::HashSet;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -347,6 +349,16 @@ enum SecretsAction {
     Status,
     /// List each registered secret: name, operator, scheme, resolved — never values.
     List,
+    /// Read-only, value-free scan of this project's `.env` files for candidate secrets
+    /// that are not yet registered. Needs no live proxy; prints only KEY names + paths.
+    Scan,
+    /// Interactive, per-value opt-in import of `.env` keys into `sordino.toml` as
+    /// `[[secrets]]` REFERENCE stanzas. Never auto-registers; prompts for every value.
+    Import {
+        /// Limit the import to a single `.env` file (default: all `.env`/`.env.*`).
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -7974,8 +7986,24 @@ fn broker_denial_note(denials: &[Value]) -> String {
 /// reference in `[[secrets]]`; secret VALUES never transit this command.)
 fn secrets_cmd(action: Option<SecretsAction>) -> Result<()> {
     let root = canonical(&project_root());
-    let snap = live_snapshot(live_identity(&root), &sordino_state::project_key(&root))
-        .context("reading secrets status (is the proxy running?)")?;
+    match action.unwrap_or(SecretsAction::Status) {
+        // Status/List describe the LIVE registered set — they hard-require the proxy.
+        SecretsAction::Status => secrets_status_cmd(&root),
+        SecretsAction::List => secrets_list_cmd(&root),
+        // Scan/Import live entirely inside the .env disk boundary — no live proxy.
+        SecretsAction::Scan => secrets_scan_cmd(&root),
+        SecretsAction::Import { file } => secrets_import_cmd(&root, file),
+    }
+}
+
+/// Fetch this project's live-proxy config snapshot (Status/List need a running proxy).
+fn secrets_snapshot(root: &str) -> Result<Value> {
+    live_snapshot(live_identity(root), &sordino_state::project_key(root))
+        .context("reading secrets status (is the proxy running?)")
+}
+
+fn secrets_status_cmd(root: &str) -> Result<()> {
+    let snap = secrets_snapshot(root)?;
     let secrets = snap.get("secrets").cloned().unwrap_or(Value::Null);
     let ready = secrets.get("ready").and_then(Value::as_bool).unwrap_or(true);
     let total = secrets.get("total").and_then(Value::as_u64).unwrap_or(0);
@@ -7986,36 +8014,423 @@ fn secrets_cmd(action: Option<SecretsAction>) -> Result<()> {
         .get("entries")
         .and_then(Value::as_array)
         .unwrap_or(&empty);
+    let gate = if ready {
+        "open"
+    } else {
+        "HELD (required secret unresolved — LLM intake 503)"
+    };
+    println!("secrets: {resolved}/{total} resolved, {required} required — intake {gate}");
+    for e in entries {
+        if !e.get("resolved").and_then(Value::as_bool).unwrap_or(false) {
+            let name = e.get("name").and_then(Value::as_str).unwrap_or("?");
+            let err = e.get("error").and_then(Value::as_str).unwrap_or("");
+            println!("  ✗ {name}: {err}");
+        }
+    }
+    Ok(())
+}
 
-    match action.unwrap_or(SecretsAction::Status) {
-        SecretsAction::Status => {
-            let gate = if ready {
-                "open"
-            } else {
-                "HELD (required secret unresolved — LLM intake 503)"
-            };
-            println!("secrets: {resolved}/{total} resolved, {required} required — intake {gate}");
-            for e in entries {
-                if !e.get("resolved").and_then(Value::as_bool).unwrap_or(false) {
-                    let name = e.get("name").and_then(Value::as_str).unwrap_or("?");
-                    let err = e.get("error").and_then(Value::as_str).unwrap_or("");
-                    println!("  ✗ {name}: {err}");
+fn secrets_list_cmd(root: &str) -> Result<()> {
+    let snap = secrets_snapshot(root)?;
+    let secrets = snap.get("secrets").cloned().unwrap_or(Value::Null);
+    let empty: Vec<Value> = Vec::new();
+    let entries = secrets
+        .get("entries")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+    if entries.is_empty() {
+        println!("(no registered secrets)");
+    }
+    for e in entries {
+        let name = e.get("name").and_then(Value::as_str).unwrap_or("?");
+        let op = e.get("operator").and_then(Value::as_str).unwrap_or("?");
+        let scheme = e.get("scheme").and_then(Value::as_str).unwrap_or("?");
+        let ok = e.get("resolved").and_then(Value::as_bool).unwrap_or(false);
+        let mark = if ok { "✓" } else { "✗" };
+        println!("{mark} {name}  [{op}]  {scheme}");
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// .env intake funnel (F2 scan + F4 import) — shared eligibility, no live proxy
+// ---------------------------------------------------------------------------
+
+/// Branded, ADVISORY (non-exhaustive) secret prefixes. A value that starts with one is
+/// a candidate REGARDLESS of the entropy classifier — and this short-circuits BEFORE the
+/// shape-suppressor, which is exactly what rescues `SLACK_WEBHOOK_URL` (a bare `https://`
+/// with no userinfo, otherwise byte-identical to the bare-URL non-secret suppressor).
+const BRANDED_PREFIXES: &[&str] = &[
+    "sk-",
+    "sk-ant-",
+    "AKIA",
+    "ASIA",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "github_pat_",
+    "xoxb-",
+    "xoxp-",
+    "AIza",
+    "ya29.",
+    "glpat-",
+    "npm_",
+    "dop_v1_",
+    "SG.",
+    "sk_live_",
+    "rk_live_",
+    "-----BEGIN",
+    "https://hooks.slack.com/",
+];
+
+fn known_prefix_match(value: &str) -> bool {
+    BRANDED_PREFIXES.iter().any(|p| value.starts_with(p))
+}
+
+/// A value whose SHAPE is a well-known NON-secret structure the entropy path wrongly
+/// admits: a UUID (8-4-4-4-12 hex), an all-lowercase-hex 40-char git SHA, a semver, or
+/// a bare URL (`https?://` with NO `@` userinfo). Applied ONLY to anonymous
+/// `Eligible{reason: Entropy}` admits — never to a branded-prefix hit (short-circuits
+/// first) and never to a NameMatch/Both admit (a NAMED secret is never shape-suppressed).
+fn structural_nonsecret(value: &str) -> bool {
+    is_uuid(value) || is_git_sha(value) || is_semver(value) || is_bare_url(value)
+}
+
+fn is_uuid(v: &str) -> bool {
+    let b = v.as_bytes();
+    if b.len() != 36 {
+        return false;
+    }
+    for (i, &c) in b.iter().enumerate() {
+        match i {
+            8 | 13 | 18 | 23 => {
+                if c != b'-' {
+                    return false;
+                }
+            }
+            _ => {
+                if !c.is_ascii_hexdigit() {
+                    return false;
                 }
             }
         }
-        SecretsAction::List => {
-            if entries.is_empty() {
-                println!("(no registered secrets)");
-            }
-            for e in entries {
-                let name = e.get("name").and_then(Value::as_str).unwrap_or("?");
-                let op = e.get("operator").and_then(Value::as_str).unwrap_or("?");
-                let scheme = e.get("scheme").and_then(Value::as_str).unwrap_or("?");
-                let ok = e.get("resolved").and_then(Value::as_bool).unwrap_or(false);
-                let mark = if ok { "✓" } else { "✗" };
-                println!("{mark} {name}  [{op}]  {scheme}");
+    }
+    true
+}
+
+/// An all-lowercase-hex 40-char git SHA (`[0-9a-f]{40}`). Uppercase hex is NOT a git SHA.
+fn is_git_sha(v: &str) -> bool {
+    v.len() == 40
+        && v.bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+/// `v?MAJOR.MINOR.PATCH` with an optional `-prerelease` / `+build` suffix.
+fn is_semver(v: &str) -> bool {
+    let core = v.strip_prefix('v').unwrap_or(v);
+    // Split off any prerelease/build suffix at the first '-' or '+'.
+    let core = core
+        .split_once(['-', '+'])
+        .map(|(c, _)| c)
+        .unwrap_or(core);
+    let parts: Vec<&str> = core.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
+}
+
+/// A bare `http(s)://` URL with NO `@` userinfo (a public URL, not a credentialed DSN).
+fn is_bare_url(v: &str) -> bool {
+    (v.starts_with("https://") || v.starts_with("http://")) && !v.contains('@')
+}
+
+/// The single, shared candidacy predicate for both scan and import. A branded prefix
+/// admits unconditionally; otherwise the entropy classifier decides, with the
+/// shape-suppressor applied ONLY to anonymous Entropy admits (the reason-gate that
+/// preserves recall on the GITHUB_TOKEN / SLACK_WEBHOOK_URL shape-collisions).
+fn is_candidate(name: &str, value: &str) -> bool {
+    if known_prefix_match(value) {
+        return true;
+    }
+    match sordino_secrets::classify(name, value) {
+        sordino_secrets::Eligibility::Eligible {
+            reason: sordino_secrets::EligibleReason::Entropy,
+            ..
+        } => !structural_nonsecret(value),
+        // NameMatch / Both: a NAMED secret is NEVER shape-suppressed.
+        sordino_secrets::Eligibility::Eligible { .. } => true,
+        sordino_secrets::Eligibility::Skip(_) => false,
+    }
+}
+
+/// This project's live registered-secret names, BEST-EFFORT (empty if the proxy is
+/// down — scan/import are supported with no proxy). Never fails the command.
+fn registered_secret_names(root: &str) -> HashSet<String> {
+    live_snapshot(live_identity(root), &sordino_state::project_key(root))
+        .ok()
+        .and_then(|s| {
+            s["secrets"]["entries"].as_array().map(|a| {
+                a.iter()
+                    .filter_map(|e| e["name"].as_str().map(str::to_string))
+                    .collect::<HashSet<String>>()
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// Is `name` a `.env` file we intake? `.env` and `.env.*` EXCEPT the example/sample
+/// sidecars (`.env.example`, `.env.sample`, `.env.*.example`).
+fn is_intake_env_file(name: &str) -> bool {
+    if name == ".env" {
+        return true;
+    }
+    if name.strip_prefix(".env.").is_none() {
+        return false;
+    }
+    if name == ".env.sample" || name.ends_with(".example") {
+        return false;
+    }
+    true
+}
+
+/// Every intakeable `.env` file directly under `root` (sorted for deterministic output).
+fn enumerate_env_files(root: &str) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(entries) = std::fs::read_dir(Path::new(root)) else {
+        return files;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(is_intake_env_file)
+        {
+            files.push(path);
+        }
+    }
+    files.sort();
+    files
+}
+
+/// `path` displayed relative to `root` when possible (for the `dotenv:<rel>#KEY` ref and
+/// the scan/prompt display). Falls back to the full path.
+fn display_rel(root: &str, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Build the VALUE-FREE scan report (pure — takes the resolved inputs so it is testable
+/// without a live proxy). Prints ONLY key names + file paths, never a value.
+fn scan_report(root: &str, files: &[PathBuf], registered: &HashSet<String>, proxy_up: bool) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if !proxy_up {
+        let _ = writeln!(
+            out,
+            "(proxy not reachable — the registered set is empty; results are best-effort)"
+        );
+    }
+    let mut any_unregistered = false;
+    for file in files {
+        let Ok(iter) = dotenvy::from_path_iter(file) else {
+            continue;
+        };
+        let mut unregistered: Vec<String> = Vec::new();
+        for item in iter {
+            let Ok((key, value)) = item else { continue };
+            if is_candidate(&key, &value) && !registered.contains(&key) {
+                unregistered.push(key);
             }
         }
+        let rel = display_rel(root, file);
+        let _ = writeln!(out, "{rel}: {} value(s) not registered", unregistered.len());
+        for key in &unregistered {
+            let _ = writeln!(out, "  • {key}");
+            any_unregistered = true;
+        }
+    }
+    if any_unregistered {
+        let _ = writeln!(
+            out,
+            "These mask only if a recognizer happens to catch them — registration via \
+             `secrets import` makes them unconditional (G1)."
+        );
+    }
+    out
+}
+
+/// F2 `secrets scan`: read-only, value-free. Enumerate `.env`/`.env.*`, list unregistered
+/// candidate KEYS per file. Best-effort registered set; exit 0 always.
+fn secrets_scan_cmd(root: &str) -> Result<()> {
+    let registered = registered_secret_names(root);
+    let proxy_up = live_identity(root).is_some();
+    let files = enumerate_env_files(root);
+    print!("{}", scan_report(root, &files, &registered, proxy_up));
+    Ok(())
+}
+
+/// A single accepted key, ready to become a `[[secrets]]` REFERENCE stanza.
+#[derive(Clone, Debug, PartialEq)]
+struct AcceptedSecret {
+    name: String,
+    from_ref: String,
+    operator: Option<String>,
+}
+
+/// Outcome of the pure [`import_merge`] transform.
+#[derive(Debug, PartialEq)]
+enum ImportOutcome {
+    Changed(String),
+    NoOp,
+    Refused(String),
+}
+
+/// PURE toml_edit merge: append each accepted key as a `[[secrets]]` REFERENCE stanza to
+/// `current`, preserving all existing stanzas + `[engine]`/comments byte-for-byte. Refuses
+/// (never overwrites) unparseable TOML or a `secrets` key that is NOT an array-of-tables.
+/// Idempotent: an accepted name already present as a `[[secrets]]` stanza is SKIPPED. NEVER
+/// writes a value/literal/secret/plaintext/from_env — only `name`, `from_ref`, and (if set)
+/// `operator`, in that deterministic order.
+fn import_merge(current: &str, accepted: &[AcceptedSecret]) -> ImportOutcome {
+    let mut doc = match current.parse::<toml_edit::DocumentMut>() {
+        Ok(d) => d,
+        Err(e) => {
+            return ImportOutcome::Refused(format!(
+                "sordino.toml is not valid TOML; refusing to overwrite: {e}"
+            ));
+        }
+    };
+
+    // Ensure `secrets` is an array-of-tables. Present-but-not-AoT (a scalar `secrets = "x"`
+    // or a `[secrets]` table) is REFUSED — never coerced/clobbered.
+    match doc.get("secrets") {
+        Some(item) if item.as_array_of_tables().is_none() => {
+            return ImportOutcome::Refused(
+                "`secrets` in sordino.toml is not an array-of-tables ([[secrets]]); \
+                 refusing to modify it"
+                    .into(),
+            );
+        }
+        None => {
+            doc["secrets"] = toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
+        }
+        _ => {}
+    }
+
+    // Snapshot existing stanza names for the idempotent skip.
+    let existing: HashSet<String> = doc["secrets"]
+        .as_array_of_tables()
+        .map(|aot| {
+            aot.iter()
+                .filter_map(|t| t.get("name").and_then(|i| i.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let aot = doc["secrets"]
+        .as_array_of_tables_mut()
+        .expect("secrets ensured array-of-tables above");
+    let mut appended = 0usize;
+    for entry in accepted {
+        if existing.contains(&entry.name) {
+            continue; // idempotent
+        }
+        let mut table = toml_edit::Table::new();
+        table["name"] = toml_edit::value(entry.name.clone());
+        table["from_ref"] = toml_edit::value(entry.from_ref.clone());
+        if let Some(op) = &entry.operator {
+            table["operator"] = toml_edit::value(op.clone());
+        }
+        aot.push(table);
+        appended += 1;
+    }
+
+    if appended == 0 {
+        ImportOutcome::NoOp
+    } else {
+        ImportOutcome::Changed(doc.to_string())
+    }
+}
+
+/// F4 `secrets import`: per-value INTERACTIVE opt-in. FAILS CLOSED on a non-interactive
+/// terminal (writes nothing). Prompts per surviving candidate (KEY + file only, never the
+/// value); accepted keys become `[[secrets]]` REFERENCE stanzas in `<root>/sordino.toml`.
+fn secrets_import_cmd(root: &str, file: Option<PathBuf>) -> Result<()> {
+    // FAIL CLOSED: per-value opt-in demands a real interactive terminal. Gate on BOTH
+    // stdin and stdout being a tty — stdout-only would be bypassed by `yes | ... import`.
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        eprintln!(
+            "Sordino: import needs an interactive terminal (per-value opt-in only; \
+             never auto-registers)"
+        );
+        std::process::exit(2);
+    }
+
+    let registered = registered_secret_names(root);
+    let files = match file {
+        Some(f) if f.is_absolute() => vec![f],
+        Some(f) => vec![Path::new(root).join(f)],
+        None => enumerate_env_files(root),
+    };
+
+    let stdin = std::io::stdin();
+    let mut accepted: Vec<AcceptedSecret> = Vec::new();
+    let mut accepted_names: HashSet<String> = HashSet::new();
+    'files: for file in &files {
+        let Ok(iter) = dotenvy::from_path_iter(file) else {
+            continue;
+        };
+        let rel = display_rel(root, file);
+        for item in iter {
+            let Ok((key, value)) = item else { continue };
+            if !is_candidate(&key, &value) {
+                continue;
+            }
+            if registered.contains(&key) || accepted_names.contains(&key) {
+                continue;
+            }
+            // Prompt on stderr (unbuffered) — KEY + file ONLY, never the value.
+            eprint!("Register {key} from {rel}? [y/N/q] ");
+            let mut line = String::new();
+            if stdin.read_line(&mut line)? == 0 {
+                break 'files; // EOF ⇒ stop, keep what was accepted so far
+            }
+            match line.trim() {
+                "y" | "Y" => {
+                    accepted_names.insert(key.clone());
+                    accepted.push(AcceptedSecret {
+                        name: key.clone(),
+                        from_ref: format!("dotenv:{rel}#{key}"),
+                        operator: None,
+                    });
+                }
+                "q" | "Q" => break 'files, // stop + write accepted-so-far
+                _ => {}                     // anything else ⇒ skip
+            }
+        }
+    }
+
+    let toml_path = Path::new(root).join("sordino.toml");
+    let current = std::fs::read_to_string(&toml_path).unwrap_or_default();
+    match import_merge(&current, &accepted) {
+        ImportOutcome::Changed(text) => {
+            atomic_write_text(&toml_path, &text)?;
+            println!(
+                "wrote {} secret reference(s) to sordino.toml — restart the session \
+                 (or POST /sordino/reload) to resolve them",
+                accepted.len()
+            );
+        }
+        ImportOutcome::NoOp => println!("nothing to import"),
+        ImportOutcome::Refused(msg) => bail!(msg),
     }
     Ok(())
 }
@@ -9999,5 +10414,451 @@ mod codex_auth_check_tests {
         // that field, not "unmapped".
         let auth = json!({ "auth_mode": "weird", "tokens": { "id_token": "x" } });
         assert_eq!(unmapped_auth_mode(Some(&auth)), None);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// intake funnel (F2 scan + F4 import) — acceptance tests
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod intake_tests {
+    use super::*;
+    use sordino_secrets::SecretProvider as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A fresh, unique temp dir per test (process id is shared across a run, so add a
+    /// monotonic counter + nanos). Created empty.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "sordino-intake-{tag}-{}-{n}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // -----------------------------------------------------------------------
+    // PRECISION CORPUS — the MEASURED offer-list gate (recall 1.0, precision >= 0.70)
+    // -----------------------------------------------------------------------
+
+    /// (filename, [(KEY, VALUE, is_secret)]). A FROZEN >=8-file corpus, secret:nonsecret
+    /// = 1:1, with the two mandatory shape-collision secrets (GITHUB_TOKEN / SLACK_WEBHOOK
+    /// URL) and the adversarial non-secret rows (UUID / 40-hex gitsha / public URL /
+    /// NODE_ENV / semver / boolean / integer / enum).
+    const CORPUS: &[(&str, &[(&str, &str, bool)])] = &[
+        (
+            "app1.env",
+            &[
+                // collision (1): 40 lowercase hex, byte-identical to the git-SHA suppressor,
+                // rescued by NameMatch (name hits TOKEN).
+                (
+                    "GITHUB_TOKEN",
+                    "5f3e2a1b9c8d7e6f0a1b2c3d4e5f60718293a4b5",
+                    true,
+                ),
+                // SAME shape under a non-matching name ⇒ suppressed (the precision win).
+                ("gitsha", "5f3e2a1b9c8d7e6f0a1b2c3d4e5f60718293a4b5", false),
+            ],
+        ),
+        (
+            "app2.env",
+            &[
+                // collision (2): a bare https:// (no userinfo), rescued ONLY by the branded
+                // hooks.slack.com prefix.
+                (
+                    "SLACK_WEBHOOK_URL",
+                    "https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX",
+                    true,
+                ),
+                // A public no-userinfo URL under a non-matching name ⇒ suppressed.
+                ("PUBLIC_URL", "https://example.com/path/to/resource", false),
+            ],
+        ),
+        (
+            "app3.env",
+            &[
+                ("DATABASE_URL", "postgres://user:pass@db.internal:5432/app", true),
+                ("NODE_ENV", "production", false),
+            ],
+        ),
+        (
+            "app4.env",
+            &[
+                (
+                    "AWS_SECRET_ACCESS_KEY",
+                    "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                    true,
+                ),
+                ("PORT", "8080", false),
+            ],
+        ),
+        (
+            "app5.env",
+            &[
+                ("STRIPE_SECRET_KEY", "sk_live_51H8xY2eZvKYlo2C0abcdefghij", true),
+                ("LOG_LEVEL", "debug", false),
+            ],
+        ),
+        (
+            "app6.env",
+            &[
+                (
+                    "OPENAI_API_KEY",
+                    "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+                    true,
+                ),
+                ("FEATURE_ENABLED", "true", false),
+            ],
+        ),
+        (
+            "app7.env",
+            &[
+                ("MYSQL_DSN", "mysql://root:hunter2@127.0.0.1:3306/db", true),
+                ("REQUEST_ID", "550e8400-e29b-41d4-a716-446655440000", false),
+            ],
+        ),
+        (
+            "app8.env",
+            &[
+                ("API_TOKEN", "k7Lm2Nq9Rp4StUvWxYz0aBcD1eF", true),
+                ("APP_VERSION", "1.2.3-alpha.1+build.42", false),
+            ],
+        ),
+    ];
+
+    /// Materialize the corpus as `.env` files + `.labels` sidecars in a frozen dir.
+    fn write_corpus(dir: &Path) {
+        for (file, rows) in CORPUS {
+            let mut env = String::new();
+            let mut labels = String::new();
+            for (k, v, secret) in *rows {
+                env.push_str(&format!("{k}={v}\n"));
+                labels.push_str(&format!("{k}={}\n", if *secret { "secret" } else { "nonsecret" }));
+            }
+            std::fs::write(dir.join(file), env).unwrap();
+            let labels_name = file.replace(".env", ".labels");
+            std::fs::write(dir.join(labels_name), labels).unwrap();
+        }
+    }
+
+    #[test]
+    fn precision_corpus_gate() {
+        let dir = scratch_dir("corpus");
+        write_corpus(&dir);
+
+        let mut tp = 0usize; // secret, offered
+        let mut fp = 0usize; // nonsecret, offered
+        let mut fn_ = 0usize; // secret, missed
+        let mut offered: std::collections::HashMap<String, bool> = Default::default();
+
+        for (file, _) in CORPUS {
+            // Read the sidecar labels (KEY=secret|nonsecret).
+            let labels_path = dir.join(file.replace(".env", ".labels"));
+            let labels_text = std::fs::read_to_string(&labels_path).unwrap();
+            let labels: std::collections::HashMap<&str, bool> = labels_text
+                .lines()
+                .filter_map(|l| l.split_once('='))
+                .map(|(k, v)| (k, v == "secret"))
+                .collect();
+
+            // Parse the .env via the SAME path scan/import use, then run the shared predicate.
+            for item in dotenvy::from_path_iter(dir.join(file)).unwrap() {
+                let (key, value) = item.unwrap();
+                let is_secret = *labels.get(key.as_str()).unwrap_or_else(|| {
+                    panic!("no label for {key} in {file}")
+                });
+                let cand = is_candidate(&key, &value);
+                offered.insert(key.clone(), cand);
+                match (is_secret, cand) {
+                    (true, true) => tp += 1,
+                    (true, false) => fn_ += 1,
+                    (false, true) => fp += 1,
+                    (false, false) => {}
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let recall = tp as f64 / (tp + fn_) as f64;
+        let precision = tp as f64 / (tp + fp) as f64;
+
+        // recall == 1.0 on labeled secrets (incl BOTH collisions).
+        assert_eq!(fn_, 0, "recall regression: {fn_} labeled secret(s) missed; offered map = {offered:?}");
+        assert_eq!(recall, 1.0, "recall must be 1.0");
+        // The two mandatory collision rows survive.
+        assert!(offered["GITHUB_TOKEN"], "GITHUB_TOKEN (NameMatch collision) must be offered");
+        assert!(offered["SLACK_WEBHOOK_URL"], "SLACK_WEBHOOK_URL (branded-prefix collision) must be offered");
+        // precision >= 0.70 over the frozen corpus.
+        assert!(precision >= 0.70, "precision {precision} < 0.70 (fp={fp})");
+        // Each named adversarial non-secret must NOT be offered.
+        for k in ["REQUEST_ID", "gitsha", "PUBLIC_URL", "NODE_ENV", "APP_VERSION"] {
+            assert!(!offered[k], "{k} must NOT be offered (precision leak)");
+        }
+    }
+
+    /// The reason-gate directly: the SAME 40-hex value is a candidate under a name that
+    /// matches (TOKEN ⇒ NameMatch/Both) but suppressed under one that does not (Entropy).
+    #[test]
+    fn reason_gate_rescues_named_shape_collision() {
+        let sha = "5f3e2a1b9c8d7e6f0a1b2c3d4e5f60718293a4b5";
+        assert!(is_candidate("GITHUB_TOKEN", sha), "named 40-hex is a secret");
+        assert!(!is_candidate("gitsha", sha), "anonymous 40-hex is a git SHA (suppressed)");
+        // A high-entropy UUID (above the entropy floor) is still suppressed via structure.
+        let uuid = "0a1b2c3d-4e5f-6789-abcd-ef0123456789";
+        assert!(!is_candidate("TRACE_ID", uuid), "anonymous UUID suppressed via structure");
+        // The webhook prefix is the ONLY rescue for a bare-https SLACK_WEBHOOK_URL.
+        assert!(is_candidate(
+            "SLACK_WEBHOOK_URL",
+            "https://hooks.slack.com/services/T0/B0/XXXX"
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Scan falsifiers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scan_lists_only_candidates_never_config_keys() {
+        let dir = scratch_dir("scan-a");
+        std::fs::write(
+            dir.join(".env"),
+            "OPENAI_KEY=sk-abcDEF123456ghiJKL\nNODE_ENV=production\nPORT=8080\n",
+        )
+        .unwrap();
+        let files = enumerate_env_files(dir.to_str().unwrap());
+        let report = scan_report(dir.to_str().unwrap(), &files, &HashSet::new(), false);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(report.contains("OPENAI_KEY"), "sk- key must be listed:\n{report}");
+        assert!(!report.contains("NODE_ENV"), "NODE_ENV must not appear:\n{report}");
+        assert!(!report.contains("PORT"), "PORT must not appear:\n{report}");
+    }
+
+    #[test]
+    fn scan_never_prints_a_value() {
+        let dir = scratch_dir("scan-b");
+        std::fs::write(dir.join(".env"), "SECRET=sk-live_deadbeefcafef00dbabe1234\n").unwrap();
+        let files = enumerate_env_files(dir.to_str().unwrap());
+        let report = scan_report(dir.to_str().unwrap(), &files, &HashSet::new(), true);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(report.contains("SECRET"), "KEY name must appear:\n{report}");
+        assert!(
+            !report.contains("sk-live_deadbeef"),
+            "the value must NEVER appear:\n{report}"
+        );
+    }
+
+    #[test]
+    fn scan_proxy_down_still_lists_with_caveat() {
+        let dir = scratch_dir("scan-c");
+        std::fs::write(dir.join(".env"), "APIKEY=sk-abcDEF123456ghiJKL\n").unwrap();
+        let files = enumerate_env_files(dir.to_str().unwrap());
+        // proxy_up = false ⇒ registered set empty + caveat printed.
+        let report = scan_report(dir.to_str().unwrap(), &files, &HashSet::new(), false);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(report.contains("APIKEY"), "candidate listed:\n{report}");
+        assert!(report.contains("best-effort"), "proxy-down caveat present:\n{report}");
+    }
+
+    #[test]
+    fn scan_skips_example_and_sample_sidecars() {
+        let dir = scratch_dir("scan-d");
+        std::fs::write(dir.join(".env.example"), "APIKEY=sk-abcDEF123456ghiJKL\n").unwrap();
+        std::fs::write(dir.join(".env.sample"), "APIKEY=sk-abcDEF123456ghiJKL\n").unwrap();
+        std::fs::write(dir.join(".env.prod.example"), "APIKEY=sk-abcDEF123456ghiJKL\n").unwrap();
+        let files = enumerate_env_files(dir.to_str().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(files.is_empty(), "example/sample sidecars must be skipped: {files:?}");
+    }
+
+    #[test]
+    fn is_intake_env_file_matrix() {
+        assert!(is_intake_env_file(".env"));
+        assert!(is_intake_env_file(".env.local"));
+        assert!(is_intake_env_file(".env.production"));
+        assert!(!is_intake_env_file(".env.example"));
+        assert!(!is_intake_env_file(".env.sample"));
+        assert!(!is_intake_env_file(".env.prod.example"));
+        assert!(!is_intake_env_file("env")); // no leading dot
+        assert!(!is_intake_env_file("config.toml"));
+    }
+
+    // -----------------------------------------------------------------------
+    // import_merge falsifiers (text -> text)
+    // -----------------------------------------------------------------------
+
+    fn accepted(name: &str, from_ref: &str, op: Option<&str>) -> AcceptedSecret {
+        AcceptedSecret {
+            name: name.into(),
+            from_ref: from_ref.into(),
+            operator: op.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn import_merge_empty_doc_one_ref_no_value_key() {
+        let out = import_merge("", &[accepted("DB_URL", "dotenv:.env#DB_URL", None)]);
+        let text = match out {
+            ImportOutcome::Changed(t) => t,
+            other => panic!("expected Changed, got {other:?}"),
+        };
+        assert!(text.contains("[[secrets]]"));
+        assert!(text.contains("name = \"DB_URL\""));
+        assert!(text.contains("from_ref = \"dotenv:.env#DB_URL\""));
+        // NEVER a value/operator (operator was None).
+        for forbidden in ["value", "literal", "secret =", "plaintext", "from_env", "operator"] {
+            assert!(!text.contains(forbidden), "{forbidden:?} must not appear:\n{text}");
+        }
+        // The proxy config parser re-accepts it.
+        let doc: toml_edit::DocumentMut = text.parse().unwrap();
+        assert!(doc.get("secrets").and_then(|s| s.as_array_of_tables()).is_some());
+    }
+
+    #[test]
+    fn import_merge_preserves_engine_and_comments() {
+        let current = "# top comment\n[engine]\nprofile = \"balanced\"  # inline note\n";
+        let out = import_merge(current, &[accepted("API", "dotenv:.env#API", Some("hash"))]);
+        let text = match out {
+            ImportOutcome::Changed(t) => t,
+            other => panic!("expected Changed, got {other:?}"),
+        };
+        assert!(text.contains("# top comment"), "top comment preserved:\n{text}");
+        assert!(text.contains("[engine]"), "[engine] preserved");
+        assert!(text.contains("profile = \"balanced\"  # inline note"), "inline comment preserved:\n{text}");
+        assert!(text.contains("[[secrets]]"), "stanza appended");
+        assert!(text.contains("operator = \"hash\""));
+    }
+
+    #[test]
+    fn import_merge_idempotent_existing_name_is_noop() {
+        let current = "[[secrets]]\nname = \"DB_URL\"\nfrom_ref = \"dotenv:.env#DB_URL\"\n";
+        let out = import_merge(current, &[accepted("DB_URL", "dotenv:.env#DB_URL", None)]);
+        assert_eq!(out, ImportOutcome::NoOp, "existing name ⇒ NoOp (no rewrite)");
+    }
+
+    #[test]
+    fn import_merge_unparseable_refuses_no_write() {
+        let out = import_merge("this = = broken\n[[[", &[accepted("X", "dotenv:.env#X", None)]);
+        assert!(matches!(out, ImportOutcome::Refused(_)), "unparseable ⇒ Refused");
+    }
+
+    #[test]
+    fn import_merge_secrets_scalar_refuses() {
+        let out = import_merge("secrets = \"x\"\n", &[accepted("X", "dotenv:.env#X", None)]);
+        assert!(matches!(out, ImportOutcome::Refused(_)), "scalar `secrets` ⇒ Refused");
+        // A `[secrets]` table (not array-of-tables) is likewise refused.
+        let out2 = import_merge("[secrets]\nfoo = 1\n", &[accepted("X", "dotenv:.env#X", None)]);
+        assert!(matches!(out2, ImportOutcome::Refused(_)), "[secrets] table ⇒ Refused");
+    }
+
+    #[test]
+    fn import_merge_exact_byte_trace() {
+        let out = import_merge(
+            "",
+            &[accepted("DB_URL", "dotenv:.env#DB_URL", Some("redact"))],
+        );
+        let text = match out {
+            ImportOutcome::Changed(t) => t,
+            other => panic!("expected Changed, got {other:?}"),
+        };
+        assert_eq!(
+            text,
+            "[[secrets]]\nname = \"DB_URL\"\nfrom_ref = \"dotenv:.env#DB_URL\"\noperator = \"redact\"\n",
+            "byte-trace mismatch:\n{text:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Offline resolve + end-to-end MASK proof (no proxy process, no network)
+    // -----------------------------------------------------------------------
+
+    /// A written import ref resolves back to the fixture value via the dotenv provider.
+    #[tokio::test]
+    async fn import_ref_resolves_offline() {
+        let dir = scratch_dir("resolve");
+        std::fs::write(dir.join(".env"), "DB_URL=postgres://u:p@h:5432/db\n").unwrap();
+        // Simulate what import writes: dotenv:<rel>#KEY.
+        let sref = sordino_secrets::SecretRef::parse("dotenv:.env#DB_URL").unwrap();
+        assert_eq!(sref.scheme, "dotenv");
+        assert_eq!(sref.field.as_deref(), Some("DB_URL"));
+        let provider = sordino_secrets::providers::dotenv::DotenvProvider::new(Some(dir.clone()));
+        let val = provider.resolve(&sref).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(val.expose(), "postgres://u:p@h:5432/db");
+    }
+
+    /// Serialize the config::load tests (they mutate the process-global user-config env).
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// REAL end-to-end: import-written sordino.toml -> config::load -> default_registry ->
+    /// resolve_and_install on a fresh MaskEngine -> the fixture value is masked. The
+    /// SKIP-negative (no install) leaves the value present.
+    #[tokio::test]
+    async fn end_to_end_written_config_masks_value() {
+        let _g = env_guard();
+        let dir = scratch_dir("e2e");
+        // Isolate the user config layer so a real ~/.config file can't pollute load().
+        unsafe { std::env::set_var("SORDINO_USER_CONFIG", dir.join("no-such-user.toml")) };
+
+        // A LOW-entropy, non-structured token (no URL/DSN shape, below the generic
+        // entropy-gated API_KEY recognizer's floor) so the ONLY thing that can mask it is
+        // the installed secret rule — otherwise a generic recognizer would mask it even
+        // without install, defeating the SKIP-negative.
+        let fixture_value = "hunter2hunter2hunter2hunter2";
+        std::fs::write(dir.join(".env"), format!("API_TOKEN={fixture_value}\n")).unwrap();
+
+        // What `secrets import` writes for an accepted API_TOKEN.
+        let toml = import_merge("", &[accepted("API_TOKEN", "dotenv:.env#API_TOKEN", Some("redact"))]);
+        let toml_text = match toml {
+            ImportOutcome::Changed(t) => t,
+            other => panic!("expected Changed, got {other:?}"),
+        };
+        let toml_path = dir.join("sordino.toml");
+        std::fs::write(&toml_path, &toml_text).unwrap();
+
+        // config::load re-parses the written refs (scope invariant passes — refs only).
+        let loaded = sordino_proxy::config::load(Some(&toml_path)).expect("config::load");
+        assert_eq!(loaded.secrets.len(), 1);
+        assert_eq!(loaded.secrets[0].name, "API_TOKEN");
+        assert_eq!(loaded.secrets[0].from_ref.as_deref(), Some("dotenv:.env#API_TOKEN"));
+
+        let registry = sordino_secrets::default_registry(Some(dir.clone()));
+        let admin_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        // POSITIVE: install ⇒ the value is masked out of the transcript surface.
+        let engine = sordino_engine::MaskEngine::new(sordino_engine::EngineConfig::default()).unwrap();
+        let (status, ok) =
+            sordino_proxy::secrets::resolve_and_install(&loaded.secrets, &engine, &registry, admin_key).await;
+        assert!(ok, "the dotenv-referenced secret resolves offline");
+        assert_eq!(status.resolved(), 1);
+        let masked = engine
+            .mask(&format!("connect via {fixture_value} now"), sordino_engine::Surface::UserMessage)
+            .unwrap();
+        assert!(
+            !masked.masked_text.contains(fixture_value),
+            "installed secret must be masked:\n{}",
+            masked.masked_text
+        );
+
+        // NEGATIVE (skip install): a fresh engine with no rules leaves the value present.
+        let engine2 = sordino_engine::MaskEngine::new(sordino_engine::EngineConfig::default()).unwrap();
+        let unmasked = engine2
+            .mask(&format!("connect via {fixture_value} now"), sordino_engine::Surface::UserMessage)
+            .unwrap();
+        assert!(
+            unmasked.masked_text.contains(fixture_value),
+            "without install the value is NOT masked (proves the install did the masking)"
+        );
+
+        unsafe { std::env::remove_var("SORDINO_USER_CONFIG") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
