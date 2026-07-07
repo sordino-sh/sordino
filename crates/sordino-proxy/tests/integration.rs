@@ -5045,3 +5045,350 @@ async fn sse_events_requires_project_on_query_fallback() {
         "SSE with correct key + correct project query must pass"
     );
 }
+
+// ===========================================================================
+// wire-refusal F1 + F9 — registered-secret relay + header tripwire.
+//
+// F1: the verbatim relay (relay_verbatim -> relay_built) NEVER masks, so a
+// registered secret appearing in the body, path, OR query must refuse 409 with
+// ZERO bytes upstream. F9: an outbound request header carrying a registered
+// secret's EXACT value (exact-only tier, credential headers excluded by name)
+// must refuse 409 at BOTH send seams (relay_built AND send_upstream) without
+// mutating the HeaderMap. All zero-egress assertions use the fake_capture_any
+// fallback recorder + the `body.is_empty() && paths.is_empty()` invariant.
+// ===========================================================================
+
+/// The registered secret value the F1/F9 tests place in bodies/paths/headers.
+const F1F9_SECRET: &str = "sk-live-9f8e7d6c5b4a";
+/// The Tier-2 base64 needle for `F1F9_SECRET` (asserted by the engine's own
+/// `a0_4_base64_needles_contains_pinned` test) — used to build a base64-embedded
+/// positive without depending on a base64 crate in the test harness.
+const F1F9_SECRET_B64_NEEDLE: &str = "c2stbGl2ZS05ZjhlN2Q2YzViNG";
+
+/// A MaskEngine with `F1F9_SECRET` registered (Tier-1 exact + Tier-2 base64 needle).
+fn f1f9_engine_with_secret() -> MaskEngine {
+    let e = MaskEngine::new(EngineConfig::default()).unwrap();
+    e.set_secret_rules(vec![sordino_engine::SecretRule {
+        name: "wire_test_key".into(),
+        value: sordino_engine::SecretValue::new(F1F9_SECRET),
+        operator: sordino_engine::Operator::Hash,
+        case_sensitive: true,
+        apply_to_surfaces: None,
+    }])
+    .unwrap();
+    e
+}
+
+/// A MaskEngine with a 4-byte secret `abcd` registered — proves F1's Tier-1 exact
+/// scan has NO length floor (the floor is only for Tier-2 base64 needles).
+fn f1f9_engine_with_short_secret() -> MaskEngine {
+    let e = MaskEngine::new(EngineConfig::default()).unwrap();
+    e.set_secret_rules(vec![sordino_engine::SecretRule {
+        name: "short_key".into(),
+        value: sordino_engine::SecretValue::new("abcd"),
+        operator: sordino_engine::Operator::Hash,
+        case_sensitive: true,
+        apply_to_surfaces: None,
+    }])
+    .unwrap();
+    e
+}
+
+/// Spawn a fake upstream (fallback recorder) + the proxy over `engine`, returning
+/// (proxy_addr, capture) so a test can drive the proxy and assert on egress.
+async fn f1f9_setup(engine: MaskEngine) -> (SocketAddr, Captured) {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .fallback(fake_capture_any)
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(engine, format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+    (proxy_addr, cap)
+}
+
+fn zero_egress(cap: &Captured) -> bool {
+    cap.body.lock().unwrap().is_empty() && cap.paths.lock().unwrap().is_empty()
+}
+
+// --- F1 / A1.1: raw body secret -> 409, ZERO bytes + ZERO paths upstream. ----
+#[tokio::test]
+async fn f1_a1_1_raw_body_secret_refuses_409_zero_bytes() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/files"))
+        .body(format!("attach this token {F1F9_SECRET} to the upload"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(zero_egress(&cap), "F1 must egress ZERO bytes + ZERO paths on a body hit");
+}
+
+// --- F1 / A1.2: base64-embedded secret (Tier 2) -> 409. ----------------------
+#[tokio::test]
+async fn f1_a1_2_base64_embedded_secret_refuses_409() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/files"))
+        .body(format!("blob=PREFIX{F1F9_SECRET_B64_NEEDLE}SUFFIX"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT, "Tier-2 base64 needle must refuse");
+    assert!(zero_egress(&cap), "F1 Tier-2 must egress ZERO bytes");
+}
+
+// --- F1 / A1.3: secret in QUERY only -> 409, ZERO bytes. ---------------------
+#[tokio::test]
+async fn f1_a1_3_query_only_secret_refuses_409_zero_bytes() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    // c1 is NOT pinned; the secret rides only the query string of the egress superset.
+    let resp = reqwest::Client::new()
+        .get(format!("http://{proxy_addr}/sordino/session/c1/v1/files?token={F1F9_SECRET}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(zero_egress(&cap), "F1 must refuse a query-only secret with ZERO bytes");
+}
+
+// --- F1 / A1.4: 4 MB UTF-8-clean body, no secret -> relayed byte-identical. --
+#[tokio::test]
+async fn f1_a1_4_large_clean_utf8_body_relayed_byte_identical() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    let body = "A".repeat(4 * 1024 * 1024);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/files"))
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "clean body must relay");
+    let recorded = cap.body.lock().unwrap().clone();
+    assert_eq!(recorded, body, "clean UTF-8 body must relay BYTE-IDENTICAL");
+    assert_eq!(
+        cap.paths.lock().unwrap().clone(),
+        vec!["/v1/files".to_string()],
+        "clean relay must reach the upstream /v1/files exactly once"
+    );
+}
+
+// --- F1 / A1.4b: 4 MB NON-UTF-8 body, no secret -> relayed (200, non-empty). -
+#[tokio::test]
+async fn f1_a1_4b_large_clean_binary_body_relayed() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    // 4 MB of 0xFF is invalid UTF-8 and contains no registered secret bytes.
+    let body = vec![0xFFu8; 4 * 1024 * 1024];
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/files"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "clean binary body must relay");
+    // from_utf8_lossy makes byte-identity unassertable; a non-empty record + the path proves egress.
+    assert!(!cap.body.lock().unwrap().is_empty(), "binary relay body must be recorded non-empty");
+    assert_eq!(cap.paths.lock().unwrap().clone(), vec!["/v1/files".to_string()]);
+}
+
+// --- F1 / A1.5: no secrets registered -> relayed untouched (short-circuit). --
+#[tokio::test]
+async fn f1_a1_5_no_secrets_registered_relayed_untouched() {
+    // Empty secret set: registered_secret_in_bytes short-circuits to false.
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let (proxy_addr, cap) = f1f9_setup(engine).await;
+    let body = format!("this body literally contains {F1F9_SECRET} but nothing is registered");
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/files"))
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "no secrets -> relayed");
+    assert_eq!(cap.body.lock().unwrap().clone(), body, "short-circuit relays untouched");
+}
+
+// --- F1 / A1.6: secret in a URL PATH segment -> 409, ZERO bytes + paths. -----
+#[tokio::test]
+async fn f1_a1_6_path_segment_secret_refuses_409_zero_bytes() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/sordino/session/c1/v1/files/{F1F9_SECRET}"))
+        .body("clean upload body")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(zero_egress(&cap), "F1 must refuse a path-segment secret with ZERO bytes + paths");
+}
+
+// --- F1 / A1.7: 4-byte secret in a 4 MB binary body -> 409 (no length floor). -
+#[tokio::test]
+async fn f1_a1_7_short_secret_in_binary_body_refuses_409() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_short_secret()).await;
+    let mut body = vec![0xFEu8; 4 * 1024 * 1024];
+    // Splice the exact 4-byte secret somewhere in the middle.
+    let at = 2 * 1024 * 1024;
+    body[at..at + 4].copy_from_slice(b"abcd");
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/files"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT, "Tier-1 exact has NO length floor");
+    assert!(zero_egress(&cap), "F1 must refuse the 4-byte-secret body with ZERO bytes");
+}
+
+// --- F1 / A1.8: secret only in the stripped session id -> 409 (over-refusal). -
+#[tokio::test]
+async fn f1_a1_8_secret_in_session_id_refuses_409() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    // Inner path + body are clean; the secret sits ONLY in the /sordino/session/<id>
+    // prefix, which path_q includes — an accepted over-refusal (L18-safe: refuse-only).
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/sordino/session/{F1F9_SECRET}/v1/files"))
+        .body("clean upload body")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(zero_egress(&cap), "F1 must refuse a secret-bearing session id with ZERO bytes");
+}
+
+// --- F9 / A2.1: relay_built header hit (x-custom) -> 409, ZERO bytes. --------
+#[tokio::test]
+async fn f9_a2_1_relay_built_custom_header_secret_refuses_409_zero_bytes() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/files"))
+        .header("x-custom", F1F9_SECRET)
+        .body("clean upload body")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(zero_egress(&cap), "F9 Seam-1 must refuse a header-value hit with ZERO bytes");
+}
+
+// --- F9 / A2.2: x-api-key = registered value -> RELAYED (release blocker). ----
+#[tokio::test]
+async fn f9_a2_2_x_api_key_registered_value_is_relayed_not_refused() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/files"))
+        .header("x-api-key", F1F9_SECRET)
+        .body("clean upload body")
+        .send()
+        .await
+        .unwrap();
+    // Normal mode forwards x-api-key verbatim (the user's own key); scanning it would self-refuse.
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "x-api-key is name-excluded and MUST relay, never 409 (release blocker)"
+    );
+    assert_eq!(cap.paths.lock().unwrap().clone(), vec!["/v1/files".to_string()]);
+}
+
+// --- F9 / A2.3: authorization: Bearer <registered value> -> RELAYED. ---------
+#[tokio::test]
+async fn f9_a2_3_authorization_registered_value_is_relayed_not_refused() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/files"))
+        .header("authorization", format!("Bearer {F1F9_SECRET}"))
+        .body("clean upload body")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "authorization is name-excluded and MUST relay, never 409"
+    );
+    assert_eq!(cap.paths.lock().unwrap().clone(), vec!["/v1/files".to_string()]);
+}
+
+// --- F9 / A2.4: base64-encoded secret in a header value -> RELAYED (exact-only). -
+#[tokio::test]
+async fn f9_a2_4_base64_header_value_is_relayed_exact_only() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    // The header tier is EXACT-ONLY (encoded-OFF): a Tier-2 base64 needle must NOT fire.
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/files"))
+        .header("x-custom", F1F9_SECRET_B64_NEEDLE)
+        .body("clean upload body")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "header scan is exact-only; a base64 needle must NOT refuse"
+    );
+    assert_eq!(cap.paths.lock().unwrap().clone(), vec!["/v1/files".to_string()]);
+}
+
+// --- F9 / A2.5: header hit refuses idempotently (no HeaderMap mutation). ------
+#[tokio::test]
+async fn f9_a2_5_header_hit_refuses_idempotently() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    let client = reqwest::Client::new();
+    // Two identical requests must both refuse identically — the scan only reads the
+    // HeaderMap, never mutates it, so a second pass sees the same value and refuses.
+    for _ in 0..2 {
+        let resp = client
+            .post(format!("http://{proxy_addr}/v1/files"))
+            .header("x-custom", F1F9_SECRET)
+            .body("clean upload body")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    }
+    assert!(zero_egress(&cap), "no send on either pass (idempotent refusal)");
+}
+
+// --- F9 / A2.6: registered secret S (distinct) in authorization -> RELAYED. ---
+#[tokio::test]
+async fn f9_a2_6_distinct_secret_in_authorization_is_relayed() {
+    // The registered secret is placed in authorization: Bearer <S>. Even though S is a
+    // registered secret, the header is excluded by NAME (not by matching a subscription
+    // key), so it relays — an accepted L9 residual.
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/files"))
+        .header("authorization", format!("Bearer {F1F9_SECRET}"))
+        .body("clean upload body")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "name-excluded authorization relays even carrying a registered secret"
+    );
+    assert_eq!(cap.paths.lock().unwrap().clone(), vec!["/v1/files".to_string()]);
+}
+
+// --- F9 / A2.7: send_upstream seam (POST /v1/messages) header hit -> 409. -----
+#[tokio::test]
+async fn f9_a2_7_send_upstream_seam_custom_header_secret_refuses_409_zero_bytes() {
+    // Second-seam falsifier: the masked-intake egress (send_upstream) must ALSO be gated,
+    // not just relay_built. Body is clean JSON (masks fine); the secret rides x-custom.
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("x-custom", F1F9_SECRET)
+        .json(&serde_json::json!({
+            "model": "claude-test", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT, "send_upstream seam must be gated");
+    assert!(zero_egress(&cap), "F9 Seam-2 must egress ZERO bytes on a header hit");
+}

@@ -484,6 +484,23 @@ pub(crate) async fn relay_verbatim(st: &AppState, req: Request) -> Response {
         .unwrap_or_else(|| parts.uri.path());
     let path_only = parts.uri.path();
 
+    // F1: registered-secret relay tripwire. The verbatim relay NEVER masks, so if a
+    // registered secret's plaintext (Tier-1) or base64 needle (Tier-2) appears in the
+    // body, or anywhere in the full path+query egress superset, refuse 409 with ZERO
+    // bytes upstream — BEFORE any adapter.build/.send below. `path_q` is a superset of
+    // every downstream relay path (session-stripped inner path or the bare path), so
+    // this single scan gates BOTH build sites. Empty secret set short-circuits to false.
+    if st.engine.registered_secret_in_bytes(&body_bytes)
+        || st.engine.registered_secret_in_bytes(path_q.as_bytes())
+    {
+        return err(
+            StatusCode::CONFLICT,
+            "a registered secret value appears in this verbatim relay body/path/query — \
+             refusing to egress it un-masked (fail-closed; this path does not mask). \
+             Refuses obvious embeds, best-effort — not a guarantee.",
+        );
+    }
+
     // Session-prefixed verbatim relay: `/sordino/session/<id>/<rest>`.
     if let Some((id, rest)) = parse_session_prefix(path_only) {
         // Traversal hardening FIRST — a legit client never sends `..`; refusing here
@@ -568,6 +585,25 @@ async fn relay_built(
     parts: &http::request::Parts,
     wire: crate::wire_adapter::WireRequest,
 ) -> Response {
+    // F9 (Seam 1): outbound header tripwire. Scan every BUILT request header EXCEPT the
+    // credential headers (x-api-key / authorization — forwarded verbatim as the user's own
+    // subscription key in Normal mode; scanning them would self-refuse). On a registered-
+    // secret hit (exact-only tier) refuse 409 WITHOUT sending and WITHOUT mutating the
+    // HeaderMap. Empty secret set short-circuits to false.
+    for (name, value) in wire.headers.iter() {
+        if name.as_str().eq_ignore_ascii_case("x-api-key")
+            || name.as_str().eq_ignore_ascii_case("authorization")
+        {
+            continue;
+        }
+        if st.engine.registered_secret_in_header_value(value.as_bytes()) {
+            return err(
+                StatusCode::CONFLICT,
+                "a registered secret value appears in an outbound request header — refusing \
+                 to egress it un-masked (fail-closed; headers are not masked).",
+            );
+        }
+    }
     let resp = match st
         .http
         .request(parts.method.clone(), &wire.url)
@@ -711,6 +747,24 @@ pub(crate) async fn send_upstream(
     // masking always applies, ZDR is routing-only in the foundation).
     let adapter = AnthropicNative::for_mode(&st.upstream_base, st.upstream_host(), pinned);
     let wire = adapter.build(&parts.headers, path, body);
+    // F9 (Seam 2): outbound header tripwire on the masked-intake egress seam (gates the
+    // Anthropic intake AND both OpenAI handlers transitively, since they all egress here).
+    // Same exclusion + exact-only tier as Seam 1; on a hit refuse 409 WITHOUT sending and
+    // WITHOUT mutating the HeaderMap. Empty secret set short-circuits to false.
+    for (name, value) in wire.headers.iter() {
+        if name.as_str().eq_ignore_ascii_case("x-api-key")
+            || name.as_str().eq_ignore_ascii_case("authorization")
+        {
+            continue;
+        }
+        if st.engine.registered_secret_in_header_value(value.as_bytes()) {
+            return Err(err(
+                StatusCode::CONFLICT,
+                "a registered secret value appears in an outbound request header — refusing \
+                 to egress it un-masked (fail-closed; headers are not masked).",
+            ));
+        }
+    }
     st.http
         .post(&wire.url)
         .headers(wire.headers)
