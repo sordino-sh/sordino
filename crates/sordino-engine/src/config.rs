@@ -361,6 +361,23 @@ impl AllowList {
             r"(?i)^(sonnet|opus|haiku)(\s+\d+(\.\d+)*)?$",
             r"(?i)^https?://(www\.)?claude\.ai(/\S*)?$",
             r"(?i)^https?://(www\.)?claude\.com(/\S*)?$",
+            // Standards / spec / license hosts whose bare URLs pervade config, schemas,
+            // XML namespaces, and license headers — never user PII, but a generic URL
+            // recognizer masks them under Network. Every entry is `^…$`-anchored to the
+            // WHOLE span (a bare substring would be an allow-list bypass): the host is
+            // anchored end-to-end, so `http://w3.org.attacker.com/` does NOT match. Safe
+            // to widen only because finish() now exempts the Secrets category from
+            // allow-span suppression — an embedded URL_CREDENTIAL still masks (see v11).
+            r"(?i)^https?://(www\.)?w3\.org(/\S*)?$",
+            r"(?i)^https?://(www\.)?schema\.org(/\S*)?$",
+            r"(?i)^https?://(www\.)?json-schema\.org(/\S*)?$",
+            r"(?i)^https?://(www\.)?purl\.org(/\S*)?$",
+            r"(?i)^https?://(www\.)?xmlns\.com(/\S*)?$",
+            r"(?i)^https?://(www\.)?apache\.org/licenses(/\S*)?$",
+            r"(?i)^https?://(www\.)?opengis\.net(/\S*)?$",
+            r"(?i)^https?://(www\.)?docbook\.org(/\S*)?$",
+            r"(?i)^https?://(www\.)?opensource\.org(/\S*)?$",
+            r"(?i)^https?://(www\.)?gnu\.org(/\S*)?$",
         ] {
             al.add_pattern(regex::Regex::new(p).expect("built-in allow-list pattern must compile"));
         }
@@ -1451,6 +1468,32 @@ mod tests {
         // A REAL Anthropic employee's personal work email is NOT swallowed by a
         // domain-wide pattern — only the one fixed `noreply@` address is allow-listed.
         assert!(!al.is_allowed("jane.doe@anthropic.com"));
+    }
+
+    // F7: anchored standards-host allow patterns admit bare spec/schema/license URLs
+    // but reject look-alike hosts that merely prefix the standards domain.
+    #[test]
+    fn common_words_allow_list_covers_standards_hosts() {
+        let al = AllowList::with_common_words();
+        for v in [
+            "http://www.w3.org/2000/svg",
+            "https://schema.org/Person",
+            "https://json-schema.org/draft/2020-12/schema",
+            "http://purl.org/dc/elements/1.1/",
+            "http://www.xmlns.com/foaf/0.1/",
+            "http://www.apache.org/licenses/LICENSE-2.0",
+            "http://www.opengis.net/gml",
+            "http://www.docbook.org/xml/5.0/",
+            "https://opensource.org/licenses/MIT",
+            "https://www.gnu.org/licenses/gpl-3.0.html",
+        ] {
+            assert!(al.is_allowed(v), "expected allowed: {v:?}");
+        }
+        // SECURITY — the `^…$` anchor: a host that merely PREFIXES the standards domain
+        // (registrable-suffix confusion) must NOT be allow-listed.
+        assert!(!al.is_allowed("http://w3.org.attacker.com/"));
+        assert!(!al.is_allowed("http://schema.org.evil.example/Person"));
+        assert!(!al.is_allowed("http://gnu.org.phish.test/"));
     }
 
     #[test]

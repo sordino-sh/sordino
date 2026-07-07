@@ -63,7 +63,15 @@ use crate::surface::Surface;
 // registered in its default recognizer set. A full `-----BEGIN … PRIVATE KEY-----`…
 // `-----END-----` block now masks ENTIRELY (base64 body included) instead of only the
 // marker line matching as API_KEY. Changes detection output for unchanged text — bump.
-pub const DETECTOR_VERSION: u64 = 10;
+// v11: finish()'s allow-span containment now exempts the ENTIRE always-on Secrets
+// category (not just Source::Secret), so a URL_CREDENTIAL (which arrives as
+// Source::Regex, not Source::Secret) embedded inside an allowed standards-host URL is
+// no longer swallowed — an embedded credential still masks. Changes output — bump.
+// v12: with_common_words() gains ten anchored standards-host allow patterns
+// (w3.org/schema.org/…), so bare references to those hosts under Network no longer mask
+// as URLs. Content is already folded into detection_fingerprint via fp_allow_list, but
+// bump per the one-vN-per-detection-output-change convention.
+pub const DETECTOR_VERSION: u64 = 12;
 
 /// Score the [`LemmaContextAwareEnhancer`] adds when a recognizer's context word
 /// is found near a match (mirrors `LemmaContextAwareEnhancer::new`'s
@@ -440,6 +448,9 @@ fn finish(
     if !allowed_spans.is_empty() {
         dets.retain(|d| {
             d.source == Source::Secret
+                || crate::config::Category::Secrets
+                    .entity_types()
+                    .contains(&d.entity_type.as_str())
                 || !allowed_spans
                     .iter()
                     .any(|(s, e)| *s <= d.start && d.end <= *e)
@@ -1041,5 +1052,105 @@ mod precision_tests {
         ] {
             assert!(plausible_generic_secret(s), "should keep secret: {s:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod net_precision_containment_tests {
+    use super::*;
+
+    // F6 unit: a Secrets-category entity (URL_CREDENTIAL) arriving as Source::Regex —
+    // NOT Source::Secret — that is fully nested inside an allow span must be KEPT.
+    #[test]
+    fn f6_secrets_category_survives_allow_span_containment() {
+        let out = finish(
+            vec![CachedDetection {
+                start: 20,
+                end: 30,
+                entity_type: "URL_CREDENTIAL".into(),
+                score: 1.0,
+                source: Source::Regex,
+                literal: false,
+                fixed_token: None,
+                secret_op: None,
+            }],
+            vec![(0, 50)],
+        );
+        assert_eq!(out.len(), 1, "URL_CREDENTIAL nested in allow span must be kept");
+    }
+
+    // F6 unit NEGATIVE: a non-Secrets entity (URL) nested in an allow span is still
+    // suppressed — cross-entity containment is preserved for everything but Secrets.
+    #[test]
+    fn f6_non_secrets_entity_still_suppressed_in_allow_span() {
+        let out = finish(
+            vec![CachedDetection {
+                start: 20,
+                end: 30,
+                entity_type: "URL".into(),
+                score: 1.0,
+                source: Source::Regex,
+                literal: false,
+                fixed_token: None,
+                secret_op: None,
+            }],
+            vec![(0, 50)],
+        );
+        assert!(out.is_empty(), "URL nested in allow span must be suppressed");
+    }
+
+    // F6 e2e: a real credential embedded in an allowed standards/vendor URL still masks.
+    #[test]
+    fn f6_embedded_credential_in_allowed_url_still_masks() {
+        let mut cfg = EngineConfig::default();
+        cfg.enabled_categories.insert(crate::config::Category::Network);
+        let e = crate::MaskEngine::new(cfg).expect("engine init");
+        let masked = e
+            .mask(
+                "see https://claude.ai/cb?token=tok3nvalue0000 here",
+                Surface::UserMessage,
+            )
+            .expect("mask")
+            .masked_text;
+        assert!(
+            masked.contains("[URL_CREDENTIAL_"),
+            "expected a URL_CREDENTIAL token, got: {masked:?}"
+        );
+        assert!(
+            !masked.contains("tok3nvalue0000"),
+            "credential must not leak, got: {masked:?}"
+        );
+        assert!(
+            masked.contains("claude.ai"),
+            "allowed host should stay verbatim, got: {masked:?}"
+        );
+    }
+
+    // F7 e2e (wiring falsifier): an allowed standards host stays verbatim while a
+    // look-alike attacker host under the same registrable prefix still masks as a URL.
+    #[test]
+    fn f7_standards_host_allowed_but_lookalike_masks() {
+        let mut cfg = EngineConfig::default();
+        cfg.enabled_categories.insert(crate::config::Category::Network);
+        let e = crate::MaskEngine::new(cfg).expect("engine init");
+        let masked = e
+            .mask(
+                "ns http://www.w3.org/2000/svg vs http://w3.org.attacker.com/ end",
+                Surface::UserMessage,
+            )
+            .expect("mask")
+            .masked_text;
+        assert!(
+            masked.contains("www.w3.org/2000/svg"),
+            "allowed standards host must stay verbatim, got: {masked:?}"
+        );
+        assert!(
+            !masked.contains("http://w3.org.attacker.com/"),
+            "look-alike attacker host must not stay verbatim, got: {masked:?}"
+        );
+        assert!(
+            masked.contains("[URL_"),
+            "attacker URL should mask, got: {masked:?}"
+        );
     }
 }
