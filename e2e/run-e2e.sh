@@ -36,14 +36,18 @@ log "proxy_healthz=$(curl -sS -m 3 http://127.0.0.1:18820/healthz)"
 #     KEY is the proxy's session key (admin_key) from the project-keyed rendezvous record
 #     it published (state/proxy/<hash>.json — the one file in this isolated state dir).
 KEY=$(grep -oE '"admin_key": "[0-9a-f]+"' state/proxy/*.json | grep -oE '[0-9a-f]{64}')
+#     PROJECT is this proxy instance's project-identity hash — the rendezvous record's
+#     own filename (state/proxy/<project_key>.json). Control-plane data handlers now
+#     require it as x-sordino-project (A5 project-ownership binding), in addition to the key.
+PROJECT=$(basename state/proxy/*.json .json)
 log "config_show=$("$BIN/sordino-hooks" config show --port 18820 2>&1 | head -1)"
 # Unauthenticated disable must be refused (the prompt-injection defense).
 log "unauth_disable_code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:18820/sordino/disable)"
 # Authenticated off → on round-trip via the CLI.
 "$BIN/sordino-hooks" config off --port 18820 >/dev/null 2>&1
-log "after_off_enabled=$(curl -sS -H "x-sordino-key: $KEY" http://127.0.0.1:18820/sordino/config | grep -oE '\"enabled\":(true|false)' | head -1)"
+log "after_off_enabled=$(curl -sS -H "x-sordino-key: $KEY" -H "x-sordino-project: $PROJECT" http://127.0.0.1:18820/sordino/config | grep -oE '\"enabled\":(true|false)' | head -1)"
 "$BIN/sordino-hooks" config on --port 18820 >/dev/null 2>&1
-log "after_on_enabled=$(curl -sS -H "x-sordino-key: $KEY" http://127.0.0.1:18820/sordino/config | grep -oE '\"enabled\":(true|false)' | head -1)"
+log "after_on_enabled=$(curl -sS -H "x-sordino-key: $KEY" -H "x-sordino-project: $PROJECT" http://127.0.0.1:18820/sordino/config | grep -oE '\"enabled\":(true|false)' | head -1)"
 
 # 3) REAL claude, spawned here; routing comes entirely from .claude/settings.json
 timeout 110 claude -p "My personal email is zoe.quine@example.com and my home server is 10.55.66.77 . Acknowledge in one short sentence." \
