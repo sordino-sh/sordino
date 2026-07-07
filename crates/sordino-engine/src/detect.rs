@@ -93,7 +93,15 @@ use crate::surface::Surface;
 // not a host, and is DROPPED in place at the ingest juncture (a sibling of F5/F8, never the shared
 // `is_suppressed`, so a deliberate custom rule over such a filename still masks). Real domains
 // (`example.com`, `www.example.io`) still mask. Changes detection output for unchanged text — bump.
-pub const DETECTOR_VERSION: u64 = 16;
+// v17: three structured-secret recognizers (F10) added upstream to presidio-analyzer's default
+// recognizer set — JwkRecognizer → PRIVATE_KEY (a JWK's private member values, e.g. `d`),
+// AwsCredentialsRecognizer → AWS_SECRET_KEY (the value of `aws_secret_access_key` /
+// `aws_session_token`), and NetrcRecognizer → URL_CREDENTIAL (the value after a `.netrc`
+// `password` keyword). All Category::Secrets/always-on, consumed automatically through
+// `default_analyzer` (no from_parts registration needed, same path as PrivateKeyRecognizer).
+// New recognizers change detection output for unchanged (text, config) — bump to abandon stale
+// cache entries computed before they registered.
+pub const DETECTOR_VERSION: u64 = 17;
 
 /// Score the [`LemmaContextAwareEnhancer`] adds when a recognizer's context word
 /// is found near a match (mirrors `LemmaContextAwareEnhancer::new`'s
@@ -1478,11 +1486,16 @@ mod net_precision_ingest_tests {
 
     // ---- F12: DOMAIN enabled under Network, filename-shaped false positives suppressed ---
 
-    // The detector output identity MUST bump when DOMAIN enters the detection path (v16),
-    // or stale cache entries computed before DOMAIN was enabled would be served verbatim.
+    // The detector output identity MUST bump whenever the recognizer set changes: DOMAIN
+    // entered at v16 (F12), and the three structured-secret recognizers (JWK/AWS/.netrc)
+    // entered at v17 (F10). Versions are monotonic, so this exact-equality guard tracks the
+    // latest bump — a future recognizer change that forgets to bump serves stale cache.
     #[test]
-    fn f12_detector_version_bumped_for_domain() {
-        assert_eq!(DETECTOR_VERSION, 16, "DOMAIN enable (F12) must bump the detector version");
+    fn f10_detector_version_bumped_for_structured_recognizers() {
+        assert_eq!(
+            DETECTOR_VERSION, 17,
+            "JWK/AWS/.netrc recognizers (F10) must bump the detector version"
+        );
     }
 
     // FROZEN-set invariants: `la` load-bearing (opts.la gate), `io` (and other popular

@@ -175,3 +175,78 @@ fn declared_codename_masks_while_path_passes() {
     assert!(!out.contains("PROJECT-NEPTUNE"), "codename not masked: {out}");
     assert!(out.contains("./src/main.rs"), "path masked alongside codename: {out}");
 }
+
+/// JWK private-member recall (F10 consumption gate): the upstream `JwkRecognizer`
+/// (presidio-analyzer, native PRIVATE_KEY, Category::Secrets/always-on) reaches the full
+/// sordino engine via `default_analyzer` and masks the *value* of a JWK's private `d`
+/// member while public members (`n`, `kty`) and every key survive. The value-only emission
+/// (no mask schema) means the masked JSON still parses — that L18/no-mask-schema survival is
+/// the falsifier: if masking widened to a carve-out over the whole object, parsing would break.
+#[test]
+fn jwk_private_member_value_masks_and_json_survives() {
+    let e = engine();
+    let jwk = r#"{"kty":"RSA","d":"AbCdEf01","n":"00ff"}"#;
+    let masked = mask(&e, jwk);
+    assert!(!masked.contains("AbCdEf01"), "JWK private `d` value should mask: {masked}");
+    assert!(masked.contains(r#""n":"00ff""#), "public `n` member should survive: {masked}");
+    assert!(masked.contains(r#""kty":"RSA""#), "public `kty` member should survive: {masked}");
+    serde_json::from_str::<serde_json::Value>(&masked)
+        .unwrap_or_else(|e| panic!("masked JWK must still parse as JSON ({e}): {masked}"));
+}
+
+/// .netrc password recall (F10 consumption gate): the upstream `NetrcRecognizer`
+/// (presidio-analyzer, URL_CREDENTIAL, Category::Secrets/always-on) reaches the sordino engine
+/// and masks only the value following the `password` keyword; the keyword itself survives.
+/// (No assertion on the host/login — those may mask via other built-ins.)
+#[test]
+fn netrc_password_value_masks() {
+    let e = engine();
+    let netrc = "machine api.example.com login bob password s3cr3tvalue";
+    let masked = mask(&e, netrc);
+    assert!(!masked.contains("s3cr3tvalue"), ".netrc password value should mask: {masked}");
+    assert!(masked.contains("password"), "`password` keyword should survive: {masked}");
+}
+
+/// AWS credentials recall (F10 consumption gate): the upstream `AwsCredentialsRecognizer`
+/// (presidio-analyzer, AWS_SECRET_KEY, Category::Secrets/always-on) reaches the full sordino
+/// engine via `default_analyzer` and masks both `aws_secret_access_key` and `aws_session_token`
+/// values while the `[default]` stanza header survives.
+///
+/// `aws_session_token` has NO built-in API_KEY fallback, so its verbatim survival would prove the
+/// recognizer never registered/reached the engine — that is the LOAD-BEARING falsifier. It also
+/// carries the value-only-emission proof: its key name survives intact (`aws_session_token = <tok>`
+/// → `aws_session_token = [MASK]`), so only the secret bytes redact.
+///
+/// NOTE on `aws_secret_access_key`: unlike the session token, its VALUE is caught by BOTH the AWS
+/// recognizer (value-only) AND the built-in generic API_KEY context recognizer, which anchors on
+/// the literal word `key` and emits the wider overlapping span `key = <value>`. That wider span
+/// wins overlap resolution and consumes the trailing `key` of the key name — an artifact of the
+/// built-in API_KEY recognizer (the API_KEY↔AWS interaction the atomic flags out-of-scope), NOT
+/// of the AWS recognizer over-masking. So the full `aws_secret_access_key` literal does NOT
+/// survive; the surviving prefix `aws_secret_access` is asserted instead. Value absence (the
+/// sordino consumption gate) holds regardless.
+#[test]
+fn aws_credentials_values_mask() {
+    let e = engine();
+    let aws = "[default]\n\
+               aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n\
+               aws_session_token = FQoGZ3JlZ2lvbg==";
+    let masked = mask(&e, aws);
+    assert!(
+        !masked.contains("FQoGZ3JlZ2lvbg=="),
+        "aws_session_token value should mask (load-bearing): {masked}"
+    );
+    assert!(
+        !masked.contains("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+        "aws_secret_access_key value should mask: {masked}"
+    );
+    assert!(
+        masked.contains("aws_session_token"),
+        "`aws_session_token` key should survive (value-only emission): {masked}"
+    );
+    assert!(
+        masked.contains("aws_secret_access"),
+        "`aws_secret_access` key prefix should survive (only the value + API_KEY-context `key` mask): {masked}"
+    );
+    assert!(masked.contains("[default]"), "`[default]` stanza header should survive: {masked}");
+}
