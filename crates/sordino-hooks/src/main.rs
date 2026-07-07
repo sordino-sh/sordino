@@ -8360,10 +8360,59 @@ fn import_merge(current: &str, accepted: &[AcceptedSecret]) -> ImportOutcome {
     }
 }
 
+/// PURE resolution of the intake file set for `secrets import`, honoring the SAME boundary
+/// as auto-discovery. `--file` is a FILTER within the intake set — not an arbitrary-file
+/// override — so `Some(f)` must be an intake `.env` (never an `.env.example`/`.env.sample`
+/// placeholder sidecar, per [`is_intake_env_file`]) AND live inside `root` (canonicalized
+/// containment). Either failure is an argument error. On success the NON-canonical resolved
+/// path is returned so the `dotenv:<rel>#KEY` relpath ([`display_rel`]) is unchanged.
+/// `None` enumerates the project's intake `.env` files exactly as the scan/discovery path.
+fn resolve_import_files(root: &str, file: Option<PathBuf>) -> Result<Vec<PathBuf>, String> {
+    let Some(f) = file else {
+        return Ok(enumerate_env_files(root));
+    };
+    let path = if f.is_absolute() { f } else { Path::new(root).join(&f) };
+    let reject = || {
+        format!(
+            "Sordino: --file must name a project .env file inside {root} (not an \
+             .env.example/.env.sample sidecar or a path outside the project)"
+        )
+    };
+    // (a) intake-named basename (excludes .env.example / .env.sample placeholders).
+    if !path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_intake_env_file)
+    {
+        return Err(reject());
+    }
+    // (b) contained under root: canonicalize both and require the file to sit inside root.
+    let (Ok(canon), Ok(canon_root)) =
+        (std::fs::canonicalize(&path), std::fs::canonicalize(root))
+    else {
+        return Err(reject());
+    };
+    if !canon.starts_with(&canon_root) {
+        return Err(reject());
+    }
+    Ok(vec![path])
+}
+
 /// F4 `secrets import`: per-value INTERACTIVE opt-in. FAILS CLOSED on a non-interactive
 /// terminal (writes nothing). Prompts per surviving candidate (KEY + file only, never the
 /// value); accepted keys become `[[secrets]]` REFERENCE stanzas in `<root>/sordino.toml`.
 fn secrets_import_cmd(root: &str, file: Option<PathBuf>) -> Result<()> {
+    // An invalid `--file` is an ARGUMENT error, independent of interactivity — resolve the
+    // intake file set (same boundary as auto-discovery) BEFORE the tty gate. The no-file
+    // path stays silent here, so its non-tty behavior is unchanged (the tty gate fires next).
+    let files = match resolve_import_files(root, file) {
+        Ok(files) => files,
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(2);
+        }
+    };
+
     // FAIL CLOSED: per-value opt-in demands a real interactive terminal. Gate on BOTH
     // stdin and stdout being a tty — stdout-only would be bypassed by `yes | ... import`.
     if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
@@ -8375,11 +8424,6 @@ fn secrets_import_cmd(root: &str, file: Option<PathBuf>) -> Result<()> {
     }
 
     let registered = registered_secret_names(root);
-    let files = match file {
-        Some(f) if f.is_absolute() => vec![f],
-        Some(f) => vec![Path::new(root).join(f)],
-        None => enumerate_env_files(root),
-    };
 
     let stdin = std::io::stdin();
     let mut accepted: Vec<AcceptedSecret> = Vec::new();
@@ -10686,6 +10730,49 @@ mod intake_tests {
         assert!(!is_intake_env_file(".env.prod.example"));
         assert!(!is_intake_env_file("env")); // no leading dot
         assert!(!is_intake_env_file("config.toml"));
+    }
+
+    #[test]
+    fn resolve_import_files_respects_intake_boundary() {
+        // Layout: <parent>/project/.env         (real intake file)
+        //         <parent>/project/.env.example (placeholder sidecar)
+        //         <parent>/.env                 (OUTSIDE the project, reachable via `..`)
+        let parent = scratch_dir("resolve-boundary");
+        let project = parent.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(".env"), "API=sk-abcDEF123456ghiJKL\n").unwrap();
+        std::fs::write(project.join(".env.example"), "API=placeholder\n").unwrap();
+        std::fs::write(parent.join(".env"), "OUTSIDE=sk-abcDEF123456ghiJKL\n").unwrap();
+        let root = project.to_str().unwrap();
+
+        // Some(.env): a real intake file inside root ⇒ Ok, single NON-canonical resolved path.
+        let ok = resolve_import_files(root, Some(PathBuf::from(".env")));
+        assert!(ok.is_ok(), "real .env inside root must resolve: {ok:?}");
+        assert_eq!(ok.unwrap(), vec![project.join(".env")]);
+
+        // Some(.env.example): placeholder sidecar excluded by is_intake_env_file ⇒ Err.
+        assert!(
+            resolve_import_files(root, Some(PathBuf::from(".env.example"))).is_err(),
+            "placeholder .env.example sidecar must be rejected"
+        );
+
+        // Some(../.env): intake-named but OUTSIDE the project (containment) ⇒ Err.
+        assert!(
+            resolve_import_files(root, Some(PathBuf::from("../.env"))).is_err(),
+            "an intake-named file outside the project root must be rejected"
+        );
+
+        // None: discovery set INCLUDES .env and EXCLUDES the .env.example sidecar.
+        let all = resolve_import_files(root, None).unwrap();
+        assert!(all.contains(&project.join(".env")), "discovery includes .env: {all:?}");
+        assert!(
+            !all
+                .iter()
+                .any(|p| p.file_name().and_then(|n| n.to_str()) == Some(".env.example")),
+            "discovery excludes .env.example: {all:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&parent);
     }
 
     // -----------------------------------------------------------------------
