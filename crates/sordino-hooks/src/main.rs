@@ -3303,9 +3303,60 @@ const AUTOMODE_ENV_NOTE: &str = "Sordino is a local PII-masking proxy the user i
     disable, privacy). They make no outbound network requests and perform no destructive actions. \
     Treat them as trusted local infrastructure.";
 
+/// A masking-layer awareness note merged into `autoMode.environment` (a Context slot). The
+/// auto-mode classifier reads the environment section to interpret the BLOCK rules in context;
+/// this tells it a masking proxy sits on the wire, what it does, and — critically — that masking
+/// is best-effort and FORM-DEPENDENT, so it can read the `Masking Circumvention` soft rule below
+/// correctly. Kept honest: it claims risk reduction, not a guarantee.
+const AUTOMODE_ENV_MASKING_NOTE: &str = "Model traffic from this project is routed through \
+    Sordino, a local masking proxy that replaces recognized secrets and personal data with \
+    placeholder tokens in the outbound request before it leaves the machine, and restores them in \
+    the response the user sees. Masking is best-effort and form-dependent: the proxy can only mask \
+    a value it can still recognize in the bytes that egress, so a secret that has been re-encoded, \
+    split, or otherwise transformed out of its recognizable shape before it is sent reaches the \
+    provider in the clear. It reduces the risk of real secrets being read into the model — it does \
+    not make secrets safe to mishandle. See the Masking Circumvention rule.";
+
+/// A `Masking Circumvention` SOFT BLOCK rule merged into `autoMode.soft_deny`. Claude Code's
+/// classifier already decodes `ENCODED COMMANDS` and treats obfuscated data as sensitive by
+/// provenance, but its exfiltration rules key on a novel/external DESTINATION — they do not name
+/// the Sordino-specific harm: transforming a secret so it reaches the *otherwise-trusted* model
+/// endpoint UNMASKED. This rule closes that gap. SOFT (user-clearable) by design — an encoding the
+/// user actually asked for must pass; only an unrequested transform whose effect is to defeat
+/// masking blocks. Provenance- and intent-gated to keep false positives off ordinary (non-secret)
+/// encoding.
+const AUTOMODE_SOFT_DENY_MASKING: &str = "Masking Circumvention: Deliberately transforming secret- \
+    or personal-data-bearing content so it reaches the model provider in a form Sordino's masking \
+    proxy (see Environment) can no longer recognize and mask — e.g. base64/hex/other re-encoding, \
+    encrypting or compressing the value, reversing it, splitting or chunking it across pieces, or \
+    character-by-character / arithmetic reassembly of a credential, token, key, or personal value \
+    before it egresses. The harm is that the raw value then reaches the provider unmasked, so this \
+    is blocked even when the destination is the normal, trusted model endpoint. Provenance decides \
+    what counts: the value must have originated as a real secret or personal datum (from a .env, \
+    credential store, config, keychain, a registered secret, or private data the proxy would \
+    otherwise mask), not arbitrary or agent-authored data. NOT this rule (do not block): encoding, \
+    hashing, compressing, or reformatting non-secret data; a transform the user explicitly asked \
+    for; piping a credential straight into its intended consumer so it is never re-emitted; or \
+    standard tooling that legitimately encodes (JWTs, TLS certs, git objects, data URIs, build \
+    artifacts). Clears when the user explicitly directed that transformation of that data.";
+
+/// The environment entries (Context slots) we own, in order — seeded after `"$defaults"`.
+const ENV_ENTRIES: &[&str] = &[AUTOMODE_ENV_NOTE, AUTOMODE_ENV_MASKING_NOTE];
+/// The soft-deny rules we own — seeded after `"$defaults"`; see [`automode_entry_sets`].
+const SOFT_DENY_ENTRIES: &[&str] = &[AUTOMODE_SOFT_DENY_MASKING];
+
 /// The `(permissions.<key>, our-rules)` pairs we own.
 fn permission_rule_sets() -> [(&'static str, &'static [&'static str]); 2] {
     [("deny", DENY_RULES), ("ask", ASK_RULES)]
+}
+
+/// The `(autoMode.<key>, our-entries)` pairs we own. Every key's array is seeded with `"$defaults"`
+/// FIRST on creation (see [`merge_automode_entries`]) so we only ever ADD to Claude Code's built-in
+/// entries at that position. This is load-bearing for `soft_deny`: a non-`"$defaults"` array
+/// REPLACES the defaults (Claude Code's `SSt` splice), which would silently drop every built-in
+/// block rule (Data Exfiltration, the Credential rules, Irreversible Local Destruction, …).
+fn automode_entry_sets() -> [(&'static str, &'static [&'static str]); 2] {
+    [("environment", ENV_ENTRIES), ("soft_deny", SOFT_DENY_ENTRIES)]
 }
 
 /// Merge our rules into `v["permissions"]`, appending only entries not already present
@@ -3378,51 +3429,92 @@ fn remove_permission_rules(v: &mut Value) -> bool {
     changed
 }
 
-/// Merge our trusted-infra note into `v["autoMode"]["environment"]` (append-if-absent, preserving
-/// the user's entries). Seeds a freshly-created array with `"$defaults"` FIRST, so we only ever ADD
-/// to Claude Code's built-in trusted-infra defaults — never silently replace them. Refuses (rather
-/// than clobbers) a non-array `environment`, mirroring [`merge_permission_rules`].
-fn merge_automode_environment(v: &mut Value) -> Result<()> {
+/// Merge our entries into each `autoMode.<key>` array (append-if-absent, preserving the user's
+/// entries). Seeds a freshly-created array with `"$defaults"` FIRST, so we only ever ADD to Claude
+/// Code's built-in entries at that position — never silently replace them (for `soft_deny` that
+/// would drop every built-in block rule). Refuses (rather than clobbers) a non-array value; every
+/// owned key is validated array-or-absent UP FRONT so the merge is all-or-nothing — a malformed
+/// later key can't leave an earlier key half-seeded/appended.
+fn merge_automode_entries(v: &mut Value) -> Result<()> {
     let auto = ensure_object(v, "autoMode");
-    let arr = auto
-        .entry("environment".to_string())
-        .or_insert_with(|| json!(["$defaults"]))
-        .as_array_mut()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "settings.local.json autoMode.environment is not a JSON array; refusing to \
+    // Transactional refuse-not-clobber: reject on ANY malformed key we own before mutating ANY of
+    // them, so e.g. a non-array `soft_deny` can't leave `environment` half-merged in `v`.
+    for (key, _) in automode_entry_sets() {
+        if auto.get(key).is_some_and(|x| !x.is_array()) {
+            bail!(
+                "settings.local.json autoMode.{key} is not a JSON array; refusing to \
                  overwrite it. Fix it and re-run /sordino:enable."
-            )
-        })?;
-    if !arr.iter().any(|x| x.as_str() == Some(AUTOMODE_ENV_NOTE)) {
-        arr.push(Value::String(AUTOMODE_ENV_NOTE.to_string()));
+            );
+        }
+    }
+    for (key, wanted) in automode_entry_sets() {
+        let arr = auto
+            .entry(key.to_string())
+            .or_insert_with(|| json!(["$defaults"]))
+            .as_array_mut()
+            .ok_or_else(|| {
+                // Unreachable after the up-front validation above; kept as a non-panicking guard.
+                anyhow::anyhow!(
+                    "settings.local.json autoMode.{key} is not a JSON array; refusing to \
+                     overwrite it. Fix it and re-run /sordino:enable."
+                )
+            })?;
+        // An EMPTY existing array means "inherit defaults" (Claude Code's SSt returns the built-in
+        // list for an empty user array). Appending our entry to it would flip it into a
+        // defaults-REPLACING array — for soft_deny that silently drops every built-in block rule —
+        // so seed "$defaults" FIRST, exactly as we do for a freshly-created key. A NON-empty user
+        // array without "$defaults" is a deliberate replacement and is left as-is (we only append).
+        if arr.is_empty() {
+            arr.push(Value::String("$defaults".to_string()));
+        }
+        for w in wanted {
+            if !arr.iter().any(|x| x.as_str() == Some(*w)) {
+                arr.push(Value::String((*w).to_string()));
+            }
+        }
     }
     Ok(())
 }
 
-/// Our note is present (so a re-enable is a true NoOp; an upgrade from a build that lacked it is
-/// correctly detected as Changed).
-fn automode_note_present(v: &Value) -> bool {
-    v.pointer("/autoMode/environment")
-        .and_then(Value::as_array)
-        .map(|a| a.iter().any(|x| x.as_str() == Some(AUTOMODE_ENV_NOTE)))
-        .unwrap_or(false)
+/// Every one of our entries is present across all keys (so a re-enable is a true NoOp; an upgrade
+/// from a build that lacked one is correctly detected as Changed).
+fn automode_entries_present(v: &Value) -> bool {
+    automode_entry_sets().iter().all(|(key, wanted)| {
+        v.pointer(&format!("/autoMode/{key}"))
+            .and_then(Value::as_array)
+            .map(|a| wanted.iter().all(|w| a.iter().any(|x| x.as_str() == Some(*w))))
+            .unwrap_or(false)
+    })
 }
 
-/// Remove ONLY our note from `v["autoMode"]["environment"]`, preserving user entries — the inverse
-/// of [`merge_automode_environment`]. Drops an `environment` array that empties or is left as only
-/// `"$defaults"` (the no-op sentinel we seeded), and the `autoMode` object if it empties. Returns
-/// whether anything changed.
-fn remove_automode_environment(v: &mut Value) -> bool {
+/// ANY of our entries is present (so disable still cleans a file carrying only our entries, after
+/// the env/statusLine takeover was already removed by hand).
+fn any_automode_entry_present(v: &Value) -> bool {
+    automode_entry_sets().iter().any(|(key, wanted)| {
+        v.pointer(&format!("/autoMode/{key}"))
+            .and_then(Value::as_array)
+            .map(|a| wanted.iter().any(|w| a.iter().any(|x| x.as_str() == Some(*w))))
+            .unwrap_or(false)
+    })
+}
+
+/// Remove ONLY our entries from each `autoMode.<key>` array, preserving user entries — the inverse
+/// of [`merge_automode_entries`]. Drops a key's array that empties or is left as only `"$defaults"`
+/// (the no-op sentinel we seeded), and the `autoMode` object if it empties. Returns whether
+/// anything changed.
+fn remove_automode_entries(v: &mut Value) -> bool {
     let mut changed = false;
     let mut auto_empty = false;
     if let Some(auto) = v.get_mut("autoMode").and_then(Value::as_object_mut) {
-        if let Some(arr) = auto.get_mut("environment").and_then(Value::as_array_mut) {
-            let before = arr.len();
-            arr.retain(|x| x.as_str() != Some(AUTOMODE_ENV_NOTE));
-            changed = arr.len() != before;
-            if changed && arr.iter().all(|x| x.as_str() == Some("$defaults")) {
-                auto.remove("environment");
+        for (key, ours) in automode_entry_sets() {
+            if let Some(arr) = auto.get_mut(key).and_then(Value::as_array_mut) {
+                let before = arr.len();
+                arr.retain(|x| !ours.iter().any(|o| x.as_str() == Some(*o)));
+                let this_changed = arr.len() != before;
+                changed |= this_changed;
+                if this_changed && arr.iter().all(|x| x.as_str() == Some("$defaults")) {
+                    auto.remove(key);
+                }
             }
         }
         auto_empty = auto.is_empty();
@@ -3511,13 +3603,14 @@ fn settings_enable(url: &str, zport: &str, statusline: &str) -> Result<SettingsO
         .pointer("/env/SORDINO_PORT")
         .and_then(Value::as_str)
         .unwrap_or("");
-    // NoOp only when the route AND the model-gating permission rules AND the auto-mode posture
-    // note are already present; a route-present-but-rules/note-missing install (e.g. an upgrade
-    // from a build before either landed) is Changed so the merge below runs.
+    // NoOp only when the route AND the model-gating permission rules AND ALL of our auto-mode
+    // posture entries (the environment notes + the soft-deny Masking Circumvention rule) are
+    // already present; a route-present-but-rules/entries-missing install (e.g. an upgrade from a
+    // build before any of them landed) is Changed so the merge below runs.
     let already = base_url_matches(cur_url, url)
         && cur_port == zport
         && permission_rules_present(&local_v)
-        && automode_note_present(&local_v);
+        && automode_entries_present(&local_v);
 
     // Status-line takeover: snapshot the user's original line to the sidecar that
     // /sordino:uninstall restores from. NEVER delete the sidecar here — an OLD install routed
@@ -3564,10 +3657,12 @@ fn settings_enable(url: &str, zport: &str, statusline: &str) -> Result<SettingsO
     // Seal the Approval Kernel: deny the model's Bash on our CLIs + force an `ask` on its
     // edits of sordino.toml/sordino.local.toml. Merge (never clobber) the user's own rules.
     merge_permission_rules(&mut v)?;
-    // Posture the auto-mode classifier to recognise our local control-plane commands as trusted
-    // infra (so /sordino:verify et al. aren't denied as "unverifiable scripts"). Also merge-not-
-    // clobber, and seeded with "$defaults" so we never drop Claude Code's built-in defaults.
-    merge_automode_environment(&mut v)?;
+    // Posture the auto-mode classifier: environment notes so our local control-plane commands
+    // aren't denied as "unverifiable scripts" AND so it knows a masking proxy sits on the wire,
+    // plus a `Masking Circumvention` soft-deny rule that blocks transforming a secret out of a
+    // maskable form before egress. Merge-not-clobber, each key seeded with "$defaults" so we never
+    // drop Claude Code's built-in entries (for soft_deny that would wipe every built-in block rule).
+    merge_automode_entries(&mut v)?;
 
     atomic_write_json(&local_file, &v)?;
     Ok(if already {
@@ -3690,62 +3785,153 @@ mod gitignore_tests {
 #[cfg(test)]
 mod permission_rule_tests {
     use super::{
-        ASK_RULES, AUTOMODE_ENV_NOTE, DENY_RULES, any_permission_rule_present,
-        automode_note_present, merge_automode_environment, merge_permission_rules,
-        permission_rules_present, remove_automode_environment, remove_permission_rules,
+        ASK_RULES, AUTOMODE_ENV_MASKING_NOTE, AUTOMODE_ENV_NOTE, AUTOMODE_SOFT_DENY_MASKING,
+        DENY_RULES, any_automode_entry_present, any_permission_rule_present,
+        automode_entries_present, merge_automode_entries, merge_permission_rules,
+        permission_rules_present, remove_automode_entries, remove_permission_rules,
     };
     use serde_json::{Value, json};
 
     fn env_arr(v: &Value) -> Vec<String> {
-        v.pointer("/autoMode/environment")
+        key_arr(v, "environment")
+    }
+    fn key_arr(v: &Value, key: &str) -> Vec<String> {
+        v.pointer(&format!("/autoMode/{key}"))
             .and_then(Value::as_array)
             .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
             .unwrap_or_default()
     }
 
     #[test]
-    fn automode_note_seeds_defaults_then_appends_and_is_idempotent() {
-        // Fresh object: seed "$defaults" FIRST (never replace built-in defaults), then our note.
+    fn automode_seeds_defaults_then_appends_across_keys_and_is_idempotent() {
+        // Fresh object: EACH key seeds "$defaults" FIRST (never replace built-in defaults), then
+        // our entries in order. soft_deny MUST be seeded — a bare rule array would wipe every
+        // built-in block rule.
         let mut v = json!({});
-        merge_automode_environment(&mut v).unwrap();
-        assert_eq!(env_arr(&v), vec!["$defaults".to_string(), AUTOMODE_ENV_NOTE.to_string()]);
-        assert!(automode_note_present(&v));
-        // Re-run must not duplicate.
-        merge_automode_environment(&mut v).unwrap();
+        merge_automode_entries(&mut v).unwrap();
+        assert_eq!(
+            env_arr(&v),
+            vec![
+                "$defaults".to_string(),
+                AUTOMODE_ENV_NOTE.to_string(),
+                AUTOMODE_ENV_MASKING_NOTE.to_string(),
+            ],
+            "environment: $defaults first, then both notes"
+        );
+        assert_eq!(
+            key_arr(&v, "soft_deny"),
+            vec!["$defaults".to_string(), AUTOMODE_SOFT_DENY_MASKING.to_string()],
+            "soft_deny: $defaults first (no-wipe), then the Masking Circumvention rule"
+        );
+        assert!(automode_entries_present(&v));
+        assert!(any_automode_entry_present(&v));
+        // Re-run must not duplicate any entry.
+        merge_automode_entries(&mut v).unwrap();
         assert_eq!(env_arr(&v).iter().filter(|s| *s == AUTOMODE_ENV_NOTE).count(), 1);
+        assert_eq!(env_arr(&v).iter().filter(|s| *s == AUTOMODE_ENV_MASKING_NOTE).count(), 1);
+        assert_eq!(
+            key_arr(&v, "soft_deny").iter().filter(|s| *s == AUTOMODE_SOFT_DENY_MASKING).count(),
+            1
+        );
     }
 
     #[test]
-    fn automode_merge_preserves_user_environment_entries() {
-        // User already curated environment (with their own entry, no "$defaults"): append only.
-        let mut v = json!({ "autoMode": { "environment": ["Trusted: my CI box"] } });
-        merge_automode_environment(&mut v).unwrap();
+    fn automode_partial_entries_are_not_present_the_upgrade_signal() {
+        // An install from a build that shipped only the first env note (no masking note, no
+        // soft_deny) must read as NOT fully present ⇒ Changed ⇒ the merge below runs on upgrade.
+        let mut v = json!({ "autoMode": { "environment": ["$defaults", AUTOMODE_ENV_NOTE] } });
+        assert!(!automode_entries_present(&v), "missing masking note + soft_deny ⇒ not present");
+        assert!(any_automode_entry_present(&v));
+        merge_automode_entries(&mut v).unwrap();
+        assert!(automode_entries_present(&v));
+    }
+
+    #[test]
+    fn automode_merge_preserves_user_entries() {
+        // User already curated BOTH keys (their own entries, no "$defaults"): append only, and
+        // never inject "$defaults" into a user-populated array.
+        let mut v = json!({
+            "autoMode": {
+                "environment": ["Trusted: my CI box"],
+                "soft_deny": ["My Rule: never touch prod"]
+            }
+        });
+        merge_automode_entries(&mut v).unwrap();
         let e = env_arr(&v);
-        assert!(e.contains(&"Trusted: my CI box".to_string()), "user entry kept: {e:?}");
+        assert!(e.contains(&"Trusted: my CI box".to_string()), "user env entry kept: {e:?}");
         assert!(e.contains(&AUTOMODE_ENV_NOTE.to_string()));
+        assert!(e.contains(&AUTOMODE_ENV_MASKING_NOTE.to_string()));
         assert!(!e.contains(&"$defaults".to_string()), "don't inject $defaults into a user array");
+        let s = key_arr(&v, "soft_deny");
+        assert!(s.contains(&"My Rule: never touch prod".to_string()), "user soft_deny kept: {s:?}");
+        assert!(s.contains(&AUTOMODE_SOFT_DENY_MASKING.to_string()));
+        assert!(!s.contains(&"$defaults".to_string()));
     }
 
     #[test]
-    fn automode_merge_refuses_non_array_environment() {
-        let mut v = json!({ "autoMode": { "environment": "oops-not-an-array" } });
-        assert!(merge_automode_environment(&mut v).is_err());
+    fn automode_merge_seeds_defaults_into_an_empty_existing_array() {
+        // A pre-existing EMPTY array means "inherit defaults" to Claude Code. Appending our rule
+        // without seeding "$defaults" would turn it into a defaults-REPLACING array — for soft_deny
+        // that would wipe every built-in block rule. Must seed "$defaults" first here too.
+        let mut v = json!({ "autoMode": { "environment": [], "soft_deny": [] } });
+        merge_automode_entries(&mut v).unwrap();
+        assert_eq!(env_arr(&v).first().map(String::as_str), Some("$defaults"), "{:?}", env_arr(&v));
+        let s = key_arr(&v, "soft_deny");
+        assert_eq!(s.first().map(String::as_str), Some("$defaults"), "no-wipe seed: {s:?}");
+        assert!(s.contains(&AUTOMODE_SOFT_DENY_MASKING.to_string()));
+    }
+
+    #[test]
+    fn automode_merge_refuses_a_non_array_key() {
+        // A malformed (schema-invalid) autoMode.soft_deny must be REFUSED, never clobbered.
+        let mut v = json!({ "autoMode": { "soft_deny": "oops-not-an-array" } });
+        assert!(merge_automode_entries(&mut v).is_err());
+        assert_eq!(
+            v.pointer("/autoMode/soft_deny").and_then(Value::as_str),
+            Some("oops-not-an-array"),
+            "the user's value must be left intact"
+        );
+    }
+
+    #[test]
+    fn automode_merge_is_transactional_on_a_malformed_later_key() {
+        // soft_deny is iterated AFTER environment. A malformed soft_deny must refuse the WHOLE
+        // merge before environment is touched — no half-seeded earlier key (all-or-nothing).
+        let mut v = json!({ "autoMode": { "soft_deny": "oops-not-an-array" } });
+        assert!(merge_automode_entries(&mut v).is_err());
+        assert!(
+            v.pointer("/autoMode/environment").is_none(),
+            "environment must NOT be half-merged when a later key is malformed: {v}"
+        );
+        assert_eq!(
+            v.pointer("/autoMode/soft_deny").and_then(Value::as_str),
+            Some("oops-not-an-array"),
+            "the user's malformed value must be left intact"
+        );
     }
 
     #[test]
     fn automode_remove_is_a_true_inverse_but_keeps_user_entries() {
-        // Fresh enable then disable → autoMode fully gone (we seeded $defaults, so it's dropped).
+        // Fresh enable then disable → autoMode fully gone (we seeded $defaults on every key we
+        // own, so each empties to $defaults-only and is dropped, then the object empties).
         let mut v = json!({});
-        merge_automode_environment(&mut v).unwrap();
-        assert!(remove_automode_environment(&mut v));
+        merge_automode_entries(&mut v).unwrap();
+        assert!(remove_automode_entries(&mut v));
         assert!(v.get("autoMode").is_none(), "our-only autoMode dropped on disable: {v}");
-        // A user entry survives disable; only our note is stripped.
-        let mut v = json!({ "autoMode": { "environment": ["Trusted: my CI box"] } });
-        merge_automode_environment(&mut v).unwrap();
-        assert!(remove_automode_environment(&mut v));
-        let e = env_arr(&v);
-        assert_eq!(e, vec!["Trusted: my CI box".to_string()]);
-        assert!(!automode_note_present(&v));
+        assert!(!any_automode_entry_present(&v));
+        // User entries in BOTH keys survive disable; only our entries are stripped.
+        let mut v = json!({
+            "autoMode": {
+                "environment": ["Trusted: my CI box"],
+                "soft_deny": ["My Rule: never touch prod"]
+            }
+        });
+        merge_automode_entries(&mut v).unwrap();
+        assert!(remove_automode_entries(&mut v));
+        assert_eq!(env_arr(&v), vec!["Trusted: my CI box".to_string()]);
+        assert_eq!(key_arr(&v, "soft_deny"), vec!["My Rule: never touch prod".to_string()]);
+        assert!(!automode_entries_present(&v));
+        assert!(!any_automode_entry_present(&v));
     }
 
     fn arr(v: &Value, key: &str) -> Vec<String> {
@@ -4110,11 +4296,11 @@ fn strip_routing_from(settings_file: &Path, restore: Option<&Value>) -> Result<(
             .and_then(Value::as_str)
             .unwrap_or(""),
     );
-    // Also trigger when only our permission rules OR our auto-mode note remain (env/statusLine
-    // hand-removed) so disable stays a true inverse and never leaves either orphaned.
+    // Also trigger when only our permission rules OR any of our auto-mode entries remain
+    // (env/statusLine hand-removed) so disable stays a true inverse and never leaves them orphaned.
     let has_perms_wiring = any_permission_rule_present(&v);
-    let has_automode_note = automode_note_present(&v);
-    if !has_env_wiring && !sl_is_ours && !has_perms_wiring && !has_automode_note {
+    let has_automode_entries = any_automode_entry_present(&v);
+    if !has_env_wiring && !sl_is_ours && !has_perms_wiring && !has_automode_entries {
         return Ok((false, false));
     }
 
@@ -4148,10 +4334,11 @@ fn strip_routing_from(settings_file: &Path, restore: Option<&Value>) -> Result<(
         }
     }
 
-    // Strip our model-gating permission rules + auto-mode posture note too (preserving any user
-    // permissions / environment entries), so disable is a true inverse of enable's merge.
+    // Strip our model-gating permission rules + all auto-mode posture entries too (preserving any
+    // user permissions / environment / soft_deny entries), so disable is a true inverse of enable's
+    // merge.
     remove_permission_rules(&mut v);
-    remove_automode_environment(&mut v);
+    remove_automode_entries(&mut v);
 
     atomic_write_json(settings_file, &v)?;
     Ok((true, restored))
