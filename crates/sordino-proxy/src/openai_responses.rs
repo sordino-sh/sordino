@@ -23,7 +23,7 @@ use sordino_engine::{
 };
 
 use crate::zdr::PinnedMode;
-use crate::{headers, monitor, routes, sse, state::AppState, walk};
+use crate::{headers, monitor, routes, sse, state::AppState, tripwire, walk};
 
 const MAX_BODY: usize = 64 * 1024 * 1024;
 
@@ -189,6 +189,15 @@ async fn mask_body(
             StatusCode::BAD_REQUEST,
             &format!("unparseable request body, refusing to forward: {e}"),
         )),
+        // A2b: registered secret in a never-masked schema/contract subtree → 409 CONFLICT,
+        // naming the secret but never its value. MUST precede the generic Engine → 500 arm.
+        Err(MaskError::Engine(EngineError::RegisteredSecretInCarveOut(name))) => Err(routes::err(
+            StatusCode::CONFLICT,
+            &format!(
+                "registered secret {name:?} found in a never-masked schema/contract subtree — \
+                 refusing rather than forwarding it in plaintext"
+            ),
+        )),
         Err(MaskError::Engine(e)) => Err(routes::err(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("masking error, request refused: {e}"),
@@ -316,6 +325,35 @@ impl MaskWalker<'_> {
         // `metadata` is developer free-form key-values (not telemetry) → still masked.
         if let Some(metadata) = req.metadata.as_mut() {
             self.value_safe(metadata, Surface::UserMessage)?;
+        }
+        // Tool definitions are a never-rewritten contract subtree on this wire — `tools` is a
+        // TYPED field so it never reaches `map_safe`'s contract-key leg. A registered secret's
+        // exact value anywhere in a tool def would forward in plaintext → DETECT and refuse
+        // (A2b). Scan-only: the tools are never rewritten.
+        if let Some(tools) = req.tools.as_ref() {
+            for tool in tools {
+                if let Some(name) = tripwire::scan_value(self.engine, tool, 0) {
+                    return Err(EngineError::RegisteredSecretInCarveOut(name));
+                }
+            }
+        }
+        // `text` / `response_format` / `tool_choice` / `reasoning` are TYPED never-rewritten
+        // contract fields on this wire — the walker masks none of them, and being typed they
+        // never reach the fallback `value_safe` contract-key leg. A registered secret's exact
+        // value in any of them (e.g. a `text.format.schema` JSON schema `const`) would forward in
+        // plaintext → DETECT and refuse (A2b), exactly as `tools` is scanned above. Scan-only.
+        for field in [
+            req.text.as_ref(),
+            req.response_format.as_ref(),
+            req.tool_choice.as_ref(),
+            req.reasoning.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Some(name) = tripwire::scan_value(self.engine, field, 0) {
+                return Err(EngineError::RegisteredSecretInCarveOut(name));
+            }
         }
         // The top-level `user` field is API-protocol TELEMETRY (OpenAI's abuse-correlation
         // identifier), contractually opaque — the direct analog of Anthropic's
@@ -448,7 +486,17 @@ impl MaskWalker<'_> {
             Value::Object(o) => {
                 let is_base64 = o.get("type").and_then(Value::as_str) == Some("base64");
                 for (k, val) in o {
-                    if (is_base64 && k == "data") || preserves_contract_key(k) {
+                    // SPLIT the two carve-outs: the base64 `data` leg is the L18 binary
+                    // carve-out (never scanned — a base64 coincidence is not a leak), while
+                    // the contract-key leg is a never-rewritten schema/contract subtree that
+                    // must be SCANNED (A2b: refuse a registered secret rather than forward it).
+                    if is_base64 && k == "data" {
+                        continue;
+                    }
+                    if preserves_contract_key(k) {
+                        if let Some(name) = tripwire::scan_value(self.engine, val, 0) {
+                            return Err(EngineError::RegisteredSecretInCarveOut(name));
+                        }
                         continue;
                     }
                     self.value_safe(val, surface)?;
@@ -466,6 +514,10 @@ impl MaskWalker<'_> {
     ) -> Result<(), EngineError> {
         for (k, val) in m {
             if preserves_contract_key(k) {
+                // Never-rewritten contract key: scan-and-refuse rather than mask (A2b).
+                if let Some(name) = tripwire::scan_value(self.engine, val, 0) {
+                    return Err(EngineError::RegisteredSecretInCarveOut(name));
+                }
                 continue;
             }
             self.value_safe(val, surface)?;
@@ -541,14 +593,19 @@ fn unmask_output_item(
     match item {
         ResponseOutputItem::Message(msg) => unmask_message(engine, manifest, msg),
         ResponseOutputItem::FunctionCall(call) => {
-            walk::unmask_str(engine, manifest, &mut call.arguments);
-            unmask_map(engine, manifest, &mut call.extra);
+            // Genuine tool-execution destination: gate both the args AND an unknown-field
+            // token riding on `extra` so neither resolves to plaintext a tool would act on (A4b).
+            walk::unmask_str_tool_input(engine, manifest, &mut call.arguments);
+            walk::unmask_map_tool_input(engine, manifest, &mut call.extra);
         }
+        // FunctionCallOutput is an ALREADY-EXECUTED tool-result echo → display path (unchanged).
         ResponseOutputItem::FunctionCallOutput(out) => {
             walk::unmask_str(engine, manifest, &mut out.output);
             unmask_map(engine, manifest, &mut out.extra);
         }
-        ResponseOutputItem::Other(v) => walk::unmask_value(engine, manifest, v),
+        // An unmodeled output item (e.g. a local_shell_call-shaped tool item) is a genuine
+        // tool-execution destination we don't have a typed arm for → gate the whole value (A4b).
+        ResponseOutputItem::Other(v) => walk::unmask_value_tool_input(engine, manifest, v),
         _ => {}
     }
 }
@@ -576,12 +633,18 @@ fn unmask_message(engine: &MaskEngine, manifest: &UnmaskManifest, msg: &mut Resp
                         | ResponseContentPart::InputFile { extra, .. } => {
                             unmask_map(engine, manifest, extra);
                         }
-                        ResponseContentPart::Other(v) => walk::unmask_value(engine, manifest, v),
+                        // Unmodeled content part: a token in an unknown-shaped part could be a
+                        // genuine tool destination we can't classify → gate it (A4b).
+                        ResponseContentPart::Other(v) => {
+                            walk::unmask_value_tool_input(engine, manifest, v)
+                        }
                         _ => {}
                     }
                 }
             }
-            ResponseMessageContent::Other(v) => walk::unmask_value(engine, manifest, v),
+            // Non-string / non-array message content (the total fallback): only reachable
+            // for an object-valued content — gate it as an unclassifiable destination (A4b).
+            ResponseMessageContent::Other(v) => walk::unmask_value_tool_input(engine, manifest, v),
             _ => {}
         }
     }
@@ -715,8 +778,10 @@ impl ResponsesSseUnmasker {
                 unmask_completed(engine, manifest, completed);
                 vec![ev]
             }
+            // Unmodeled streaming event (e.g. response.custom_tool_call.arguments.delta): could
+            // carry tool-call args we can't type → gate the whole value (A4b).
             ResponseStreamEvent::Other(v) => {
-                walk::unmask_value(engine, manifest, v);
+                walk::unmask_value_tool_input(engine, manifest, v);
                 vec![ev]
             }
             _ => vec![ev],
@@ -756,8 +821,9 @@ impl ResponsesSseUnmasker {
         };
         let (safe, held) = split_safe(&buf);
         self.args_carry.insert(key, held.to_string());
+        // Streamed function-call args are a genuine tool-execution destination: gate (A4b).
         engine
-            .unmask(safe, manifest)
+            .unmask_tool_input(safe, manifest)
             .unwrap_or_else(|_| safe.to_string())
     }
 
@@ -808,9 +874,10 @@ fn flush_held(st: &mut StreamState) {
         }
     }
     for ((item_id, output_index), held) in args {
+        // Held function-call args tail is a genuine tool-execution destination: gate (A4b).
         let emitted = st
             .engine
-            .unmask(&held, st.manifest.as_ref())
+            .unmask_tool_input(&held, st.manifest.as_ref())
             .unwrap_or(held);
         if emitted.is_empty() {
             continue;
@@ -1075,9 +1142,10 @@ mod tests {
         let out = unmask_response(&e, &masked.manifest, resp.to_string().as_bytes()).unwrap();
         let v: Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["output"][0]["content"][0]["text"], "ok <bob@example.com>");
+        // FunctionCall arguments: GATED (A4b) — the token stays verbatim, never resolves.
         assert_eq!(
             v["output"][1]["arguments"],
-            "{\"email\":\"bob@example.com\"}"
+            format!("{{\"email\":\"{token}\"}}")
         );
         assert_eq!(v["output_text"], "summary <bob@example.com>");
     }
@@ -1130,7 +1198,8 @@ mod tests {
         let ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(delta) = &out[0] else {
             panic!("expected args delta");
         };
-        assert_eq!(delta.delta, "{\"email\":\"stream@example.com\"}");
+        // Streamed tool args: GATED (A4b) — the token stays verbatim, never resolves.
+        assert_eq!(delta.delta, format!("{{\"email\":\"{token}\"}}"));
     }
 
     // With a model `Ready`, `mask_request` runs the COLLECT → prewarm → MASK two-phase

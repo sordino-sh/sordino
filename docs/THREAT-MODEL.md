@@ -1,10 +1,13 @@
 # Sordino Threat Model
 
 Grounded at `main` (v0.13.0 line, verified at commit `b5782ad`; the one code change
-since — `bfcd794`, the monitor Google-Fonts removal — is reflected in L19). Every current-behavior
-claim in this document cites the mechanism (file/line at that commit) and, where one
-exists, the test that pins it. If a claim here and the code disagree, the code is right
-and this document has a bug — file it.
+since — `bfcd794`, the monitor Google-Fonts removal — is reflected in L19). The
+GAP-CLOSURE hardening items reconciled in this pass are grounded one step further, at
+branch `feat/sordino-hardening` (tip `4a3958f`), and their cites reference that tip — the
+Verification note at the foot of this document lists exactly which items. Every
+current-behavior claim in this document cites the mechanism (file/line at the relevant
+commit) and, where one exists, the test that pins it. If a claim here and the code
+disagree, the code is right and this document has a bug — file it.
 
 This document is the controlling statement of what Sordino defends against, how, and
 what it does not. Where any other material — including marketing copy at sordino.sh —
@@ -46,7 +49,14 @@ allowlist-gated (L23). The monitor UI's former Google Fonts load was removed at
 **Boundary 1 — client to proxy.** Plaintext HTTP, loopback only. The proxy refuses a
 non-loopback bind unless `SORDINO_ALLOW_NON_LOOPBACK_BIND` is explicitly set, because
 the key-gated control plane (reveal/config/monitor) must not become a network-reachable
-PII oracle (`crates/sordino-proxy/src/bind.rs:8-30`).
+PII oracle (`crates/sordino-proxy/src/bind.rs:8-30`). Control-plane writers are
+additionally bound to the specific live proxy instance: `authed_for_project` requires the
+bearer admin key AND an `x-sordino-project` header equal to a non-secret
+`blake3(canonical project_root)`, so a client that resolved a valid `(port, key)` pair for a
+collided/recycled-port instance is rejected rather than served
+(`crates/sordino-proxy/src/state.rs:812-827`; `authed_for_project_truth_table`,
+`state.rs:993`). This is a coherence hardening of this boundary, not a new §5 guarantee —
+the admin key is still the secret; the project hash only pins WHICH instance answers.
 
 **Boundary 2 — proxy to provider.** HTTPS with rustls and standard certificate
 verification; `reqwest` is built with `default-features = false` and `rustls-tls`
@@ -65,11 +75,13 @@ proxy; the hooks are a second, weaker layer.
 (`sordino-secrets`), proxy (`sordino-proxy`), and hook binary (`sordino-hooks`) all run
 locally. ML inference is local for the `local` (in-process Candle) and `sidecar`
 (child process over a private pipe, no port) backends
-(`crates/sordino-engine/src/config.rs:646-668`). The `http` backend is NOT a locality
-guarantee: it POSTs the raw text of every un-cached leaf to whatever `endpoint` URL
-the user configures, with no loopback requirement (`require_local: false` —
-`crates/sordino-engine/src/ml.rs:318-327`; `config.rs:560-565`). Pointing it at a
-non-local endpoint creates a second, pre-masking egress channel — see L17.
+(`crates/sordino-engine/src/config.rs:674-696`). The `http` backend is NOT a locality
+guarantee: it POSTs the raw text of every un-cached leaf to whatever `endpoint` URL the
+user configures. A non-loopback endpoint is REFUSED at backend construction unless the
+operator sets `allow_remote_ml_endpoint = true` (default `false`), and the opt-in warns
+(`crates/sordino-engine/src/ml.rs:301-322`; `config.rs:584-593`). Pointing it at a remote
+endpoint — the warned opt-in — creates a second, pre-masking egress channel that no §5
+guarantee covers; see L17.
 
 ## 3. Assets protected
 
@@ -105,8 +117,9 @@ non-local endpoint creates a second, pre-masking egress channel — see L17.
   or manipulated model that tries to move a registered secret to an egress boundary:
   broker resolution is default-deny at MCP/agent/shell tool boundaries
   (§5, G4), and display-path resolution of broker tokens is refused by prefix before
-  any lookup (§5, G3). *Scope fence: the same protection does not extend to detected
-  PII tokens — see Limitation L6.*
+  any lookup (§5, G3). *Scope fence: a tool-egress gate now keeps detected-PII tokens masked
+  into genuine tool destinations too (L6, MITIGATED), but — unlike registered secrets — they
+  still resolve to plaintext on the display and compaction/citation paths; see Limitation L6.*
 - **Misrouted sessions** — an editor session that believes it is masked but is not.
   The intake gate blocks prompts in a plumbed-but-unverified session rather than let
   them egress unmasked (§5, G7), with the harness-level caveat in L2.
@@ -142,9 +155,12 @@ disabled, surface disabled, profile minimal — a registered secret still masks;
 configuration state lets a known secret value egress in plaintext through the mask
 path. *Scope fence: the guarantee covers the leaves the walkers visit. Schema/contract
 fields that are deliberately never walked (tool `input_schema`; the OpenAI-wire
-contract-key subtrees) sit outside it — a registered secret embedded there egresses
-verbatim (L20) — and so do unknown fields the Anthropic typed parse preserves through
-its `extra` flatten sinks (L22).*
+contract-key subtrees) sit outside it — a registered secret's exact value embedded there
+is not masked, though a best-effort tripwire now REFUSES (409, zero bytes upstream) rather
+than forwarding it verbatim (L20) — and the same holds for unknown fields the Anthropic
+typed parse preserves through its `extra` flatten sinks (L22). The tripwire is
+exact-value-only; detected PII and non-exact/encoded secret forms in those fields still
+pass.*
 Mechanism: `crates/sordino-engine/src/lib.rs:745-758`.
 Evidence: `secret_masked_even_when_engine_disabled` (`lib.rs:3638`),
 `secret_masked_inside_user_bypass` (`lib.rs:3661`).
@@ -358,16 +374,21 @@ fields are walked (`openai_responses.rs:350-352,443-455`); the Responses
 `input_image`/`image_file` subtrees are skipped whole (L20)
 (OPEN, by design — binary payloads are not reliably maskable; same class as L1).
 
-**L17 — The `http` ML backend egresses raw text to its configured endpoint.** Every
-un-cached text leaf is POSTed, pre-masking, to the user-configured `endpoint` URL, and
-nothing requires that URL to be loopback (`require_local: false`,
-`crates/sordino-engine/src/ml.rs:318-327`; privacy note at `config.rs:560-565`). With
-a local endpoint — the intended deployment — nothing leaves the machine; with a remote
-endpoint the user has configured a second, unmasked egress channel that no §5
-guarantee covers. The load-time checks verify the endpoint behaves like a privacy
-filter, not where it runs (OPEN, by design — the backend exists to call an external
-inference server; §2's "runs locally" claim holds only for the `local` and `sidecar`
-backends).
+**L17 — CLOSED by default: the `http` ML backend refuses a non-loopback endpoint unless
+the operator opts in; the remote path is a warned escape hatch no §5 guarantee covers.**
+When enabled, the `http` backend POSTs every un-cached text leaf, pre-masking, to the
+configured `endpoint` URL. Backend construction now REFUSES an endpoint whose host is not
+loopback (`127.0.0.1`/`::1`/`localhost`) unless `allow_remote_ml_endpoint = true`, which
+defaults `false` — a loopback endpoint always loads, a remote one is rejected before any
+request is issued (`crates/sordino-engine/src/ml.rs:301-315`; config field + privacy note
+`config.rs:581,584-593`; the emitted `require_local` is now honest-labeled `is_loopback`,
+not the former hard-coded `false`, `ml.rs:347-351`). With the opt-in set the remote endpoint
+loads and a per-load `tracing::warn!` narrates that raw leaves egress there pre-masking
+(`ml.rs:316-322`). That opted-in remote path is an explicit operator escape hatch: a second,
+unmasked egress channel that no §5 guarantee covers, and §2's "runs locally" claim holds only
+for the `local`/`sidecar` backends and for a loopback `http` endpoint (OPEN, by design — the
+backend exists to call an external inference server; the non-loopback egress is now gated and
+warned, not silent).
 
 **L23 — Enabling the `local` or `sidecar` ML backend downloads model weights from
 Hugging Face.** This is the one third-party fetch in the product: first load (or an
@@ -384,9 +405,15 @@ pre-seeding the `hf-hub` cache offline avoids the fetch entirely).
 **L7 — The default (Balanced) profile sends URLs, IPs, and MAC addresses in the
 clear.** The Network category is deliberately OFF in Balanced; in-URL credentials are
 still caught via the always-on `URL_CREDENTIAL` recognizer, but the URL/IP/MAC
-themselves egress unmasked unless the user enables Network or Strict.
-Mechanism: `config.rs:104-112` (OPEN, by design; disclose to users whose
-infrastructure topology is itself sensitive).
+themselves egress unmasked unless the user enables Network or Strict. Sordino now
+DISCLOSES this: a report-only `verify` probe (`verify_category_coverage`,
+`crates/sordino-hooks/src/main.rs:4482-4495`) names every category OFF for the effective
+profile and what it lets through in clear (Network OFF ⇒ "bare URLs/IPs/MACs sent in
+clear"). Disclosure, not masking — the default still egresses them, and the net-precision
+recognizer work only changes behavior when Network is turned ON; it does not mask URLs/IPs
+under the default profile.
+Mechanism: `config.rs:104-112`; disclosure at `main.rs:4482-4535` (OPEN, by design;
+disclose to users whose infrastructure topology is itself sensitive).
 
 **L8 — Deliberate false-positive allowances are small unmasked surfaces.** The
 built-in allow-list passes Claude Code self-reference vocabulary (model names,
@@ -402,23 +429,36 @@ OpenAI-compatible wires the skip is broader: entire subtrees under contract keys
 `input_schema`, `parameters`, `guided_*`, and on Responses also `text`/`format`, the
 file/call ID fields, and the `image_file`/`input_image`/`encrypted_content`/
 `signature` subtrees) are skipped before the engine runs
-(`openai_chat.rs:402-417`, `openai_responses.rs:431-455`). An in-URL credential
-inside a skipped subtree (e.g. an `input_image` URL) passes verbatim — asset 3's
-always-on recognizer runs only on walked leaves. Because the skip lives in
-the proxy walker — upstream of the engine — G1's unconditional-secret masking does not
-apply here: a registered secret embedded in a tool schema or contract subtree egresses
-in plaintext. This and L22 are the two carve-outs from G1. Do not put sensitive
-values in tool schemas or sampling-contract fields (OPEN, by design — masking schema
-constraints
-corrupts tool-call validation).
+(`openai_chat.rs:479,502` and `preserves_contract_key` at `openai_chat.rs:515`;
+`openai_responses.rs:496`). An in-URL credential inside a skipped subtree (e.g. an
+`input_image` URL) passes verbatim — asset 3's always-on recognizer runs only on walked
+leaves. Because the skip lives in the proxy walker — upstream of the engine — G1's
+unconditional-secret *masking* does not apply here. A best-effort tripwire narrows the
+carve-out: a registered secret's EXACT value (or a key equal to it) appearing anywhere in
+such a skipped subtree now trips a 409 refusal with zero bytes upstream — detect-then-refuse,
+never mask, so the subtree is still never rewritten (`tripwire::scan_value` over the
+exact-match `registered_secret_hit`, `crates/sordino-proxy/src/tripwire.rs:29-53`; wired at
+`walk.rs:214,225-230`, `openai_chat.rs:349,361,366,483,504`,
+`openai_responses.rs:335,354,497,518`). RESIDUAL — the tripwire is exact-value-only and
+secret-only: detected PII in these fields still egresses verbatim, a non-exact / encoded /
+partial form of a registered secret is not caught here (`registered_secret_hit` is an exact
+Aho-Corasick match, `crates/sordino-engine/src/lib.rs:528-545`), and the L18 base64 `data`
+subtree is skipped BEFORE the tripwire runs. This and L22 are the two carve-outs from G1. Do
+not put sensitive values in tool schemas or sampling-contract fields (OPEN, by design —
+masking schema constraints corrupts tool-call validation; the tripwire is a best-effort
+backstop, not a mask).
 
 **L22 — Unknown fields on the Anthropic typed wire pass verbatim, warn-only.** The
 `/v1/messages` typed parse preserves fields it does not model through serde `extra`
 flatten sinks at the request, message, system-block, and tool levels; the walker logs
-a warning and forwards them UNMASKED (`walk.rs:163,174,181,210`, `warn_unknown_map`
-at `walk.rs:431-441`). Like L20 the skip sits upstream of the engine, so this is a
-carve-out from G1 too: a registered secret placed in such a field egresses in
-plaintext. The exposure is exactly the fields the typed parse accepts but does not
+a warning and forwards them UNMASKED (`check_unknown_map`, `walk.rs:508-526`, called at
+`walk.rs:194,205,217,257`). Like L20 the skip sits upstream of the engine, so this is a
+carve-out from G1 too — narrowed by the same best-effort tripwire: a registered secret's
+EXACT value or key inside such an `extra` sink trips a 409 refusal with zero bytes upstream
+(`tripwire::scan_map`, `tripwire.rs:47-53`, wired via `check_unknown_map` at `walk.rs:522`),
+detect-then-refuse, so the sink is still never rewritten. RESIDUAL is the same exact-value-only,
+secret-only shape as L20: detected PII and non-exact/encoded secret forms in these fields
+still egress verbatim. The exposure is exactly the fields the typed parse accepts but does not
 model — a body that fails the typed parse entirely takes the fail-safe whole-body
 Value-walk instead (every string leaf masked, `walk.rs:26-31`), and the
 OpenAI-compatible wires mask their `extra` maps (`openai_chat.rs:295,317`), so this
@@ -430,12 +470,16 @@ disclosure, not enforcement).
 Text wrapped in `>>…<<` inside a user message is a deliberate one-shot escape hatch:
 the wrapped span goes upstream with no PII detection and no token minting, while
 surrounding text masks normally. Registered secrets are the exception — they are still
-masked inside a bypass (the hatch is a convenience, not a secret-exfil channel; G1's
-`secret_masked_inside_user_bypass`, `lib.rs:3661`) — but detected-PII protection is
-OFF inside the markers: any PII a user (or anything that composes user-message text)
-places there egresses unmasked. Mechanism: `crates/sordino-engine/src/lib.rs:1112-1161`,
-`user_bypass_segments` (`lib.rs:1568-1596`) (OPEN, by design — user-controlled bypass;
-cataloged here so N1 cannot be quoted as covering bypassed spans).
+masked inside a bypass, now UNSCOPED: a registered secret trips regardless of its
+`apply_to_surfaces` scoping (a ToolResult-scoped secret pasted into a UserMessage bypass
+would previously have egressed; it now masks in place), closing the scoped-secret gap (the
+hatch is a convenience, not a secret-exfil channel; `mask_user_bypass` unscoped scan,
+`crates/sordino-engine/src/lib.rs:1247-1266`; G1's `secret_masked_inside_user_bypass`,
+`lib.rs:4023`) — but detected-PII protection is OFF inside the markers: any PII a user (or
+anything that composes user-message text) places there egresses unmasked. Mechanism:
+`crates/sordino-engine/src/lib.rs:1223-1275`, `user_bypass_segments` (`lib.rs:1715`) (OPEN,
+by design — user-controlled bypass; cataloged here so N1 cannot be quoted as covering
+bypassed spans).
 
 **L26 — The proxy master switch, flipped off, is transparent passthrough for detected
 PII.** `POST /sordino/disable` (key-gated on the admin key like every control-plane
@@ -512,14 +556,22 @@ reliably activates from the next session. The intake gate exists precisely so th
 interim state blocks instead of leaking (`sordino-plugin/scripts/session-start.sh:10-18`)
 (OPEN — upstream behavior; mitigated by G7).
 
-**L10 — Claude Code's own OTel can egress unmasked reveals.** If a downstream user
-enables Claude Code telemetry content flags (`OTEL_LOG_TOOL_DETAILS` etc.), unmasked
-revealed content — including PII restored on the display path — can leave the machine
-through a channel Sordino does not sit on. This is opt-in and off by default in Claude
-Code, and Sordino emits none of it (G18), but the planned SessionStart detect-and-warn
-has NOT shipped: nothing in Sordino currently detects or warns about these flags
-(OPEN — detection/warn is roadmap, not implemented; verify by grepping the tree for
-`OTEL`).
+**L10 — MITIGATED (SessionStart detect-and-warn): Claude Code's own OTel can still egress
+unmasked reveals; the channel is upstream-owned, not closed.** If a downstream user enables
+Claude Code telemetry content flags, unmasked revealed content — including PII restored on
+the display path — can leave the machine through a channel Sordino does not sit on and cannot
+mask. This is opt-in and off by default in Claude Code, and Sordino emits none of it (G18).
+SessionStart now DETECTS this configuration and warns (stderr, every session, routed or not):
+gated on the master switch `CLAUDE_CODE_ENABLE_TELEMETRY` being truthy (with it off, Claude
+Code builds no exporter, so a lone content flag exports nothing and the warning stays silent),
+it names any of `OTEL_LOG_TOOL_DETAILS`, `OTEL_LOG_TOOL_CONTENT`, `OTEL_LOG_USER_PROMPTS`, or
+`OTEL_LOG_RAW_API_BODIES` (the last also on a `file:` value) that are set
+(`otel_content_flag_warning`, `crates/sordino-hooks/src/main.rs:5410-5437`; fired at
+`main.rs:4996`). RESIDUAL: this is warn-only — the OTel pipeline is Claude Code's, so Sordino
+discloses the exposure but cannot block it, and the detection is a best-effort match on the
+currently-known flag names (it does NOT cover, e.g., `OTEL_LOGS_EXPORTER`), re-verified on a
+CC version bump (OPEN — upstream-owned channel; detect-and-warn shipped, closure is not
+Sordino's to make).
 
 ### 7.3 Token- and reveal-model limitations
 
@@ -528,18 +580,30 @@ user" is NOT implemented.** Sordino ships exactly three Claude Code hooks (Sessi
 PreToolUse, UserPromptSubmit — `sordino-plugin/hooks/hooks.json`); there is no
 PostToolUse or display-redaction hook. When PreToolUse resolves a broker token into a
 tool input, that plaintext is visible in the local session transcript and display from
-then on. G3's guarantee is about the *provider-facing response path*, not the local
-screen (OPEN — local display is out of the proxy's reach; a redaction hook would
-itself be fail-open per L2).
+then on. Sordino now DISCLOSES this exposure — a report-only `doctor` probe
+(`probe_transcript_exposure`, `crates/sordino-hooks/src/main.rs:4806-4869`) reports the
+count and total on-disk SIZE of this project's plaintext session transcripts (metadata only:
+it opens no file content and performs no redaction) and points at `sordino scrub` to burn a
+leaked value — but disclosure is not redaction: no local display redaction exists. G3's
+guarantee is about the *provider-facing response path*, not the local screen (OPEN — local
+display is out of the proxy's reach; a redaction hook would itself be fail-open per L2).
 
-**L6 — Any model-emitted PII token dereferences into tool inputs; there is no
-tool-egress gate for detected PII.** Broker tokens are display-refused and Local
-tokens are tool-refused, but a standard PII token the model chooses to emit resolves
-to plaintext on BOTH the display and tool paths — meaning a manipulated model can move
-previously-masked PII into a file write or command line. The plaintext does not go to
-the provider (it is re-masked on any subsequent wire trip), but it lands in local tool
-effects the user may not expect. Mechanism: `walk.rs:470-482`, `lib.rs:1274-1348`
-(OPEN — a positive-provenance token ledger is the known prerequisite for closing this).
+**L6 — MITIGATED (tool-egress gate), not closed: detected PII still resolves to plaintext
+on the display and compaction/citation paths.** A three-way unmask context now gates
+detected-PII tokens by destination. A genuine tool-execution destination unmasks through
+`unmask_tool_input` (`UnmaskContext::ToolInput`), which keeps every detected-PII /
+custom-literal token MASKED, so a manipulated model can no longer dereference
+previously-masked PII into a file write or command line
+(`crates/sordino-engine/src/lib.rs:349-353,1355-1361,1448-1457,1483`; wired in
+`walk.rs:628`, `openai_chat.rs:785,834`, `openai_responses.rs:826,880`, `sse.rs:132,218,346`).
+RESIDUAL — this is destination-scoped, not a global provenance ledger: PII still resolves to
+plaintext on the local display path (`unmask_assistant` → `UnmaskContext::Display`,
+`lib.rs:1369-1384`) and in compaction / citation / other non-display re-sends (`unmask` →
+`UnmaskContext::Other`, `lib.rs:1344-1348`), both byte-identical to the pre-gate behavior.
+The plaintext still never reaches the provider (it is re-masked on any subsequent wire
+trip), but it can land in local display/effects the user may not expect. Mechanism:
+`crates/sordino-engine/src/lib.rs:1405-1494` (OPEN — a positive-provenance token ledger,
+closing the display and compaction paths too, is the remaining aim).
 
 **L13 — Token correlation within a project.** The masking salt is per-project;
 `SaltScope::Conversation` parses but is inert. The same plaintext yields the same
@@ -571,9 +635,10 @@ the user sets `required = true` (`config.rs:544-550`). F16-on-Metal recall (Appl
 Silicon GPU) is not separately recall-gated — the recall gate proved CPU-F32 and
 CUDA-BF16 only (`ml.rs:172-174`) (OPEN — tracked follow-up).
 
-**L25 — Regex/default-profile recall gaps: named entities that egress unmasked without
-ML or a context word.** Detection quality is not uniform across entity types even before
-ML enters:
+**L25 — Regex/default-profile recall: named-entity gaps and the structured-secret
+recognizers that narrow them.** Detection quality is not uniform across entity types even
+before ML enters — one gap remains context-dependent, while structured Secrets recognizers
+now cover several shapes best-effort:
 - *Context-free phone numbers.* `PHONE_NUMBER` carries a base score of `0.4`
   (`PHONE_BASE_SCORE`, `detect.rs:79`), which sits below the default masking threshold;
   only a nearby context word ("call", "number", "phone", …) boosts a match over the
@@ -583,16 +648,33 @@ ML enters:
   deliberate false-positive control — it is exactly what stops an order number like
   `Order #4021558` from masking — traded against context-free phone recall; ML or a
   context word recovers it.
-- *PEM/private keys have no regex recognizer.* `PRIVATE_KEY` is a default Secrets-category
-  entity (`config.rs:176`), but no in-tree recognizer emits it (`recognizers.rs` defines
-  none) — so regex-only detection does not mask a raw PEM private-key block. Register
-  private keys as `[[secrets]]` (masked unconditionally, G1) or rely on the ML classifier.
+- *PEM/private keys mask via a whole-block recognizer (best-effort).* `PRIVATE_KEY` is a
+  default Secrets-category entity (`config.rs:176`, always-on in every profile), and the
+  upstream whole-block `PrivateKeyRecognizer` (presidio-analyzer, registered in
+  `default_recognizers` and consumed through the engine's `default_analyzer`) emits native
+  `PRIVATE_KEY` over a full `-----BEGIN…-----END-----` PEM block, so the marker lines AND the
+  base64 body mask together instead of relying on the entropy catch-all
+  (`pem_private_key_block_fully_masks`, `crates/sordino-engine/tests/code_sensitivity.rs:144`).
+  This is best-effort detection over the armored-block shape, not a guarantee — an unarmored
+  or malformed key the recognizer does not match can still slip. Register private keys as
+  `[[secrets]]` for the unconditional path (masked unconditionally, G1); the ML classifier is
+  an additional layer.
+- *Structured secret recognizers (JWK / .netrc / AWS) — incremental, best-effort.* Three more
+  upstream recognizers reach the engine the same way (`default_recognizers` → `default_analyzer`)
+  and emit always-on Secrets entities, value-only (leaving the surrounding JSON/config
+  parseable): `JwkRecognizer` masks a JWK's private `d` member (`PRIVATE_KEY`), `NetrcRecognizer`
+  masks a `.netrc` `password` value (`URL_CREDENTIAL`), and `AwsCredentialsRecognizer` masks
+  `aws_secret_access_key` / `aws_session_token` values (`AWS_SECRET_KEY`)
+  (`jwk_private_member_value_masks_and_json_survives`, `netrc_password_value_masks`,
+  `aws_credentials_values_mask`, `code_sensitivity.rs:186,202,229`). These are structured
+  coverage for specific shapes, not a guarantee: N6 still governs everything they miss.
 
 Not every shape has this gap: a bare SSN still masks context-free (the `US_SSN` pattern
 scores `0.5`, above all profile floors, and the phone tie-break is scoped to
 `PHONE_NUMBER` — `real_ssn_still_masks_under_strict`, `detect.rs:818`; comment
-`detect.rs:812-816`) (OPEN, by design — regex recall is a threshold/FP tradeoff and the
-private-key entity is intended for ML/secret-registration coverage).
+`detect.rs:812-816`) (OPEN, by design — regex recall is a threshold/FP tradeoff; the
+context-free phone gap remains, while the private-key entity is now covered best-effort by
+the whole-block recognizer above, with secret-registration the unconditional path).
 
 ### 7.5 ZDR limitations
 
@@ -628,8 +710,8 @@ provider on every request; that is the product working, not a breach of the prom
 Content on passthrough endpoints (L1), undetected content (N6), inline binary
 payloads (L18), protocol ID fields (L9), schema/contract fields (L20), unknown
 Anthropic-wire fields (L22), user-bypassed `>>…<<` spans (L21), regex recall gaps —
-context-free phone numbers and PEM private keys under regex-only detection (L25),
-harness-side channels
+context-free phone numbers, and any private-key block the whole-block recognizer does not
+match (L25), harness-side channels
 (L10), traffic from a session that never reaches the proxy at all — a failed-open
 hook or an unrouted first session (L2, L16), infrastructure URLs/IPs/MAC addresses
 under the default (Balanced) profile
@@ -700,10 +782,10 @@ misrepresentation.
 - **ZDR forward work.** Conversation-scoped salts (L13), the reveal-clearance gate on
   captured-PinnedMode conversations (scaffolding exists: `RevealClearanceCtx`,
   `zdr.rs:250-278`, defined but not yet consumed), attestation for TEE-basis targets.
-- **Token-provenance ledger.** The prerequisite for a tool-egress gate on detected
-  PII (L6) and for safe neutralization of fabricated token-shaped strings.
-- **OTel detect-and-warn.** SessionStart detection of Claude Code telemetry content
-  flags (L10).
+- **Token-provenance ledger.** The tool-egress gate on detected PII now ships (L6,
+  MITIGATED); the remaining aim is the positive-provenance ledger that would also close the
+  display and compaction/citation paths and enable safe neutralization of fabricated
+  token-shaped strings.
 - **Sordino Enterprise.** Team permissioning, deployment tooling, and audit/retention
   surfaces are under consideration and deliberately non-committal pending real use
   cases. No enterprise capability should be assumed, quoted, or resold from this
@@ -713,6 +795,10 @@ misrepresentation.
 ---
 
 *Verification note: line numbers reference commit `b5782ad` (L19's closure references
-`bfcd794`). The fastest way to check any claim: `git grep` the cited test name and run
-it; every guarantee in §5 names at least one, except G18, whose evidence is a
-greppable absence rather than a test.*
+`bfcd794`), EXCEPT the GAP-CLOSURE hardening items reconciled against branch
+`feat/sordino-hardening` (tip `4a3958f`) — the §2 Boundary-1 project-binding note, the §2
+`http`-backend locality note, L25 and the §7.4 structured-recognizer bullet, L6, the
+G1/L20/L21/L22 tripwire additions, L10, L17, the L5/L7 disclosure legs, and §9 — whose cites
+reference that tip. The fastest way to check any claim: `git grep` the cited test name and
+run it; every guarantee in §5 names at least one, except G18, whose evidence is a greppable
+absence rather than a test.*

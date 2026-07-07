@@ -175,7 +175,7 @@ pub(crate) fn push_policy(st: &AppState, hdrs: &HeaderMap, snap: &serde_json::Va
 
 /// `GET /sordino/config` — current effective config + live state.
 pub async fn get_config(State(st): State<AppState>, hdrs: HeaderMap) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
     json_ok(&snapshot(&st))
@@ -208,7 +208,7 @@ fn merge_json(base: &mut serde_json::Value, over: serde_json::Value) {
 /// every omitted field is preserved (a real merge, not a whole-object replace that
 /// resets omitted fields to serde defaults).
 pub async fn put_config(State(st): State<AppState>, hdrs: HeaderMap, body: Bytes) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
     // Parse the body as a raw JSON object so we can tell which keys were actually
@@ -326,7 +326,7 @@ pub async fn apply_profile(
     Path(name): Path<String>,
     Query(q): Query<HashMap<String, String>>,
 ) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
     // Parse the profile id via serde so the `development_safe` alias is honored.
@@ -436,7 +436,7 @@ fn scope_label(scope: Scope) -> &'static str {
 /// `POST /sordino/ml/enable` — turn the ML recognizer on. The model loads in the
 /// background; masking stays regex-only until it is `Ready`.
 pub async fn ml_enable(State(st): State<AppState>, hdrs: HeaderMap) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
     // Serialize against a concurrent enable/disable AND any other config writer.
@@ -459,7 +459,7 @@ pub async fn ml_enable(State(st): State<AppState>, hdrs: HeaderMap) -> Response 
 /// `POST /sordino/ml/disable` — turn the ML recognizer off live (drops the model
 /// from the detection path immediately; any in-flight load is invalidated).
 pub async fn ml_disable(State(st): State<AppState>, hdrs: HeaderMap) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
     let _cfg_guard = st.config_control.lock().expect("config_control mutex poisoned");
@@ -486,7 +486,7 @@ pub async fn disable(State(st): State<AppState>, hdrs: HeaderMap) -> Response {
 }
 
 fn set_enabled(st: &AppState, hdrs: &HeaderMap, on: bool) -> Response {
-    if !st.authed(hdrs) {
+    if !st.authed_for_project(hdrs) {
         return forbidden();
     }
     // The master switch is config state, so it must compose under `config_control`
@@ -502,7 +502,7 @@ fn set_enabled(st: &AppState, hdrs: &HeaderMap, on: bool) -> Response {
 
 /// `POST /sordino/reload` — re-read the per-scope config files and hot-swap.
 pub async fn reload(State(st): State<AppState>, hdrs: HeaderMap) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
     // Serialize the file-reload RMW against live config writers. Lock order
@@ -570,7 +570,7 @@ pub async fn reload(State(st): State<AppState>, hdrs: HeaderMap) -> Response {
 /// + key-gated: the resolved values are for the LOCAL tool only — this is the one
 /// place a broker value is spliced back in. Denied / unknown tokens stay tokenized.
 pub async fn broker_resolve(State(st): State<AppState>, hdrs: HeaderMap, body: Bytes) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
     #[derive(Deserialize)]
@@ -627,7 +627,7 @@ fn deny_reason_label(reason: &sordino_engine::DenyReason) -> &'static str {
 /// from "this session is routed". Never forwards upstream. Key-gated so the model can't use it
 /// as a masking oracle.
 pub async fn diag_mask(State(st): State<AppState>, hdrs: HeaderMap, body: Bytes) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
     #[derive(Deserialize)]
@@ -667,7 +667,7 @@ pub async fn session_routed(
     hdrs: HeaderMap,
     Path(conversation_id): Path<String>,
 ) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
     let (routed_recently, last_seen_ms) = st
@@ -687,7 +687,7 @@ pub async fn zdr_get(
     hdrs: HeaderMap,
     Path(conversation): Path<String>,
 ) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
     json_ok(&zdr_status(&st, &conversation))
@@ -705,7 +705,7 @@ pub async fn zdr_set(
     Path(conversation): Path<String>,
     body: Bytes,
 ) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
     #[derive(Deserialize, Default)]
@@ -791,7 +791,7 @@ pub async fn zdr_clear(
     hdrs: HeaderMap,
     Path(conversation): Path<String>,
 ) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
     // Fail-closed-and-VISIBLE (S1): a failed durable write of the disengage must NOT report
@@ -834,7 +834,7 @@ pub async fn masking_get(
     hdrs: HeaderMap,
     Path(conversation): Path<String>,
 ) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
     json_ok(&masking_status(&st, &conversation))
@@ -850,7 +850,7 @@ pub async fn masking_disable(
     hdrs: HeaderMap,
     Path(conversation): Path<String>,
 ) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
     let newly = st.set_masking_disabled(&conversation);
@@ -876,7 +876,7 @@ pub async fn masking_enable(
     hdrs: HeaderMap,
     Path(conversation): Path<String>,
 ) -> Response {
-    if !st.authed(&hdrs) {
+    if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
     let was_disabled = st.clear_masking_disabled(&conversation);

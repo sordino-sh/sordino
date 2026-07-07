@@ -65,7 +65,10 @@ use detect::{
     CompiledCustom, compile_customs, resolve_operator, resolve_overlaps, run_detection,
     run_detection_batch, today_days,
 };
-use secrets::{CompiledSecret, SecretSet, compile_secrets, detect_secrets, secrets_fingerprint};
+use secrets::{
+    CompiledSecret, SecretSet, compile_secrets, detect_secrets, secret_hit_bytes,
+    secrets_fingerprint,
+};
 use store::SessionStore;
 use token::{hash_value, make_hash_token};
 
@@ -245,6 +248,12 @@ fn compute_ml_fp(rt: &MlRuntime) -> u64 {
                     // never wrong; the alternative (out-of-sync) silently breaks the
                     // `fp <=> same_model_params` invariant the module relies on.
                     h.update(&d.http_timeout_secs.to_le_bytes());
+                    // `allow_remote_ml_endpoint` is in `same_model_params`'s http
+                    // identity (it gates backend construction — the non-loopback
+                    // refuse-check), so it MUST move the fingerprint in lockstep or
+                    // the `fp <=> same_model_params` invariant breaks and a live
+                    // true->false flip reports "unchanged" (the fail-open this closes).
+                    h.update(&[d.allow_remote_ml_endpoint as u8]);
                 }
                 crate::config::MlBackend::Sidecar => {
                     // MUST mirror `same_model_params`'s Sidecar identity (same
@@ -329,6 +338,18 @@ pub struct MaskEngine {
     /// `secrets`; consulted only at the tool-input boundary by
     /// [`MaskEngine::broker_resolve_pointers`]. Hot-swappable.
     broker_policy: RwLock<Arc<BrokerPolicy>>,
+}
+
+/// Surface-aware unmask context threaded into [`MaskEngine::unmask_inner`]. `Display` is
+/// the assistant-prose path (reveals `Local`); `ToolInput` is a genuine tool-execution
+/// destination (PII / custom-literal tokens stay MASKED — the tool-egress gate); `Other`
+/// is every remaining non-display re-send (compaction / citation / already-executed
+/// echoes), which is byte-identical to the pre-gate behavior.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum UnmaskContext {
+    Display,
+    ToolInput,
+    Other,
 }
 
 impl MaskEngine {
@@ -502,6 +523,44 @@ impl MaskEngine {
             .expect("secrets rwlock poisoned")
             .compiled
             .len()
+    }
+
+    /// Scan-only tripwire: return the NAME of the first registered secret whose exact
+    /// value appears in `text`, or `None`. NEVER returns the value itself (audit-safety,
+    /// mirrors G3). Reads the LIVE secret set unconditionally — engine-disabled /
+    /// profile-minimal / surface-disabled all still trip it (like `mask()`'s
+    /// disabled-surface fast path) — and ignores each secret's `apply_to_surfaces`
+    /// scoping (via [`secrets::detect_secrets_unscoped`]), because the schema/contract
+    /// carve-out subtrees the proxy (A2b) refuses on sit on no well-defined surface.
+    /// DETECT-ONLY: this never rewrites anything; A2b maps a hit to a 409.
+    pub fn registered_secret_hit(&self, text: &str) -> Option<String> {
+        let secrets = Arc::clone(&self.secrets.read().expect("secrets rwlock poisoned"));
+        if secrets.compiled.is_empty() {
+            return None;
+        }
+        secrets::detect_secrets_unscoped(&secrets.compiled, text)
+            .into_iter()
+            .next()
+            .map(|d| d.entity_type)
+    }
+
+    /// Refuse-only byte-scan tripwire for a request body/path: `true` if any registered
+    /// secret's exact plaintext (Tier-1) OR its base64 needle (Tier-2, encoded-ON)
+    /// appears anywhere in `bytes`. Reads the LIVE secret set unconditionally (like
+    /// [`Self::registered_secret_hit`]) and ignores each secret's `apply_to_surfaces`.
+    /// Tier-2 catches a registered secret embedded inside a larger base64 blob.
+    /// DETECT-ONLY: never rewrites; the proxy (S2) maps a hit to a 409.
+    pub fn registered_secret_in_bytes(&self, bytes: &[u8]) -> bool {
+        let secrets = Arc::clone(&self.secrets.read().expect("secrets rwlock poisoned"));
+        secret_hit_bytes(&secrets, bytes, true)
+    }
+
+    /// Like [`Self::registered_secret_in_bytes`] but Tier-1 EXACT-ONLY (encoded-OFF) —
+    /// for outbound HEADER values, where base64-needle matching over structured header
+    /// tokens would storm. DETECT-ONLY.
+    pub fn registered_secret_in_header_value(&self, bytes: &[u8]) -> bool {
+        let secrets = Arc::clone(&self.secrets.read().expect("secrets rwlock poisoned"));
+        secret_hit_bytes(&secrets, bytes, false)
     }
 
     /// Install (hot-swap) the broker policy (default-deny base + allow rules).
@@ -1189,7 +1248,12 @@ impl MaskEngine {
                     let dets = if secrets.compiled.is_empty() {
                         Vec::new()
                     } else {
-                        resolve_overlaps(detect_secrets(&secrets.compiled, s, Surface::UserMessage))
+                        // Unscoped: a registered secret inside a `>>…<<` bypass span must
+                        // trip regardless of its `apply_to_surfaces` scoping (third-G1 fix).
+                        // A ToolResult-scoped secret pasted into a UserMessage bypass would
+                        // otherwise egress unmasked. Still masked in place — the bypass
+                        // tolerates masking (never a 409).
+                        resolve_overlaps(secrets::detect_secrets_unscoped(&secrets.compiled, s))
                     };
                     if dets.is_empty() {
                         masked_text.push_str(s);
@@ -1280,7 +1344,20 @@ impl MaskEngine {
     pub fn unmask(&self, text: &str, manifest: &UnmaskManifest) -> Result<String, EngineError> {
         // Tool-input / compaction / citation path (Arrow 3 + machine context): `Local`
         // ("owner-reveal") tokens are REFUSED here (left verbatim) unless promoted.
-        self.unmask_inner(text, manifest, None, false)
+        self.unmask_inner(text, manifest, None, UnmaskContext::Other)
+    }
+
+    /// Unmask a surface bound for a GENUINE tool-execution destination (Arrow 3 tool
+    /// input). Identical to [`Self::unmask`] EXCEPT that any detected PII / custom-literal
+    /// token that would otherwise resolve to plaintext is instead left MASKED (verbatim
+    /// token) — the tool-egress gate. `Local` (promoted) and broker tokens keep their
+    /// existing fate (broker refused by prefix, `Local` decided by promotion).
+    pub fn unmask_tool_input(
+        &self,
+        text: &str,
+        manifest: &UnmaskManifest,
+    ) -> Result<String, EngineError> {
+        self.unmask_inner(text, manifest, None, UnmaskContext::ToolInput)
     }
 
     /// Unmask assistant prose (Arrow 2 → display) and, when the live config's
@@ -1298,7 +1375,12 @@ impl MaskEngine {
         let marker = &policy.config.reveal_marker;
         // Display path (Arrow 2 → the user): `Local` ("owner-reveal") tokens ARE revealed
         // here so the user sees their own value (e.g. the monitor URL the model relays).
-        self.unmask_inner(text, manifest, marker.is_active().then_some(marker), true)
+        self.unmask_inner(
+            text,
+            manifest,
+            marker.is_active().then_some(marker),
+            UnmaskContext::Display,
+        )
     }
 
     /// Strip the terminal reveal-marker decoration from already-unmasked assistant
@@ -1325,11 +1407,15 @@ impl MaskEngine {
         text: &str,
         manifest: &UnmaskManifest,
         marker: Option<&RevealMarker>,
-        // True ONLY on the display path (`unmask_assistant`): reveal `Local` ("owner-
-        // reveal") tokens. False everywhere else (tool input / compaction / citation),
-        // where a `Local` token is refused unless its handle was promoted this session.
-        reveal_local: bool,
+        // Surface-aware unmask context. `Display` reveals `Local` ("owner-reveal")
+        // tokens; `ToolInput` additionally keeps PII / custom-literal tokens MASKED so
+        // detected secrets never egress into a genuine tool call; `Other` is today's
+        // non-display behavior (compaction / citation / already-executed echoes).
+        ctx: UnmaskContext,
     ) -> Result<String, EngineError> {
+        // `Local` ("owner-reveal") tokens are revealed ONLY on the display path — this
+        // derived flag keeps every existing `Local`/broker branch byte-identical.
+        let reveal_local = ctx == UnmaskContext::Display;
         let store = self.store.lock().expect("store mutex poisoned");
         let re = token_regex();
         let mut out = String::with_capacity(text.len());
@@ -1359,6 +1445,16 @@ impl MaskEngine {
                 last = m.end();
                 continue;
             }
+            // TOOL-EGRESS GATE: on a genuine tool-input surface, a non-`Local` token
+            // reaching here is PII/custom-literal class (broker refused by prefix above;
+            // `Local`'s fate decided above). Keep it MASKED so detected secrets never
+            // resolve into a real tool call. Display / compaction / echo paths are
+            // unaffected (they are `Display`/`Other`).
+            if ctx == UnmaskContext::ToolInput && !is_local {
+                out.push_str(tok);
+                last = m.end();
+                continue;
+            }
             // Resolve to plaintext (manifest first, then the cross-turn store); only a
             // genuine resolution is wrapped — an unknown token stays verbatim. A `Local`
             // token resolves cross-turn via the kind-gated `reveal_for`.
@@ -1382,7 +1478,9 @@ impl MaskEngine {
             // Never reveal a broker value on the display path; a `local` custom literal
             // (none today — `Local` mints standard-grammar tokens) is likewise skipped
             // here so it can never bypass the surface-aware gate above.
-            if e.broker || e.local {
+            // Broker / `local` are never revealed here; on a tool-input surface a custom
+            // literal is ALSO kept masked (GATE 2) so it can't leak into a real tool call.
+            if e.broker || e.local || ctx == UnmaskContext::ToolInput {
                 continue;
             }
             if !re.is_match(&e.token_handle) {
@@ -2515,6 +2613,31 @@ mod tests {
             http_fp(30, false),
             http_fp(30, true),
             "required is refusal policy, not identity; ml_fp must not move"
+        );
+
+        // `allow_remote_ml_endpoint` IS http identity (it gates backend construction
+        // — the non-loopback refuse-check), so ml_fp must move with it, mirroring the
+        // http_timeout_secs guard. Without this, a live true->false flip reports
+        // "unchanged" → no reload → the remote backend keeps receiving pre-mask leaves.
+        fn http_fp_allow(allow: bool) -> u64 {
+            let rt = MlRuntime {
+                status: MlStatus::Ready,
+                recognizer: Some(Arc::new(InfallibleMl(Arc::new(MockPerson::new("X"))))),
+                desired: Some(MlConfig {
+                    enabled: true,
+                    backend: MlBackend::Http,
+                    endpoint: Some("https://remote.invalid/detect".into()),
+                    allow_remote_ml_endpoint: allow,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            };
+            compute_ml_fp(&rt)
+        }
+        assert_ne!(
+            http_fp_allow(false),
+            http_fp_allow(true),
+            "allow_remote_ml_endpoint is http recognizer identity; ml_fp must move with it"
         );
     }
 
@@ -3676,6 +3799,117 @@ mod tests {
         assert!(e.unmask_assistant(&out.masked_text, &out.manifest).unwrap().contains("AdminKeyValue123"));
     }
 
+    // A4a (tool-egress gate, ENGINE half): on a genuine tool-input surface a detected PII
+    // token stays MASKED (verbatim token), while the two PRE-EXISTING entry points —
+    // `unmask` (== `Other`) and `unmask_assistant` (== `Display`) — both resolve the SAME
+    // token to plaintext. Proves the gate is context-scoped and the existing callers are
+    // byte-identical to before.
+    #[test]
+    fn tool_input_gate_keeps_pii_token_masked() {
+        let e = engine();
+        let out = e
+            .mask("contact me at alice@example.com please", Surface::UserMessage)
+            .unwrap();
+        assert!(out.masked_text.contains("[EMAIL_ADDRESS_"), "got {}", out.masked_text);
+        let token = out.manifest.entries[0].token_handle.clone();
+
+        // Both pre-existing entry points resolve to plaintext (unchanged behavior).
+        assert!(
+            e.unmask(&out.masked_text, &out.manifest).unwrap().contains("alice@example.com"),
+            "unmask() must still resolve PII"
+        );
+        assert!(
+            e.unmask_assistant(&out.masked_text, &out.manifest).unwrap().contains("alice@example.com"),
+            "unmask_assistant() must still resolve PII"
+        );
+
+        // Tool-input gate (GATE 1): PII token stays VERBATIM; plaintext never egresses.
+        let tool = e.unmask_tool_input(&out.masked_text, &out.manifest).unwrap();
+        assert!(!tool.contains("alice@example.com"), "PII leaked into tool input: {tool}");
+        assert!(tool.contains(&token), "PII token must stay verbatim: {tool}");
+    }
+
+    // A4a GATE 2 (tail loop): a `custom_replacements`-declared LITERAL token (which does
+    // NOT match the standard token grammar, so it unmasks only via the tail loop) ALSO
+    // stays masked under `unmask_tool_input`, while `unmask` still resolves it. Proves the
+    // second gate site is wired — missing it would silently leak a custom literal.
+    #[test]
+    fn tool_input_gate_keeps_custom_literal_masked() {
+        let mut cfg = EngineConfig::default();
+        cfg.custom_replacements.push(CustomReplacement {
+            pattern: "ACME-CODENAME".into(),
+            entity_type: "CODENAME".into(),
+            is_regex: false,
+            case_sensitive: true,
+            priority: 0,
+            literal_token: true,
+            token: Some("[CODENAME_acme]".into()),
+            apply_to_surfaces: None,
+        });
+        let e = MaskEngine::new(cfg).unwrap();
+        let out = e.mask("deploy ACME-CODENAME now", Surface::UserMessage).unwrap();
+        assert!(out.masked_text.contains("[CODENAME_acme]"), "got {}", out.masked_text);
+
+        // `unmask` (Other) still resolves the literal back to its plaintext.
+        assert_eq!(
+            e.unmask(&out.masked_text, &out.manifest).unwrap(),
+            "deploy ACME-CODENAME now"
+        );
+
+        // Tool-input gate (GATE 2): the tail loop is skipped for ToolInput, so the literal
+        // token stays verbatim and its plaintext never egresses.
+        let tool = e.unmask_tool_input(&out.masked_text, &out.manifest).unwrap();
+        assert!(!tool.contains("ACME-CODENAME"), "custom literal leaked into tool input: {tool}");
+        assert!(tool.contains("[CODENAME_acme]"), "literal token must stay verbatim: {tool}");
+    }
+
+    // A4a: the gate fires ONLY for `!is_local`. A promoted/authorized Local token still
+    // RESOLVES under `unmask_tool_input` — its fate is decided by the existing Local branch
+    // ABOVE the gate, and the new gate must not regress promotion.
+    #[test]
+    fn tool_input_gate_resolves_promoted_local() {
+        let e = engine();
+        e.set_secret_rules(vec![secret_rule(
+            "sordino_admin_key",
+            "AdminKeyValue123",
+            Operator::Local,
+        )])
+        .unwrap();
+        let out = e
+            .mask("open AdminKeyValue123 now", Surface::UserMessage)
+            .unwrap();
+        let token = out.manifest.entries[0].token_handle.clone();
+
+        // Un-promoted: refused by the existing Local branch, left as the token.
+        assert!(
+            !e.unmask_tool_input(&out.masked_text, &out.manifest).unwrap().contains("AdminKeyValue123"),
+            "an un-promoted Local token must not resolve into a tool input"
+        );
+
+        // Promote → the Local branch reveals it even on the tool-input path; the new gate
+        // (which only fires for `!is_local`) does not intercept it.
+        e.promote_token(&token);
+        let tool = e.unmask_tool_input(&out.masked_text, &out.manifest).unwrap();
+        assert!(
+            tool.contains("AdminKeyValue123"),
+            "a promoted Local token must resolve under unmask_tool_input: {tool}"
+        );
+    }
+
+    // A4a: a broker-prefixed token is prefix-refused ABOVE the gate, so it stays refused /
+    // verbatim under `unmask_tool_input` too (unchanged behavior).
+    #[test]
+    fn tool_input_gate_refuses_broker_token() {
+        let e = engine();
+        e.set_secret_rules(vec![secret_rule("api_key", "sk-LIVE-9999", Operator::Broker)])
+            .unwrap();
+        let out = e.mask("key sk-LIVE-9999 here", Surface::UserMessage).unwrap();
+        assert!(out.masked_text.contains("[BROKER__API_KEY_"), "got {}", out.masked_text);
+        let tool = e.unmask_tool_input(&out.masked_text, &out.manifest).unwrap();
+        assert!(!tool.contains("sk-LIVE-9999"), "broker value leaked into tool input: {tool}");
+        assert!(tool.contains("[BROKER__API_KEY_"), "broker token must stay verbatim: {tool}");
+    }
+
     // Cross-turn: a Local token echoed in a LATER turn (no manifest entry this turn) is
     // still display-revealed / tool-denied via the store kind, using an EMPTY manifest.
     #[test]
@@ -3796,6 +4030,62 @@ mod tests {
         assert!(
             !out.masked_text.contains("LEAKME123"),
             "bypass must not leak a known secret: {}",
+            out.masked_text
+        );
+        assert!(
+            out.masked_text.contains("and hi"),
+            "non-secret bypass text stays verbatim: {}",
+            out.masked_text
+        );
+    }
+
+    // A2a: the scan-only tripwire returns the secret NAME (never the value).
+    #[test]
+    fn registered_secret_hit_returns_name_not_value() {
+        let e = engine();
+        e.set_secret_rules(vec![secret_rule("db_pw", "S3cretPlaintext!", Operator::Hash)])
+            .unwrap();
+        let hit = e.registered_secret_hit("connect with S3cretPlaintext! now");
+        assert_eq!(
+            hit.as_deref(),
+            Some("db_pw"),
+            "returns the registered NAME on a hit"
+        );
+        let name = hit.unwrap();
+        assert!(
+            !name.contains("S3cretPlaintext!"),
+            "must NEVER return the secret value: {name}"
+        );
+        assert_eq!(
+            e.registered_secret_hit("nothing sensitive here"),
+            None,
+            "no hit ⇒ None"
+        );
+    }
+
+    // A2a SCOPED-BYPASS REGRESSION (third-G1 fix): a registered secret scoped to
+    // ToolResult ONLY (excluding UserMessage) that is pasted inside a `>>…<<` bypass
+    // span of a UserMessage must STILL be masked. Before the unscoped-scan fix this
+    // leaked, because the bypass scan was surface-scoped to UserMessage and the secret
+    // was not scoped there. The all-surfaces `secret_masked_inside_user_bypass` above
+    // must still pass.
+    #[test]
+    fn scoped_secret_masked_inside_user_bypass() {
+        let e = engine();
+        e.set_secret_rules(vec![SecretRule {
+            name: "tok".into(),
+            value: SecretValue::new("LEAKME123"),
+            operator: Operator::Hash,
+            case_sensitive: true,
+            apply_to_surfaces: Some(std::collections::HashSet::from([Surface::ToolResult])),
+        }])
+        .unwrap();
+        let out = e
+            .mask("send >>LEAKME123 and hi<<", Surface::UserMessage)
+            .unwrap();
+        assert!(
+            !out.masked_text.contains("LEAKME123"),
+            "ToolResult-scoped secret in a UserMessage bypass must not leak: {}",
             out.masked_text
         );
         assert!(

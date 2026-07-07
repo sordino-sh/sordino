@@ -11,12 +11,14 @@ use axum::extract::State;
 use axum::response::{IntoResponse, Json};
 use axum::routing::post;
 use http::{HeaderMap, StatusCode, header::CONTENT_TYPE};
-use sordino_engine::{EngineConfig, MaskEngine, token_regex};
+use sordino_engine::{EngineConfig, MaskEngine, Surface, token_regex};
 use sordino_proxy::{
     config::ConfigLayers,
     monitor::Monitor,
+    openai_chat, openai_responses,
     routes::router as proxy_router,
     state::AppState,
+    walk,
     zdr::{TrustBasis, ZdrSelection, ZdrTarget},
 };
 
@@ -33,6 +35,18 @@ fn engage_in_memory(state: &AppState, conversation: &str, target: &str) {
         },
     );
 }
+
+/// The `x-sordino-project` value a control-plane request must present now that the
+/// handlers gate on `authed_for_project`: the project-identity hash of the proxy's
+/// `project_root`, identical to what `AppState::project_key` computes server-side. An
+/// honest same-project caller derives the same value from the same canonical root.
+fn project_hdr(root: &str) -> String {
+    sordino_state::project_key(root)
+}
+
+/// The root `mk_state` binds as `AppState::project_root`, so `project_hdr(TEST_PROJECT_ROOT)`
+/// is the project header every `mk_state`-based control-plane request must send.
+const TEST_PROJECT_ROOT: &str = "/tmp/sordino-test-project";
 
 /// Build an `AppState` for tests (no real config files; reload points at a
 /// nonexistent user layer so it's a deterministic no-op).
@@ -376,17 +390,20 @@ async fn openai_chat_completions_mask_unmask_and_header_passthrough() {
         Some("Bearer sk-secret-123")
     );
 
+    // Assistant CONTENT is a display surface → resolves to plaintext.
     assert!(
         client_text.contains("dana@example.com"),
-        "response not unmasked: {client_text}"
+        "content not unmasked: {client_text}"
+    );
+    // tool_calls arguments are a GENUINE tool-execution destination → GATED (A4b): the
+    // detected-PII token stays verbatim, the real email never resolves into the tool call.
+    assert!(
+        client_text.contains("[EMAIL_ADDRESS_"),
+        "tool args must keep the token: {client_text}"
     );
     assert!(
-        !client_text.contains("[EMAIL_ADDRESS_"),
-        "token leaked to client: {client_text}"
-    );
-    assert!(
-        client_text.contains("{\\\"email\\\":\\\"dana@example.com\\\"}"),
-        "tool arguments were not unmasked without markers: {client_text}"
+        !client_text.contains("{\\\"email\\\":\\\"dana@example.com\\\"}"),
+        "tool arguments must NOT resolve to the real email (tool-egress gate): {client_text}"
     );
 }
 
@@ -477,6 +494,7 @@ async fn openai_chat_stream_held_tail_reaches_client_and_monitor() {
     // And it is captured onto the monitor record — the reply is not truncated.
     let snap: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/monitor/snapshot"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "tail-key")
         .send()
         .await
@@ -539,6 +557,7 @@ async fn openai_chat_stream_content_and_finish_in_one_chunk_orders_correctly() {
     // The captured reply preserves the correct order (wire == capture).
     let snap: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/monitor/snapshot"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "combo-key")
         .send()
         .await
@@ -589,14 +608,17 @@ async fn openai_responses_mask_unmask_json_response() {
         "plaintext leaked upstream: {up_body}"
     );
     assert!(up_body.contains("[EMAIL_ADDRESS_"));
+    // Message output_text + top-level output_text are display surfaces → resolve to plaintext.
     assert!(out.contains("response@example.com"), "not unmasked: {out}");
+    // FunctionCall.arguments is a GENUINE tool-execution destination → GATED (A4b): the token
+    // stays verbatim, the real email never resolves into the executable function call.
     assert!(
-        !out.contains("[EMAIL_ADDRESS_"),
-        "token leaked to client: {out}"
+        out.contains("[EMAIL_ADDRESS_"),
+        "function_call args must keep the token: {out}"
     );
     assert!(
-        out.contains("{\\\"email\\\":\\\"response@example.com\\\"}"),
-        "function call arguments were not unmasked: {out}"
+        !out.contains("{\\\"email\\\":\\\"response@example.com\\\"}"),
+        "function_call arguments must NOT resolve to the real email (tool-egress gate): {out}"
     );
 }
 
@@ -653,6 +675,7 @@ async fn openai_responses_streaming_unmasks_and_preserves_sse_events() {
     // CompletionGuard::complete() already finalized the record.
     let snap: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/monitor/snapshot"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "test-key")
         .send()
         .await
@@ -761,6 +784,7 @@ async fn config_endpoints_gated_and_toggle_masking() {
     // With the key → 200 and `enabled: true`.
     let cfg: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/config"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "secret-key")
         .send()
         .await
@@ -782,6 +806,7 @@ async fn config_endpoints_gated_and_toggle_masking() {
     // disable WITH the key → masking off.
     let off: serde_json::Value = client
         .post(format!("http://{proxy_addr}/sordino/disable"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "secret-key")
         .send()
         .await
@@ -813,6 +838,7 @@ async fn config_endpoints_gated_and_toggle_masking() {
     // Re-enable and masking resumes.
     let on: serde_json::Value = client
         .post(format!("http://{proxy_addr}/sordino/enable"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "secret-key")
         .send()
         .await
@@ -856,6 +882,7 @@ async fn master_switch_toggle_preserves_data_policy() {
     // Establish a distinctive, hand-tuned data policy via the live control plane.
     let put = client
         .put(format!("http://{proxy_addr}/sordino/config"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "secret-key")
         .json(&serde_json::json!({
             "score_threshold": 0.73,
@@ -870,6 +897,7 @@ async fn master_switch_toggle_preserves_data_policy() {
     let get_policy = |client: reqwest::Client, addr: String| async move {
         client
             .get(format!("http://{addr}/sordino/config"))
+            .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
             .header("x-sordino-key", "secret-key")
             .send()
             .await
@@ -893,6 +921,7 @@ async fn master_switch_toggle_preserves_data_policy() {
     // DISABLE (the master switch the DISABLED posture drives).
     let off: serde_json::Value = client
         .post(format!("http://{proxy_addr}/sordino/disable"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "secret-key")
         .send()
         .await
@@ -914,6 +943,7 @@ async fn master_switch_toggle_preserves_data_policy() {
     // RE-ENABLE → masking back on, and the exact same policy is restored.
     let on: serde_json::Value = client
         .post(format!("http://{proxy_addr}/sordino/enable"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "secret-key")
         .send()
         .await
@@ -940,6 +970,7 @@ async fn ml_endpoints_gated_and_snapshot_shape() {
     // Snapshot carries the ml block: off + default model + status "disabled".
     let cfg: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/config"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "mlkey")
         .send()
         .await
@@ -965,6 +996,7 @@ async fn ml_endpoints_gated_and_snapshot_shape() {
     // Disable with the key is a safe no-network op → 200, still "disabled".
     let off: serde_json::Value = client
         .post(format!("http://{proxy_addr}/sordino/ml/disable"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "mlkey")
         .send()
         .await
@@ -989,6 +1021,7 @@ async fn put_config_cannot_flip_ml_enabled() {
 
     let mut cfg: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/config"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "k2")
         .send()
         .await
@@ -1001,6 +1034,7 @@ async fn put_config_cannot_flip_ml_enabled() {
     wire["ml"]["enabled"] = serde_json::json!(true);
     let put: serde_json::Value = client
         .put(format!("http://{proxy_addr}/sordino/config"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "k2")
         .json(&wire)
         .send()
@@ -1031,6 +1065,7 @@ async fn put_config_replaces_live_policy() {
     // Pull the current config, set EMAIL_ADDRESS -> redact, PUT it back.
     let mut cfg: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/config"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "kk")
         .send()
         .await
@@ -1043,6 +1078,7 @@ async fn put_config_replaces_live_policy() {
     wire["entity_operators"]["EMAIL_ADDRESS"] = serde_json::json!({"kind": "redact"});
     let put = client
         .put(format!("http://{proxy_addr}/sordino/config"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "kk")
         .json(&wire)
         .send()
@@ -1100,6 +1136,7 @@ async fn monitor_default_observes_without_blocking() {
 
     let snap: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/monitor/snapshot"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "mon")
         .send()
         .await
@@ -1147,6 +1184,7 @@ async fn monitor_backpressure_rejects_when_pending_queue_is_full() {
 
     let mode = client
         .post(format!("http://{proxy_addr}/sordino/monitor/mode"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "bp-key")
         .json(&serde_json::json!({
             "mode": "manual_all_llm",
@@ -1184,6 +1222,7 @@ async fn monitor_backpressure_rejects_when_pending_queue_is_full() {
 
     let snap: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/monitor/snapshot"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "bp-key")
         .send()
         .await
@@ -1205,6 +1244,7 @@ async fn monitor_backpressure_rejects_when_pending_queue_is_full() {
         .post(format!(
             "http://{proxy_addr}/sordino/monitor/requests/{id}/approve"
         ))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "bp-key")
         .send()
         .await
@@ -1229,6 +1269,7 @@ async fn monitor_manual_reject_never_reaches_upstream() {
 
     let mode = client
         .post(format!("http://{proxy_addr}/sordino/monitor/mode"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "reject-key")
         .json(&serde_json::json!({"mode":"manual_all_llm"}))
         .send()
@@ -1253,6 +1294,7 @@ async fn monitor_manual_reject_never_reaches_upstream() {
         .post(format!(
             "http://{proxy_addr}/sordino/monitor/requests/{id}/reject"
         ))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "reject-key")
         .json(&serde_json::json!({"reason":"test reject"}))
         .send()
@@ -1279,6 +1321,7 @@ async fn monitor_manual_approve_releases_request() {
 
     client
         .post(format!("http://{proxy_addr}/sordino/monitor/mode"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "approve-key")
         .json(&serde_json::json!({"mode":"manual_all_llm"}))
         .send()
@@ -1302,6 +1345,7 @@ async fn monitor_manual_approve_releases_request() {
         .post(format!(
             "http://{proxy_addr}/sordino/monitor/requests/{id}/approve"
         ))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "approve-key")
         .send()
         .await
@@ -1327,6 +1371,7 @@ async fn monitor_custom_mask_applies_to_future_requests() {
 
     let resp = client
         .post(format!("http://{proxy_addr}/sordino/monitor/custom-mask"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "custom-key")
         .json(&serde_json::json!({"pattern":"ACME-ALPHA"}))
         .send()
@@ -1379,6 +1424,7 @@ async fn monitor_session_prefixed_route_groups_by_conversation() {
 
     let snap: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/monitor/snapshot"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "session-key")
         .send()
         .await
@@ -1437,6 +1483,7 @@ async fn per_conversation_disable_isolates_to_that_conversation() {
     // Disable masking for "alpha" only.
     let off: serde_json::Value = client
         .post(format!("http://{proxy_addr}/sordino/session/alpha/masking"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "mkey")
         .send()
         .await
@@ -1472,6 +1519,7 @@ async fn per_conversation_disable_isolates_to_that_conversation() {
     // The config snapshot lists alpha (and only alpha) as masking-disabled.
     let cfg: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/config"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "mkey")
         .send()
         .await
@@ -1487,6 +1535,7 @@ async fn per_conversation_disable_isolates_to_that_conversation() {
     // Re-enable alpha → masking resumes.
     let on: serde_json::Value = client
         .delete(format!("http://{proxy_addr}/sordino/session/alpha/masking"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "mkey")
         .send()
         .await
@@ -1509,6 +1558,7 @@ async fn wait_for_pending(client: &reqwest::Client, proxy_addr: SocketAddr, key:
     for _ in 0..50 {
         let snap: serde_json::Value = client
             .get(format!("http://{proxy_addr}/sordino/monitor/snapshot"))
+            .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
             .header("x-sordino-key", key)
             .send()
             .await
@@ -1582,6 +1632,7 @@ async fn profile_endpoint_applies_and_persists() {
         .post(format!(
             "http://{proxy_addr}/sordino/profile/strict?scope=local"
         ))
+        .header("x-sordino-project", project_hdr(&dir.to_string_lossy()))
         .header("x-sordino-key", "pk")
         .send()
         .await
@@ -1607,6 +1658,7 @@ async fn profile_endpoint_applies_and_persists() {
         .post(format!(
             "http://{proxy_addr}/sordino/profile/development_safe?scope=session"
         ))
+        .header("x-sordino-project", project_hdr(&dir.to_string_lossy()))
         .header("x-sordino-key", "pk")
         .send()
         .await
@@ -1620,6 +1672,7 @@ async fn profile_endpoint_applies_and_persists() {
     // An unknown profile is a 400.
     let bad = client
         .post(format!("http://{proxy_addr}/sordino/profile/bogus"))
+        .header("x-sordino-project", project_hdr(&dir.to_string_lossy()))
         .header("x-sordino-key", "pk")
         .send()
         .await
@@ -1643,6 +1696,7 @@ async fn put_config_merges_partial_body() {
     // PUT ONLY a new threshold.
     let put: serde_json::Value = client
         .put(format!("http://{proxy_addr}/sordino/config"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "mp")
         .json(&serde_json::json!({ "score_threshold": 0.77 }))
         .send()
@@ -1669,6 +1723,7 @@ async fn put_config_rejects_unknown_entity_operator_key() {
 
     let bad = client
         .put(format!("http://{proxy_addr}/sordino/config"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "uk")
         .json(&serde_json::json!({ "entity_operators": { "EMIAL": { "kind": "redact" } } }))
         .send()
@@ -1695,6 +1750,7 @@ async fn custom_mask_persist_list_remove() {
 
     let add: serde_json::Value = client
         .post(format!("http://{proxy_addr}/sordino/monitor/custom-mask"))
+        .header("x-sordino-project", project_hdr(&dir.to_string_lossy()))
         .header("x-sordino-key", "cm")
         .json(&serde_json::json!({"pattern":"ACME-XYZ"}))
         .send()
@@ -1711,6 +1767,7 @@ async fn custom_mask_persist_list_remove() {
     // List shows it.
     let list: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/monitor/custom-mask"))
+        .header("x-sordino-project", project_hdr(&dir.to_string_lossy()))
         .header("x-sordino-key", "cm")
         .send()
         .await
@@ -1727,6 +1784,7 @@ async fn custom_mask_persist_list_remove() {
             reqwest::Method::DELETE,
             format!("http://{proxy_addr}/sordino/monitor/custom-mask"),
         )
+        .header("x-sordino-project", project_hdr(&dir.to_string_lossy()))
         .header("x-sordino-key", "cm")
         .json(&serde_json::json!({"pattern":"ACME-XYZ"}))
         .send()
@@ -1758,6 +1816,7 @@ async fn reveal_then_remask_keyphrase_roundtrip() {
     // Seed a custom keyphrase, then reveal it to the model.
     client
         .post(format!("http://{proxy_addr}/sordino/monitor/custom-mask"))
+        .header("x-sordino-project", project_hdr(&dir.to_string_lossy()))
         .header("x-sordino-key", "rv")
         .json(&serde_json::json!({"pattern":"SEKRET-1"}))
         .send()
@@ -1766,6 +1825,7 @@ async fn reveal_then_remask_keyphrase_roundtrip() {
 
     let rev: serde_json::Value = client
         .post(format!("http://{proxy_addr}/sordino/monitor/reveal"))
+        .header("x-sordino-project", project_hdr(&dir.to_string_lossy()))
         .header("x-sordino-key", "rv")
         .json(&serde_json::json!({"value":"SEKRET-1","pattern":"SEKRET-1","entity_type":"CUSTOM_KEYWORD"}))
         .send()
@@ -1788,6 +1848,7 @@ async fn reveal_then_remask_keyphrase_roundtrip() {
     // The live config endpoint confirms the value egresses plaintext now.
     let cfg: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/config"))
+        .header("x-sordino-project", project_hdr(&dir.to_string_lossy()))
         .header("x-sordino-key", "rv")
         .send()
         .await
@@ -1804,6 +1865,7 @@ async fn reveal_then_remask_keyphrase_roundtrip() {
             reqwest::Method::DELETE,
             format!("http://{proxy_addr}/sordino/monitor/reveal"),
         )
+        .header("x-sordino-project", project_hdr(&dir.to_string_lossy()))
         .header("x-sordino-key", "rv")
         .json(&serde_json::json!({"value":"SEKRET-1"}))
         .send()
@@ -1854,6 +1916,7 @@ async fn session_routed_reflects_inbound_and_is_gated() {
     // 1) No inbound yet for this id → routed_recently:false, last_seen_ms:null.
     let before: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/session/{sid}/routed"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "obs-key")
         .send()
         .await
@@ -1888,6 +1951,7 @@ async fn session_routed_reflects_inbound_and_is_gated() {
     // 3) The endpoint now attributes that inbound to the session id.
     let after: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/session/{sid}/routed"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "obs-key")
         .send()
         .await
@@ -1908,6 +1972,7 @@ async fn session_routed_reflects_inbound_and_is_gated() {
     // A different, never-seen id is still not routed (no false positive on liveness).
     let other: serde_json::Value = client
         .get(format!("http://{proxy_addr}/sordino/session/never-seen-id/routed"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "obs-key")
         .send()
         .await
@@ -2360,6 +2425,7 @@ async fn zdr_control_endpoint_engage_status_and_refuse() {
     // Engage a verified config.
     let ok = client
         .post(format!("http://{proxy_addr}/sordino/session/c/zdr"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "test-key")
         .json(&serde_json::json!({"config":"trusted"}))
         .send()
@@ -2376,6 +2442,7 @@ async fn zdr_control_endpoint_engage_status_and_refuse() {
     // GET status reflects the active selection.
     let st = client
         .get(format!("http://{proxy_addr}/sordino/session/c/zdr"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "test-key")
         .send()
         .await
@@ -2386,6 +2453,7 @@ async fn zdr_control_endpoint_engage_status_and_refuse() {
     // Engaging an unverified config → 400.
     let unv = client
         .post(format!("http://{proxy_addr}/sordino/session/c2/zdr"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "test-key")
         .json(&serde_json::json!({"config":"raw"}))
         .send()
@@ -2396,6 +2464,7 @@ async fn zdr_control_endpoint_engage_status_and_refuse() {
     // Engaging an unknown config → 404.
     let unk = client
         .post(format!("http://{proxy_addr}/sordino/session/c3/zdr"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "test-key")
         .json(&serde_json::json!({"config":"nope"}))
         .send()
@@ -2406,6 +2475,7 @@ async fn zdr_control_endpoint_engage_status_and_refuse() {
     // DELETE disengages.
     let del = client
         .delete(format!("http://{proxy_addr}/sordino/session/c/zdr"))
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
         .header("x-sordino-key", "test-key")
         .send()
         .await
@@ -3356,6 +3426,7 @@ mod zdr_persist {
         let client = reqwest::Client::new();
         let resp = client
             .post(format!("http://{proxy_addr}/sordino/session/cx/zdr"))
+            .header("x-sordino-project", project_hdr("/proj/set-5xx"))
             .header("x-sordino-key", "test-key")
             .json(&serde_json::json!({"config":"box"}))
             .send()
@@ -3848,4 +3919,1476 @@ async fn bare_path_no_header_is_masked_normal() {
         !body.is_empty() && !body.contains("eve@example.com") && body.contains("[EMAIL_ADDRESS_"),
         "header-absent bare request is masked-Normal (masked token, never plaintext): {body}"
     );
+}
+
+// ===========================================================================
+// A2b — registered-secret tripwire (GAP-CLOSURE G1/L20).
+//
+// When a registered secret's EXACT value appears in a never-rewritten
+// schema/contract subtree (tool.input_schema, an OpenAI contract-key subtree,
+// or an `extra` flatten sink), the proxy REFUSES with 409 and ZERO bytes
+// upstream instead of forwarding it verbatim. Detect-then-refuse: the subtree
+// is still never masked (the no-mask-schema invariant is untouched).
+// ===========================================================================
+
+/// A distinctive registered-secret value used across the tripwire tests.
+const A2B_SECRET_VAL: &str = "S3cr3tRegisteredValue";
+/// The secret's registered NAME — appears in the 409 body; its value never does.
+const A2B_SECRET_NAME: &str = "prod_api_key";
+
+/// Engine with one registered secret (`Hash` operator; A2b is detect-only so the
+/// operator is immaterial). `disabled`/`no_secrets` variants exercise the invariant that
+/// `registered_secret_hit` reads the live secret set unconditionally.
+fn a2b_engine_with_secret() -> MaskEngine {
+    let e = MaskEngine::new(EngineConfig::default()).unwrap();
+    e.set_secret_rules(vec![sordino_engine::SecretRule {
+        name: A2B_SECRET_NAME.into(),
+        value: sordino_engine::SecretValue::new(A2B_SECRET_VAL),
+        operator: sordino_engine::Operator::Hash,
+        case_sensitive: true,
+        apply_to_surfaces: None,
+    }])
+    .unwrap();
+    e
+}
+
+// --- Test 1a: Anthropic tool.input_schema → 409, zero upstream bytes. -------
+#[tokio::test]
+async fn a2b_anthropic_input_schema_secret_refuses_409_zero_bytes() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-test", "max_tokens": 10, "messages": [],
+            "tools": [{
+                "name": "send", "description": "d",
+                "input_schema": {"type": "object", "properties": {
+                    "default_key": {"const": A2B_SECRET_VAL}
+                }}
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(A2B_SECRET_NAME), "409 body names the secret: {body}");
+    assert!(!body.contains(A2B_SECRET_VAL), "409 body must NEVER echo the value: {body}");
+    assert!(cap.body.lock().unwrap().is_empty(), "zero bytes upstream");
+    assert!(cap.bodies.lock().unwrap().is_empty(), "fake upstream never hit");
+}
+
+// --- Test 1b: OpenAI-chat tools[].function.parameters → 409, zero bytes. ----
+#[tokio::test]
+async fn a2b_openai_chat_tool_parameters_secret_refuses_409_zero_bytes() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/chat/completions", post(fake_openai_chat_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"type": "function", "function": {
+                "name": "send",
+                "parameters": {"type": "object", "properties": {
+                    "default_key": {"const": A2B_SECRET_VAL}
+                }}
+            }}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(A2B_SECRET_NAME), "409 body names the secret: {body}");
+    assert!(!body.contains(A2B_SECRET_VAL), "409 body must NEVER echo the value: {body}");
+    assert!(cap.body.lock().unwrap().is_empty(), "zero bytes upstream");
+    assert!(cap.bodies.lock().unwrap().is_empty(), "fake upstream never hit");
+}
+
+// --- Test 1c: OpenAI-responses input_schema (extra sink) → 409, zero bytes. -
+#[tokio::test]
+async fn a2b_openai_responses_input_schema_secret_refuses_409_zero_bytes() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/responses", post(fake_responses_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&serde_json::json!({
+            "model": "gpt-test", "input": "hi",
+            "input_schema": {"type": "object", "properties": {
+                "default_key": {"const": A2B_SECRET_VAL}
+            }}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(A2B_SECRET_NAME), "409 body names the secret: {body}");
+    assert!(!body.contains(A2B_SECRET_VAL), "409 body must NEVER echo the value: {body}");
+    assert!(cap.body.lock().unwrap().is_empty(), "zero bytes upstream");
+    assert!(cap.bodies.lock().unwrap().is_empty(), "fake upstream never hit");
+}
+
+// --- Test 2: FAIL-SAFE — malformed top-level field fails the typed ApiRequest
+// parse, so the fallback value-walk runs; a secret in tools[].input_schema must
+// STILL 409 (proves tool_value_safe's OWN input_schema arm scans — the
+// match-arm-ordering trap where the guard never sees input_schema). -----------
+#[tokio::test]
+async fn a2b_failsafe_fallback_walk_input_schema_secret_refuses_409() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    // `max_tokens` as a STRING fails the typed `u32` parse (but is valid JSON), so the
+    // Anthropic path falls to the structure-agnostic value_safe walk.
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-test", "max_tokens": "not_a_number", "messages": [],
+            "tools": [{
+                "name": "send", "description": "d",
+                "input_schema": {"type": "object", "properties": {
+                    "default_key": {"const": A2B_SECRET_VAL}
+                }}
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(cap.body.lock().unwrap().is_empty(), "zero bytes upstream");
+    assert!(cap.bodies.lock().unwrap().is_empty(), "fake upstream never hit");
+}
+
+// --- Test 3: OBJECT-KEY — the secret value used as a JSON object KEY
+// (`properties.<SECRET>`) → 409 (proves keys are scanned, not just values). ----
+#[tokio::test]
+async fn a2b_object_key_secret_refuses_409() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    // The secret sits as a `properties` KEY — build the JSON as a raw string so the key
+    // is a dynamic value. (No JSON-special chars in the secret, so it needs no escaping.)
+    let raw = format!(
+        r#"{{"model":"claude-test","max_tokens":10,"messages":[],"tools":[{{"name":"send","description":"d","input_schema":{{"type":"object","properties":{{"{A2B_SECRET_VAL}":{{"type":"string"}}}}}}}}]}}"#
+    );
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header(CONTENT_TYPE, "application/json")
+        .body(raw)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(cap.body.lock().unwrap().is_empty(), "zero bytes upstream");
+    assert!(cap.bodies.lock().unwrap().is_empty(), "fake upstream never hit");
+}
+
+// --- Test 4a: BASE64-COINCIDENCE (Anthropic) — the secret's literal bytes
+// inside a base64 image `data` field must NOT be refused (L18 binary boundary). -
+#[tokio::test]
+async fn a2b_base64_coincidence_anthropic_not_refused_200() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let data = format!("QUJD{A2B_SECRET_VAL}WFla");
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-test", "max_tokens": 10,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "look"},
+                {"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": data}}
+            ]}]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "base64 coincidence must not 409");
+    let up = cap.body.lock().unwrap().clone();
+    assert!(up.contains(A2B_SECRET_VAL), "base64 data passes through verbatim (never scanned): {up}");
+}
+
+// --- Test 4b: BASE64-COINCIDENCE (OpenAI-chat) — secret bytes in a base64
+// `data` field carried through `extra` must NOT be refused. -------------------
+#[tokio::test]
+async fn a2b_base64_coincidence_openai_chat_not_refused_200() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/chat/completions", post(fake_openai_chat_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let data = format!("QUJD{A2B_SECRET_VAL}");
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "x_blob": {"type": "base64", "data": data}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "base64 coincidence must not 409");
+    let up = cap.body.lock().unwrap().clone();
+    assert!(up.contains(A2B_SECRET_VAL), "base64 data passes through verbatim: {up}");
+}
+
+// --- Test 4c: BASE64-COINCIDENCE (OpenAI-responses) — must NOT be refused.
+// This specifically proves the responses `value_safe` combined `if` was SPLIT:
+// were the base64-data and contract-key legs still fused with a scan attached,
+// the base64 `data` would 409. -----------------------------------------------
+#[tokio::test]
+async fn a2b_base64_coincidence_openai_responses_not_refused_200() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/responses", post(fake_responses_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let data = format!("QUJD{A2B_SECRET_VAL}");
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&serde_json::json!({
+            "model": "gpt-test", "input": "hi",
+            "x_blob": {"type": "base64", "data": data}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "base64 coincidence must not 409");
+    let up = cap.body.lock().unwrap().clone();
+    assert!(up.contains(A2B_SECRET_VAL), "base64 data passes through verbatim: {up}");
+}
+
+// --- Test 5: SUBSTRING — the secret as a substring of a larger string leaf →
+// 409 (registered_secret_hit is a substring/Aho-Corasick match, not whole-leaf). -
+#[tokio::test]
+async fn a2b_substring_secret_refuses_409() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let embedded = format!("prefix-{A2B_SECRET_VAL}-suffix");
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-test", "max_tokens": 10, "messages": [],
+            "tools": [{
+                "name": "send", "description": "d",
+                "input_schema": {"type": "object", "properties": {
+                    "default_key": {"const": embedded}
+                }}
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(cap.body.lock().unwrap().is_empty(), "zero bytes upstream");
+}
+
+// --- Test 6: ENGINE-DISABLED — with masking turned OFF the secret in
+// input_schema must STILL 409 (registered_secret_hit reads the live secret set
+// unconditionally). -----------------------------------------------------------
+#[tokio::test]
+async fn a2b_engine_disabled_still_refuses_409() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let engine = a2b_engine_with_secret();
+    engine.set_enabled(false); // master masking switch OFF
+    assert!(!engine.is_enabled());
+    let state = mk_state(engine, format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-test", "max_tokens": 10, "messages": [],
+            "tools": [{
+                "name": "send", "description": "d",
+                "input_schema": {"type": "object", "properties": {
+                    "default_key": {"const": A2B_SECRET_VAL}
+                }}
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(cap.body.lock().unwrap().is_empty(), "zero bytes upstream");
+}
+
+// --- Test 7: NO SECRETS registered — identical body forwards normally (200),
+// zero behavior change. -------------------------------------------------------
+#[tokio::test]
+async fn a2b_no_secrets_registered_forwards_200() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    // Default engine — NO registered secrets.
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-test", "max_tokens": 10, "messages": [],
+            "tools": [{
+                "name": "send", "description": "d",
+                "input_schema": {"type": "object", "properties": {
+                    "default_key": {"const": A2B_SECRET_VAL}
+                }}
+            }]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let up = cap.body.lock().unwrap().clone();
+    assert!(
+        up.contains(A2B_SECRET_VAL),
+        "with no secrets the input_schema const forwards verbatim: {up}"
+    );
+}
+
+// --- Test 8: DEPTH-129 — a programmatically-nested body (129 nested objects)
+// with the secret deep inside is REFUSED with zero upstream bytes because
+// serde_json's 128-depth parse limit rejects the body BEFORE any walker runs.
+// KILL-CONDITION: a 200 with the body forwarded would mean an unparseable-body
+// passthrough exists (the walker is bypassable by deep nesting) — a
+// FOUNDATION-level finding, not something to paper over. --------------------
+#[tokio::test]
+async fn a2b_depth_129_body_refused_zero_bytes() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    // 129 nested `{"properties": …}` objects around the secret leaf → deeper than
+    // serde_json's 128 recursion limit, so BOTH the typed and the fallback Value parse
+    // fail before any walker runs.
+    let mut deep = format!("\"{A2B_SECRET_VAL}\"");
+    for _ in 0..129 {
+        deep = format!("{{\"properties\":{deep}}}");
+    }
+    let raw = format!(
+        r#"{{"model":"claude-test","max_tokens":10,"messages":[],"tools":[{{"name":"x","description":"d","input_schema":{deep}}}]}}"#
+    );
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header(CONTENT_TYPE, "application/json")
+        .body(raw)
+        .send()
+        .await
+        .unwrap();
+
+    assert_ne!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "KILL-CONDITION: a 129-deep body must be REFUSED (serde depth cap), not forwarded"
+    );
+    assert!(resp.status().is_client_error(), "refused as a 4xx: {}", resp.status());
+    assert!(
+        cap.body.lock().unwrap().is_empty() && cap.bodies.lock().unwrap().is_empty(),
+        "KILL-CONDITION: ZERO bytes upstream for an unparseable deep body"
+    );
+}
+
+// ===========================================================================
+// A2b FIX ROUND — sibling TYPED never-rewritten contract/structured-output
+// fields (not just `tools`). A registered secret's exact value in these fields
+// previously forwarded UPSTREAM in plaintext (200); it must now REFUSE 409 with
+// ZERO bytes upstream, exactly like the `tools` carve-out. One test per wire per
+// field family; each proves the field is scanned in the walker's request().
+// ===========================================================================
+
+// --- Anthropic `output_config.format.schema` → 409, zero upstream bytes. ----
+#[tokio::test]
+async fn a2b_anthropic_output_config_schema_secret_refuses_409_zero_bytes() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-test", "max_tokens": 10, "messages": [],
+            "output_config": {
+                "format": {"type": "json_schema", "schema": {"const": A2B_SECRET_VAL}}
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(A2B_SECRET_NAME), "409 body names the secret: {body}");
+    assert!(!body.contains(A2B_SECRET_VAL), "409 body must NEVER echo the value: {body}");
+    assert!(cap.body.lock().unwrap().is_empty(), "zero bytes upstream");
+    assert!(cap.bodies.lock().unwrap().is_empty(), "fake upstream never hit");
+}
+
+// --- OpenAI-chat `response_format` schema → 409, zero upstream bytes. --------
+#[tokio::test]
+async fn a2b_openai_chat_response_format_secret_refuses_409_zero_bytes() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/chat/completions", post(fake_openai_chat_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {"schema": {"properties": {"k": {"const": A2B_SECRET_VAL}}}}
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(A2B_SECRET_NAME), "409 body names the secret: {body}");
+    assert!(!body.contains(A2B_SECRET_VAL), "409 body must NEVER echo the value: {body}");
+    assert!(cap.body.lock().unwrap().is_empty(), "zero bytes upstream");
+    assert!(cap.bodies.lock().unwrap().is_empty(), "fake upstream never hit");
+}
+
+// --- OpenAI-chat `guided_choice` (Vec<String> contract field) → 409. --------
+// Proves the typed String/Vec guided-decoding fields are scanned, not just the
+// `Value` ones.
+#[tokio::test]
+async fn a2b_openai_chat_guided_choice_secret_refuses_409_zero_bytes() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/chat/completions", post(fake_openai_chat_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "gpt-test",
+            "messages": [{"role": "user", "content": "hi"}],
+            "guided_choice": ["alpha", A2B_SECRET_VAL, "omega"]
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(A2B_SECRET_NAME), "409 body names the secret: {body}");
+    assert!(!body.contains(A2B_SECRET_VAL), "409 body must NEVER echo the value: {body}");
+    assert!(cap.body.lock().unwrap().is_empty(), "zero bytes upstream");
+    assert!(cap.bodies.lock().unwrap().is_empty(), "fake upstream never hit");
+}
+
+// --- OpenAI-responses `text` (structured-output) → 409, zero upstream bytes. -
+#[tokio::test]
+async fn a2b_openai_responses_text_secret_refuses_409_zero_bytes() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/responses", post(fake_responses_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&serde_json::json!({
+            "model": "gpt-test", "input": "hi",
+            "text": {"format": {"type": "json_schema", "schema": {"const": A2B_SECRET_VAL}}}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(A2B_SECRET_NAME), "409 body names the secret: {body}");
+    assert!(!body.contains(A2B_SECRET_VAL), "409 body must NEVER echo the value: {body}");
+    assert!(cap.body.lock().unwrap().is_empty(), "zero bytes upstream");
+    assert!(cap.bodies.lock().unwrap().is_empty(), "fake upstream never hit");
+}
+
+// --- OpenAI-responses `tool_choice` → 409, zero upstream bytes. -------------
+#[tokio::test]
+async fn a2b_openai_responses_tool_choice_secret_refuses_409_zero_bytes() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/responses", post(fake_responses_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&serde_json::json!({
+            "model": "gpt-test", "input": "hi",
+            "tool_choice": {"type": "function", "name": A2B_SECRET_VAL}
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    let body = resp.text().await.unwrap();
+    assert!(body.contains(A2B_SECRET_NAME), "409 body names the secret: {body}");
+    assert!(!body.contains(A2B_SECRET_VAL), "409 body must NEVER echo the value: {body}");
+    assert!(cap.body.lock().unwrap().is_empty(), "zero bytes upstream");
+    assert!(cap.bodies.lock().unwrap().is_empty(), "fake upstream never hit");
+}
+
+// --- Negative: a NON-secret value in these sibling fields still forwards 200
+// (the scan is detect-then-refuse, never a blanket block of contract fields). -
+#[tokio::test]
+async fn a2b_output_config_without_secret_forwards_200() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(a2b_engine_with_secret(), format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-test", "max_tokens": 10, "messages": [],
+            "output_config": {
+                "format": {"type": "json_schema", "schema": {"const": "not-a-secret"}}
+            }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::OK);
+    let up = cap.body.lock().unwrap().clone();
+    assert!(
+        up.contains("not-a-secret"),
+        "a non-secret output_config schema forwards verbatim: {up}"
+    );
+}
+
+// ===========================================================================
+// A4b — tool-egress gate: genuine tool-execution destinations keep the TOKEN
+// (never resolve to plaintext a tool would act on), while display / compaction /
+// echo surfaces STILL resolve. Each test asserts the CLIENT-VISIBLE payload.
+//
+// Non-streaming cases call the exact `unmask_response` the proxy uses on the
+// non-SSE path (its output IS the client body); streaming cases go end-to-end
+// (the OpenAI SSE unmaskers are not public, so HTTP is the only client-visible
+// path). All tokens are minted via `engine.mask`, so under the OLD (plain-unmask)
+// behavior they WOULD resolve — a retained token / absent plaintext proves the gate.
+// ===========================================================================
+
+/// Marker-OFF engine so display surfaces resolve to BARE plaintext (crisp assertions).
+fn a4b_engine() -> MaskEngine {
+    let cfg = EngineConfig {
+        reveal_marker: sordino_engine::RevealMarker {
+            enabled: false,
+            ..Default::default()
+        },
+        ..EngineConfig::default()
+    };
+    MaskEngine::new(cfg).unwrap()
+}
+
+// --- 1(a) Anthropic non-stream ToolUse.input --------------------------------
+#[test]
+fn a4b_anthropic_nonstream_tooluse_input_gated() {
+    let e = a4b_engine();
+    let m = e.mask("bob@example.com", Surface::UserMessage).unwrap();
+    let token = m.manifest.entries[0].token_handle.clone();
+    let resp = serde_json::json!({
+        "content": [
+            {"type": "text", "text": format!("writing to {token}")},
+            {"type": "tool_use", "id": "t1", "name": "write_file",
+             "input": {"body": format!("addr={token}")}}
+        ],
+        "model": "claude-test"
+    });
+    let out = walk::unmask_response(&e, &m.manifest, resp.to_string().as_bytes()).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    // Assistant Text (display) resolves; ToolUse.input is GATED (token retained verbatim).
+    assert_eq!(v["content"][0]["text"], "writing to bob@example.com");
+    assert_eq!(v["content"][1]["input"]["body"], format!("addr={token}"));
+}
+
+// --- 1(c) OpenAI-chat NON-streamed tool_calls[].function.arguments ----------
+#[test]
+fn a4b_openai_chat_nonstream_tool_args_gated() {
+    let e = a4b_engine();
+    let m = e.mask("bob@example.com", Surface::UserMessage).unwrap();
+    let token = m.manifest.entries[0].token_handle.clone();
+    let resp = serde_json::json!({
+        "id": "c", "object": "chat.completion", "model": "gpt-test",
+        "choices": [{"index": 0, "message": {
+            "role": "assistant",
+            "content": format!("ok {token}"),
+            "tool_calls": [{"id": "call_1", "type": "function",
+                "function": {"name": "send", "arguments": format!("{{\"email\":\"{token}\"}}")}}]
+        }, "finish_reason": "tool_calls"}]
+    });
+    let out = openai_chat::unmask_response(&e, &m.manifest, resp.to_string().as_bytes()).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["choices"][0]["message"]["content"], "ok bob@example.com");
+    assert_eq!(
+        v["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+        format!("{{\"email\":\"{token}\"}}")
+    );
+}
+
+// --- 1(e) Responses NON-streamed FunctionCall.arguments ---------------------
+#[test]
+fn a4b_responses_nonstream_function_call_args_gated() {
+    let e = a4b_engine();
+    let m = e.mask("bob@example.com", Surface::UserMessage).unwrap();
+    let token = m.manifest.entries[0].token_handle.clone();
+    let resp = serde_json::json!({
+        "id": "r", "object": "response", "model": "gpt-test",
+        "output": [
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": format!("ok {token}")}]},
+            {"type": "function_call", "call_id": "c1", "name": "send",
+             "arguments": format!("{{\"email\":\"{token}\"}}")}
+        ],
+        "output_text": format!("done {token}")
+    });
+    let out =
+        openai_responses::unmask_response(&e, &m.manifest, resp.to_string().as_bytes()).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    // Display surfaces resolve; FunctionCall.arguments GATED.
+    assert_eq!(v["output"][0]["content"][0]["text"], "ok bob@example.com");
+    assert_eq!(v["output_text"], "done bob@example.com");
+    assert_eq!(v["output"][1]["arguments"], format!("{{\"email\":\"{token}\"}}"));
+}
+
+// --- 2(a) Responses unmodeled OUTPUT ITEM (ResponseOutputItem::Other) -------
+// A local_shell_call-shaped item we have no typed arm for: its nested token is gated.
+#[test]
+fn a4b_responses_output_item_other_gated() {
+    let e = a4b_engine();
+    let m = e.mask("bob@example.com", Surface::UserMessage).unwrap();
+    let token = m.manifest.entries[0].token_handle.clone();
+    let resp = serde_json::json!({
+        "id": "r", "object": "response", "model": "gpt-test",
+        "output": [
+            {"type": "local_shell_call", "call_id": "s1",
+             "action": {"type": "exec", "command": format!("mail {token}")}}
+        ]
+    });
+    let out =
+        openai_responses::unmask_response(&e, &m.manifest, resp.to_string().as_bytes()).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["output"][0]["action"]["command"], format!("mail {token}"));
+}
+
+// --- 2(c) Responses message content ARRAY with unmodeled part (ContentPart::Other)
+#[test]
+fn a4b_responses_content_part_other_gated() {
+    let e = a4b_engine();
+    let m = e.mask("bob@example.com", Surface::UserMessage).unwrap();
+    let token = m.manifest.entries[0].token_handle.clone();
+    let resp = serde_json::json!({
+        "id": "r", "object": "response", "model": "gpt-test",
+        "output": [
+            {"type": "message", "role": "assistant", "content": [
+                {"type": "custom_tool_reasoning", "payload": format!("do {token}")}
+            ]}
+        ]
+    });
+    let out =
+        openai_responses::unmask_response(&e, &m.manifest, resp.to_string().as_bytes()).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["output"][0]["content"][0]["payload"], format!("do {token}"));
+}
+
+// --- 2(d) Responses message content NON-STRING/NON-ARRAY (MessageContent::Other)
+// An object-valued content is the ONLY shape that reaches ResponseMessageContent::Other
+// (any array deserializes into Parts and hits ContentPart::Other instead).
+#[test]
+fn a4b_responses_message_content_other_gated() {
+    let e = a4b_engine();
+    let m = e.mask("bob@example.com", Surface::UserMessage).unwrap();
+    let token = m.manifest.entries[0].token_handle.clone();
+    let resp = serde_json::json!({
+        "id": "r", "object": "response", "model": "gpt-test",
+        "output": [
+            {"type": "message", "role": "assistant",
+             "content": {"type": "vendor_blob", "payload": format!("x {token}")}}
+        ]
+    });
+    let out =
+        openai_responses::unmask_response(&e, &m.manifest, resp.to_string().as_bytes()).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["output"][0]["content"]["payload"], format!("x {token}"));
+}
+
+// --- 3 FunctionCall.extra: a token on an unknown field of a function_call item
+#[test]
+fn a4b_responses_function_call_extra_gated() {
+    let e = a4b_engine();
+    let m = e.mask("bob@example.com", Surface::UserMessage).unwrap();
+    let token = m.manifest.entries[0].token_handle.clone();
+    let resp = serde_json::json!({
+        "id": "r", "object": "response", "model": "gpt-test",
+        "output": [
+            {"type": "function_call", "call_id": "c1", "name": "send", "arguments": "{}",
+             "x_vendor_meta": format!("note {token}")}
+        ]
+    });
+    let out =
+        openai_responses::unmask_response(&e, &m.manifest, resp.to_string().as_bytes()).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["output"][0]["x_vendor_meta"], format!("note {token}"));
+}
+
+// --- 4 Display-regression guards: these MUST still resolve to plaintext ------
+#[test]
+fn a4b_display_and_echo_surfaces_still_resolve() {
+    let e = a4b_engine();
+    let m = e.mask("bob@example.com", Surface::UserMessage).unwrap();
+    let token = m.manifest.entries[0].token_handle.clone();
+
+    // Anthropic: assistant Text block AND a Compaction block must resolve.
+    let anth = serde_json::json!({
+        "content": [
+            {"type": "text", "text": format!("see {token}")},
+            {"type": "compaction", "content": format!("ctx {token}")}
+        ],
+        "model": "claude-test"
+    });
+    let out = walk::unmask_response(&e, &m.manifest, anth.to_string().as_bytes()).unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(v["content"][0]["text"], "see bob@example.com");
+    assert_eq!(v["content"][1]["content"], "ctx bob@example.com");
+
+    // Responses: FunctionCallOutput.output (already-executed echo) AND a vendor display
+    // field on msg.extra (reasoning-content-shaped) must resolve.
+    let resp = serde_json::json!({
+        "id": "r", "object": "response", "model": "gpt-test",
+        "output": [
+            {"type": "function_call_output", "call_id": "c1", "output": format!("tool said {token}")},
+            {"type": "message", "role": "assistant",
+             "content": [{"type": "output_text", "text": "hi"}],
+             "reasoning_content": format!("reason {token}")}
+        ]
+    });
+    let out2 =
+        openai_responses::unmask_response(&e, &m.manifest, resp.to_string().as_bytes()).unwrap();
+    let v2: serde_json::Value = serde_json::from_slice(&out2).unwrap();
+    assert_eq!(v2["output"][0]["output"], "tool said bob@example.com");
+    assert_eq!(v2["output"][1]["reasoning_content"], "reason bob@example.com");
+}
+
+// ---- Streaming (end-to-end HTTP) fake upstreams for the four SSE gate cases --
+
+/// Anthropic SSE emitting a tool_use block whose `input.body` carries the minted token
+/// SPLIT across two `input_json_delta` chunks — the relay must reassemble then gate ONCE.
+async fn fake_anthropic_stream_tooluse_upstream(
+    State(cap): State<Captured>,
+    req: axum::extract::Request,
+) -> impl IntoResponse {
+    let body = axum::body::to_bytes(req.into_body(), usize::MAX).await.unwrap();
+    let s = String::from_utf8_lossy(&body).to_string();
+    *cap.body.lock().unwrap() = s.clone();
+    let tok = token_regex().find(&s).map(|m| m.as_str().to_string()).unwrap_or_default();
+    let (a, b) = tok.split_at(tok.len() / 2);
+    let start = serde_json::json!({"type": "content_block_start", "index": 0,
+        "content_block": {"type": "tool_use", "id": "tu1", "name": "write_file", "input": {}}});
+    let d1 = serde_json::json!({"type": "content_block_delta", "index": 0,
+        "delta": {"type": "input_json_delta", "partial_json": format!("{{\"body\":\"{a}")}});
+    let d2 = serde_json::json!({"type": "content_block_delta", "index": 0,
+        "delta": {"type": "input_json_delta", "partial_json": format!("{b}\"}}")}});
+    let stop = serde_json::json!({"type": "content_block_stop", "index": 0});
+    let mstop = serde_json::json!({"type": "message_stop"});
+    let body = format!(
+        "event: content_block_start\ndata: {start}\n\nevent: content_block_delta\ndata: {d1}\n\nevent: content_block_delta\ndata: {d2}\n\nevent: content_block_stop\ndata: {stop}\n\nevent: message_stop\ndata: {mstop}\n\n"
+    );
+    (StatusCode::OK, [(CONTENT_TYPE, "text/event-stream")], body)
+}
+
+/// OpenAI-chat SSE streaming tool_calls args, token split across two arg deltas.
+async fn fake_openai_chat_stream_tool_args_upstream(
+    State(cap): State<Captured>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let s = String::from_utf8_lossy(&body).to_string();
+    *cap.body.lock().unwrap() = s.clone();
+    let tok = token_regex().find(&s).map(|m| m.as_str().to_string()).unwrap_or_default();
+    let (a, b) = tok.split_at(tok.len() / 2);
+    let d1 = serde_json::json!({"id": "cs", "object": "chat.completion.chunk", "model": "gpt-test",
+        "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_1",
+            "type": "function", "function": {"name": "send", "arguments": format!("{{\"email\":\"{a}")}}]},
+            "finish_reason": null}]});
+    let d2 = serde_json::json!({"id": "cs", "object": "chat.completion.chunk", "model": "gpt-test",
+        "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0,
+            "function": {"arguments": format!("{b}\"}}")}}]}, "finish_reason": null}]});
+    let d3 = serde_json::json!({"id": "cs", "object": "chat.completion.chunk", "model": "gpt-test",
+        "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]});
+    let body = format!("data: {d1}\n\ndata: {d2}\n\ndata: {d3}\n\ndata: [DONE]\n\n");
+    (StatusCode::OK, [(CONTENT_TYPE, "text/event-stream")], body)
+}
+
+/// Responses SSE streaming function_call args, token split across two arg deltas.
+async fn fake_responses_stream_function_args_upstream(
+    State(cap): State<Captured>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let s = String::from_utf8_lossy(&body).to_string();
+    *cap.body.lock().unwrap() = s.clone();
+    let tok = token_regex().find(&s).map(|m| m.as_str().to_string()).unwrap_or_default();
+    let (a, b) = tok.split_at(tok.len() / 2);
+    let d1 = serde_json::json!({"type": "response.function_call_arguments.delta",
+        "sequence_number": 1, "item_id": "call_1", "output_index": 0,
+        "delta": format!("{{\"email\":\"{a}")});
+    let d2 = serde_json::json!({"type": "response.function_call_arguments.delta",
+        "sequence_number": 2, "item_id": "call_1", "output_index": 0,
+        "delta": format!("{b}\"}}")});
+    let d3 = serde_json::json!({"type": "response.completed", "sequence_number": 3,
+        "response": {"id": "r", "object": "response", "model": "gpt-test", "output": []}});
+    let body = format!(
+        "event: response.function_call_arguments.delta\ndata: {d1}\n\nevent: response.function_call_arguments.delta\ndata: {d2}\n\nevent: response.completed\ndata: {d3}\n\n"
+    );
+    (StatusCode::OK, [(CONTENT_TYPE, "text/event-stream")], body)
+}
+
+/// Responses SSE emitting an UNMODELED event (response.custom_tool_call.arguments.delta-shaped)
+/// carrying the minted token — must route through ResponseStreamEvent::Other's gate.
+async fn fake_responses_stream_other_event_upstream(
+    State(cap): State<Captured>,
+    body: Bytes,
+) -> impl IntoResponse {
+    let s = String::from_utf8_lossy(&body).to_string();
+    *cap.body.lock().unwrap() = s.clone();
+    let tok = token_regex().find(&s).map(|m| m.as_str().to_string()).unwrap_or_default();
+    let d1 = serde_json::json!({"type": "response.custom_tool_call.arguments.delta",
+        "sequence_number": 1, "item_id": "ct1", "delta": format!("run {tok}")});
+    let d2 = serde_json::json!({"type": "response.completed", "sequence_number": 2,
+        "response": {"id": "r", "object": "response", "model": "gpt-test", "output": []}});
+    let body = format!(
+        "event: response.custom_tool_call.arguments.delta\ndata: {d1}\n\nevent: response.completed\ndata: {d2}\n\n"
+    );
+    (StatusCode::OK, [(CONTENT_TYPE, "text/event-stream")], body)
+}
+
+/// Assert the client-visible stream KEPT the token (gated) and never resolved the plaintext.
+fn assert_stream_gated(text: &str) {
+    assert!(
+        !text.contains("bob@example.com"),
+        "gated tool destination resolved plaintext into the stream: {text}"
+    );
+    assert!(
+        text.contains("[EMAIL_ADDRESS_"),
+        "gated tool destination did not keep the token: {text}"
+    );
+}
+
+// --- 1(b) Anthropic SSE InputJsonDelta, token split across a chunk boundary --
+#[tokio::test]
+async fn a4b_anthropic_stream_input_json_split_gated() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/messages", post(fake_anthropic_stream_tooluse_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let text = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .json(&serde_json::json!({
+            "model": "claude-test", "max_tokens": 10, "stream": true,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "write to bob@example.com"}
+            ]}]
+        }))
+        .send().await.unwrap().text().await.unwrap();
+    assert_stream_gated(&text);
+}
+
+// --- 1(d) OpenAI-chat streamed tool args ------------------------------------
+#[tokio::test]
+async fn a4b_openai_chat_stream_tool_args_gated() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/chat/completions", post(fake_openai_chat_stream_tool_args_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let text = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/chat/completions"))
+        .json(&serde_json::json!({
+            "model": "gpt-test", "stream": true,
+            "messages": [{"role": "user", "content": "write to bob@example.com"}]
+        }))
+        .send().await.unwrap().text().await.unwrap();
+    assert_stream_gated(&text);
+}
+
+// --- 1(f) Responses streamed function-call args -----------------------------
+#[tokio::test]
+async fn a4b_responses_stream_function_call_args_gated() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/responses", post(fake_responses_stream_function_args_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let text = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&serde_json::json!({
+            "model": "gpt-test", "stream": true,
+            "input": "write to bob@example.com"
+        }))
+        .send().await.unwrap().text().await.unwrap();
+    assert_stream_gated(&text);
+}
+
+// --- 2(b) Responses streamed UNMODELED event (ResponseStreamEvent::Other) ----
+#[tokio::test]
+async fn a4b_responses_stream_other_event_gated() {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .route("/v1/responses", post(fake_responses_stream_other_event_upstream))
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+
+    let text = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/responses"))
+        .json(&serde_json::json!({
+            "model": "gpt-test", "stream": true,
+            "input": "shell out bob@example.com"
+        }))
+        .send().await.unwrap().text().await.unwrap();
+    assert_stream_gated(&text);
+}
+
+// -- A5-server (GAP-CLOSURE G19): control-plane handlers bind THIS proxy's project ---
+// identity. Beyond the bearer admin key, a data-bearing control-plane call must ALSO
+// present this instance's `x-sordino-project` hash — closing the residual where a
+// caller holding a valid (port,key) pair resolved for the WRONG live instance (a
+// collided/recycled-port race) is accepted.
+
+#[tokio::test]
+async fn control_plane_requires_matching_project_header() {
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, "http://127.0.0.1:1".into(), "proj-key");
+    let proxy_addr = spawn(proxy_router(state)).await;
+    let client = reqwest::Client::new();
+    let url = format!("http://{proxy_addr}/sordino/monitor/snapshot");
+
+    // correct key + correct project -> 200 (a no-op for the honest same-project caller).
+    let ok = client
+        .get(&url)
+        .header("x-sordino-key", "proj-key")
+        .header("x-sordino-project", project_hdr(TEST_PROJECT_ROOT))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(ok.status(), StatusCode::OK, "correct key + correct project must pass");
+
+    // correct key + WRONG project -> 403 (the collided-instance case).
+    let wrong = client
+        .get(&url)
+        .header("x-sordino-key", "proj-key")
+        .header("x-sordino-project", "not-this-projects-hash")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        wrong.status(),
+        StatusCode::FORBIDDEN,
+        "correct key + WRONG project must 403"
+    );
+
+    // correct key + MISSING project -> 403 (the project header is required).
+    let missing = client
+        .get(&url)
+        .header("x-sordino-key", "proj-key")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        missing.status(),
+        StatusCode::FORBIDDEN,
+        "correct key + MISSING project must 403"
+    );
+}
+
+#[tokio::test]
+async fn sse_events_requires_project_on_query_fallback() {
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let state = mk_state(engine, "http://127.0.0.1:1".into(), "sse-key");
+    let proxy_addr = spawn(proxy_router(state)).await;
+    let client = reqwest::Client::new();
+    let proj = project_hdr(TEST_PROJECT_ROOT);
+
+    // valid key via query, but NO project query param -> 403 (project required on the
+    // EventSource query fallback too, not just the header path).
+    let no_proj = client
+        .get(format!("http://{proxy_addr}/sordino/monitor/events?key=sse-key"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        no_proj.status(),
+        StatusCode::FORBIDDEN,
+        "SSE must require the project on the query fallback"
+    );
+
+    // valid key + correct project via query -> 200.
+    let ok = client
+        .get(format!(
+            "http://{proxy_addr}/sordino/monitor/events?key=sse-key&project={proj}"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        ok.status(),
+        StatusCode::OK,
+        "SSE with correct key + correct project query must pass"
+    );
+}
+
+// ===========================================================================
+// wire-refusal F1 + F9 — registered-secret relay + header tripwire.
+//
+// F1: the verbatim relay (relay_verbatim -> relay_built) NEVER masks, so a
+// registered secret appearing in the body, path, OR query must refuse 409 with
+// ZERO bytes upstream. F9: an outbound request header carrying a registered
+// secret's EXACT value (exact-only tier, credential headers excluded by name)
+// must refuse 409 at BOTH send seams (relay_built AND send_upstream) without
+// mutating the HeaderMap. All zero-egress assertions use the fake_capture_any
+// fallback recorder + the `body.is_empty() && paths.is_empty()` invariant.
+// ===========================================================================
+
+/// The registered secret value the F1/F9 tests place in bodies/paths/headers.
+const F1F9_SECRET: &str = "sk-live-9f8e7d6c5b4a";
+/// The Tier-2 base64 needle for `F1F9_SECRET` (asserted by the engine's own
+/// `a0_4_base64_needles_contains_pinned` test) — used to build a base64-embedded
+/// positive without depending on a base64 crate in the test harness.
+const F1F9_SECRET_B64_NEEDLE: &str = "c2stbGl2ZS05ZjhlN2Q2YzViNG";
+
+/// A MaskEngine with `F1F9_SECRET` registered (Tier-1 exact + Tier-2 base64 needle).
+fn f1f9_engine_with_secret() -> MaskEngine {
+    let e = MaskEngine::new(EngineConfig::default()).unwrap();
+    e.set_secret_rules(vec![sordino_engine::SecretRule {
+        name: "wire_test_key".into(),
+        value: sordino_engine::SecretValue::new(F1F9_SECRET),
+        operator: sordino_engine::Operator::Hash,
+        case_sensitive: true,
+        apply_to_surfaces: None,
+    }])
+    .unwrap();
+    e
+}
+
+/// A MaskEngine with a 4-byte secret `abcd` registered — proves F1's Tier-1 exact
+/// scan has NO length floor (the floor is only for Tier-2 base64 needles).
+fn f1f9_engine_with_short_secret() -> MaskEngine {
+    let e = MaskEngine::new(EngineConfig::default()).unwrap();
+    e.set_secret_rules(vec![sordino_engine::SecretRule {
+        name: "short_key".into(),
+        value: sordino_engine::SecretValue::new("abcd"),
+        operator: sordino_engine::Operator::Hash,
+        case_sensitive: true,
+        apply_to_surfaces: None,
+    }])
+    .unwrap();
+    e
+}
+
+/// Spawn a fake upstream (fallback recorder) + the proxy over `engine`, returning
+/// (proxy_addr, capture) so a test can drive the proxy and assert on egress.
+async fn f1f9_setup(engine: MaskEngine) -> (SocketAddr, Captured) {
+    let cap = Captured::default();
+    let upstream = Router::new()
+        .fallback(fake_capture_any)
+        .with_state(cap.clone());
+    let up_addr = spawn(upstream).await;
+    let state = mk_state(engine, format!("http://{up_addr}"), "k");
+    let proxy_addr = spawn(proxy_router(state)).await;
+    (proxy_addr, cap)
+}
+
+fn zero_egress(cap: &Captured) -> bool {
+    cap.body.lock().unwrap().is_empty() && cap.paths.lock().unwrap().is_empty()
+}
+
+// --- F1 / A1.1: raw body secret -> 409, ZERO bytes + ZERO paths upstream. ----
+#[tokio::test]
+async fn f1_a1_1_raw_body_secret_refuses_409_zero_bytes() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/files"))
+        .body(format!("attach this token {F1F9_SECRET} to the upload"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(zero_egress(&cap), "F1 must egress ZERO bytes + ZERO paths on a body hit");
+}
+
+// --- F1 / A1.2: base64-embedded secret (Tier 2) -> 409. ----------------------
+#[tokio::test]
+async fn f1_a1_2_base64_embedded_secret_refuses_409() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/files"))
+        .body(format!("blob=PREFIX{F1F9_SECRET_B64_NEEDLE}SUFFIX"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT, "Tier-2 base64 needle must refuse");
+    assert!(zero_egress(&cap), "F1 Tier-2 must egress ZERO bytes");
+}
+
+// --- F1 / A1.3: secret in QUERY only -> 409, ZERO bytes. ---------------------
+#[tokio::test]
+async fn f1_a1_3_query_only_secret_refuses_409_zero_bytes() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    // c1 is NOT pinned; the secret rides only the query string of the egress superset.
+    let resp = reqwest::Client::new()
+        .get(format!("http://{proxy_addr}/sordino/session/c1/v1/files?token={F1F9_SECRET}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(zero_egress(&cap), "F1 must refuse a query-only secret with ZERO bytes");
+}
+
+// --- F1 / A1.4: 4 MB UTF-8-clean body, no secret -> relayed byte-identical. --
+#[tokio::test]
+async fn f1_a1_4_large_clean_utf8_body_relayed_byte_identical() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    let body = "A".repeat(4 * 1024 * 1024);
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/files"))
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "clean body must relay");
+    let recorded = cap.body.lock().unwrap().clone();
+    assert_eq!(recorded, body, "clean UTF-8 body must relay BYTE-IDENTICAL");
+    assert_eq!(
+        cap.paths.lock().unwrap().clone(),
+        vec!["/v1/files".to_string()],
+        "clean relay must reach the upstream /v1/files exactly once"
+    );
+}
+
+// --- F1 / A1.4b: 4 MB NON-UTF-8 body, no secret -> relayed (200, non-empty). -
+#[tokio::test]
+async fn f1_a1_4b_large_clean_binary_body_relayed() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    // 4 MB of 0xFF is invalid UTF-8 and contains no registered secret bytes.
+    let body = vec![0xFFu8; 4 * 1024 * 1024];
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/files"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "clean binary body must relay");
+    // from_utf8_lossy makes byte-identity unassertable; a non-empty record + the path proves egress.
+    assert!(!cap.body.lock().unwrap().is_empty(), "binary relay body must be recorded non-empty");
+    assert_eq!(cap.paths.lock().unwrap().clone(), vec!["/v1/files".to_string()]);
+}
+
+// --- F1 / A1.5: no secrets registered -> relayed untouched (short-circuit). --
+#[tokio::test]
+async fn f1_a1_5_no_secrets_registered_relayed_untouched() {
+    // Empty secret set: registered_secret_in_bytes short-circuits to false.
+    let engine = MaskEngine::new(EngineConfig::default()).unwrap();
+    let (proxy_addr, cap) = f1f9_setup(engine).await;
+    let body = format!("this body literally contains {F1F9_SECRET} but nothing is registered");
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/files"))
+        .body(body.clone())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::OK, "no secrets -> relayed");
+    assert_eq!(cap.body.lock().unwrap().clone(), body, "short-circuit relays untouched");
+}
+
+// --- F1 / A1.6: secret in a URL PATH segment -> 409, ZERO bytes + paths. -----
+#[tokio::test]
+async fn f1_a1_6_path_segment_secret_refuses_409_zero_bytes() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/sordino/session/c1/v1/files/{F1F9_SECRET}"))
+        .body("clean upload body")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(zero_egress(&cap), "F1 must refuse a path-segment secret with ZERO bytes + paths");
+}
+
+// --- F1 / A1.7: 4-byte secret in a 4 MB binary body -> 409 (no length floor). -
+#[tokio::test]
+async fn f1_a1_7_short_secret_in_binary_body_refuses_409() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_short_secret()).await;
+    let mut body = vec![0xFEu8; 4 * 1024 * 1024];
+    // Splice the exact 4-byte secret somewhere in the middle.
+    let at = 2 * 1024 * 1024;
+    body[at..at + 4].copy_from_slice(b"abcd");
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/files"))
+        .body(body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT, "Tier-1 exact has NO length floor");
+    assert!(zero_egress(&cap), "F1 must refuse the 4-byte-secret body with ZERO bytes");
+}
+
+// --- F1 / A1.8: secret only in the stripped session id -> 409 (over-refusal). -
+#[tokio::test]
+async fn f1_a1_8_secret_in_session_id_refuses_409() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    // Inner path + body are clean; the secret sits ONLY in the /sordino/session/<id>
+    // prefix, which path_q includes — an accepted over-refusal (L18-safe: refuse-only).
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/sordino/session/{F1F9_SECRET}/v1/files"))
+        .body("clean upload body")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(zero_egress(&cap), "F1 must refuse a secret-bearing session id with ZERO bytes");
+}
+
+// --- F9 / A2.1: relay_built header hit (x-custom) -> 409, ZERO bytes. --------
+#[tokio::test]
+async fn f9_a2_1_relay_built_custom_header_secret_refuses_409_zero_bytes() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/files"))
+        .header("x-custom", F1F9_SECRET)
+        .body("clean upload body")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    assert!(zero_egress(&cap), "F9 Seam-1 must refuse a header-value hit with ZERO bytes");
+}
+
+// --- F9 / A2.2: x-api-key = registered value -> RELAYED (release blocker). ----
+#[tokio::test]
+async fn f9_a2_2_x_api_key_registered_value_is_relayed_not_refused() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/files"))
+        .header("x-api-key", F1F9_SECRET)
+        .body("clean upload body")
+        .send()
+        .await
+        .unwrap();
+    // Normal mode forwards x-api-key verbatim (the user's own key); scanning it would self-refuse.
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "x-api-key is name-excluded and MUST relay, never 409 (release blocker)"
+    );
+    assert_eq!(cap.paths.lock().unwrap().clone(), vec!["/v1/files".to_string()]);
+}
+
+// --- F9 / A2.3: authorization: Bearer <registered value> -> RELAYED. ---------
+#[tokio::test]
+async fn f9_a2_3_authorization_registered_value_is_relayed_not_refused() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/files"))
+        .header("authorization", format!("Bearer {F1F9_SECRET}"))
+        .body("clean upload body")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "authorization is name-excluded and MUST relay, never 409"
+    );
+    assert_eq!(cap.paths.lock().unwrap().clone(), vec!["/v1/files".to_string()]);
+}
+
+// --- F9 / A2.4: base64-encoded secret in a header value -> RELAYED (exact-only). -
+#[tokio::test]
+async fn f9_a2_4_base64_header_value_is_relayed_exact_only() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    // The header tier is EXACT-ONLY (encoded-OFF): a Tier-2 base64 needle must NOT fire.
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/files"))
+        .header("x-custom", F1F9_SECRET_B64_NEEDLE)
+        .body("clean upload body")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "header scan is exact-only; a base64 needle must NOT refuse"
+    );
+    assert_eq!(cap.paths.lock().unwrap().clone(), vec!["/v1/files".to_string()]);
+}
+
+// --- F9 / A2.5: header hit refuses idempotently (no HeaderMap mutation). ------
+#[tokio::test]
+async fn f9_a2_5_header_hit_refuses_idempotently() {
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    let client = reqwest::Client::new();
+    // Two identical requests must both refuse identically — the scan only reads the
+    // HeaderMap, never mutates it, so a second pass sees the same value and refuses.
+    for _ in 0..2 {
+        let resp = client
+            .post(format!("http://{proxy_addr}/v1/files"))
+            .header("x-custom", F1F9_SECRET)
+            .body("clean upload body")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT);
+    }
+    assert!(zero_egress(&cap), "no send on either pass (idempotent refusal)");
+}
+
+// --- F9 / A2.6: registered secret S (distinct) in authorization -> RELAYED. ---
+#[tokio::test]
+async fn f9_a2_6_distinct_secret_in_authorization_is_relayed() {
+    // The registered secret is placed in authorization: Bearer <S>. Even though S is a
+    // registered secret, the header is excluded by NAME (not by matching a subscription
+    // key), so it relays — an accepted L9 residual.
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/files"))
+        .header("authorization", format!("Bearer {F1F9_SECRET}"))
+        .body("clean upload body")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        reqwest::StatusCode::OK,
+        "name-excluded authorization relays even carrying a registered secret"
+    );
+    assert_eq!(cap.paths.lock().unwrap().clone(), vec!["/v1/files".to_string()]);
+}
+
+// --- F9 / A2.7: send_upstream seam (POST /v1/messages) header hit -> 409. -----
+#[tokio::test]
+async fn f9_a2_7_send_upstream_seam_custom_header_secret_refuses_409_zero_bytes() {
+    // Second-seam falsifier: the masked-intake egress (send_upstream) must ALSO be gated,
+    // not just relay_built. Body is clean JSON (masks fine); the secret rides x-custom.
+    let (proxy_addr, cap) = f1f9_setup(f1f9_engine_with_secret()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("http://{proxy_addr}/v1/messages"))
+        .header("x-custom", F1F9_SECRET)
+        .json(&serde_json::json!({
+            "model": "claude-test", "max_tokens": 10,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), reqwest::StatusCode::CONFLICT, "send_upstream seam must be gated");
+    assert!(zero_egress(&cap), "F9 Seam-2 must egress ZERO bytes on a header hit");
 }

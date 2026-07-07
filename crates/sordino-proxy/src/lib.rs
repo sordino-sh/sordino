@@ -26,6 +26,7 @@ pub mod routes;
 pub mod secrets;
 pub mod sse;
 pub mod state;
+pub mod tripwire;
 pub mod walk;
 pub mod wire_adapter;
 pub mod zdr;

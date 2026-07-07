@@ -245,9 +245,10 @@ impl Category {
             // URL relies on presidio's strict `UrlRecognizer` (the default since
             // its strict-mode change), which drops scheme-less `file.ext`/`opts.la`
             // false positives while keeping real URLs (scheme / www. / path).
-            // DOMAIN stays OFF: its recognizer is still aggressive on filenames;
-            // re-enable per-deployment via `entity_operators` if wanted.
-            Category::Network => &["IP_ADDRESS", "URL", "MAC_ADDRESS"],
+            // DOMAIN is enabled here too, but the ingest juncture in `detect.rs`
+            // suppresses its bare-filename false positives (`is_filename_shaped_domain`)
+            // so `utils.py`/`README.md`/`opts.la` don't mask while real domains do.
+            Category::Network => &["IP_ADDRESS", "URL", "MAC_ADDRESS", "DOMAIN"],
             Category::Personal => &["PERSON", "LOCATION", "ORGANIZATION"],
         }
     }
@@ -361,6 +362,23 @@ impl AllowList {
             r"(?i)^(sonnet|opus|haiku)(\s+\d+(\.\d+)*)?$",
             r"(?i)^https?://(www\.)?claude\.ai(/\S*)?$",
             r"(?i)^https?://(www\.)?claude\.com(/\S*)?$",
+            // Standards / spec / license hosts whose bare URLs pervade config, schemas,
+            // XML namespaces, and license headers — never user PII, but a generic URL
+            // recognizer masks them under Network. Every entry is `^…$`-anchored to the
+            // WHOLE span (a bare substring would be an allow-list bypass): the host is
+            // anchored end-to-end, so `http://w3.org.attacker.com/` does NOT match. Safe
+            // to widen only because finish() now exempts the Secrets category from
+            // allow-span suppression — an embedded URL_CREDENTIAL still masks (see v11).
+            r"(?i)^https?://(www\.)?w3\.org(/\S*)?$",
+            r"(?i)^https?://(www\.)?schema\.org(/\S*)?$",
+            r"(?i)^https?://(www\.)?json-schema\.org(/\S*)?$",
+            r"(?i)^https?://(www\.)?purl\.org(/\S*)?$",
+            r"(?i)^https?://(www\.)?xmlns\.com(/\S*)?$",
+            r"(?i)^https?://(www\.)?apache\.org/licenses(/\S*)?$",
+            r"(?i)^https?://(www\.)?opengis\.net(/\S*)?$",
+            r"(?i)^https?://(www\.)?docbook\.org(/\S*)?$",
+            r"(?i)^https?://(www\.)?opensource\.org(/\S*)?$",
+            r"(?i)^https?://(www\.)?gnu\.org(/\S*)?$",
         ] {
             al.add_pattern(regex::Regex::new(p).expect("built-in allow-list pattern must compile"));
         }
@@ -563,6 +581,16 @@ pub struct MlConfig {
     /// Privacy: every un-cached leaf's raw text is sent to this endpoint.
     #[serde(default)]
     pub endpoint: Option<String>,
+    /// `backend = "http"` only: opt IN to a non-loopback ML `endpoint`. A `http`
+    /// endpoint whose host is NOT loopback (`127.0.0.1`/`::1`/`localhost`) is
+    /// REFUSED at backend construction unless this is `true`, because every
+    /// un-cached text leaf is POSTed to that endpoint PRE-masking — a raw-PII
+    /// egress the operator must acknowledge explicitly (threat model L17). A
+    /// self-hosted inference server on another host is a legitimate deployment, so
+    /// this is a config field (not an env var), but it defaults `false` (fail
+    /// closed): a loopback endpoint always loads; a remote one requires this flag.
+    #[serde(default)]
+    pub allow_remote_ml_endpoint: bool,
     /// `backend = "http"` only: env var name for the bearer token. The token
     /// itself never lives in config files.
     #[serde(default)]
@@ -814,6 +842,7 @@ impl Default for MlConfig {
             backend: MlBackend::Local,
             model: default_ml_model(),
             endpoint: None,
+            allow_remote_ml_endpoint: false,
             auth_token_env: None,
             http_timeout_secs: default_ml_http_timeout_secs(),
             sidecar_path: None,
@@ -879,6 +908,13 @@ impl MlConfig {
                     && self.endpoint == other.endpoint
                     && self.auth_token_env == other.auth_token_env
                     && self.http_timeout_secs == other.http_timeout_secs
+                    // `allow_remote_ml_endpoint` gates backend CONSTRUCTION (the
+                    // non-loopback refuse-check in `ml::http_config`), so flipping it
+                    // must force a reload that re-runs that gate — otherwise a
+                    // true->false live-reload reports "unchanged", never reloads, and
+                    // the already-loaded remote backend keeps receiving pre-mask
+                    // leaves (fail-open). Must move `compute_ml_fp` in lockstep.
+                    && self.allow_remote_ml_endpoint == other.allow_remote_ml_endpoint
             }
             MlBackend::Sidecar => {
                 // The burn child receives model/revision/banded-attention as argv
@@ -1150,11 +1186,10 @@ impl EngineConfig {
     /// Why the full Display set, not [`Category::canonical_entity_types`]: a key is a
     /// valid, functional `entity_operators` lever as long as it names a real canonical
     /// `EntityType` Display string, even if that type is deliberately in NO category.
-    /// Two such types are documented opt-in levers driven exactly through this map:
+    /// One such type is a documented opt-in lever driven exactly through this map:
     /// `DATE_TIME` (re-enabled per deployment via an explicit `entity_operators` entry
-    /// — proven by `date_time_unmapped_by_default_but_opt_in` in lib.rs) and `DOMAIN`
-    /// (re-enable per deployment if wanted). Validating against category membership
-    /// wrongly flagged both as unknown, 400-ing valid configs.
+    /// — proven by `date_time_unmapped_by_default_but_opt_in` in lib.rs). Validating
+    /// against category membership wrongly flagged it as unknown, 400-ing valid configs.
     ///
     /// Detection of typos vs aliases: resolve each key with
     /// [`presidio_core::EntityType::from_str`] (infallible — an unknown label becomes
@@ -1435,6 +1470,32 @@ mod tests {
         assert!(!al.is_allowed("jane.doe@anthropic.com"));
     }
 
+    // F7: anchored standards-host allow patterns admit bare spec/schema/license URLs
+    // but reject look-alike hosts that merely prefix the standards domain.
+    #[test]
+    fn common_words_allow_list_covers_standards_hosts() {
+        let al = AllowList::with_common_words();
+        for v in [
+            "http://www.w3.org/2000/svg",
+            "https://schema.org/Person",
+            "https://json-schema.org/draft/2020-12/schema",
+            "http://purl.org/dc/elements/1.1/",
+            "http://www.xmlns.com/foaf/0.1/",
+            "http://www.apache.org/licenses/LICENSE-2.0",
+            "http://www.opengis.net/gml",
+            "http://www.docbook.org/xml/5.0/",
+            "https://opensource.org/licenses/MIT",
+            "https://www.gnu.org/licenses/gpl-3.0.html",
+        ] {
+            assert!(al.is_allowed(v), "expected allowed: {v:?}");
+        }
+        // SECURITY — the `^…$` anchor: a host that merely PREFIXES the standards domain
+        // (registrable-suffix confusion) must NOT be allow-listed.
+        assert!(!al.is_allowed("http://w3.org.attacker.com/"));
+        assert!(!al.is_allowed("http://schema.org.evil.example/Person"));
+        assert!(!al.is_allowed("http://gnu.org.phish.test/"));
+    }
+
     #[test]
     fn authorized_model_allowlist_admits_default_only() {
         // The compiled default is on the allowlist; arbitrary repos are not. This is
@@ -1490,6 +1551,18 @@ mod tests {
         assert!(
             http.same_model_params(&http_local_knob_changed),
             "http identity should ignore local-only Candle knobs"
+        );
+
+        // `allow_remote_ml_endpoint` is http-backend identity: flipping it must count
+        // as a different recognizer, so a live true->false reload re-runs the
+        // construction-time non-loopback refuse-check (the fail-open guard).
+        let http_allow_flipped = MlConfig {
+            allow_remote_ml_endpoint: !http.allow_remote_ml_endpoint,
+            ..http.clone()
+        };
+        assert!(
+            !http.same_model_params(&http_allow_flipped),
+            "an allow_remote_ml_endpoint flip requires a new recognizer (re-run the refuse-check)"
         );
 
         let http_other_endpoint = MlConfig {
@@ -1821,11 +1894,11 @@ mod tests {
 
     #[test]
     fn entity_operators_opt_in_levers_not_flagged() {
-        // DATE_TIME and DOMAIN are real canonical `EntityType` Display names that are
-        // DELIBERATELY in NO category — they are the documented opt-in levers driven
-        // through `entity_operators`. They must NOT be flagged as unknown even though
-        // they appear in no `Category::entity_types()` list. (Validating against
-        // category membership instead of the full Display set was the bug.)
+        // Both are real canonical `EntityType` Display names that must NOT be flagged
+        // as unknown. `DATE_TIME` is DELIBERATELY in NO category (the documented opt-in
+        // lever driven through `entity_operators`); `DOMAIN` is now a `Network` member,
+        // but either way validation is against the full Display set — not category
+        // membership (validating against membership instead was the bug).
         let mut cfg = EngineConfig::default();
         cfg.entity_operators
             .insert("DATE_TIME".into(), Operator::Redact);

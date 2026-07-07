@@ -69,7 +69,7 @@ fn code_constructs_pass_through_at_balanced() {
 #[test]
 fn real_secrets_and_pii_still_mask_at_balanced() {
     let e = engine();
-    let cases: [(&str, &str); 7] = [
+    let cases: [(&str, &str); 8] = [
         ("aws key AKIAIOSFODNN7EXAMPLE rotate it", "AKIAIOSFODNN7EXAMPLE"),
         (
             "jwt eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N here",
@@ -84,10 +84,15 @@ fn real_secrets_and_pii_still_mask_at_balanced() {
         ("card 4111111111111111 charged", "4111111111111111"),
         ("iban GB82WEST12345698765432 transfer", "GB82WEST12345698765432"),
         ("call https://h/p?token=letmein-opaque now", "letmein-opaque"),
-        // NOTE: a full multi-line PEM PRIVATE KEY block is deliberately NOT asserted
-        // here — at Balanced only the `-----BEGIN … KEY-----` marker masks (as API_KEY)
-        // while the base64 body relies on the entropy catch-all; private-key *block*
-        // recall is a separate, pre-existing concern out of scope for this corpus.
+        // A full multi-line PEM PRIVATE KEY block now masks ENTIRELY (marker lines +
+        // base64 body) via the upstream whole-block PrivateKeyRecognizer → native
+        // PRIVATE_KEY (Secrets, always-on); the body no longer leaks past the marker.
+        (
+            "-----BEGIN PRIVATE KEY-----\n\
+             MIIBVwIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA\n\
+             -----END PRIVATE KEY-----",
+            "MIIBVwIBADANBgkqhkiG9w0BAQEFAASCAT8wggE7AgEAAkEA",
+        ),
     ];
     for (t, secret) in cases {
         let out = mask(&e, t);
@@ -97,7 +102,7 @@ fn real_secrets_and_pii_still_mask_at_balanced() {
 
 /// KNOWN PRECISION GAPS — characterization of CURRENT Balanced behavior that is not
 /// ideal, kept VISIBLE/tracked rather than silently omitted (ship-gate chunk-3 finding).
-/// All but PEM are over-masking FALSE POSITIVES: safe-but-confusing (tokens resolve on
+/// These are all over-masking FALSE POSITIVES: safe-but-confusing (tokens resolve on
 /// the wire, so correctness holds; the cost is model-context noise). When a gap is fixed
 /// the relevant assertion flips and this test must be updated.
 #[test]
@@ -131,13 +136,11 @@ fn known_precision_gaps_current_behavior() {
     );
 }
 
-/// KNOWN RECALL GAP (PEM): a full PRIVATE KEY block should mask entirely, but at Balanced
-/// only the `-----BEGIN … KEY-----` marker masks while the base64 body relies on the
-/// entropy catch-all (which misses short/structured bodies). Ignored so it does not fail
-/// CI; un-ignore when private-key *block* recall lands. Tracked outside the precision
-/// corpus per the chunk-3 review.
+/// PEM private-key block recall (CLOSED): a full PRIVATE KEY block masks entirely at the
+/// Balanced default. The upstream whole-block `PrivateKeyRecognizer` (presidio-analyzer)
+/// emits native `PRIVATE_KEY` (Category::Secrets, always-on) over the BEGIN..END armor, so
+/// the base64 body masks with the marker lines instead of relying on the entropy catch-all.
 #[test]
-#[ignore = "known gap: PEM private-key block body not fully masked at Balanced"]
 fn pem_private_key_block_fully_masks() {
     let e = engine();
     let pem = "-----BEGIN PRIVATE KEY-----\n\
@@ -171,4 +174,79 @@ fn declared_codename_masks_while_path_passes() {
     let out = mask(&e, "deploy PROJECT-NEPTUNE from ./src/main.rs");
     assert!(!out.contains("PROJECT-NEPTUNE"), "codename not masked: {out}");
     assert!(out.contains("./src/main.rs"), "path masked alongside codename: {out}");
+}
+
+/// JWK private-member recall (F10 consumption gate): the upstream `JwkRecognizer`
+/// (presidio-analyzer, native PRIVATE_KEY, Category::Secrets/always-on) reaches the full
+/// sordino engine via `default_analyzer` and masks the *value* of a JWK's private `d`
+/// member while public members (`n`, `kty`) and every key survive. The value-only emission
+/// (no mask schema) means the masked JSON still parses — that L18/no-mask-schema survival is
+/// the falsifier: if masking widened to a carve-out over the whole object, parsing would break.
+#[test]
+fn jwk_private_member_value_masks_and_json_survives() {
+    let e = engine();
+    let jwk = r#"{"kty":"RSA","d":"AbCdEf01","n":"00ff"}"#;
+    let masked = mask(&e, jwk);
+    assert!(!masked.contains("AbCdEf01"), "JWK private `d` value should mask: {masked}");
+    assert!(masked.contains(r#""n":"00ff""#), "public `n` member should survive: {masked}");
+    assert!(masked.contains(r#""kty":"RSA""#), "public `kty` member should survive: {masked}");
+    serde_json::from_str::<serde_json::Value>(&masked)
+        .unwrap_or_else(|e| panic!("masked JWK must still parse as JSON ({e}): {masked}"));
+}
+
+/// .netrc password recall (F10 consumption gate): the upstream `NetrcRecognizer`
+/// (presidio-analyzer, URL_CREDENTIAL, Category::Secrets/always-on) reaches the sordino engine
+/// and masks only the value following the `password` keyword; the keyword itself survives.
+/// (No assertion on the host/login — those may mask via other built-ins.)
+#[test]
+fn netrc_password_value_masks() {
+    let e = engine();
+    let netrc = "machine api.example.com login bob password s3cr3tvalue";
+    let masked = mask(&e, netrc);
+    assert!(!masked.contains("s3cr3tvalue"), ".netrc password value should mask: {masked}");
+    assert!(masked.contains("password"), "`password` keyword should survive: {masked}");
+}
+
+/// AWS credentials recall (F10 consumption gate): the upstream `AwsCredentialsRecognizer`
+/// (presidio-analyzer, AWS_SECRET_KEY, Category::Secrets/always-on) reaches the full sordino
+/// engine via `default_analyzer` and masks both `aws_secret_access_key` and `aws_session_token`
+/// values while the `[default]` stanza header survives.
+///
+/// `aws_session_token` has NO built-in API_KEY fallback, so its verbatim survival would prove the
+/// recognizer never registered/reached the engine — that is the LOAD-BEARING falsifier. It also
+/// carries the value-only-emission proof: its key name survives intact (`aws_session_token = <tok>`
+/// → `aws_session_token = [MASK]`), so only the secret bytes redact.
+///
+/// NOTE on `aws_secret_access_key`: unlike the session token, its VALUE is caught by BOTH the AWS
+/// recognizer (value-only) AND the built-in generic API_KEY context recognizer, which anchors on
+/// the literal word `key` and emits the wider overlapping span `key = <value>`. That wider span
+/// wins overlap resolution and consumes the trailing `key` of the key name — an artifact of the
+/// built-in API_KEY recognizer (the API_KEY↔AWS interaction the atomic flags out-of-scope), NOT
+/// of the AWS recognizer over-masking. So the full `aws_secret_access_key` literal does NOT
+/// survive; the surviving prefix `aws_secret_access` is asserted instead. Value absence (the
+/// sordino consumption gate) holds regardless.
+#[test]
+fn aws_credentials_values_mask() {
+    let e = engine();
+    let aws = "[default]\n\
+               aws_secret_access_key = wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n\
+               aws_session_token = FQoGZ3JlZ2lvbg==";
+    let masked = mask(&e, aws);
+    assert!(
+        !masked.contains("FQoGZ3JlZ2lvbg=="),
+        "aws_session_token value should mask (load-bearing): {masked}"
+    );
+    assert!(
+        !masked.contains("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"),
+        "aws_secret_access_key value should mask: {masked}"
+    );
+    assert!(
+        masked.contains("aws_session_token"),
+        "`aws_session_token` key should survive (value-only emission): {masked}"
+    );
+    assert!(
+        masked.contains("aws_secret_access"),
+        "`aws_secret_access` key prefix should survive (only the value + API_KEY-context `key` mask): {masked}"
+    );
+    assert!(masked.contains("[default]"), "`[default]` stanza header should survive: {masked}");
 }

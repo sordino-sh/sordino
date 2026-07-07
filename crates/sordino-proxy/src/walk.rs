@@ -16,6 +16,8 @@ use anthropic_wire::{
 use serde_json::{Map, Value};
 use sordino_engine::{EngineError, MaskEngine, MaskStats, Surface, UnmaskManifest};
 
+use crate::tripwire;
+
 // ---------------------------------------------------------------------------
 // Request — mask
 // ---------------------------------------------------------------------------
@@ -189,7 +191,7 @@ impl MaskWalker<'_> {
                 SystemContent::Blocks(blocks) => {
                     for b in blocks.iter_mut() {
                         self.str(&mut b.text, Surface::SystemPrompt)?;
-                        warn_unknown_map(&b.extra, "system block");
+                        check_unknown_map(self.engine, &b.extra, "system block")?;
                     }
                 }
                 _ => {}
@@ -200,15 +202,31 @@ impl MaskWalker<'_> {
             for block in msg.content.iter_mut() {
                 self.block(block, &role)?;
             }
-            warn_unknown_map(&msg.extra, "message");
+            check_unknown_map(self.engine, &msg.extra, "message")?;
         }
         if let Some(tools) = req.tools.as_mut() {
             for tool in tools.iter_mut() {
                 self.str(&mut tool.description, Surface::SystemPrompt)?;
                 // input_schema is left verbatim: masking schema constraints could
-                // break the model's tool-call validation.
-                warn_unknown_map(&tool.extra, "tool");
+                // break the model's tool-call validation. But a registered secret's
+                // EXACT value appearing here would forward in plaintext — DETECT and
+                // refuse (A2b) rather than mask (the no-mask-schema invariant holds).
+                if let Some(name) = tripwire::scan_value(self.engine, &tool.input_schema, 0) {
+                    return Err(EngineError::RegisteredSecretInCarveOut(name));
+                }
+                check_unknown_map(self.engine, &tool.extra, "tool")?;
             }
+        }
+        // `output_config` (structured-output format / effort) is a TYPED never-rewritten
+        // contract field: the walker masks none of it, and being typed it never reaches the
+        // fallback `value_safe` contract-key leg. A registered secret's exact value in the
+        // schema (e.g. `output_config.format.schema`) would forward in plaintext → DETECT and
+        // refuse (A2b), mirroring the `tool.input_schema` scan above. Scan-only: never rewritten.
+        if let Some(oc) = req.output_config.as_ref()
+            && let Ok(v) = serde_json::to_value(oc)
+            && let Some(name) = tripwire::scan_value(self.engine, &v, 0)
+        {
+            return Err(EngineError::RegisteredSecretInCarveOut(name));
         }
         // `metadata.user_id` is API-protocol TELEMETRY, not natural-language content:
         // Anthropic populates it (Claude Code sets it to an opaque account/session
@@ -236,7 +254,7 @@ impl MaskWalker<'_> {
         if let Some(ctx) = req.context_management.as_mut() {
             self.context_management(ctx)?;
         }
-        warn_unknown_map(&req.extra, "request");
+        check_unknown_map(self.engine, &req.extra, "request")?;
         Ok(())
     }
 
@@ -390,6 +408,13 @@ impl MaskWalker<'_> {
                     } else if k == "tools" {
                         self.tools_value_safe(val)?;
                     } else if preserves_contract_key(k) {
+                        // Never-rewritten contract subtree (schema/json_schema/signature/
+                        // data/…): still not masked, but a registered secret's exact value
+                        // hiding here would forward in plaintext — DETECT and refuse (A2b).
+                        // NOT the `is_base64 && k=="data"` leg above (L18 binary carve-out).
+                        if let Some(name) = tripwire::scan_value(self.engine, val, 0) {
+                            return Err(EngineError::RegisteredSecretInCarveOut(name));
+                        }
                         continue;
                     } else {
                         self.value_safe(val, surface)?;
@@ -419,8 +444,23 @@ impl MaskWalker<'_> {
                 for (k, val) in o.iter_mut() {
                     match k.as_str() {
                         "description" => self.value_safe(val, Surface::SystemPrompt)?,
-                        "input_schema" | "cache_control" | "name" | "type" => {}
-                        _ if preserves_contract_key(k) => {}
+                        // input_schema gets its OWN arm ABOVE the preserves_contract_key
+                        // guard: the guard also matches "input_schema", so a scan added
+                        // only there would NEVER run for it (this arm consumes it first).
+                        // Left verbatim (never masked) but DETECT-and-refuse on a hit (A2b).
+                        "input_schema" => {
+                            if let Some(name) = tripwire::scan_value(self.engine, val, 0) {
+                                return Err(EngineError::RegisteredSecretInCarveOut(name));
+                            }
+                        }
+                        "cache_control" | "name" | "type" => {}
+                        _ if preserves_contract_key(k) => {
+                            // Other never-rewritten contract keys (schema/json_schema/
+                            // signature/…) reaching a tool via the fallback walk: scan too.
+                            if let Some(name) = tripwire::scan_value(self.engine, val, 0) {
+                                return Err(EngineError::RegisteredSecretInCarveOut(name));
+                            }
+                        }
                         _ => self.value_safe(val, Surface::SystemPrompt)?,
                     }
                 }
@@ -461,9 +501,17 @@ fn is_context_management_protocol_key(key: &str) -> bool {
     )
 }
 
-fn warn_unknown_map(m: &Map<String, Value>, location: &'static str) {
+/// An unknown-field `extra` flatten sink is preserved verbatim (never masked). Warn (as
+/// before) AND scan it for a registered secret's exact value — a hit here would forward in
+/// plaintext, so refuse (A2b) rather than pass it through. DETECT-only: the map is never
+/// rewritten.
+fn check_unknown_map(
+    engine: &MaskEngine,
+    m: &Map<String, Value>,
+    location: &'static str,
+) -> Result<(), EngineError> {
     if m.is_empty() {
-        return;
+        return Ok(());
     }
     let keys = m.keys().map(String::as_str).collect::<Vec<_>>().join(",");
     tracing::warn!(
@@ -471,6 +519,10 @@ fn warn_unknown_map(m: &Map<String, Value>, location: &'static str) {
         keys = %keys,
         "preserving unknown Anthropic request fields without masking"
     );
+    if let Some(name) = tripwire::scan_map(engine, m) {
+        return Err(EngineError::RegisteredSecretInCarveOut(name));
+    }
+    Ok(())
 }
 
 fn surface_for_role(role: &str) -> Surface {
@@ -505,9 +557,11 @@ fn unmask_block(engine: &MaskEngine, manifest: &UnmaskManifest, block: &mut ApiC
         // Assistant prose → display: the ONLY place the reveal marker decorates, so
         // the operator can see which spans were un-masked.
         ApiContentBlock::Text { text, .. } => unmask_str_assistant(engine, manifest, text),
-        // Tool input is consumed verbatim by a tool (could be written to a file): no
-        // decoration, ever. Same for compaction (machine context that is re-sent).
-        ApiContentBlock::ToolUse { input, .. } => unmask_value(engine, manifest, input),
+        // Tool input is a GENUINE tool-execution destination (could be written to a file /
+        // executed on): route it through the tool-egress gate so a detected-PII token stays a
+        // verbatim TOKEN instead of resolving to plaintext the tool would act on (A4b). Same
+        // token in the assistant Text block above STILL resolves — the gate is destination-scoped.
+        ApiContentBlock::ToolUse { input, .. } => unmask_value_tool_input(engine, manifest, input),
         ApiContentBlock::Compaction { content, .. } => unmask_str(engine, manifest, content),
         // Opaque: leave thinking/redacted tokenized so signatures stay valid.
         _ => {}
@@ -556,6 +610,55 @@ fn unmask_map(engine: &MaskEngine, manifest: &UnmaskManifest, m: &mut Map<String
     }
 }
 
+// ---------------------------------------------------------------------------
+// Tool-egress gate variants (A4b, GAP-CLOSURE L6)
+// ---------------------------------------------------------------------------
+//
+// Sibling helpers of `unmask_str` / `unmask_value` / `unmask_map` that route a leaf
+// through [`MaskEngine::unmask_tool_input`] instead of [`MaskEngine::unmask`], so a
+// detected-PII / custom-literal token bound for a GENUINE tool-execution destination is
+// left MASKED (verbatim token) rather than resolved to plaintext a tool would act on.
+// Called ONLY from genuine tool-execution destinations (ToolUse.input, tool_calls
+// arguments, function_call arguments, the Responses `Other` fallthroughs, function_call
+// `extra`, and streaming equivalents). Display / compaction / echo paths keep the plain
+// `unmask*` variants above.
+
+/// Unmask a single string in place through the tool-egress gate (no decoration).
+pub fn unmask_str_tool_input(engine: &MaskEngine, manifest: &UnmaskManifest, text: &mut String) {
+    if let Ok(out) = engine.unmask_tool_input(text, manifest) {
+        *text = out;
+    }
+}
+
+/// Recursively unmask every string leaf of `v` through the tool-egress gate.
+pub fn unmask_value_tool_input(engine: &MaskEngine, manifest: &UnmaskManifest, v: &mut Value) {
+    match v {
+        Value::String(s) => {
+            if let Ok(out) = engine.unmask_tool_input(s, manifest) {
+                *s = out;
+            }
+        }
+        Value::Array(a) => a
+            .iter_mut()
+            .for_each(|i| unmask_value_tool_input(engine, manifest, i)),
+        Value::Object(o) => o
+            .values_mut()
+            .for_each(|v| unmask_value_tool_input(engine, manifest, v)),
+        _ => {}
+    }
+}
+
+/// Unmask every value of a map through the tool-egress gate (e.g. `FunctionCall.extra`).
+pub fn unmask_map_tool_input(
+    engine: &MaskEngine,
+    manifest: &UnmaskManifest,
+    m: &mut Map<String, Value>,
+) {
+    for (_k, val) in m.iter_mut() {
+        unmask_value_tool_input(engine, manifest, val);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,8 +689,9 @@ mod tests {
         MaskEngine::new(cfg).unwrap()
     }
 
-    // The reveal marker decorates the assistant `text` block but MUST leave a
-    // `tool_use` input untouched (it may be written verbatim into a file/tool).
+    // The reveal marker decorates the assistant `text` block; a `tool_use` input now routes
+    // through the tool-egress gate (A4b), so a detected-PII token there stays a verbatim TOKEN
+    // (never resolved, never decorated) — the file would otherwise get the real value.
     #[test]
     fn reveal_marker_decorates_text_block_not_tool_input() {
         let e = engine_marked();
@@ -620,11 +724,11 @@ mod tests {
             v["content"][0]["text"].as_str().unwrap(),
             "I'll write to «bob@example.com» now"
         );
-        // Tool input: un-masked but NOT decorated — the file would otherwise get the
-        // marker bytes baked in.
+        // Tool input: GATED — the detected-PII token stays verbatim (never resolves to the
+        // real email a tool would write to disk / act on), never decorated.
         assert_eq!(
             v["content"][1]["input"]["contents"].as_str().unwrap(),
-            "addr=bob@example.com"
+            format!("addr={token}")
         );
     }
 

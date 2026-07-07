@@ -298,6 +298,28 @@ fn http_config(cfg: &MlConfig) -> Result<HttpConfig, EngineError> {
             "[engine.ml] endpoint must be http:// or https://, got '{endpoint}'"
         )));
     }
+    // Refuse a NON-LOOPBACK endpoint unless the operator opted in explicitly: the
+    // http backend POSTs every un-cached text leaf here BEFORE masking (threat
+    // model L17), so a remote host is a raw-PII egress that must be acknowledged.
+    // `is_loopback_bind` handles bare IPv4/IPv6, bracketed `[::1]`, `localhost`, and
+    // IPv4-mapped forms; an unparseable host errs safe (treated non-loopback →
+    // refused). Loopback (127.0.0.1 / ::1 / localhost) always loads.
+    let host = base_url.host_str().unwrap_or_default();
+    let is_loopback = sordino_state::is_loopback_bind(host);
+    if !is_loopback && !cfg.allow_remote_ml_endpoint {
+        return Err(EngineError::Ml(format!(
+            "[engine.ml] endpoint '{endpoint}' resolves to a non-loopback host ('{host}'); \
+             every un-cached text leaf is POSTed there BEFORE masking (threat model L17). \
+             Set `allow_remote_ml_endpoint = true` under [engine.ml] to opt in explicitly."
+        )));
+    }
+    if !is_loopback {
+        tracing::warn!(
+            endpoint = %endpoint,
+            "Sordino: ML http backend pointed at a NON-LOOPBACK endpoint via explicit \
+             allow_remote_ml_endpoint=true — every un-cached text leaf is sent there pre-masking"
+        );
+    }
     // Resolve the bearer token from the named env var at load time and wrap it
     // in a `SecretString` (zeroized, never Debug-printed). The token never lives
     // in config files; a named-but-empty var fails closed.
@@ -322,8 +344,11 @@ fn http_config(cfg: &MlConfig) -> Result<HttpConfig, EngineError> {
         auth,
         call_timeout: std::time::Duration::from_secs(cfg.http_timeout_secs.max(1)),
         retry: RetryPolicy::default(),
-        // Remote by definition; we make no localhost-trust claim here.
-        require_local: false,
+        // Honest labeling of what we just verified: loopback endpoints are local,
+        // non-loopback ones (reached only via `allow_remote_ml_endpoint = true`) are
+        // not. Upstream's `require_local` is cosmetic (no enforcement consumers in
+        // presidio-rs); the real gate is the non-loopback refuse-check above.
+        require_local: is_loopback,
     })
 }
 
@@ -843,6 +868,51 @@ mod http_tests {
         assert!(
             rec.analyze("private text with sarah@example.com").is_err(),
             "an unreachable endpoint must be Err, never an empty Ok"
+        );
+    }
+
+    /// GAP-CLOSURE A6 (threat model L17): a NON-LOOPBACK http endpoint is refused
+    /// at config translation (backend construction) unless `allow_remote_ml_endpoint
+    /// = true` — because the http backend POSTs every un-cached leaf there PRE-mask.
+    /// Loopback endpoints load byte-identically to before (and are labeled local).
+    #[test]
+    fn non_loopback_endpoint_refused_unless_opted_in() {
+        // Every loopback form loads unchanged and is honestly labeled `require_local`.
+        for ep in [
+            "http://127.0.0.1:8787",
+            "http://localhost:9000",
+            "http://[::1]:8787",
+        ] {
+            let hc = http_config(&cfg_for(ep))
+                .unwrap_or_else(|e| panic!("loopback endpoint {ep} must load: {e}"));
+            assert!(
+                hc.require_local,
+                "loopback endpoint {ep} must be labeled require_local"
+            );
+        }
+
+        // A non-loopback endpoint with the flag UNSET is refused, naming the opt-in.
+        let remote = cfg_for("https://inference.example.com/classify");
+        let err = http_config(&remote)
+            .expect_err("a non-loopback endpoint must be refused without the opt-in");
+        let msg = err.to_string();
+        assert!(msg.contains("non-loopback"), "got: {msg}");
+        assert!(
+            msg.contains("allow_remote_ml_endpoint = true"),
+            "the refusal must name the opt-in flag, got: {msg}"
+        );
+
+        // The SAME endpoint with the opt-in loads (the tracing warn fires on this
+        // path) and is honestly labeled NON-local.
+        let allowed = MlConfig {
+            allow_remote_ml_endpoint: true,
+            ..remote
+        };
+        let hc = http_config(&allowed)
+            .expect("a non-loopback endpoint must load with allow_remote_ml_endpoint = true");
+        assert!(
+            !hc.require_local,
+            "a remote endpoint must NOT be labeled require_local"
         );
     }
 

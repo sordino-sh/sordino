@@ -70,14 +70,6 @@ fn split_safe(buf: &str) -> (&str, &str) {
 // Per-stream transform
 // ---------------------------------------------------------------------------
 
-/// Whether an unmasked delta is decorated with the reveal marker. Only assistant
-/// prose (`text_delta`) is `Reveal`; tool-input/compaction deltas are `Plain`.
-#[derive(Clone, Copy)]
-enum Wrap {
-    Reveal,
-    Plain,
-}
-
 /// The delta kind of a content block, remembered per block index so a HELD partial-token
 /// tail is flushed (at `ContentBlockStop` / stream drain) as the block's TRUE kind — not
 /// blindly as a `text_delta`. Without this, a held tool-args / compaction tail was
@@ -91,15 +83,6 @@ enum HeldKind {
 }
 
 impl HeldKind {
-    /// Reveal-marker policy for the SAFE (resolvable) prefix of this block: assistant
-    /// prose is decorated; machine context (compaction / tool input) is left plain.
-    fn wrap(self) -> Wrap {
-        match self {
-            HeldKind::Text => Wrap::Reveal,
-            HeldKind::Compaction | HeldKind::InputJson => Wrap::Plain,
-        }
-    }
-
     /// Rebuild a [`ContentBlockDelta`] of this kind around `text`.
     fn delta(self, text: String) -> ContentBlockDelta {
         match self {
@@ -141,10 +124,17 @@ impl SseUnmasker {
                 if let Some(held) = self.carry.remove(&index)
                     && !held.is_empty()
                 {
-                    let flushed = engine.unmask(&held, manifest).unwrap_or(held);
+                    // Resolve the block's TRUE kind BEFORE unmasking, so a held tool-input
+                    // tail routes through the tool-egress gate (A4b) instead of resolving to
+                    // plaintext a tool would act on; text / compaction tails resolve as before.
+                    let kind = self.held_kind.get(&index).copied().unwrap_or(HeldKind::Text);
+                    let flushed = match kind {
+                        HeldKind::InputJson => engine.unmask_tool_input(&held, manifest),
+                        _ => engine.unmask(&held, manifest),
+                    }
+                    .unwrap_or(held);
                     if !flushed.is_empty() {
                         // Flush as the block's TRUE kind, not blindly as text.
-                        let kind = self.held_kind.get(&index).copied().unwrap_or(HeldKind::Text);
                         out.push(StreamEvent::ContentBlockDelta {
                             index,
                             delta: kind.delta(flushed),
@@ -217,12 +207,15 @@ impl SseUnmasker {
             std::mem::take(c)
         };
         let (safe, held) = split_safe(&buf);
-        // Only the `safe` prefix is unmasked here; `held` is at most one INCOMPLETE
-        // token tail (never a resolvable token), so the reveal marker only ever needs
-        // to apply on this path — the stop/drain flushes below stay plain.
-        let emitted = match kind.wrap() {
-            Wrap::Reveal => engine.unmask_assistant(safe, manifest),
-            Wrap::Plain => engine.unmask(safe, manifest),
+        // Only the `safe` prefix is unmasked here; `held` is at most one INCOMPLETE token
+        // tail (never a resolvable token), so the reveal marker only ever needs to apply on
+        // this path — the stop/drain flushes below stay plain. Dispatch directly on kind:
+        // assistant prose is revealed (+marker); compaction resolves plain; tool input routes
+        // through the tool-egress gate so a detected-PII token stays a TOKEN (A4b).
+        let emitted = match kind {
+            HeldKind::Text => engine.unmask_assistant(safe, manifest),
+            HeldKind::Compaction => engine.unmask(safe, manifest),
+            HeldKind::InputJson => engine.unmask_tool_input(safe, manifest),
         }
         .unwrap_or_else(|_| safe.to_string());
         self.carry.insert(index, held.to_string());
@@ -346,10 +339,15 @@ pub fn unmask_sse_body(
                 }
                 None => {
                     for (index, kind, held) in st.xform.drain() {
-                        let flushed = st
-                            .engine
-                            .unmask(&held, st.manifest.as_ref())
-                            .unwrap_or(held);
+                        // Kind-aware: a held tool-input tail routes through the tool-egress
+                        // gate (A4b); text / compaction tails resolve as before.
+                        let flushed = match kind {
+                            HeldKind::InputJson => {
+                                st.engine.unmask_tool_input(&held, st.manifest.as_ref())
+                            }
+                            _ => st.engine.unmask(&held, st.manifest.as_ref()),
+                        }
+                        .unwrap_or(held);
                         if !flushed.is_empty() {
                             // Re-emit the held tail as its TRUE kind and capture through the
                             // same classifier as the streaming path (compaction → not

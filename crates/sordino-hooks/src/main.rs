@@ -27,6 +27,8 @@
 
 use std::io::Read;
 use std::net::TcpListener;
+use std::collections::HashSet;
+use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -122,6 +124,10 @@ enum Cmd {
     Secrets {
         #[command(subcommand)]
         action: Option<SecretsAction>,
+        /// Emit a machine-readable JSON posture projection instead of the human view.
+        /// Read-only: reshapes the already-fetched proxy snapshot; never mutates.
+        #[arg(long)]
+        json: bool,
     },
     /// Redact burned plaintext values from a Claude Code transcript JSONL file.
     Scrub {
@@ -232,6 +238,10 @@ enum Cmd {
     Zdr {
         #[command(subcommand)]
         action: Option<ZdrAction>,
+        /// Emit a machine-readable JSON posture projection instead of the human view.
+        /// Read-only: never engages/disengages ZDR — reshapes the status snapshot only.
+        #[arg(long)]
+        json: bool,
     },
     /// Turn Sordino masking OFF (backs `/sordino:disable`). Default: THIS conversation
     /// only (session-scoped, in-memory — lifts on the next Claude Code restart).
@@ -347,6 +357,16 @@ enum SecretsAction {
     Status,
     /// List each registered secret: name, operator, scheme, resolved — never values.
     List,
+    /// Read-only, value-free scan of this project's `.env` files for candidate secrets
+    /// that are not yet registered. Needs no live proxy; prints only KEY names + paths.
+    Scan,
+    /// Interactive, per-value opt-in import of `.env` keys into `sordino.toml` as
+    /// `[[secrets]]` REFERENCE stanzas. Never auto-registers; prompts for every value.
+    Import {
+        /// Limit the import to a single `.env` file (default: all `.env`/`.env.*`).
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -481,8 +501,8 @@ fn main() -> Result<()> {
         Cmd::PreToolUse => pre_tool_use(),
         Cmd::Reveal { token } => reveal(token),
         Cmd::Monitor => monitor_cmd(),
-        Cmd::Secrets { action } => secrets_cmd(action),
-        Cmd::Zdr { action } => zdr_cmd(action),
+        Cmd::Secrets { action, json } => secrets_cmd(action, json),
+        Cmd::Zdr { action, json } => zdr_cmd(action, json),
         Cmd::Disable { project } => disable_cmd(project),
         Cmd::Scrub {
             transcript,
@@ -1907,6 +1927,7 @@ fn a8_routed_recently(port: u16, root: &str, raw_session_id: &str) -> Option<boo
         ))
         .timeout(timeout)
         .header("x-sordino-key", &rec.admin_key)
+        .header("x-sordino-project", sordino_state::project_key(root))
         .send()
         .ok()
         .filter(|r| r.status().is_success())?;
@@ -4262,6 +4283,7 @@ fn doctor(json: bool) -> Result<()> {
         probe_project_proxy(&root),
         probe_windows_excluded_range(),
         probe_no_bare_or_safe_mode_env(),
+        probe_transcript_exposure(&root),
     ];
     let any_fail = probes.iter().any(|p| p.status == ProbeStatus::Fail);
 
@@ -4312,7 +4334,11 @@ fn doctor(json: bool) -> Result<()> {
 /// to surface (masking is on, but this session bypasses it and sends UNMASKED).
 fn verify(json: bool) -> Result<()> {
     let root = canonical(&project_root());
-    let legs = vec![verify_engine_masks(&root), verify_session_routed(&root)];
+    let legs = vec![
+        verify_engine_masks(&root),
+        verify_session_routed(&root),
+        verify_category_coverage(&root),
+    ];
     let any_fail = legs.iter().any(|p| p.status == ProbeStatus::Fail);
     if json {
         let arr: Vec<Value> = legs
@@ -4373,6 +4399,7 @@ fn verify_engine_masks(root: &str) -> Probe {
     let resp = blocking_client()
         .post(format!("http://127.0.0.1:{port}/sordino/diag/mask"))
         .header("x-sordino-key", &key)
+        .header("x-sordino-project", sordino_state::project_key(root))
         .json(&json!({ "text": format!("contact {canary} please") }))
         .send();
     match resp {
@@ -4441,6 +4468,79 @@ fn verify_session_routed(root: &str) -> Probe {
             ProbeStatus::Fail,
             detail,
             Some("restart Claude Code once to apply the route (written but not live this session), or /sordino:enable"),
+        )
+    }
+}
+
+/// Verify disclosure leg F3 (report-only, ALWAYS Info): make it LEGIBLE that a green
+/// `verify` still passes whole categories through untouched. Under the Balanced default
+/// both Network and Personal are OFF, so their entity classes are sent in clear — this
+/// leg names them at preflight. It reads config only (the LIVE snapshot if the proxy is
+/// reachable, else the config FILES — see `effective_categories`), opens no extra
+/// connection, and mutates nothing. It is never a Pass/Fail and it does NOT close the
+/// gap; it only surfaces it.
+fn verify_category_coverage(root: &str) -> Probe {
+    let name = "category coverage (report-only)";
+    let effective = effective_categories(
+        live_identity(root),
+        &sordino_state::project_key(root),
+        root,
+    );
+    probe(
+        name,
+        ProbeStatus::Info,
+        category_coverage_detail(&effective),
+        None,
+    )
+}
+
+/// Pure copy for [`verify_category_coverage`]: given the EFFECTIVE enabled-category
+/// name set (snake_case), name every category that is OFF and what it lets through in
+/// clear. Diffs against `sordino_engine::Category::ALL`; the per-category clause is an
+/// EXHAUSTIVE (compiler-enforced) 6-arm match, so a new category can't silently ship
+/// without a sentence. If every category is on, says so. This describes the
+/// pass-through — it does NOT read as if it closes it.
+fn category_coverage_detail(effective: &[String]) -> String {
+    let on: std::collections::HashSet<&str> = effective.iter().map(String::as_str).collect();
+    let mut clauses: Vec<String> = Vec::new();
+    for c in sordino_engine::Category::ALL {
+        let cat_name = serde_json::to_value(c)
+            .ok()
+            .and_then(|j| j.as_str().map(str::to_string))
+            .unwrap_or_default();
+        if on.contains(cat_name.as_str()) {
+            continue;
+        }
+        // Exhaustive over all 6 variants: a new Category variant fails to compile until
+        // it gets an honest pass-through sentence here.
+        let sentence = match c {
+            sordino_engine::Category::Secrets => {
+                "API keys/tokens/private keys sent in clear"
+            }
+            sordino_engine::Category::Financial => {
+                "card/IBAN/financial numbers sent in clear"
+            }
+            sordino_engine::Category::Identity => {
+                "SSNs and other identity numbers sent in clear"
+            }
+            sordino_engine::Category::Contact => {
+                "emails/phone numbers sent in clear"
+            }
+            sordino_engine::Category::Network => {
+                "bare URLs/IPs/MACs sent in clear (a real secret in a URL is still caught via Secrets/URL_CREDENTIAL)"
+            }
+            sordino_engine::Category::Personal => {
+                "names/locations need the ML model and are not masked"
+            }
+        };
+        clauses.push(format!("{cat_name} OFF — {sentence}"));
+    }
+    if clauses.is_empty() {
+        "all categories on".to_string()
+    } else {
+        format!(
+            "a green verify still passes whole categories through untouched: {}",
+            clauses.join("; ")
         )
     }
 }
@@ -4693,6 +4793,117 @@ fn probe_no_bare_or_safe_mode_env() -> Probe {
     }
 }
 
+/// Doctor disclosure leg F11 (report-only, ALWAYS Info): report the COUNT and
+/// approximate total SIZE of THIS project's local session transcripts — plaintext the
+/// harness persists locally (threat-model L5). Discovery reads a single `cwd` line per
+/// candidate dir via `first_cwd_in_jsonl` to match exactly one dir to `root`; the sizing
+/// path ([`transcript_exposure_detail`]) then uses `read_dir` + `metadata().len()` ONLY
+/// and opens NO `*.jsonl` content. It echoes NO transcript value and writes/rewrites
+/// NO harness file. It makes L5 discoverable; it does NOT close it (transcript retention
+/// is the harness's own lever, outside Sordino's control). Because doctor's human table
+/// prints `remediation` only for Fail|Warn probes, an Info probe's remediation is dropped
+/// from human output — so the scrub pointer lives in the DETAIL to stay discoverable.
+fn probe_transcript_exposure(root: &str) -> Probe {
+    let name = "local session transcripts (report-only)";
+    // Narrow the `discover_session_cwds` walk to THIS project: find the single
+    // projects/<encoded> dir whose first session log's `cwd` canonicalizes to `root`.
+    let project_dir = claude_config_dir()
+        .map(|d| d.join("projects"))
+        .and_then(|projects| {
+            let entries = std::fs::read_dir(&projects).ok()?;
+            for sub in entries.filter_map(|e| e.ok()).map(|e| e.path()) {
+                if !sub.is_dir() {
+                    continue;
+                }
+                let Ok(files) = std::fs::read_dir(&sub) else {
+                    continue;
+                };
+                // One session log with a cwd identifies the dir — every log in it shares one.
+                for f in files.filter_map(|e| e.ok()).map(|e| e.path()) {
+                    if f.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+                        continue;
+                    }
+                    // Only a log that actually yields a `cwd` identifies the dir — a
+                    // leading cwd-less log (e.g. summary-only) must NOT short-circuit
+                    // it, matching the `discover_session_cwds` walk (breaks on Some only).
+                    let Some(cwd) = first_cwd_in_jsonl(&f) else {
+                        continue;
+                    };
+                    if canonical(Path::new(&cwd)) == root {
+                        return Some(sub);
+                    }
+                    break;
+                }
+            }
+            None
+        });
+
+    let (present, count, bytes) = match &project_dir {
+        Some(dir) => transcript_exposure_detail(dir),
+        None => (false, 0, 0),
+    };
+
+    if !present {
+        return probe(
+            name,
+            ProbeStatus::Info,
+            "no transcripts found for this project".to_string(),
+            None,
+        );
+    }
+
+    let detail = format!(
+        "the harness keeps {count} plaintext session transcript(s) for this project on local \
+         disk (~{} total, stored UNMASKED — Sordino masks the API wire, not what the harness \
+         persists here); to burn a leaked value out of one, run `sordino scrub --transcript \
+         <file> --value <burned-value>`; the harness's own transcript-retention settings are the \
+         other lever, outside Sordino's control",
+        approx_size(bytes),
+    );
+    probe(
+        name,
+        ProbeStatus::Info,
+        detail,
+        Some("sordino scrub --transcript <file> --value <burned-value>"),
+    )
+}
+
+/// Pure logic for [`probe_transcript_exposure`]: given a project's Claude Code session-log
+/// DIR, report `(present, count, total_bytes)` for its `*.jsonl` transcripts using
+/// `read_dir` + `metadata().len()` ONLY — it opens NO file content. An absent/unreadable
+/// dir, or one with no `*.jsonl`, yields `(false, 0, 0)`.
+fn transcript_exposure_detail(dir: &Path) -> (bool, usize, u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (false, 0, 0);
+    };
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    for f in entries.filter_map(|e| e.ok()).map(|e| e.path()) {
+        if f.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+            continue;
+        }
+        // metadata().len() reads the directory entry's size — never the file's content.
+        if let Ok(meta) = std::fs::metadata(&f) {
+            count += 1;
+            bytes += meta.len();
+        }
+    }
+    (count > 0, count, bytes)
+}
+
+/// Coarse human-readable byte size for the report-only transcript-exposure detail.
+fn approx_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 // ---------------------------------------------------------------------------
 // scrub
 // ---------------------------------------------------------------------------
@@ -4777,6 +4988,15 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
     let conversation = conversation_id_from_hook_payload(&stdin);
 
     let root = canonical(&project_root());
+
+    // L10 mitigation: warn (stderr, every session, both routed and unrouted paths) if Claude Code's
+    // own OTel content-logging is live — it exports UNMASKED tool/prompt content on a channel this
+    // proxy does not sit on. Fires here, before the routed/unrouted split, so it never depends on
+    // our route. stderr only: never route dynamic env-derived text through the model-context channel.
+    if let Some(w) = otel_content_flag_warning(|k| std::env::var(k).ok()) {
+        eprintln!("{w}");
+    }
+
     // Is THIS session routed through OUR proxy? The SessionStart hook fires in every project
     // (the plugin is installed globally), but we only act where Claude Code has applied our
     // route to the live session — at which point this hook subprocess inherits it. The route
@@ -5172,6 +5392,49 @@ fn intake_should_block_verified(
 /// be flipped off by a `=0` a user meant as "keep it on".
 fn is_truthy_flag(v: &str) -> bool {
     matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on")
+}
+
+/// Detect Claude Code's OTel content-logging env vars and, if any are live, return a human-facing
+/// warning string (stderr, push-based, every SessionStart). This mitigates threat-model limitation
+/// L10: Claude Code's OWN OTel pipeline can export UNMASKED tool/prompt content on a channel the
+/// masking proxy does not sit on — Sordino cannot see or mask it.
+///
+/// Verified against the live-running Claude Code binary this session; re-verify these names on a
+/// major CC version bump (see the threat model's L10 — an upstream-owned surface). The master gate
+/// `CLAUDE_CODE_ENABLE_TELEMETRY` is REQUIRED: with it off, CC constructs no exporter, so a lone
+/// content flag exports nothing and this must stay silent. `OTEL_LOG_RAW_API_BODIES` is NOT
+/// boolean-only: a value starting with `file:` also enables it (raw bodies to disk) and is
+/// recognized here. NOTE residual tunable: `CLAUDE_CODE_ENHANCED_TELEMETRY_BETA` is deliberately
+/// NOT required as a third gate (unconfirmed which content flags it further restricts; over-warning
+/// is strictly safer than silent under-detection).
+fn otel_content_flag_warning(lookup: impl Fn(&str) -> Option<String>) -> Option<String> {
+    let truthy = |v: &str| is_truthy_flag(v);
+    if !lookup("CLAUDE_CODE_ENABLE_TELEMETRY").is_some_and(|v| truthy(&v)) {
+        return None;
+    }
+    let mut flagged: Vec<&str> = Vec::new();
+    for name in ["OTEL_LOG_TOOL_DETAILS", "OTEL_LOG_TOOL_CONTENT", "OTEL_LOG_USER_PROMPTS"] {
+        if lookup(name).is_some_and(|v| truthy(&v)) {
+            flagged.push(name);
+        }
+    }
+    if let Some(v) = lookup("OTEL_LOG_RAW_API_BODIES")
+        && (v.starts_with("file:") || truthy(&v))
+    {
+        flagged.push("OTEL_LOG_RAW_API_BODIES");
+    }
+    if flagged.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "Sordino: Claude Code telemetry content flag(s) are ENABLED in this environment \
+         ({}) with CLAUDE_CODE_ENABLE_TELEMETRY on — these export UNMASKED tool/prompt \
+         content (including PII Sordino restores on the display path) through Claude \
+         Code's own OTel pipeline, a channel Sordino does not sit on and cannot mask \
+         (threat model L10). Unset them, or point your OTel collector at infrastructure \
+         you trust with the same content this proxy protects.",
+        flagged.join(", ")
+    ))
 }
 
 /// Is this submitted prompt an invocation of a Sordino control-plane command (pure — for
@@ -5620,6 +5883,7 @@ fn routed_proxy_status(routed_port: u16, root: &str) -> (MaskState, String) {
         .get(format!("http://127.0.0.1:{routed_port}/sordino/config"))
         .timeout(remaining())
         .header("x-sordino-key", &rec.admin_key)
+        .header("x-sordino-project", sordino_state::project_key(root))
         .send()
     {
         Ok(r) if r.status().is_success() => {
@@ -6284,7 +6548,7 @@ fn render_segment(port: Option<u16>, root: &str, mode: SlMode) -> String {
     let Some((_, key)) = live_identity(root).filter(|(lp, _)| *lp == port) else {
         return unverified(port, mode);
     };
-    match admin_get(port, &key) {
+    match admin_get(port, &key, &sordino_state::project_key(root)) {
         Ok(snap) => match serde_json::from_value::<Snapshot>(snap) {
             Ok(s) if s.enabled => render_on(&s, port, mode),
             Ok(_) => match mode {
@@ -6591,30 +6855,43 @@ fn kill_group(child: &mut std::process::Child) {
 
 fn config_cmd(action: Option<ConfigAction>) -> Result<()> {
     let root = canonical(&project_root());
-    // Best-effort live port. The mutating `--scope project|user|local` actions PERSIST to the
-    // config file even when the proxy is DOWN (the apply_* helpers degrade to "applies on the
-    // next session" — they gate every live admin call on key_for(root)), so they must NOT
-    // hard-require a live proxy. When the proxy is up the real port flows through; when down,
-    // `0` is a sentinel that never reaches a live admin call. Only `Show` and `--scope session`
-    // genuinely need a live proxy, and they surface the resolver's error themselves.
-    let port = resolve_live_port(&root).unwrap_or(0);
+    // Resolve this project's live (port, admin_key) identity EXACTLY ONCE per invocation — a single
+    // nonce-verified `live_identity` round-trip — and thread that one triple (port, key, project)
+    // into every helper below, so no helper ever re-resolves. This closes a TOCTOU: the old chain
+    // re-ran `resolve_live_port` / `key_for` independently across the helpers, so two round-trips
+    // could land on DIFFERENT live instances after a proxy restart / recycled-port race.
+    // `ident == None` means no live, verified proxy: the mutating `--scope project|user|local`
+    // actions STILL persist to the config file ("applies on the next session"); only `Show` and
+    // `--scope session` need a live proxy and surface a hard error themselves. `project` (the
+    // canonical-root identity hash) rides on every control-plane request as `x-sordino-project`,
+    // so a (port,key) resolved against the WRONG instance is rejected once the server binding lands.
+    let ident = live_identity(&root);
+    let project = sordino_state::project_key(&root);
 
     match action.unwrap_or(ConfigAction::Show) {
         ConfigAction::Show => {
-            let port = resolve_live_port(&root)?;
-            let snap = live_snapshot(port, &root)
+            let port = ident.as_ref().map(|(p, _)| *p).unwrap_or(0);
+            let snap = live_snapshot(ident, &project)
                 .context("could not reach this project's proxy (is a `claude` session running?)")?;
             print_status(&snap, port)?;
         }
-        ConfigAction::On { scope } => apply_enabled(port, &root, scope, true)?,
-        ConfigAction::Off { scope } => apply_enabled(port, &root, scope, false)?,
-        ConfigAction::Profile { name, scope } => apply_profile(port, &root, scope, name.into())?,
-        ConfigAction::Category { name, state, scope } => {
-            apply_category(port, &root, scope, &name, matches!(state, OnOff::On))?
+        ConfigAction::On { scope } => apply_enabled(ident, &project, &root, scope, true)?,
+        ConfigAction::Off { scope } => apply_enabled(ident, &project, &root, scope, false)?,
+        ConfigAction::Profile { name, scope } => {
+            apply_profile(ident, &project, &root, scope, name.into())?
         }
-        ConfigAction::Threshold { value, scope } => apply_threshold(port, &root, scope, value)?,
-        ConfigAction::Entity { name, op, scope } => apply_entity(port, &root, scope, &name, &op)?,
-        ConfigAction::Ml { action } => ml_cmd(port, &root, action.unwrap_or(MlAction::Status))?,
+        ConfigAction::Category { name, state, scope } => {
+            apply_category(ident, &project, &root, scope, &name, matches!(state, OnOff::On))?
+        }
+        ConfigAction::Threshold { value, scope } => {
+            apply_threshold(ident, &project, &root, scope, value)?
+        }
+        ConfigAction::Entity { name, op, scope } => {
+            apply_entity(ident, &project, &root, scope, &name, &op)?
+        }
+        ConfigAction::Ml { action } => {
+            ml_cmd(ident, &project, &root, action.unwrap_or(MlAction::Status))?
+        }
     }
     Ok(())
 }
@@ -6623,29 +6900,37 @@ fn config_cmd(action: Option<ConfigAction>) -> Result<()> {
 // config ml (/sordino:privacy model …)
 // ---------------------------------------------------------------------------
 
-fn ml_cmd(port: u16, root: &str, action: MlAction) -> Result<()> {
+fn ml_cmd(ident: Option<(u16, String)>, project: &str, root: &str, action: MlAction) -> Result<()> {
     match action {
         MlAction::Status => {
-            let snap = live_snapshot(port, root)
+            let port = ident.as_ref().map(|(p, _)| *p).unwrap_or(0);
+            let snap = live_snapshot(ident, project)
                 .context("could not reach this project's proxy (is a `claude` session running?)")?;
             print_ml_line(&parse_snapshot(&snap)?, port);
             Ok(())
         }
-        MlAction::On { model, scope } => apply_ml(port, root, scope, true, model),
-        MlAction::Off { scope } => apply_ml(port, root, scope, false, None),
+        MlAction::On { model, scope } => apply_ml(ident, project, root, scope, true, model),
+        MlAction::Off { scope } => apply_ml(ident, project, root, scope, false, None),
     }
 }
 
 /// Turn the ML recognizer on/off. Session scope hits the dedicated control
 /// endpoint (live, not persisted); file scopes persist `[engine.ml]` then apply
 /// live (a `reload` first so a model change is picked up, then the toggle).
-fn apply_ml(port: u16, root: &str, scope: Scope, on: bool, model: Option<String>) -> Result<()> {
+fn apply_ml(
+    ident: Option<(u16, String)>,
+    project: &str,
+    root: &str,
+    scope: Scope,
+    on: bool,
+    model: Option<String>,
+) -> Result<()> {
     let endpoint = if on { "ml/enable" } else { "ml/disable" };
 
     if scope == Scope::Session {
-        let key =
-            key_for(root).context("proxy not running; use --scope project/user to persist")?;
-        let snap = admin_post(port, &key, endpoint)?;
+        let (port, key) =
+            ident.context("proxy not running; use --scope project/user to persist")?;
+        let snap = admin_post(port, &key, endpoint, project)?;
         print_ml_applied(&snap, port, "session", on);
         return Ok(());
     }
@@ -6658,16 +6943,17 @@ fn apply_ml(port: u16, root: &str, scope: Scope, on: bool, model: Option<String>
     })?;
 
     let path = scope_path(scope, root);
-    let applied = match key_for(root) {
-        Ok(key) => {
+    let port = ident.as_ref().map(|(p, _)| *p).unwrap_or(0);
+    let applied = match &ident {
+        Some((p, key)) => {
             // For ON, reload first so a `--model` change in the file is loaded into
             // the live config before we flip the toggle (which starts the load).
             if on {
-                let _ = admin_post(port, &key, "reload");
+                let _ = admin_post(*p, key, "reload", project);
             }
-            admin_post(port, &key, endpoint).ok()
+            admin_post(*p, key, endpoint, project).ok()
         }
-        Err(_) => None,
+        None => None,
     };
     match applied {
         Some(snap) => print_ml_applied(&snap, port, scope_label(scope), on),
@@ -6770,11 +7056,17 @@ fn print_ml_line(s: &Snapshot, port: u16) {
     }
 }
 
-fn apply_enabled(port: u16, root: &str, scope: Scope, on: bool) -> Result<()> {
+fn apply_enabled(
+    ident: Option<(u16, String)>,
+    project: &str,
+    root: &str,
+    scope: Scope,
+    on: bool,
+) -> Result<()> {
     if scope == Scope::Session {
-        let key =
-            key_for(root).context("proxy not running; use --scope project/user to persist")?;
-        let snap = admin_post(port, &key, if on { "enable" } else { "disable" })?;
+        let (port, key) =
+            ident.context("proxy not running; use --scope project/user to persist")?;
+        let snap = admin_post(port, &key, if on { "enable" } else { "disable" }, project)?;
         // "On means on": turning masking back on for this session ALSO clears any
         // per-conversation disable (`/sordino:disable`), so masking is reliably active here
         // regardless of which switch turned it off. Best-effort — the master enable already
@@ -6787,6 +7079,7 @@ fn apply_enabled(port: u16, root: &str, scope: Scope, on: bool) -> Result<()> {
             let _ = blocking_client()
                 .delete(&url)
                 .header("x-sordino-key", &key)
+                .header("x-sordino-project", project)
                 .send();
         }
         print_applied(&snap, port, "session")?;
@@ -6795,27 +7088,33 @@ fn apply_enabled(port: u16, root: &str, scope: Scope, on: bool) -> Result<()> {
     edit_scope_file(scope, root, |doc| {
         doc["engine"]["enabled"] = toml_edit::value(on);
     })?;
-    finish_file_scope(port, scope, root, if on { "enable" } else { "disable" })
+    finish_file_scope(ident, project, scope, root, if on { "enable" } else { "disable" })
 }
 
-fn apply_threshold(port: u16, root: &str, scope: Scope, value: f32) -> Result<()> {
+fn apply_threshold(
+    ident: Option<(u16, String)>,
+    project: &str,
+    root: &str,
+    scope: Scope,
+    value: f32,
+) -> Result<()> {
     anyhow::ensure!(
         (0.0..=1.0).contains(&value),
         "threshold must be in 0.0..=1.0"
     );
     if scope == Scope::Session {
-        let key =
-            key_for(root).context("proxy not running; use --scope project/user to persist")?;
-        let mut cfg = admin_get(port, &key)?;
+        let (port, key) =
+            ident.context("proxy not running; use --scope project/user to persist")?;
+        let mut cfg = admin_get(port, &key, project)?;
         cfg["config"]["score_threshold"] = json!(value);
-        let snap = admin_put(port, &key, &cfg["config"])?;
+        let snap = admin_put(port, &key, &cfg["config"], project)?;
         print_applied(&snap, port, "session")?;
         return Ok(());
     }
     edit_scope_file(scope, root, |doc| {
         doc["engine"]["score_threshold"] = toml_edit::value(f32_to_toml(value));
     })?;
-    finish_file_scope(port, scope, root, "reload")
+    finish_file_scope(ident, project, scope, root, "reload")
 }
 
 /// Widen an `f32` to `f64` via its shortest decimal form, so a value like `0.3`
@@ -6831,17 +7130,23 @@ fn f32_to_toml(v: f32) -> f64 {
 /// does the CLI fall back to writing the scope file itself (so a profile can still
 /// be persisted offline); the field shape it writes matches the proxy's
 /// `persist_profile`, both deriving from `EngineConfig::for_profile`.
-fn apply_profile(port: u16, root: &str, scope: Scope, profile: Profile) -> Result<()> {
+fn apply_profile(
+    ident: Option<(u16, String)>,
+    project: &str,
+    root: &str,
+    scope: Scope,
+    profile: Profile,
+) -> Result<()> {
     let profile_id = serde_json::to_value(profile)?
         .as_str()
         .map(str::to_string)
         .unwrap_or_else(|| "balanced".to_string());
 
     // Proxy up: the endpoint is the single source of truth for apply + persist.
-    if let Ok(key) = key_for(root) {
+    if let Some((port, key)) = ident.as_ref() {
         let path = format!("profile/{profile_id}?scope={}", scope_label(scope));
-        let snap = admin_post(port, &key, &path)?;
-        print_applied(&snap, port, scope_label(scope))?;
+        let snap = admin_post(*port, key, &path, project)?;
+        print_applied(&snap, *port, scope_label(scope))?;
         if scope != Scope::Session {
             println!(
                 "persisted to {} ({} scope).",
@@ -6880,13 +7185,20 @@ fn apply_profile(port: u16, root: &str, scope: Scope, profile: Profile) -> Resul
     Ok(())
 }
 
-fn apply_category(port: u16, root: &str, scope: Scope, name: &str, on: bool) -> Result<()> {
+fn apply_category(
+    ident: Option<(u16, String)>,
+    project: &str,
+    root: &str,
+    scope: Scope,
+    name: &str,
+    on: bool,
+) -> Result<()> {
     let name = name.to_lowercase();
     validate_category(&name)?;
 
     // Base the toggle on the effective set (live proxy, else the config files —
     // never the balanced default, which would clobber a custom persisted set).
-    let mut cats = effective_categories(port, root);
+    let mut cats = effective_categories(ident.clone(), project, root);
     if on {
         if !cats.contains(&name) {
             cats.push(name.clone());
@@ -6898,18 +7210,18 @@ fn apply_category(port: u16, root: &str, scope: Scope, name: &str, on: bool) -> 
     cats.dedup();
 
     if scope == Scope::Session {
-        let key =
-            key_for(root).context("proxy not running; use --scope project/user to persist")?;
-        let mut cfg = admin_get(port, &key)?;
+        let (port, key) =
+            ident.context("proxy not running; use --scope project/user to persist")?;
+        let mut cfg = admin_get(port, &key, project)?;
         cfg["config"]["enabled_categories"] = json!(cats);
-        let snap = admin_put(port, &key, &cfg["config"])?;
+        let snap = admin_put(port, &key, &cfg["config"], project)?;
         print_applied(&snap, port, "session")?;
         return Ok(());
     }
     edit_scope_file(scope, root, |doc| {
         doc["engine"]["enabled_categories"] = toml_edit::value(str_array(&cats));
     })?;
-    finish_file_scope(port, scope, root, "reload")
+    finish_file_scope(ident, project, scope, root, "reload")
 }
 
 /// Per-entity operator override (`config entity <TYPE> <op>`) — the finer-grained
@@ -6917,7 +7229,14 @@ fn apply_category(port: u16, root: &str, scope: Scope, name: &str, on: bool) -> 
 /// type (`entity_enabled` is true for any keyed type) and sets how it masks — so
 /// `on`/`off` work regardless of the type's category (e.g. enable URL masking without
 /// turning the whole Network category on). `clear` removes an override (file scope only).
-fn apply_entity(port: u16, root: &str, scope: Scope, name: &str, op: &str) -> Result<()> {
+fn apply_entity(
+    ident: Option<(u16, String)>,
+    project: &str,
+    root: &str,
+    scope: Scope,
+    name: &str,
+    op: &str,
+) -> Result<()> {
     let (name, builtin) = resolve_entity_type(name);
     if !builtin {
         // Not a typo we can prove here — could be a declared `[[custom_replacements]]`
@@ -6930,7 +7249,7 @@ fn apply_entity(port: u16, root: &str, scope: Scope, name: &str, op: &str) -> Re
     }
 
     if op.eq_ignore_ascii_case("clear") {
-        return clear_entity(port, root, scope, &name);
+        return clear_entity(ident, project, root, scope, &name);
     }
 
     let (op_json, op_toml) = entity_operator_value(op)?;
@@ -6948,27 +7267,33 @@ fn apply_entity(port: u16, root: &str, scope: Scope, name: &str, op: &str) -> Re
     }
 
     if scope == Scope::Session {
-        let key =
-            key_for(root).context("proxy not running; use --scope project/user to persist")?;
+        let (port, key) =
+            ident.context("proxy not running; use --scope project/user to persist")?;
         // Minimal MERGE patch (not the whole fetched config): the control-plane PUT
         // recurses into `entity_operators`, so this overlays exactly the one key —
         // race-safe (a concurrent edit to another key isn't clobbered by stale GET data)
         // and the proxy validates this delta's key (rejecting a typo).
         let patch = json!({ "entity_operators": { name.clone(): op_json } });
-        let snap = admin_put(port, &key, &patch)?;
+        let snap = admin_put(port, &key, &patch, project)?;
         print_applied(&snap, port, "session")?;
         return Ok(());
     }
     edit_scope_file(scope, root, move |doc| {
         doc["engine"]["entity_operators"][name.as_str()] = toml_edit::value(op_toml);
     })?;
-    finish_file_scope(port, scope, root, "reload")
+    finish_file_scope(ident, project, scope, root, "reload")
 }
 
 /// Remove a per-entity override. Only meaningful at a FILE scope: the live session merge
 /// is additive (it cannot delete a key), and a `reload` would reset ALL session state,
 /// so a session-only override is cleared by reload/restart, not surgically here.
-fn clear_entity(port: u16, root: &str, scope: Scope, name: &str) -> Result<()> {
+fn clear_entity(
+    ident: Option<(u16, String)>,
+    project: &str,
+    root: &str,
+    scope: Scope,
+    name: &str,
+) -> Result<()> {
     if scope == Scope::Session {
         bail!(
             "clearing an override needs a file scope (--scope project/user/local); the live session merge cannot remove a key (a session-only override is dropped on the next reload/restart)"
@@ -6980,7 +7305,7 @@ fn clear_entity(port: u16, root: &str, scope: Scope, name: &str) -> Result<()> {
             tbl.remove(&name);
         }
     })?;
-    finish_file_scope(port, scope, root, "reload")
+    finish_file_scope(ident, project, scope, root, "reload")
 }
 
 /// Resolve a user-supplied entity type to its stored form + whether it is a recognized
@@ -7038,14 +7363,23 @@ fn entity_operator_value(op: &str) -> Result<(Value, toml_edit::InlineTable)> {
 /// report where it was persisted. Most edits use `"reload"` (re-read the files);
 /// the master switch uses `"enable"`/`"disable"` because `reload` deliberately
 /// preserves the live switch (so an unrelated edit can't flip masking — review F3).
-fn finish_file_scope(port: u16, scope: Scope, root: &str, action: &str) -> Result<()> {
+fn finish_file_scope(
+    ident: Option<(u16, String)>,
+    project: &str,
+    scope: Scope,
+    root: &str,
+    action: &str,
+) -> Result<()> {
     let path = scope_path(scope, root);
-    let applied = match key_for(root).and_then(|k| admin_post(port, &k, action)) {
-        Ok(snap) => {
-            print_applied(&snap, port, scope_label(scope))?;
-            true
-        }
-        Err(_) => false,
+    let applied = match &ident {
+        Some((port, key)) => match admin_post(*port, key, action, project) {
+            Ok(snap) => {
+                print_applied(&snap, *port, scope_label(scope))?;
+                true
+            }
+            Err(_) => false,
+        },
+        None => false,
     };
     if !applied {
         println!(
@@ -7061,6 +7395,42 @@ fn finish_file_scope(port: u16, scope: Scope, root: &str, action: &str) -> Resul
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod a5_binding_tests {
+    use super::{finish_file_scope, Scope};
+
+    // A5b: the project-identity hash threaded onto every control-plane request is derived from
+    // the canonical root by a PURE hash — no IO, and stable for a fixed root across calls (so the
+    // header the client sends matches the value the server-side binding will compute for the same
+    // instance). Different roots hash to different keys.
+    #[test]
+    fn project_key_is_pure_and_deterministic() {
+        let root = "/home/user/projects/alpha";
+        let a = sordino_state::project_key(root);
+        let b = sordino_state::project_key(root);
+        assert_eq!(a, b, "project_key must be deterministic for a fixed root");
+        assert!(!a.is_empty(), "project_key must produce a non-empty hash");
+        let other = sordino_state::project_key("/home/user/projects/beta");
+        assert_ne!(a, other, "distinct roots must hash to distinct project keys");
+    }
+
+    // A5a degrade-gracefully: with NO live proxy (`ident == None`), a file-scope apply STILL
+    // succeeds — `finish_file_scope` performs no control-plane call, reports "applies on the next
+    // session", and returns Ok(()) rather than erroring. This is the tolerance the config CLI must
+    // preserve after the single-`live_identity`-resolve refactor: a proxy being down never blocks
+    // persisting a project/user/local policy change.
+    #[test]
+    fn file_scope_persist_succeeds_with_no_live_proxy() {
+        for scope in [Scope::Project, Scope::User, Scope::Local] {
+            let out = finish_file_scope(None, "deadbeef", scope, "/tmp/sordino-a5-fixture", "reload");
+            assert!(
+                out.is_ok(),
+                "finish_file_scope must degrade gracefully (Ok) when ident is None for {scope:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7174,6 +7544,7 @@ fn reveal(token: String) -> Result<()> {
     let resp = blocking_client()
         .get(&url)
         .header("x-sordino-key", &key)
+        .header("x-sordino-project", sordino_state::project_key(&root))
         .send()
         .context("calling proxy reveal endpoint")?;
     if resp.status().is_success() {
@@ -7196,7 +7567,8 @@ fn monitor_cmd() -> Result<()> {
     let root = canonical(&project_root());
     let (port, key) = live_identity(&root)
         .context("could not reach this project's proxy — is a `claude` session running here?")?;
-    println!("http://127.0.0.1:{port}/sordino/ui?key={key}");
+    let project = sordino_state::project_key(&root);
+    println!("http://127.0.0.1:{port}/sordino/ui?key={key}&project={project}");
     Ok(())
 }
 
@@ -7282,7 +7654,7 @@ mod prompt_spoof_tests {
 /// Backs `/sordino:zdr`. Targets THIS session's conversation — the SessionStart hook
 /// baked the id into `ANTHROPIC_BASE_URL` as `.../sordino/session/<id>`, which this
 /// process inherits, so the CLI keys the same id the proxy sees on the wire.
-fn zdr_cmd(action: Option<ZdrAction>) -> Result<()> {
+fn zdr_cmd(action: Option<ZdrAction>, json: bool) -> Result<()> {
     let root = canonical(&project_root());
     let (port, key) = live_identity(&root)
         .context("could not reach this project's proxy — is a `claude` session running here?")?;
@@ -7295,13 +7667,40 @@ fn zdr_cmd(action: Option<ZdrAction>) -> Result<()> {
         percent_encode(&conv)
     );
     let client = blocking_client();
+    let project = sordino_state::project_key(&root);
+    // Read-only JSON posture projection. Same GET as the Status arm (fail-closed on
+    // unreachable proxy / non-routable session); short-circuits AHEAD of the human path
+    // and the action match, so On/Off's POST/DELETE are unreachable under --json.
+    if json {
+        let snap = json_or_err(
+            client
+                .get(&url)
+                .header("x-sordino-key", &key)
+                .header("x-sordino-project", &project)
+                .send()?,
+        )?;
+        println!("{}", zdr_json_contract(&snap));
+        return Ok(());
+    }
     match action.unwrap_or(ZdrAction::Status) {
         ZdrAction::Status => {
-            let snap = json_or_err(client.get(&url).header("x-sordino-key", &key).send()?)?;
+            let snap = json_or_err(
+                client
+                    .get(&url)
+                    .header("x-sordino-key", &key)
+                    .header("x-sordino-project", &project)
+                    .send()?,
+            )?;
             print_zdr_status(&snap);
         }
         ZdrAction::Config => {
-            let snap = json_or_err(client.get(&url).header("x-sordino-key", &key).send()?)?;
+            let snap = json_or_err(
+                client
+                    .get(&url)
+                    .header("x-sordino-key", &key)
+                    .header("x-sordino-project", &project)
+                    .send()?,
+            )?;
             print_zdr_configs(&snap);
         }
         ZdrAction::On { config } => {
@@ -7310,6 +7709,7 @@ fn zdr_cmd(action: Option<ZdrAction>) -> Result<()> {
                 client
                     .post(&url)
                     .header("x-sordino-key", &key)
+                    .header("x-sordino-project", &project)
                     .json(&body)
                     .send()?,
             )
@@ -7320,13 +7720,59 @@ fn zdr_cmd(action: Option<ZdrAction>) -> Result<()> {
             print_zdr_status(&resp);
         }
         ZdrAction::Off => {
-            let resp = json_or_err(client.delete(&url).header("x-sordino-key", &key).send()?)?;
+            let resp = json_or_err(
+                client
+                    .delete(&url)
+                    .header("x-sordino-key", &key)
+                    .header("x-sordino-project", &project)
+                    .send()?,
+            )?;
             println!("ZDR disengaged — this session is back on the masked Anthropic path.");
             println!("(The prompt cache breaks once on the next turn.)\n");
             print_zdr_status(&resp);
         }
     }
     Ok(())
+}
+
+/// Pure reshape of the per-session `zdr_status` snapshot into the frozen v1 posture
+/// contract. Re-derives nothing: `engaged`/`target` come straight off `active`, `default`
+/// is copied raw (nullable), and each configured target is copied through an EXACT
+/// allowlist that DROPS `base_url`; the top-level `conversation` key is dropped entirely.
+/// `trust_basis` stays a bare unordered string (THREAT-MODEL N7/L11 — no ranked/numeric
+/// trust). OFF case (active null): `engaged:false`, `target:null`.
+fn zdr_json_contract(snap: &Value) -> Value {
+    let target = snap
+        .get("active")
+        .cloned()
+        .filter(|v| !v.is_null())
+        .unwrap_or(Value::Null);
+    let engaged = !target.is_null();
+    let default = snap.get("default").cloned().unwrap_or(Value::Null);
+    let empty: Vec<Value> = Vec::new();
+    let configured = snap
+        .get("configured")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+    let targets: Vec<Value> = configured
+        .iter()
+        .map(|t| {
+            let mut o = serde_json::Map::new();
+            for k in ["name", "trust_basis", "user_verified", "has_key"] {
+                if let Some(v) = t.get(k) {
+                    o.insert(k.to_string(), v.clone());
+                }
+            }
+            Value::Object(o)
+        })
+        .collect();
+    json!({
+        "schema_version": 1,
+        "engaged": engaged,
+        "target": target,
+        "default": default,
+        "targets": targets,
+    })
 }
 
 /// Backs `/sordino:disable`. Turns masking OFF — for THIS conversation by default
@@ -7338,11 +7784,12 @@ fn disable_cmd(project: bool) -> Result<()> {
     let root = canonical(&project_root());
     let (port, key) = live_identity(&root)
         .context("could not reach this project's proxy — is a `claude` session running here?")?;
+    let project_key = sordino_state::project_key(&root);
 
     if project {
         // Project-wide master switch off (session-live — not persisted, so the data policy
         // on disk is unchanged). Same endpoint `config off` uses.
-        let snap = admin_post(port, &key, "disable")
+        let snap = admin_post(port, &key, "disable", &project_key)
             .context("turning the project master switch off")?;
         println!(
             "Sordino masking DISABLED for this PROJECT (master switch off). Every conversation \
@@ -7371,6 +7818,7 @@ fn disable_cmd(project: bool) -> Result<()> {
         blocking_client()
             .post(&url)
             .header("x-sordino-key", &key)
+            .header("x-sordino-project", &project_key)
             .send()?,
     )
     .context("disabling masking for this conversation")?;
@@ -7476,6 +7924,201 @@ mod disable_cli_tests {
     }
 }
 
+/// Machine-readable-posture (F13): pure reshape + parse gates for `secrets --json`
+/// and `zdr --json`.
+#[cfg(test)]
+mod mrp_posture_tests {
+    use super::{secrets_json_contract, zdr_json_contract, Cli, Cmd, SecretsAction, ZdrAction};
+    use clap::Parser;
+    use serde_json::{json, Value};
+
+    // The frozen allowlists. Any key outside these in the projection is a leak.
+    const SECRET_KEYS: &[&str] = &["name", "operator", "scheme", "required", "resolved", "error"];
+    const TARGET_KEYS: &[&str] = &["name", "trust_basis", "user_verified", "has_key"];
+
+    // ---- Contract A: secrets ----
+
+    #[test]
+    fn secrets_contract_exact_shape_and_allowlist() {
+        // Raw admin `secrets` block: entries carry a bogus `value` + extra key to prove
+        // the allowlist DROPS them (never a value in the projection).
+        let block = json!({
+            "ready": false,
+            "total": 3,
+            "resolved": 2,
+            "required": 1,
+            "entries": [
+                {"name": "A", "operator": "op1password", "scheme": "env", "required": true,
+                 "resolved": false, "error": "not found", "value": "sk-LEAK", "extra": 1},
+                {"name": "B", "operator": "literal", "scheme": "ref", "required": false,
+                 "resolved": true, "error": null, "value": "sk-LEAK2"},
+                // C omits `error` entirely -> exercises the allowlist's present-keys-only copy.
+                {"name": "C", "operator": "literal", "scheme": "ref", "required": false,
+                 "resolved": true}
+            ]
+        });
+        let got = secrets_json_contract(&block);
+        let want = json!({
+            "schema_version": 1,
+            "ready": false,
+            "registered": 3,
+            "resolved": 2,
+            "required": 1,
+            "unresolved": ["A"],
+            "secrets": [
+                {"name": "A", "operator": "op1password", "scheme": "env", "required": true,
+                 "resolved": false, "error": "not found"},
+                {"name": "B", "operator": "literal", "scheme": "ref", "required": false,
+                 "resolved": true, "error": null},
+                // C omitted `error` in the input -> allowlist copies present keys only,
+                // so `error` is absent here too (proving the copy is faithful, not synthesized).
+                {"name": "C", "operator": "literal", "scheme": "ref", "required": false,
+                 "resolved": true}
+            ]
+        });
+        // Shape-drift gate: any field add/rename/remove fails this equality.
+        assert_eq!(got, want);
+        // schema_version is a flat top-level integer.
+        assert_eq!(got["schema_version"], json!(1));
+        // NEVER-A-VALUE walk: every secrets[*] key set is a subset of the allowlist.
+        for s in got["secrets"].as_array().unwrap() {
+            for k in s.as_object().unwrap().keys() {
+                assert!(
+                    SECRET_KEYS.contains(&k.as_str()),
+                    "leaked key `{k}` in secrets projection"
+                );
+            }
+            assert!(s.get("value").is_none(), "a secret VALUE leaked into projection");
+        }
+    }
+
+    #[test]
+    fn secrets_contract_defaults_when_absent() {
+        // Empty block: ready defaults true, counts 0, arrays empty.
+        let got = secrets_json_contract(&json!({}));
+        assert_eq!(
+            got,
+            json!({
+                "schema_version": 1,
+                "ready": true,
+                "registered": 0,
+                "resolved": 0,
+                "required": 0,
+                "unresolved": [],
+                "secrets": []
+            })
+        );
+    }
+
+    // ---- Contract B: zdr ----
+
+    #[test]
+    fn zdr_contract_engaged_exact_shape_and_allowlist() {
+        // Raw per-session zdr_status: targets carry base_url (must DROP); top-level
+        // `conversation` present (must DROP).
+        let snap = json!({
+            "conversation": "conv-123",
+            "active": "trusted-a",
+            "default": "trusted-a",
+            "configured": [
+                {"name": "trusted-a", "base_url": "https://a.example/v1",
+                 "trust_basis": "self-hosted", "user_verified": true, "has_key": true},
+                {"name": "trusted-b", "base_url": "https://b.example/v1",
+                 "trust_basis": "contractual", "user_verified": false, "has_key": false}
+            ]
+        });
+        let got = zdr_json_contract(&snap);
+        let want = json!({
+            "schema_version": 1,
+            "engaged": true,
+            "target": "trusted-a",
+            "default": "trusted-a",
+            "targets": [
+                {"name": "trusted-a", "trust_basis": "self-hosted",
+                 "user_verified": true, "has_key": true},
+                {"name": "trusted-b", "trust_basis": "contractual",
+                 "user_verified": false, "has_key": false}
+            ]
+        });
+        assert_eq!(got, want);
+        // No top-level conversation key survives.
+        assert!(got.get("conversation").is_none(), "conversation leaked into projection");
+        for t in got["targets"].as_array().unwrap() {
+            for k in t.as_object().unwrap().keys() {
+                assert!(
+                    TARGET_KEYS.contains(&k.as_str()),
+                    "leaked target key `{k}`"
+                );
+            }
+            // base_url must be dropped.
+            assert!(t.get("base_url").is_none(), "base_url survived into projection");
+            // trust_basis stays a bare STRING (never ranked/numeric).
+            assert!(t["trust_basis"].is_string(), "trust_basis must be a JSON string");
+        }
+    }
+
+    #[test]
+    fn zdr_contract_off_case() {
+        // active null => engaged:false, target:null.
+        let snap = json!({
+            "conversation": "conv-x",
+            "active": Value::Null,
+            "default": Value::Null,
+            "configured": []
+        });
+        let got = zdr_json_contract(&snap);
+        assert_eq!(
+            got,
+            json!({
+                "schema_version": 1,
+                "engaged": false,
+                "target": Value::Null,
+                "default": Value::Null,
+                "targets": []
+            })
+        );
+    }
+
+    // ---- Parse: --json is a PARENT-only flag on Secrets/Zdr ----
+
+    #[test]
+    fn secrets_json_parse_matrix() {
+        // [secrets, --json] -> action None, json true.
+        let cli = Cli::try_parse_from(["sordino-hooks", "secrets", "--json"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Secrets { action: None, json: true }));
+        // [secrets] -> json false.
+        let cli = Cli::try_parse_from(["sordino-hooks", "secrets"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Secrets { action: None, json: false }));
+        // [secrets, list, --json] -> err (List declares no --json).
+        assert!(Cli::try_parse_from(["sordino-hooks", "secrets", "list", "--json"]).is_err());
+        // COEXISTENCE: [secrets, scan, --json] -> err (Scan declares no --json; parent-only).
+        assert!(Cli::try_parse_from(["sordino-hooks", "secrets", "scan", "--json"]).is_err());
+        // [secrets, --json, scan] -> Ok(action Some(Scan), json true): short-circuit is
+        // reachable even with a live action.
+        let cli = Cli::try_parse_from(["sordino-hooks", "secrets", "--json", "scan"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Secrets { action: Some(SecretsAction::Scan), json: true }
+        ));
+    }
+
+    #[test]
+    fn zdr_json_parse_matrix() {
+        // [zdr, --json] -> action None, json true.
+        let cli = Cli::try_parse_from(["sordino-hooks", "zdr", "--json"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Zdr { action: None, json: true }));
+        // [zdr, on, --json] -> err (no --json on the mutating action; no-mutation at parse).
+        assert!(Cli::try_parse_from(["sordino-hooks", "zdr", "on", "--json"]).is_err());
+        // [zdr, --json, on] -> Ok(action Some(On), json true): runtime short-circuit
+        // suppresses the POST.
+        let cli = Cli::try_parse_from(["sordino-hooks", "zdr", "--json", "on"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Zdr { action: Some(ZdrAction::On { .. }), json: true }
+        ));
+    }
+}
+
 /// PreToolUse broker resolver (T2). Reads the hook payload from stdin, asks the proxy
 /// to resolve allow-listed broker tokens into `tool_input`, and emits `updatedInput`.
 /// Every failure path is silent (emit nothing, exit 0) so the tool runs with the
@@ -7532,11 +8175,13 @@ fn pre_tool_use() -> Result<()> {
     let Some((port, key)) = live_identity(&root) else {
         return Ok(());
     };
+    let project = sordino_state::project_key(&root);
 
     let req = json!({ "tool_name": tool_name, "tool_input": tool_input });
     let resp = match blocking_client()
         .post(format!("http://127.0.0.1:{port}/sordino/broker/resolve"))
         .header("x-sordino-key", &key)
+        .header("x-sordino-project", &project)
         .json(&req)
         .send()
     {
@@ -7596,10 +8241,35 @@ fn broker_denial_note(denials: &[Value]) -> String {
 /// `/sordino:secrets` — read-only view of the registered-secret gate + status. Pulls
 /// the value-free `secrets` block from the proxy snapshot. (Registration is by
 /// reference in `[[secrets]]`; secret VALUES never transit this command.)
-fn secrets_cmd(action: Option<SecretsAction>) -> Result<()> {
+fn secrets_cmd(action: Option<SecretsAction>, json: bool) -> Result<()> {
     let root = canonical(&project_root());
-    let port = resolve_live_port(&root)?;
-    let snap = live_snapshot(port, &root).context("reading secrets status (is the proxy running?)")?;
+    // Read-only JSON posture projection. Action-independent: it inherits Status's
+    // fail-closed proxy precondition (secrets_snapshot) and short-circuits AHEAD of the
+    // match, so Scan/Import (and their disk/import side effects) are never reached.
+    if json {
+        let snap = secrets_snapshot(&root)?;
+        let secrets = snap.get("secrets").cloned().unwrap_or(Value::Null);
+        println!("{}", secrets_json_contract(&secrets));
+        return Ok(());
+    }
+    match action.unwrap_or(SecretsAction::Status) {
+        // Status/List describe the LIVE registered set — they hard-require the proxy.
+        SecretsAction::Status => secrets_status_cmd(&root),
+        SecretsAction::List => secrets_list_cmd(&root),
+        // Scan/Import live entirely inside the .env disk boundary — no live proxy.
+        SecretsAction::Scan => secrets_scan_cmd(&root),
+        SecretsAction::Import { file } => secrets_import_cmd(&root, file),
+    }
+}
+
+/// Fetch this project's live-proxy config snapshot (Status/List need a running proxy).
+fn secrets_snapshot(root: &str) -> Result<Value> {
+    live_snapshot(live_identity(root), &sordino_state::project_key(root))
+        .context("reading secrets status (is the proxy running?)")
+}
+
+fn secrets_status_cmd(root: &str) -> Result<()> {
+    let snap = secrets_snapshot(root)?;
     let secrets = snap.get("secrets").cloned().unwrap_or(Value::Null);
     let ready = secrets.get("ready").and_then(Value::as_bool).unwrap_or(true);
     let total = secrets.get("total").and_then(Value::as_u64).unwrap_or(0);
@@ -7610,36 +8280,510 @@ fn secrets_cmd(action: Option<SecretsAction>) -> Result<()> {
         .get("entries")
         .and_then(Value::as_array)
         .unwrap_or(&empty);
+    let gate = if ready {
+        "open"
+    } else {
+        "HELD (required secret unresolved — LLM intake 503)"
+    };
+    println!("secrets: {resolved}/{total} resolved, {required} required — intake {gate}");
+    for e in entries {
+        if !e.get("resolved").and_then(Value::as_bool).unwrap_or(false) {
+            let name = e.get("name").and_then(Value::as_str).unwrap_or("?");
+            let err = e.get("error").and_then(Value::as_str).unwrap_or("");
+            println!("  ✗ {name}: {err}");
+        }
+    }
+    Ok(())
+}
 
-    match action.unwrap_or(SecretsAction::Status) {
-        SecretsAction::Status => {
-            let gate = if ready {
-                "open"
-            } else {
-                "HELD (required secret unresolved — LLM intake 503)"
-            };
-            println!("secrets: {resolved}/{total} resolved, {required} required — intake {gate}");
-            for e in entries {
-                if !e.get("resolved").and_then(Value::as_bool).unwrap_or(false) {
-                    let name = e.get("name").and_then(Value::as_str).unwrap_or("?");
-                    let err = e.get("error").and_then(Value::as_str).unwrap_or("");
-                    println!("  ✗ {name}: {err}");
+fn secrets_list_cmd(root: &str) -> Result<()> {
+    let snap = secrets_snapshot(root)?;
+    let secrets = snap.get("secrets").cloned().unwrap_or(Value::Null);
+    let empty: Vec<Value> = Vec::new();
+    let entries = secrets
+        .get("entries")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+    if entries.is_empty() {
+        println!("(no registered secrets)");
+    }
+    for e in entries {
+        let name = e.get("name").and_then(Value::as_str).unwrap_or("?");
+        let op = e.get("operator").and_then(Value::as_str).unwrap_or("?");
+        let scheme = e.get("scheme").and_then(Value::as_str).unwrap_or("?");
+        let ok = e.get("resolved").and_then(Value::as_bool).unwrap_or(false);
+        let mark = if ok { "✓" } else { "✗" };
+        println!("{mark} {name}  [{op}]  {scheme}");
+    }
+    Ok(())
+}
+
+/// Pure reshape of the admin `secrets` block into the frozen v1 posture contract.
+/// Re-derives nothing: `total` maps to `registered`, counts copy through (0 when absent),
+/// `ready` defaults true, `unresolved` lists the names of `resolved==false` entries in
+/// order, and each entry is copied through an EXACT allowlist — a secret VALUE (or any
+/// other key) can NEVER appear in the projection.
+fn secrets_json_contract(secrets: &Value) -> Value {
+    let ready = secrets.get("ready").and_then(Value::as_bool).unwrap_or(true);
+    let registered = secrets.get("total").and_then(Value::as_u64).unwrap_or(0);
+    let resolved = secrets.get("resolved").and_then(Value::as_u64).unwrap_or(0);
+    let required = secrets.get("required").and_then(Value::as_u64).unwrap_or(0);
+    let empty: Vec<Value> = Vec::new();
+    let entries = secrets
+        .get("entries")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+    let unresolved: Vec<Value> = entries
+        .iter()
+        .filter(|e| !e.get("resolved").and_then(Value::as_bool).unwrap_or(false))
+        .filter_map(|e| e.get("name").cloned())
+        .collect();
+    let secrets_list: Vec<Value> = entries
+        .iter()
+        .map(|e| {
+            let mut o = serde_json::Map::new();
+            for k in ["name", "operator", "scheme", "required", "resolved", "error"] {
+                if let Some(v) = e.get(k) {
+                    o.insert(k.to_string(), v.clone());
+                }
+            }
+            Value::Object(o)
+        })
+        .collect();
+    json!({
+        "schema_version": 1,
+        "ready": ready,
+        "registered": registered,
+        "resolved": resolved,
+        "required": required,
+        "unresolved": unresolved,
+        "secrets": secrets_list,
+    })
+}
+
+// ---------------------------------------------------------------------------
+// .env intake funnel (F2 scan + F4 import) — shared eligibility, no live proxy
+// ---------------------------------------------------------------------------
+
+/// Branded, ADVISORY (non-exhaustive) secret prefixes. A value that starts with one is
+/// a candidate REGARDLESS of the entropy classifier — and this short-circuits BEFORE the
+/// shape-suppressor, which is exactly what rescues `SLACK_WEBHOOK_URL` (a bare `https://`
+/// with no userinfo, otherwise byte-identical to the bare-URL non-secret suppressor).
+const BRANDED_PREFIXES: &[&str] = &[
+    "sk-",
+    "sk-ant-",
+    "AKIA",
+    "ASIA",
+    "ghp_",
+    "gho_",
+    "ghu_",
+    "ghs_",
+    "github_pat_",
+    "xoxb-",
+    "xoxp-",
+    "AIza",
+    "ya29.",
+    "glpat-",
+    "npm_",
+    "dop_v1_",
+    "SG.",
+    "sk_live_",
+    "rk_live_",
+    "-----BEGIN",
+    "https://hooks.slack.com/",
+];
+
+fn known_prefix_match(value: &str) -> bool {
+    BRANDED_PREFIXES.iter().any(|p| value.starts_with(p))
+}
+
+/// A value whose SHAPE is a well-known NON-secret structure the entropy path wrongly
+/// admits: a UUID (8-4-4-4-12 hex), an all-lowercase-hex 40-char git SHA, a semver, or
+/// a bare URL (`https?://` with NO `@` userinfo). Applied ONLY to anonymous
+/// `Eligible{reason: Entropy}` admits — never to a branded-prefix hit (short-circuits
+/// first) and never to a NameMatch/Both admit (a NAMED secret is never shape-suppressed).
+fn structural_nonsecret(value: &str) -> bool {
+    is_uuid(value) || is_git_sha(value) || is_semver(value) || is_bare_url(value)
+}
+
+fn is_uuid(v: &str) -> bool {
+    let b = v.as_bytes();
+    if b.len() != 36 {
+        return false;
+    }
+    for (i, &c) in b.iter().enumerate() {
+        match i {
+            8 | 13 | 18 | 23 => {
+                if c != b'-' {
+                    return false;
+                }
+            }
+            _ => {
+                if !c.is_ascii_hexdigit() {
+                    return false;
                 }
             }
         }
-        SecretsAction::List => {
-            if entries.is_empty() {
-                println!("(no registered secrets)");
-            }
-            for e in entries {
-                let name = e.get("name").and_then(Value::as_str).unwrap_or("?");
-                let op = e.get("operator").and_then(Value::as_str).unwrap_or("?");
-                let scheme = e.get("scheme").and_then(Value::as_str).unwrap_or("?");
-                let ok = e.get("resolved").and_then(Value::as_bool).unwrap_or(false);
-                let mark = if ok { "✓" } else { "✗" };
-                println!("{mark} {name}  [{op}]  {scheme}");
+    }
+    true
+}
+
+/// An all-lowercase-hex 40-char git SHA (`[0-9a-f]{40}`). Uppercase hex is NOT a git SHA.
+fn is_git_sha(v: &str) -> bool {
+    v.len() == 40
+        && v.bytes()
+            .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c))
+}
+
+/// `v?MAJOR.MINOR.PATCH` with an optional `-prerelease` / `+build` suffix.
+fn is_semver(v: &str) -> bool {
+    let core = v.strip_prefix('v').unwrap_or(v);
+    // Split off any prerelease/build suffix at the first '-' or '+'.
+    let core = core
+        .split_once(['-', '+'])
+        .map(|(c, _)| c)
+        .unwrap_or(core);
+    let parts: Vec<&str> = core.split('.').collect();
+    parts.len() == 3
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))
+}
+
+/// A bare `http(s)://` URL with NO `@` userinfo (a public URL, not a credentialed DSN).
+fn is_bare_url(v: &str) -> bool {
+    (v.starts_with("https://") || v.starts_with("http://")) && !v.contains('@')
+}
+
+/// The single, shared candidacy predicate for both scan and import. A branded prefix
+/// admits unconditionally; otherwise the entropy classifier decides, with the
+/// shape-suppressor applied ONLY to anonymous Entropy admits (the reason-gate that
+/// preserves recall on the GITHUB_TOKEN / SLACK_WEBHOOK_URL shape-collisions).
+fn is_candidate(name: &str, value: &str) -> bool {
+    if known_prefix_match(value) {
+        return true;
+    }
+    match sordino_secrets::classify(name, value) {
+        sordino_secrets::Eligibility::Eligible {
+            reason: sordino_secrets::EligibleReason::Entropy,
+            ..
+        } => !structural_nonsecret(value),
+        // NameMatch / Both: a NAMED secret is NEVER shape-suppressed.
+        sordino_secrets::Eligibility::Eligible { .. } => true,
+        sordino_secrets::Eligibility::Skip(_) => false,
+    }
+}
+
+/// This project's live registered-secret names, BEST-EFFORT (empty if the proxy is
+/// down — scan/import are supported with no proxy). Never fails the command.
+fn registered_secret_names(root: &str) -> HashSet<String> {
+    live_snapshot(live_identity(root), &sordino_state::project_key(root))
+        .ok()
+        .and_then(|s| {
+            s["secrets"]["entries"].as_array().map(|a| {
+                a.iter()
+                    .filter_map(|e| e["name"].as_str().map(str::to_string))
+                    .collect::<HashSet<String>>()
+            })
+        })
+        .unwrap_or_default()
+}
+
+/// Is `name` a `.env` file we intake? `.env` and `.env.*` EXCEPT the example/sample
+/// sidecars (`.env.example`, `.env.sample`, `.env.*.example`).
+fn is_intake_env_file(name: &str) -> bool {
+    if name == ".env" {
+        return true;
+    }
+    if name.strip_prefix(".env.").is_none() {
+        return false;
+    }
+    if name == ".env.sample" || name.ends_with(".example") {
+        return false;
+    }
+    true
+}
+
+/// Every intakeable `.env` file directly under `root` (sorted for deterministic output).
+fn enumerate_env_files(root: &str) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(entries) = std::fs::read_dir(Path::new(root)) else {
+        return files;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(is_intake_env_file)
+        {
+            files.push(path);
+        }
+    }
+    files.sort();
+    files
+}
+
+/// `path` displayed relative to `root` when possible (for the `dotenv:<rel>#KEY` ref and
+/// the scan/prompt display). Falls back to the full path.
+fn display_rel(root: &str, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Build the VALUE-FREE scan report (pure — takes the resolved inputs so it is testable
+/// without a live proxy). Prints ONLY key names + file paths, never a value.
+fn scan_report(root: &str, files: &[PathBuf], registered: &HashSet<String>, proxy_up: bool) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    if !proxy_up {
+        let _ = writeln!(
+            out,
+            "(proxy not reachable — the registered set is empty; results are best-effort)"
+        );
+    }
+    let mut any_unregistered = false;
+    for file in files {
+        let Ok(iter) = dotenvy::from_path_iter(file) else {
+            continue;
+        };
+        let mut unregistered: Vec<String> = Vec::new();
+        for item in iter {
+            let Ok((key, value)) = item else { continue };
+            if is_candidate(&key, &value) && !registered.contains(&key) {
+                unregistered.push(key);
             }
         }
+        let rel = display_rel(root, file);
+        let _ = writeln!(out, "{rel}: {} value(s) not registered", unregistered.len());
+        for key in &unregistered {
+            let _ = writeln!(out, "  • {key}");
+            any_unregistered = true;
+        }
+    }
+    if any_unregistered {
+        let _ = writeln!(
+            out,
+            "These mask only if a recognizer happens to catch them — registration via \
+             `secrets import` makes them unconditional (G1)."
+        );
+    }
+    out
+}
+
+/// F2 `secrets scan`: read-only, value-free. Enumerate `.env`/`.env.*`, list unregistered
+/// candidate KEYS per file. Best-effort registered set; exit 0 always.
+fn secrets_scan_cmd(root: &str) -> Result<()> {
+    let registered = registered_secret_names(root);
+    let proxy_up = live_identity(root).is_some();
+    let files = enumerate_env_files(root);
+    print!("{}", scan_report(root, &files, &registered, proxy_up));
+    Ok(())
+}
+
+/// A single accepted key, ready to become a `[[secrets]]` REFERENCE stanza.
+#[derive(Clone, Debug, PartialEq)]
+struct AcceptedSecret {
+    name: String,
+    from_ref: String,
+    operator: Option<String>,
+}
+
+/// Outcome of the pure [`import_merge`] transform.
+#[derive(Debug, PartialEq)]
+enum ImportOutcome {
+    Changed(String),
+    NoOp,
+    Refused(String),
+}
+
+/// PURE toml_edit merge: append each accepted key as a `[[secrets]]` REFERENCE stanza to
+/// `current`, preserving all existing stanzas + `[engine]`/comments byte-for-byte. Refuses
+/// (never overwrites) unparseable TOML or a `secrets` key that is NOT an array-of-tables.
+/// Idempotent: an accepted name already present as a `[[secrets]]` stanza is SKIPPED. NEVER
+/// writes a value/literal/secret/plaintext/from_env — only `name`, `from_ref`, and (if set)
+/// `operator`, in that deterministic order.
+fn import_merge(current: &str, accepted: &[AcceptedSecret]) -> ImportOutcome {
+    let mut doc = match current.parse::<toml_edit::DocumentMut>() {
+        Ok(d) => d,
+        Err(e) => {
+            return ImportOutcome::Refused(format!(
+                "sordino.toml is not valid TOML; refusing to overwrite: {e}"
+            ));
+        }
+    };
+
+    // Ensure `secrets` is an array-of-tables. Present-but-not-AoT (a scalar `secrets = "x"`
+    // or a `[secrets]` table) is REFUSED — never coerced/clobbered.
+    match doc.get("secrets") {
+        Some(item) if item.as_array_of_tables().is_none() => {
+            return ImportOutcome::Refused(
+                "`secrets` in sordino.toml is not an array-of-tables ([[secrets]]); \
+                 refusing to modify it"
+                    .into(),
+            );
+        }
+        None => {
+            doc["secrets"] = toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
+        }
+        _ => {}
+    }
+
+    // Snapshot existing stanza names for the idempotent skip.
+    let existing: HashSet<String> = doc["secrets"]
+        .as_array_of_tables()
+        .map(|aot| {
+            aot.iter()
+                .filter_map(|t| t.get("name").and_then(|i| i.as_str()).map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let aot = doc["secrets"]
+        .as_array_of_tables_mut()
+        .expect("secrets ensured array-of-tables above");
+    let mut appended = 0usize;
+    for entry in accepted {
+        if existing.contains(&entry.name) {
+            continue; // idempotent
+        }
+        let mut table = toml_edit::Table::new();
+        table["name"] = toml_edit::value(entry.name.clone());
+        table["from_ref"] = toml_edit::value(entry.from_ref.clone());
+        if let Some(op) = &entry.operator {
+            table["operator"] = toml_edit::value(op.clone());
+        }
+        aot.push(table);
+        appended += 1;
+    }
+
+    if appended == 0 {
+        ImportOutcome::NoOp
+    } else {
+        ImportOutcome::Changed(doc.to_string())
+    }
+}
+
+/// PURE resolution of the intake file set for `secrets import`, honoring the SAME boundary
+/// as auto-discovery. `--file` is a FILTER within the intake set — not an arbitrary-file
+/// override — so `Some(f)` must be an intake `.env` (never an `.env.example`/`.env.sample`
+/// placeholder sidecar, per [`is_intake_env_file`]) AND live inside `root` (canonicalized
+/// containment). Either failure is an argument error. On success the NON-canonical resolved
+/// path is returned so the `dotenv:<rel>#KEY` relpath ([`display_rel`]) is unchanged.
+/// `None` enumerates the project's intake `.env` files exactly as the scan/discovery path.
+fn resolve_import_files(root: &str, file: Option<PathBuf>) -> Result<Vec<PathBuf>, String> {
+    let Some(f) = file else {
+        return Ok(enumerate_env_files(root));
+    };
+    let path = if f.is_absolute() { f } else { Path::new(root).join(&f) };
+    let reject = || {
+        format!(
+            "Sordino: --file must name a project .env file inside {root} (not an \
+             .env.example/.env.sample sidecar or a path outside the project)"
+        )
+    };
+    // (a) intake-named basename (excludes .env.example / .env.sample placeholders).
+    if !path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(is_intake_env_file)
+    {
+        return Err(reject());
+    }
+    // (b) contained under root: canonicalize both and require the file to sit inside root.
+    let (Ok(canon), Ok(canon_root)) =
+        (std::fs::canonicalize(&path), std::fs::canonicalize(root))
+    else {
+        return Err(reject());
+    };
+    if !canon.starts_with(&canon_root) {
+        return Err(reject());
+    }
+    Ok(vec![path])
+}
+
+/// F4 `secrets import`: per-value INTERACTIVE opt-in. FAILS CLOSED on a non-interactive
+/// terminal (writes nothing). Prompts per surviving candidate (KEY + file only, never the
+/// value); accepted keys become `[[secrets]]` REFERENCE stanzas in `<root>/sordino.toml`.
+fn secrets_import_cmd(root: &str, file: Option<PathBuf>) -> Result<()> {
+    // An invalid `--file` is an ARGUMENT error, independent of interactivity — resolve the
+    // intake file set (same boundary as auto-discovery) BEFORE the tty gate. The no-file
+    // path stays silent here, so its non-tty behavior is unchanged (the tty gate fires next).
+    let files = match resolve_import_files(root, file) {
+        Ok(files) => files,
+        Err(msg) => {
+            eprintln!("{msg}");
+            std::process::exit(2);
+        }
+    };
+
+    // FAIL CLOSED: per-value opt-in demands a real interactive terminal. Gate on BOTH
+    // stdin and stdout being a tty — stdout-only would be bypassed by `yes | ... import`.
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
+        eprintln!(
+            "Sordino: import needs an interactive terminal (per-value opt-in only; \
+             never auto-registers)"
+        );
+        std::process::exit(2);
+    }
+
+    let registered = registered_secret_names(root);
+
+    let stdin = std::io::stdin();
+    let mut accepted: Vec<AcceptedSecret> = Vec::new();
+    let mut accepted_names: HashSet<String> = HashSet::new();
+    'files: for file in &files {
+        let Ok(iter) = dotenvy::from_path_iter(file) else {
+            continue;
+        };
+        let rel = display_rel(root, file);
+        for item in iter {
+            let Ok((key, value)) = item else { continue };
+            if !is_candidate(&key, &value) {
+                continue;
+            }
+            if registered.contains(&key) || accepted_names.contains(&key) {
+                continue;
+            }
+            // Prompt on stderr (unbuffered) — KEY + file ONLY, never the value.
+            eprint!("Register {key} from {rel}? [y/N/q] ");
+            let mut line = String::new();
+            if stdin.read_line(&mut line)? == 0 {
+                break 'files; // EOF ⇒ stop, keep what was accepted so far
+            }
+            match line.trim() {
+                "y" | "Y" => {
+                    accepted_names.insert(key.clone());
+                    accepted.push(AcceptedSecret {
+                        name: key.clone(),
+                        from_ref: format!("dotenv:{rel}#{key}"),
+                        operator: None,
+                    });
+                }
+                "q" | "Q" => break 'files, // stop + write accepted-so-far
+                _ => {}                     // anything else ⇒ skip
+            }
+        }
+    }
+
+    let toml_path = Path::new(root).join("sordino.toml");
+    let current = std::fs::read_to_string(&toml_path).unwrap_or_default();
+    match import_merge(&current, &accepted) {
+        ImportOutcome::Changed(text) => {
+            atomic_write_text(&toml_path, &text)?;
+            println!(
+                "wrote {} secret reference(s) to sordino.toml — restart the session \
+                 (or POST /sordino/reload) to resolve them",
+                accepted.len()
+            );
+        }
+        ImportOutcome::NoOp => println!("nothing to import"),
+        ImportOutcome::Refused(msg) => bail!(msg),
     }
     Ok(())
 }
@@ -7683,30 +8827,35 @@ fn key_for(root: &str) -> Result<String> {
         .context("could not read this project's proxy key — is a `claude` session running here?")
 }
 
-fn live_snapshot(port: u16, root: &str) -> Result<Value> {
-    admin_get(port, &key_for(root)?)
+fn live_snapshot(ident: Option<(u16, String)>, project: &str) -> Result<Value> {
+    let (port, key) = ident
+        .context("could not read this project's proxy key — is a `claude` session running here?")?;
+    admin_get(port, &key, project)
 }
 
-fn admin_get(port: u16, key: &str) -> Result<Value> {
+fn admin_get(port: u16, key: &str, project: &str) -> Result<Value> {
     let resp = blocking_client()
         .get(format!("http://127.0.0.1:{port}/sordino/config"))
         .header("x-sordino-key", key)
+        .header("x-sordino-project", project)
         .send()?;
     json_or_err(resp)
 }
 
-fn admin_post(port: u16, key: &str, path: &str) -> Result<Value> {
+fn admin_post(port: u16, key: &str, path: &str, project: &str) -> Result<Value> {
     let resp = blocking_client()
         .post(format!("http://127.0.0.1:{port}/sordino/{path}"))
         .header("x-sordino-key", key)
+        .header("x-sordino-project", project)
         .send()?;
     json_or_err(resp)
 }
 
-fn admin_put(port: u16, key: &str, config: &Value) -> Result<Value> {
+fn admin_put(port: u16, key: &str, config: &Value, project: &str) -> Result<Value> {
     let resp = blocking_client()
         .put(format!("http://127.0.0.1:{port}/sordino/config"))
         .header("x-sordino-key", key)
+        .header("x-sordino-project", project)
         .json(config)
         .send()?;
     json_or_err(resp)
@@ -7753,8 +8902,8 @@ fn category_set_to_vec(cats: &std::collections::HashSet<sordino_engine::Category
 /// reachable, else computed from the config FILES (user < project < local) — NOT
 /// the balanced default, which would silently erase a custom persisted set when the
 /// proxy happens to be down (review finding F2/C4).
-fn effective_categories(port: u16, root: &str) -> Vec<String> {
-    if let Ok(snap) = live_snapshot(port, root)
+fn effective_categories(ident: Option<(u16, String)>, project: &str, root: &str) -> Vec<String> {
+    if let Ok(snap) = live_snapshot(ident, project)
         && let Some(arr) = snap
             .pointer("/config/enabled_categories")
             .and_then(Value::as_array)
@@ -8844,6 +9993,191 @@ mod route_gate_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    // ---- F3: verify category-coverage disclosure leg ----
+
+    #[test]
+    fn category_coverage_detail_names_off_categories() {
+        // (a) Balanced default: Network + Personal are OFF → detail names BOTH, each with
+        // its honest pass-through sentence.
+        let balanced: Vec<String> = ["secrets", "financial", "identity", "contact"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let d = category_coverage_detail(&balanced);
+        assert!(d.contains("network"), "must name network OFF: {d}");
+        assert!(d.contains("personal"), "must name personal OFF: {d}");
+        assert!(
+            d.contains("bare URLs/IPs/MACs sent in clear"),
+            "network sentence: {d}"
+        );
+        assert!(
+            d.contains("names/locations need the ML model"),
+            "personal sentence: {d}"
+        );
+        assert_ne!(d, "all categories on");
+
+        // (b) all six categories on → the succinct 'all categories on'.
+        let all: Vec<String> =
+            ["secrets", "financial", "identity", "contact", "network", "personal"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        assert_eq!(category_coverage_detail(&all), "all categories on");
+    }
+
+    #[test]
+    fn verify_category_coverage_is_always_info() {
+        // (c) At a temp dir with no live proxy and no TOML, the leg is still report-only
+        // Info — it never participates in any_fail.
+        let dir = std::env::temp_dir().join(format!("sordino-cov-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = canonical(&dir);
+        assert_eq!(verify_category_coverage(&root).status, ProbeStatus::Info);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- F11: doctor transcript-exposure disclosure leg ----
+
+    #[test]
+    fn transcript_exposure_detail_counts_and_sums_via_metadata_only() {
+        let dir = std::env::temp_dir().join(format!("sordino-tx-detail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Empty dir → absent; a non-existent dir → absent.
+        assert_eq!(transcript_exposure_detail(&dir), (false, 0, 0));
+        assert_eq!(
+            transcript_exposure_detail(&dir.join("does-not-exist")),
+            (false, 0, 0)
+        );
+
+        // Two *.jsonl transcripts (5 + 3 bytes) plus a non-jsonl decoy: counts and sums
+        // ONLY the jsonl files, via metadata (content is never opened).
+        std::fs::write(dir.join("a.jsonl"), "12345").unwrap();
+        std::fs::write(dir.join("b.jsonl"), "678").unwrap();
+        std::fs::write(dir.join("notes.txt"), "ignored").unwrap();
+        assert_eq!(transcript_exposure_detail(&dir), (true, 2, 8));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_transcript_exposure_is_info_present_and_absent() {
+        let base = std::env::temp_dir().join(format!("sordino-tx-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let cfg = base.join("cfg");
+        let projects = cfg.join("projects").join("encoded-root");
+        std::fs::create_dir_all(&projects).unwrap();
+
+        // A real project dir; key the transcript match on its canonical path.
+        let proj = base.join("myproject");
+        std::fs::create_dir_all(&proj).unwrap();
+        let root = canonical(&proj);
+
+        // A session log carrying that cwd + a fake transcript to size.
+        std::fs::write(
+            projects.join("session.jsonl"),
+            format!("{{\"type\":\"user\",\"cwd\":\"{root}\"}}\n"),
+        )
+        .unwrap();
+        std::fs::write(projects.join("t1.jsonl"), "hello").unwrap();
+
+        let prev = std::env::var_os("CLAUDE_CONFIG_DIR");
+        // SAFETY (edition 2024): the probe under test reads CLAUDE_CONFIG_DIR; no other
+        // thread in this test relies on it, and it is restored below.
+        unsafe {
+            std::env::set_var("CLAUDE_CONFIG_DIR", &cfg);
+        }
+
+        // Present: matching project dir with jsonl files → report-only Info.
+        assert_eq!(
+            probe_transcript_exposure(&root).status,
+            ProbeStatus::Info
+        );
+
+        // Absent: a root with no matching session dir → still Info (quiet 'none found').
+        let other = canonical(&base.join("no-such-project"));
+        assert_eq!(
+            probe_transcript_exposure(&other).status,
+            ProbeStatus::Info
+        );
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", v) },
+            None => unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn probe_transcript_exposure_survives_leading_cwdless_log() {
+        // Regression: a cwd-less leading log (e.g. summary-only jsonl) in the matching
+        // project dir must NOT short-circuit discovery into a false 'no transcripts found'.
+        // The narrowing walk breaks only on a log that yields a `cwd` (mismatch = other
+        // project); a `None` continues to the next file, mirroring discover_session_cwds.
+        let base = std::env::temp_dir().join(format!("sordino-tx-lead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let cfg = base.join("cfg");
+        let projects = cfg.join("projects").join("encoded-root");
+        std::fs::create_dir_all(&projects).unwrap();
+
+        let proj = base.join("myproject");
+        std::fs::create_dir_all(&proj).unwrap();
+        let root = canonical(&proj);
+
+        // Force a cwd-less log to sort BEFORE the one carrying the cwd (aaa_ vs zzz_).
+        std::fs::write(
+            projects.join("aaa_summary.jsonl"),
+            "{\"type\":\"summary\",\"summary\":\"no cwd here\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            projects.join("zzz_session.jsonl"),
+            format!("{{\"type\":\"user\",\"cwd\":\"{root}\"}}\n"),
+        )
+        .unwrap();
+
+        let prev = std::env::var_os("CLAUDE_CONFIG_DIR");
+        // SAFETY (edition 2024): the probe under test reads CLAUDE_CONFIG_DIR; no other
+        // thread in this test relies on it, and it is restored below.
+        unsafe {
+            std::env::set_var("CLAUDE_CONFIG_DIR", &cfg);
+        }
+
+        let p = probe_transcript_exposure(&root);
+        assert_eq!(p.status, ProbeStatus::Info);
+        // The dir WAS discovered despite the leading cwd-less log — not the quiet 'none'.
+        assert!(
+            !p.detail.contains("no transcripts found"),
+            "leading cwd-less log wrongly skipped the matching project dir: {}",
+            p.detail
+        );
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", v) },
+            None => unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn any_fail_predicates_stay_fail_only() {
+        // Guardrail: both doctor's and verify's any_fail predicate must remain
+        // Fail-only — an Info leg NEVER flips ok/exit. The needle is assembled from
+        // two fragments so THIS test's own source contains no verbatim occurrence;
+        // the count therefore reflects ONLY the two production sites (asserting a bare
+        // n>=2 against the whole file is vacuous — the literal would appear here twice).
+        let src = include_str!("main.rs");
+        let needle = concat!(".any(|p| p.status == ProbeStatus::", "Fail)");
+        let n = src.matches(needle).count();
+        assert_eq!(
+            n, 2,
+            "exactly the doctor and verify any_fail predicates must stay Fail-only; \
+             found {n} occurrence(s)"
+        );
+    }
+
     #[test]
     fn is_truthy_flag_only_affirmative_values() {
         for t in ["1", "true", "TRUE", "Yes", "on", " on "] {
@@ -8853,6 +10187,73 @@ mod route_gate_tests {
         for f in ["0", "false", "", "off", "no", "2", "enabled"] {
             assert!(!is_truthy_flag(f), "{f:?} should NOT be truthy");
         }
+    }
+
+    // L10 / A3: OTel content-flag warning. Pure — a HashMap-backed lookup closure, no real env
+    // mutation and no test serialization required.
+    fn otel_lookup(pairs: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<String, String> =
+            pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect();
+        move |k: &str| map.get(k).cloned()
+    }
+
+    #[test]
+    fn otel_warn_empty_env_is_silent() {
+        // Clean session: no false-positive nag.
+        assert_eq!(otel_content_flag_warning(otel_lookup(&[])), None);
+    }
+
+    #[test]
+    fn otel_warn_master_gate_only_is_silent() {
+        // Telemetry master gate on but no content flag => nothing exports content => silent.
+        assert_eq!(
+            otel_content_flag_warning(otel_lookup(&[("CLAUDE_CODE_ENABLE_TELEMETRY", "1")])),
+            None
+        );
+    }
+
+    #[test]
+    fn otel_warn_tool_details_flags() {
+        let w = otel_content_flag_warning(otel_lookup(&[
+            ("CLAUDE_CODE_ENABLE_TELEMETRY", "true"),
+            ("OTEL_LOG_TOOL_DETAILS", "yes"),
+        ]))
+        .expect("content flag with master gate on must warn");
+        assert!(w.contains("OTEL_LOG_TOOL_DETAILS"), "warning names the flag: {w}");
+    }
+
+    #[test]
+    fn otel_warn_raw_api_bodies_file_mode() {
+        // `file:` prefix enables raw-body-to-disk even though it isn't boolean-truthy.
+        let w = otel_content_flag_warning(otel_lookup(&[
+            ("CLAUDE_CODE_ENABLE_TELEMETRY", "on"),
+            ("OTEL_LOG_RAW_API_BODIES", "file:/tmp/otel"),
+        ]))
+        .expect("file: raw-body mode must warn");
+        assert!(w.contains("OTEL_LOG_RAW_API_BODIES"), "warning names the flag: {w}");
+    }
+
+    #[test]
+    fn otel_warn_master_gate_off_is_inert() {
+        // Master gate off => no exporter constructed => an inert leftover content flag stays silent.
+        assert_eq!(
+            otel_content_flag_warning(otel_lookup(&[
+                ("CLAUDE_CODE_ENABLE_TELEMETRY", "0"),
+                ("OTEL_LOG_USER_PROMPTS", "1"),
+            ])),
+            None
+        );
+    }
+
+    #[test]
+    fn otel_warn_mixed_case_reuses_truthy_parse() {
+        // Mixed-case values must parse via is_truthy_flag (case-insensitive, trimmed).
+        let w = otel_content_flag_warning(otel_lookup(&[
+            ("CLAUDE_CODE_ENABLE_TELEMETRY", "TRUE"),
+            ("OTEL_LOG_USER_PROMPTS", "On"),
+        ]))
+        .expect("mixed-case truthy content flag must warn");
+        assert!(w.contains("OTEL_LOG_USER_PROMPTS"), "warning names the flag: {w}");
     }
 }
 
@@ -9366,5 +10767,494 @@ mod codex_auth_check_tests {
         // that field, not "unmapped".
         let auth = json!({ "auth_mode": "weird", "tokens": { "id_token": "x" } });
         assert_eq!(unmapped_auth_mode(Some(&auth)), None);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// intake funnel (F2 scan + F4 import) — acceptance tests
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod intake_tests {
+    use super::*;
+    use sordino_secrets::SecretProvider as _;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A fresh, unique temp dir per test (process id is shared across a run, so add a
+    /// monotonic counter + nanos). Created empty.
+    fn scratch_dir(tag: &str) -> PathBuf {
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "sordino-intake-{tag}-{}-{n}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    // -----------------------------------------------------------------------
+    // PRECISION CORPUS — the MEASURED offer-list gate (recall 1.0, precision >= 0.70)
+    // -----------------------------------------------------------------------
+
+    /// (filename, [(KEY, VALUE, is_secret)]). A FROZEN >=8-file corpus, secret:nonsecret
+    /// = 1:1, with the two mandatory shape-collision secrets (GITHUB_TOKEN / SLACK_WEBHOOK
+    /// URL) and the adversarial non-secret rows (UUID / 40-hex gitsha / public URL /
+    /// NODE_ENV / semver / boolean / integer / enum).
+    const CORPUS: &[(&str, &[(&str, &str, bool)])] = &[
+        (
+            "app1.env",
+            &[
+                // collision (1): 40 lowercase hex, byte-identical to the git-SHA suppressor,
+                // rescued by NameMatch (name hits TOKEN).
+                (
+                    "GITHUB_TOKEN",
+                    "5f3e2a1b9c8d7e6f0a1b2c3d4e5f60718293a4b5",
+                    true,
+                ),
+                // SAME shape under a non-matching name ⇒ suppressed (the precision win).
+                ("gitsha", "5f3e2a1b9c8d7e6f0a1b2c3d4e5f60718293a4b5", false),
+            ],
+        ),
+        (
+            "app2.env",
+            &[
+                // collision (2): a bare https:// (no userinfo), rescued ONLY by the branded
+                // hooks.slack.com prefix.
+                (
+                    "SLACK_WEBHOOK_URL",
+                    "https://hooks.slack.com/services/T00000000/B00000000/XXXXXXXXXXXXXXXXXXXXXXXX",
+                    true,
+                ),
+                // A public no-userinfo URL under a non-matching name ⇒ suppressed.
+                ("PUBLIC_URL", "https://example.com/path/to/resource", false),
+            ],
+        ),
+        (
+            "app3.env",
+            &[
+                ("DATABASE_URL", "postgres://user:pass@db.internal:5432/app", true),
+                ("NODE_ENV", "production", false),
+            ],
+        ),
+        (
+            "app4.env",
+            &[
+                (
+                    "AWS_SECRET_ACCESS_KEY",
+                    "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+                    true,
+                ),
+                ("PORT", "8080", false),
+            ],
+        ),
+        (
+            "app5.env",
+            &[
+                ("STRIPE_SECRET_KEY", "sk_live_51H8xY2eZvKYlo2C0abcdefghij", true),
+                ("LOG_LEVEL", "debug", false),
+            ],
+        ),
+        (
+            "app6.env",
+            &[
+                (
+                    "OPENAI_API_KEY",
+                    "sk-ant-api03-AbCdEfGhIjKlMnOpQrStUvWxYz0123456789",
+                    true,
+                ),
+                ("FEATURE_ENABLED", "true", false),
+            ],
+        ),
+        (
+            "app7.env",
+            &[
+                ("MYSQL_DSN", "mysql://root:hunter2@127.0.0.1:3306/db", true),
+                ("REQUEST_ID", "550e8400-e29b-41d4-a716-446655440000", false),
+            ],
+        ),
+        (
+            "app8.env",
+            &[
+                ("API_TOKEN", "k7Lm2Nq9Rp4StUvWxYz0aBcD1eF", true),
+                ("APP_VERSION", "1.2.3-alpha.1+build.42", false),
+            ],
+        ),
+    ];
+
+    /// Materialize the corpus as `.env` files + `.labels` sidecars in a frozen dir.
+    fn write_corpus(dir: &Path) {
+        for (file, rows) in CORPUS {
+            let mut env = String::new();
+            let mut labels = String::new();
+            for (k, v, secret) in *rows {
+                env.push_str(&format!("{k}={v}\n"));
+                labels.push_str(&format!("{k}={}\n", if *secret { "secret" } else { "nonsecret" }));
+            }
+            std::fs::write(dir.join(file), env).unwrap();
+            let labels_name = file.replace(".env", ".labels");
+            std::fs::write(dir.join(labels_name), labels).unwrap();
+        }
+    }
+
+    #[test]
+    fn precision_corpus_gate() {
+        let dir = scratch_dir("corpus");
+        write_corpus(&dir);
+
+        let mut tp = 0usize; // secret, offered
+        let mut fp = 0usize; // nonsecret, offered
+        let mut fn_ = 0usize; // secret, missed
+        let mut offered: std::collections::HashMap<String, bool> = Default::default();
+
+        for (file, _) in CORPUS {
+            // Read the sidecar labels (KEY=secret|nonsecret).
+            let labels_path = dir.join(file.replace(".env", ".labels"));
+            let labels_text = std::fs::read_to_string(&labels_path).unwrap();
+            let labels: std::collections::HashMap<&str, bool> = labels_text
+                .lines()
+                .filter_map(|l| l.split_once('='))
+                .map(|(k, v)| (k, v == "secret"))
+                .collect();
+
+            // Parse the .env via the SAME path scan/import use, then run the shared predicate.
+            for item in dotenvy::from_path_iter(dir.join(file)).unwrap() {
+                let (key, value) = item.unwrap();
+                let is_secret = *labels.get(key.as_str()).unwrap_or_else(|| {
+                    panic!("no label for {key} in {file}")
+                });
+                let cand = is_candidate(&key, &value);
+                offered.insert(key.clone(), cand);
+                match (is_secret, cand) {
+                    (true, true) => tp += 1,
+                    (true, false) => fn_ += 1,
+                    (false, true) => fp += 1,
+                    (false, false) => {}
+                }
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+
+        let recall = tp as f64 / (tp + fn_) as f64;
+        let precision = tp as f64 / (tp + fp) as f64;
+
+        // recall == 1.0 on labeled secrets (incl BOTH collisions).
+        assert_eq!(fn_, 0, "recall regression: {fn_} labeled secret(s) missed; offered map = {offered:?}");
+        assert_eq!(recall, 1.0, "recall must be 1.0");
+        // The two mandatory collision rows survive.
+        assert!(offered["GITHUB_TOKEN"], "GITHUB_TOKEN (NameMatch collision) must be offered");
+        assert!(offered["SLACK_WEBHOOK_URL"], "SLACK_WEBHOOK_URL (branded-prefix collision) must be offered");
+        // precision >= 0.70 over the frozen corpus.
+        assert!(precision >= 0.70, "precision {precision} < 0.70 (fp={fp})");
+        // Each named adversarial non-secret must NOT be offered.
+        for k in ["REQUEST_ID", "gitsha", "PUBLIC_URL", "NODE_ENV", "APP_VERSION"] {
+            assert!(!offered[k], "{k} must NOT be offered (precision leak)");
+        }
+    }
+
+    /// The reason-gate directly: the SAME 40-hex value is a candidate under a name that
+    /// matches (TOKEN ⇒ NameMatch/Both) but suppressed under one that does not (Entropy).
+    #[test]
+    fn reason_gate_rescues_named_shape_collision() {
+        let sha = "5f3e2a1b9c8d7e6f0a1b2c3d4e5f60718293a4b5";
+        assert!(is_candidate("GITHUB_TOKEN", sha), "named 40-hex is a secret");
+        assert!(!is_candidate("gitsha", sha), "anonymous 40-hex is a git SHA (suppressed)");
+        // A high-entropy UUID (above the entropy floor) is still suppressed via structure.
+        let uuid = "0a1b2c3d-4e5f-6789-abcd-ef0123456789";
+        assert!(!is_candidate("TRACE_ID", uuid), "anonymous UUID suppressed via structure");
+        // The webhook prefix is the ONLY rescue for a bare-https SLACK_WEBHOOK_URL.
+        assert!(is_candidate(
+            "SLACK_WEBHOOK_URL",
+            "https://hooks.slack.com/services/T0/B0/XXXX"
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Scan falsifiers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn scan_lists_only_candidates_never_config_keys() {
+        let dir = scratch_dir("scan-a");
+        std::fs::write(
+            dir.join(".env"),
+            "OPENAI_KEY=sk-abcDEF123456ghiJKL\nNODE_ENV=production\nPORT=8080\n",
+        )
+        .unwrap();
+        let files = enumerate_env_files(dir.to_str().unwrap());
+        let report = scan_report(dir.to_str().unwrap(), &files, &HashSet::new(), false);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(report.contains("OPENAI_KEY"), "sk- key must be listed:\n{report}");
+        assert!(!report.contains("NODE_ENV"), "NODE_ENV must not appear:\n{report}");
+        assert!(!report.contains("PORT"), "PORT must not appear:\n{report}");
+    }
+
+    #[test]
+    fn scan_never_prints_a_value() {
+        let dir = scratch_dir("scan-b");
+        std::fs::write(dir.join(".env"), "SECRET=sk-live_deadbeefcafef00dbabe1234\n").unwrap();
+        let files = enumerate_env_files(dir.to_str().unwrap());
+        let report = scan_report(dir.to_str().unwrap(), &files, &HashSet::new(), true);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(report.contains("SECRET"), "KEY name must appear:\n{report}");
+        assert!(
+            !report.contains("sk-live_deadbeef"),
+            "the value must NEVER appear:\n{report}"
+        );
+    }
+
+    #[test]
+    fn scan_proxy_down_still_lists_with_caveat() {
+        let dir = scratch_dir("scan-c");
+        std::fs::write(dir.join(".env"), "APIKEY=sk-abcDEF123456ghiJKL\n").unwrap();
+        let files = enumerate_env_files(dir.to_str().unwrap());
+        // proxy_up = false ⇒ registered set empty + caveat printed.
+        let report = scan_report(dir.to_str().unwrap(), &files, &HashSet::new(), false);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(report.contains("APIKEY"), "candidate listed:\n{report}");
+        assert!(report.contains("best-effort"), "proxy-down caveat present:\n{report}");
+    }
+
+    #[test]
+    fn scan_skips_example_and_sample_sidecars() {
+        let dir = scratch_dir("scan-d");
+        std::fs::write(dir.join(".env.example"), "APIKEY=sk-abcDEF123456ghiJKL\n").unwrap();
+        std::fs::write(dir.join(".env.sample"), "APIKEY=sk-abcDEF123456ghiJKL\n").unwrap();
+        std::fs::write(dir.join(".env.prod.example"), "APIKEY=sk-abcDEF123456ghiJKL\n").unwrap();
+        let files = enumerate_env_files(dir.to_str().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(files.is_empty(), "example/sample sidecars must be skipped: {files:?}");
+    }
+
+    #[test]
+    fn is_intake_env_file_matrix() {
+        assert!(is_intake_env_file(".env"));
+        assert!(is_intake_env_file(".env.local"));
+        assert!(is_intake_env_file(".env.production"));
+        assert!(!is_intake_env_file(".env.example"));
+        assert!(!is_intake_env_file(".env.sample"));
+        assert!(!is_intake_env_file(".env.prod.example"));
+        assert!(!is_intake_env_file("env")); // no leading dot
+        assert!(!is_intake_env_file("config.toml"));
+    }
+
+    #[test]
+    fn resolve_import_files_respects_intake_boundary() {
+        // Layout: <parent>/project/.env         (real intake file)
+        //         <parent>/project/.env.example (placeholder sidecar)
+        //         <parent>/.env                 (OUTSIDE the project, reachable via `..`)
+        let parent = scratch_dir("resolve-boundary");
+        let project = parent.join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join(".env"), "API=sk-abcDEF123456ghiJKL\n").unwrap();
+        std::fs::write(project.join(".env.example"), "API=placeholder\n").unwrap();
+        std::fs::write(parent.join(".env"), "OUTSIDE=sk-abcDEF123456ghiJKL\n").unwrap();
+        let root = project.to_str().unwrap();
+
+        // Some(.env): a real intake file inside root ⇒ Ok, single NON-canonical resolved path.
+        let ok = resolve_import_files(root, Some(PathBuf::from(".env")));
+        assert!(ok.is_ok(), "real .env inside root must resolve: {ok:?}");
+        assert_eq!(ok.unwrap(), vec![project.join(".env")]);
+
+        // Some(.env.example): placeholder sidecar excluded by is_intake_env_file ⇒ Err.
+        assert!(
+            resolve_import_files(root, Some(PathBuf::from(".env.example"))).is_err(),
+            "placeholder .env.example sidecar must be rejected"
+        );
+
+        // Some(../.env): intake-named but OUTSIDE the project (containment) ⇒ Err.
+        assert!(
+            resolve_import_files(root, Some(PathBuf::from("../.env"))).is_err(),
+            "an intake-named file outside the project root must be rejected"
+        );
+
+        // None: discovery set INCLUDES .env and EXCLUDES the .env.example sidecar.
+        let all = resolve_import_files(root, None).unwrap();
+        assert!(all.contains(&project.join(".env")), "discovery includes .env: {all:?}");
+        assert!(
+            !all
+                .iter()
+                .any(|p| p.file_name().and_then(|n| n.to_str()) == Some(".env.example")),
+            "discovery excludes .env.example: {all:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&parent);
+    }
+
+    // -----------------------------------------------------------------------
+    // import_merge falsifiers (text -> text)
+    // -----------------------------------------------------------------------
+
+    fn accepted(name: &str, from_ref: &str, op: Option<&str>) -> AcceptedSecret {
+        AcceptedSecret {
+            name: name.into(),
+            from_ref: from_ref.into(),
+            operator: op.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn import_merge_empty_doc_one_ref_no_value_key() {
+        let out = import_merge("", &[accepted("DB_URL", "dotenv:.env#DB_URL", None)]);
+        let text = match out {
+            ImportOutcome::Changed(t) => t,
+            other => panic!("expected Changed, got {other:?}"),
+        };
+        assert!(text.contains("[[secrets]]"));
+        assert!(text.contains("name = \"DB_URL\""));
+        assert!(text.contains("from_ref = \"dotenv:.env#DB_URL\""));
+        // NEVER a value/operator (operator was None).
+        for forbidden in ["value", "literal", "secret =", "plaintext", "from_env", "operator"] {
+            assert!(!text.contains(forbidden), "{forbidden:?} must not appear:\n{text}");
+        }
+        // The proxy config parser re-accepts it.
+        let doc: toml_edit::DocumentMut = text.parse().unwrap();
+        assert!(doc.get("secrets").and_then(|s| s.as_array_of_tables()).is_some());
+    }
+
+    #[test]
+    fn import_merge_preserves_engine_and_comments() {
+        let current = "# top comment\n[engine]\nprofile = \"balanced\"  # inline note\n";
+        let out = import_merge(current, &[accepted("API", "dotenv:.env#API", Some("hash"))]);
+        let text = match out {
+            ImportOutcome::Changed(t) => t,
+            other => panic!("expected Changed, got {other:?}"),
+        };
+        assert!(text.contains("# top comment"), "top comment preserved:\n{text}");
+        assert!(text.contains("[engine]"), "[engine] preserved");
+        assert!(text.contains("profile = \"balanced\"  # inline note"), "inline comment preserved:\n{text}");
+        assert!(text.contains("[[secrets]]"), "stanza appended");
+        assert!(text.contains("operator = \"hash\""));
+    }
+
+    #[test]
+    fn import_merge_idempotent_existing_name_is_noop() {
+        let current = "[[secrets]]\nname = \"DB_URL\"\nfrom_ref = \"dotenv:.env#DB_URL\"\n";
+        let out = import_merge(current, &[accepted("DB_URL", "dotenv:.env#DB_URL", None)]);
+        assert_eq!(out, ImportOutcome::NoOp, "existing name ⇒ NoOp (no rewrite)");
+    }
+
+    #[test]
+    fn import_merge_unparseable_refuses_no_write() {
+        let out = import_merge("this = = broken\n[[[", &[accepted("X", "dotenv:.env#X", None)]);
+        assert!(matches!(out, ImportOutcome::Refused(_)), "unparseable ⇒ Refused");
+    }
+
+    #[test]
+    fn import_merge_secrets_scalar_refuses() {
+        let out = import_merge("secrets = \"x\"\n", &[accepted("X", "dotenv:.env#X", None)]);
+        assert!(matches!(out, ImportOutcome::Refused(_)), "scalar `secrets` ⇒ Refused");
+        // A `[secrets]` table (not array-of-tables) is likewise refused.
+        let out2 = import_merge("[secrets]\nfoo = 1\n", &[accepted("X", "dotenv:.env#X", None)]);
+        assert!(matches!(out2, ImportOutcome::Refused(_)), "[secrets] table ⇒ Refused");
+    }
+
+    #[test]
+    fn import_merge_exact_byte_trace() {
+        let out = import_merge(
+            "",
+            &[accepted("DB_URL", "dotenv:.env#DB_URL", Some("redact"))],
+        );
+        let text = match out {
+            ImportOutcome::Changed(t) => t,
+            other => panic!("expected Changed, got {other:?}"),
+        };
+        assert_eq!(
+            text,
+            "[[secrets]]\nname = \"DB_URL\"\nfrom_ref = \"dotenv:.env#DB_URL\"\noperator = \"redact\"\n",
+            "byte-trace mismatch:\n{text:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Offline resolve + end-to-end MASK proof (no proxy process, no network)
+    // -----------------------------------------------------------------------
+
+    /// A written import ref resolves back to the fixture value via the dotenv provider.
+    #[tokio::test]
+    async fn import_ref_resolves_offline() {
+        let dir = scratch_dir("resolve");
+        std::fs::write(dir.join(".env"), "DB_URL=postgres://u:p@h:5432/db\n").unwrap();
+        // Simulate what import writes: dotenv:<rel>#KEY.
+        let sref = sordino_secrets::SecretRef::parse("dotenv:.env#DB_URL").unwrap();
+        assert_eq!(sref.scheme, "dotenv");
+        assert_eq!(sref.field.as_deref(), Some("DB_URL"));
+        let provider = sordino_secrets::providers::dotenv::DotenvProvider::new(Some(dir.clone()));
+        let val = provider.resolve(&sref).await.unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(val.expose(), "postgres://u:p@h:5432/db");
+    }
+
+    /// Serialize the config::load tests (they mutate the process-global user-config env).
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// REAL end-to-end: import-written sordino.toml -> config::load -> default_registry ->
+    /// resolve_and_install on a fresh MaskEngine -> the fixture value is masked. The
+    /// SKIP-negative (no install) leaves the value present.
+    #[tokio::test]
+    async fn end_to_end_written_config_masks_value() {
+        let _g = env_guard();
+        let dir = scratch_dir("e2e");
+        // Isolate the user config layer so a real ~/.config file can't pollute load().
+        unsafe { std::env::set_var("SORDINO_USER_CONFIG", dir.join("no-such-user.toml")) };
+
+        // A LOW-entropy, non-structured token (no URL/DSN shape, below the generic
+        // entropy-gated API_KEY recognizer's floor) so the ONLY thing that can mask it is
+        // the installed secret rule — otherwise a generic recognizer would mask it even
+        // without install, defeating the SKIP-negative.
+        let fixture_value = "hunter2hunter2hunter2hunter2";
+        std::fs::write(dir.join(".env"), format!("API_TOKEN={fixture_value}\n")).unwrap();
+
+        // What `secrets import` writes for an accepted API_TOKEN.
+        let toml = import_merge("", &[accepted("API_TOKEN", "dotenv:.env#API_TOKEN", Some("redact"))]);
+        let toml_text = match toml {
+            ImportOutcome::Changed(t) => t,
+            other => panic!("expected Changed, got {other:?}"),
+        };
+        let toml_path = dir.join("sordino.toml");
+        std::fs::write(&toml_path, &toml_text).unwrap();
+
+        // config::load re-parses the written refs (scope invariant passes — refs only).
+        let loaded = sordino_proxy::config::load(Some(&toml_path)).expect("config::load");
+        assert_eq!(loaded.secrets.len(), 1);
+        assert_eq!(loaded.secrets[0].name, "API_TOKEN");
+        assert_eq!(loaded.secrets[0].from_ref.as_deref(), Some("dotenv:.env#API_TOKEN"));
+
+        let registry = sordino_secrets::default_registry(Some(dir.clone()));
+        let admin_key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+        // POSITIVE: install ⇒ the value is masked out of the transcript surface.
+        let engine = sordino_engine::MaskEngine::new(sordino_engine::EngineConfig::default()).unwrap();
+        let (status, ok) =
+            sordino_proxy::secrets::resolve_and_install(&loaded.secrets, &engine, &registry, admin_key).await;
+        assert!(ok, "the dotenv-referenced secret resolves offline");
+        assert_eq!(status.resolved(), 1);
+        let masked = engine
+            .mask(&format!("connect via {fixture_value} now"), sordino_engine::Surface::UserMessage)
+            .unwrap();
+        assert!(
+            !masked.masked_text.contains(fixture_value),
+            "installed secret must be masked:\n{}",
+            masked.masked_text
+        );
+
+        // NEGATIVE (skip install): a fresh engine with no rules leaves the value present.
+        let engine2 = sordino_engine::MaskEngine::new(sordino_engine::EngineConfig::default()).unwrap();
+        let unmasked = engine2
+            .mask(&format!("connect via {fixture_value} now"), sordino_engine::Surface::UserMessage)
+            .unwrap();
+        assert!(
+            unmasked.masked_text.contains(fixture_value),
+            "without install the value is NOT masked (proves the install did the masking)"
+        );
+
+        unsafe { std::env::remove_var("SORDINO_USER_CONFIG") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

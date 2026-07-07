@@ -58,7 +58,50 @@ use crate::surface::Surface;
 // (`is_near_now_date`/`is_suppressed`, wired into both the custom-rule pass and
 // `ingest_results`) and extended `AllowList::with_common_words()`. All three change
 // detection output for unchanged (text, config) — bump to abandon stale cache entries.
-pub const DETECTOR_VERSION: u64 = 9;
+// v10: upstream presidio-analyzer now ships a dedicated whole-block PrivateKeyRecognizer
+// (native EntityType::PrivateKey → "PRIVATE_KEY", in Category::Secrets/always-on),
+// registered in its default recognizer set. A full `-----BEGIN … PRIVATE KEY-----`…
+// `-----END-----` block now masks ENTIRELY (base64 body included) instead of only the
+// marker line matching as API_KEY. Changes detection output for unchanged text — bump.
+// v11: finish()'s allow-span containment now exempts the ENTIRE always-on Secrets
+// category (not just Source::Secret), so a URL_CREDENTIAL (which arrives as
+// Source::Regex, not Source::Secret) embedded inside an allowed standards-host URL is
+// no longer swallowed — an embedded credential still masks. Changes output — bump.
+// v12: with_common_words() gains ten anchored standards-host allow patterns
+// (w3.org/schema.org/…), so bare references to those hosts under Network no longer mask
+// as URLs. Content is already folded into detection_fingerprint via fp_allow_list, but
+// bump per the one-vN-per-detection-output-change convention.
+// v13: reserved/non-routable IP suppression (F5) — an IP_ADDRESS whose literal is a
+// loopback/private/link-local/unspecified (IPv4) or loopback/unspecified/fe80::/10/
+// 2001:db8::/32 (IPv6) address, tolerating a trailing `/<prefix>` or `%<zone>`, is
+// infra noise, not PII, and is dropped in place under Network. An entity-gated
+// ingest-juncture pre-check (a sibling of the API_KEY precision gate, NOT the shared
+// `is_suppressed` which the custom-rule pass also calls) so a deliberate custom rule over
+// such an IP still masks. Changes detection output for unchanged text.
+// v14: namespace-URL suppression (F8) — a URL that is the VALUE of a namespace-declaring
+// key (xmlns / xmlns:* / $schema / $id / $ref / targetNamespace / *schemaLocation) is a
+// structural identifier, not a user URL, and is suppressed under Network regardless of the
+// F7 standards-host allow-list. Also an ingest-juncture entity-gated pre-check, sibling of
+// F5, never the shared `is_suppressed`. Changes output for unchanged text — bump.
+// v15: tightened the F8 namespace-key match — the `schemaLocation` clause was `ends_with`, which
+// over-matched a contrived key (e.g. `dataschemaLocation`) and UNDER-MASKED a real user URL; it
+// now matches only the real `schemaLocation` / `<ns>:schemaLocation` forms. A URL under such a
+// non-namespace key now MASKS instead of being suppressed — changes output, so bump.
+// v16: DOMAIN enabled under Network (F12) — presidio's DomainRecognizer now feeds detections, but
+// a bare filename-shaped domain (`utils.py` / `main.rs` / `README.md` / `opts.la`: no `/`, no `:`,
+// not `www.`-prefixed, rightmost dot-label in the frozen FILE_EXTENSIONS set) is a file reference,
+// not a host, and is DROPPED in place at the ingest juncture (a sibling of F5/F8, never the shared
+// `is_suppressed`, so a deliberate custom rule over such a filename still masks). Real domains
+// (`example.com`, `www.example.io`) still mask. Changes detection output for unchanged text — bump.
+// v17: three structured-secret recognizers (F10) added upstream to presidio-analyzer's default
+// recognizer set — JwkRecognizer → PRIVATE_KEY (a JWK's private member values, e.g. `d`),
+// AwsCredentialsRecognizer → AWS_SECRET_KEY (the value of `aws_secret_access_key` /
+// `aws_session_token`), and NetrcRecognizer → URL_CREDENTIAL (the value after a `.netrc`
+// `password` keyword). All Category::Secrets/always-on, consumed automatically through
+// `default_analyzer` (no from_parts registration needed, same path as PrivateKeyRecognizer).
+// New recognizers change detection output for unchanged (text, config) — bump to abandon stale
+// cache entries computed before they registered.
+pub const DETECTOR_VERSION: u64 = 17;
 
 /// Score the [`LemmaContextAwareEnhancer`] adds when a recognizer's context word
 /// is found near a match (mirrors `LemmaContextAwareEnhancer::new`'s
@@ -423,6 +466,113 @@ fn is_suppressed(cfg: &EngineConfig, slice: &str, today: i64) -> bool {
     cfg.allow_list.is_allowed(slice) || (cfg.preserve_current_date && is_near_now_date(slice, today))
 }
 
+/// F5: is `slice` a reserved / non-routable IP literal — infra noise, not PII?
+///
+/// Tolerates a trailing `/<prefix>` (CIDR) and/or `%<zone>` (IPv6 scope-id) suffix by
+/// stripping them (in that order) before parsing. Covers IPv4 loopback (127/8), private
+/// (10/8, 172.16/12, 192.168/16), link-local (169.254/16) and unspecified (0.0.0.0); and
+/// IPv6 loopback (::1), unspecified (::), link-local (fe80::/10) and documentation
+/// (2001:db8::/32). A public/routable address (e.g. 8.8.8.8) returns false and still masks
+/// under Network. Called ONLY at the IP_ADDRESS ingest branch — never from the shared
+/// `is_suppressed` (which the custom-rule pass also calls), so a deliberate custom rule
+/// over a reserved IP is unaffected.
+fn is_reserved_net_id(slice: &str) -> bool {
+    // Strip a CIDR prefix, then an IPv6 zone id, before parsing.
+    let s = slice.split('/').next().unwrap_or(slice);
+    let s = s.split('%').next().unwrap_or(s);
+    match s.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(v4)) => {
+            v4.is_loopback() || v4.is_private() || v4.is_link_local() || v4.is_unspecified()
+        }
+        Ok(std::net::IpAddr::V6(v6)) => {
+            // `is_unicast_link_local` / `is_documentation` are unstable on stable Rust, so
+            // check the fe80::/10 and 2001:db8::/32 prefixes directly on the segments.
+            let seg = v6.segments();
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (seg[0] & 0xffc0) == 0xfe80
+                || (seg[0] == 0x2001 && seg[1] == 0x0db8)
+        }
+        Err(_) => false,
+    }
+}
+
+/// F8: does the key IMMEDIATELY preceding the value at byte offset `start` declare a
+/// namespace/schema (xmlns, xmlns:*, $schema, $id, $ref, targetNamespace, *schemaLocation)?
+///
+/// Such a URL value is a structural identifier, not a user URL. Context tokens are not
+/// threaded into `ingest_results`, so this is a direct backward scan of `text[..start]`:
+/// trim the separator zone (whitespace, `"`, `'`, `:`, `=`) off the end, then take the
+/// maximal trailing key-char run (`[A-Za-z0-9_$:-]`) and match it. All scanning is
+/// char-based (`trim_end_matches` + `char_indices`), so a multibyte char immediately before
+/// the value (e.g. `é$schema=…`) can never split a boundary or panic.
+fn preceding_key_is_namespace(text: &str, start: usize) -> bool {
+    let head = &text[..start];
+    // Separator zone between a key and its value: attribute/JSON punctuation.
+    let trimmed = head.trim_end_matches(|c: char| {
+        c.is_whitespace() || matches!(c, '"' | '\'' | ':' | '=')
+    });
+    let is_key_char = |c: char| c.is_ascii_alphanumeric() || matches!(c, '_' | '$' | ':' | '-');
+    // Byte index where the maximal trailing key-char run begins (char-boundary safe).
+    let run_start = trimmed
+        .char_indices()
+        .rev()
+        .take_while(|(_, c)| is_key_char(*c))
+        .last()
+        .map(|(i, _)| i)
+        .unwrap_or(trimmed.len());
+    let key = &trimmed[run_start..];
+    key == "xmlns"
+        || key.starts_with("xmlns:")
+        || key == "$schema"
+        || key == "$id"
+        || key == "$ref"
+        || key == "targetNamespace"
+        // v15: tightened from `key.ends_with("schemaLocation")` — the bare suffix over-matched a
+        // contrived key like `dataschemaLocation` and would UNDER-MASK a real user URL. Only the
+        // bare `schemaLocation` and namespaced `<ns>:schemaLocation` (e.g. `xsi:schemaLocation`)
+        // forms are genuine namespace-declaring keys.
+        || key == "schemaLocation"
+        || key.ends_with(":schemaLocation")
+}
+
+/// FROZEN set of file-name suffixes that presidio's `DomainRecognizer` would otherwise
+/// mask as a domain because they collide with a real TLD (`la` = Laos, `rs` = Serbia,
+/// `md` = Moldova, `sh` = Saint Helena, `cc` = Cocos, `pl` = Poland, `ml` = Mali,
+/// `so` = Somalia). A bare `opts.la` / `main.rs` in code or prose is a file, not a host.
+///
+/// LOAD-BEARING invariants (do NOT edit casually — both are pinned by tests):
+///   - `la` MUST be present: `opts.la` in the committed `strict_url_skips_filenames_keeps_real_urls`
+///     test would otherwise mask once DOMAIN is enabled.
+///   - popular real gTLDs a user would actually type as a website (`io`, `ai`, `app`, `dev`,
+///     `co`, `com`, `net`, `org`, `me`, `tv`) are DELIBERATELY EXCLUDED so real domains
+///     (`example.com`, `www.example.io`) still mask.
+///
+/// Kept sorted for `binary_search`; membership is on the lowercased rightmost dot-label.
+static FILE_EXTENSIONS: &[&str] = &[
+    "cc", "go", "la", "md", "ml", "pl", "py", "rb", "rs", "sh", "so",
+];
+
+/// F12: is `slice` a bare, filename-shaped domain rather than a real host? True when it
+/// has no path/scheme punctuation (`/`, `:`), is not a `www.`-prefixed hostname, and its
+/// rightmost dot-label (lowercased) is in the frozen [`FILE_EXTENSIONS`] set. Called ONLY
+/// at the DOMAIN ingest branch — never from the shared `is_suppressed` (which the
+/// custom-rule pass also calls), so a deliberate custom rule over such a filename still
+/// masks.
+fn is_filename_shaped_domain(slice: &str) -> bool {
+    if slice.contains('/') || slice.contains(':') {
+        return false;
+    }
+    if slice.starts_with("www.") {
+        return false;
+    }
+    let Some(label) = slice.rsplit('.').next() else {
+        return false;
+    };
+    let ext = label.to_ascii_lowercase();
+    FILE_EXTENSIONS.binary_search(&ext.as_str()).is_ok()
+}
+
 /// Suppress detections fully contained within an allow-listed span, then resolve
 /// overlaps into the final sorted, non-overlapping list. Shared tail of
 /// [`run_detection`] and [`run_detection_batch`].
@@ -435,6 +585,9 @@ fn finish(
     if !allowed_spans.is_empty() {
         dets.retain(|d| {
             d.source == Source::Secret
+                || crate::config::Category::Secrets
+                    .entity_types()
+                    .contains(&d.entity_type.as_str())
                 || !allowed_spans
                     .iter()
                     .any(|(s, e)| *s <= d.start && d.end <= *e)
@@ -538,6 +691,33 @@ fn ingest_results(
             && r.recognition_metadata.pattern_name.as_deref() == Some(GENERIC_ENTROPY_PATTERN)
             && !plausible_generic_secret(slice)
         {
+            continue;
+        }
+        // F5: a reserved/non-routable IP literal is infra noise, not PII. A sibling of
+        // the API_KEY precision gate above — it DROPS the presidio detection in place
+        // (does NOT record an allow span). This matters: it is applied ONLY here, at the
+        // IP_ADDRESS ingest branch, and NEVER in the shared `is_suppressed` (which the
+        // custom-rule pass also calls) — so a deliberate custom rule over a reserved IP
+        // still masks. Recording an allow span instead would defeat that, because
+        // `finish`'s allow-span containment would then swallow the custom det (presidio
+        // also detects the same IP at the same span, so the span is allowed regardless of
+        // where this check sits). Dropping keeps the custom rule authoritative.
+        if entity_type == "IP_ADDRESS" && is_reserved_net_id(slice) {
+            continue;
+        }
+        // F8: a URL that is the VALUE of a namespace-declaring key is a structural
+        // identifier, not a user URL. Sibling of F5 — entity-gated to URL, ingest-juncture
+        // only, and a plain drop (no allow span) for the same custom-rule reason.
+        if entity_type == "URL" && preceding_key_is_namespace(text, r.start) {
+            continue;
+        }
+        // F12: a bare filename-shaped domain (`utils.py`, `main.rs`, `opts.la`) is a file
+        // reference, not a host — presidio's DomainRecognizer validates its TLD (`la`/`rs`/…
+        // are real ccTLDs) and would mask it. Sibling of F5/F8: entity-gated to DOMAIN,
+        // ingest-juncture only, and a plain DROP (no allow span) — so a deliberate custom rule
+        // over the same filename still masks (an allow span would swallow it in `finish`).
+        // Real domains (`example.com`, `www.example.io`) fail the filename shape and still mask.
+        if entity_type == "DOMAIN" && is_filename_shaped_domain(slice) {
             continue;
         }
         if is_suppressed(cfg, slice, today) {
@@ -1036,5 +1216,500 @@ mod precision_tests {
         ] {
             assert!(plausible_generic_secret(s), "should keep secret: {s:?}");
         }
+    }
+}
+
+#[cfg(test)]
+mod net_precision_ingest_tests {
+    use super::*;
+    use crate::config::{Category, CustomReplacement, EngineConfig};
+
+    fn analyzer() -> presidio_analyzer::AnalyzerEngine {
+        // The Network category is default-OFF (Balanced), so URL/IP/MAC only mask when
+        // it is explicitly enabled — every test here does exactly that.
+        presidio_analyzer::default_analyzer("en")
+            .with_context_enhancer(presidio_analyzer::LemmaContextAwareEnhancer::new())
+    }
+
+    /// Balanced default with Network ON — the config under which F5/F8 apply.
+    fn network_on() -> EngineConfig {
+        let mut cfg = EngineConfig::default();
+        cfg.enabled_categories.insert(Category::Network);
+        cfg
+    }
+
+    /// Full RUN of the non-ML detection path (`detect_base` + `finish`) for one text,
+    /// returning the surviving detections of `entity` with their spans. Non-stubbable:
+    /// this drives the same code path production uses.
+    fn dets_of(cfg: &EngineConfig, customs: &[CompiledCustom], text: &str, entity: &str) -> Vec<(usize, usize)> {
+        let (dets, allowed, _today) =
+            detect_base(&analyzer(), cfg, customs, &[], text, Surface::UserMessage);
+        finish(dets, allowed)
+            .into_iter()
+            .filter(|d| d.entity_type == entity)
+            .map(|d| (d.start, d.end))
+            .collect()
+    }
+
+    // ---- F5: reserved / non-routable IP suppression -----------------------------------
+
+    // Direct unit: the predicate covers loopback/private/link-local/unspecified (v4) and
+    // loopback/unspecified/fe80::/10/2001:db8::/32 (v6), tolerating a trailing `/<prefix>`
+    // and/or `%<zone>` — and rejects public / non-IP input.
+    #[test]
+    fn f5_is_reserved_net_id_covers_reserved_and_rejects_public() {
+        for s in [
+            "10.0.0.5",         // private 10/8
+            "172.16.5.5",       // private 172.16/12
+            "192.168.1.1",      // private 192.168/16
+            "192.168.1.1/24",   // /-strip (CIDR)
+            "127.0.0.1",        // loopback v4
+            "169.254.10.10",    // link-local v4
+            "0.0.0.0",          // unspecified v4
+            "::1",              // loopback v6
+            "::",               // unspecified v6
+            "fe80::1",          // link-local v6
+            "fe80::1%eth0",     // %-strip (zone id)
+            "fe80::1%eth0/10",  // both suffixes
+            "2001:db8::1",      // documentation v6 (doc-range)
+            "2001:db8::1/64",   // doc-range + /-strip
+        ] {
+            assert!(is_reserved_net_id(s), "should be reserved: {s:?}");
+        }
+        for s in [
+            "8.8.8.8",          // public
+            "1.1.1.1",          // public
+            "2606:4700::1111",  // public v6 (Cloudflare)
+            "203.0.113.5",      // TEST-NET-3 doc range is NOT in scope for v4 here
+            "not-an-ip",
+            "example.com",
+            "999.1.1.1",        // out of range
+            "",
+        ] {
+            assert!(!is_reserved_net_id(s), "should NOT be reserved: {s:?}");
+        }
+    }
+
+    // e2e: a reserved IP is suppressed by the F5 GATE (not the allow-list — 10.0.0.5 is
+    // not an allow-list entry), while a public IP still masks under Network.
+    #[test]
+    fn f5_reserved_ip_suppressed_public_ip_masks() {
+        let cfg = network_on();
+        assert!(
+            !cfg.allow_list.is_allowed("10.0.0.5"),
+            "precondition: 10.0.0.5 must NOT be allow-listed, so suppression proves the gate"
+        );
+        assert!(
+            dets_of(&cfg, &[], "connect to 10.0.0.5 now", "IP_ADDRESS").is_empty(),
+            "reserved IP must be suppressed under Network by the F5 gate"
+        );
+        assert_eq!(
+            dets_of(&cfg, &[], "reach 8.8.8.8 today", "IP_ADDRESS").len(),
+            1,
+            "a public IP must still mask under Network"
+        );
+    }
+
+    // WIRING falsifier: a custom_replacement matching exactly 10.0.0.5 STILL masks. This
+    // proves the F5 check lives at the IP_ADDRESS ingest branch (regex/ML pass) and NOT in
+    // the shared `is_suppressed` — which the custom-rule pass also calls, and which would
+    // otherwise silently defeat a deliberate custom rule. (It also proves F5 is a plain
+    // drop, not an allow-span: an allow-span would let `finish`'s containment swallow the
+    // custom det at the same coordinates.)
+    #[test]
+    fn f5_custom_rule_over_reserved_ip_still_masks() {
+        let cfg = network_on();
+        let customs = compile_customs(&[CustomReplacement {
+            pattern: r"10\.0\.0\.5".to_string(),
+            entity_type: "MY_IP".to_string(),
+            is_regex: true,
+            case_sensitive: true,
+            priority: 0,
+            literal_token: false,
+            token: None,
+            apply_to_surfaces: None,
+        }])
+        .expect("custom rule compiles");
+        let hits = dets_of(&cfg, &customs, "connect to 10.0.0.5 now", "MY_IP");
+        assert_eq!(
+            hits.len(),
+            1,
+            "a custom rule over a reserved IP must still mask (F5 is at the IP ingest branch, not shared is_suppressed), got {hits:?}"
+        );
+    }
+
+    // ---- F8: namespace-declaring-key URL suppression ----------------------------------
+
+    // e2e: a URL that is the VALUE of a namespace-declaring key is suppressed under Network,
+    // even though its host is NOT in the F7 standards-host allow-list — proving the
+    // STRUCTURAL mechanism, not the allow-list. Each positive case is a URL presidio DOES
+    // detect (verified: score-0.6 Quoted URL), so F8 is load-bearing, not trivially unseen.
+    #[test]
+    fn f8_namespace_key_url_suppressed() {
+        let cfg = network_on();
+        assert!(
+            !cfg.allow_list.is_allowed("https://example.com/my/schema.json"),
+            "precondition: the host must NOT be allow-listed, so suppression proves F8"
+        );
+        for text in [
+            r#"{"$schema":"https://example.com/my/schema.json"}"#, // $schema
+            r#"{"$id":"https://example.com/x"}"#,                  // $id
+            r#"{"$ref":"https://example.com/x"}"#,                 // $ref
+            r#"targetNamespace="https://example.com/x""#,          // targetNamespace
+            r#"xsi:schemaLocation="https://example.com/x""#,       // *schemaLocation
+            r#"xmlns="https://example.com/x""#,                    // bare xmlns
+            r#"<svg xmlns:custom="https://example.com/x">"#,       // xmlns: compound
+        ] {
+            assert!(
+                dets_of(&cfg, &[], text, "URL").is_empty(),
+                "namespace-key URL must be suppressed by F8: {text:?}"
+            );
+        }
+    }
+
+    // Negative control (the differential that proves F8 does the work): the IDENTICAL URL
+    // under a NON-namespace key (`url`) still masks. Presidio detects both identically, so
+    // the only reason `$schema` is suppressed and `url` is not is the F8 key check.
+    #[test]
+    fn f8_non_namespace_key_url_still_masks() {
+        let cfg = network_on();
+        assert_eq!(
+            dets_of(&cfg, &[], r#"{"url":"https://example.com/x"}"#, "URL").len(),
+            1,
+            "a URL under a non-namespace key must still mask"
+        );
+    }
+
+    // v15 regression: the F8 `schemaLocation` clause used to be `ends_with`, so a contrived key
+    // like `dataschemaLocation` matched and SUPPRESSED a real user URL — an UNDER-MASK (a leak).
+    // After the tightening, only bare `schemaLocation` / `<ns>:schemaLocation` suppress; a URL
+    // under `dataschemaLocation` must MASK again. The genuine forms must still be suppressed.
+    #[test]
+    fn f8_schema_location_tightened_to_real_namespace_forms() {
+        let cfg = network_on();
+        // Hosts here use example.com (a TLD presidio DOES parse: score-0.6 Quoted URL) so both
+        // directions are load-bearing — a `.example` host would go undetected and prove nothing.
+        assert!(
+            !cfg.allow_list.is_allowed("https://example.com/x"),
+            "precondition: the host must NOT be allow-listed, so suppression proves F8"
+        );
+        // Regression: key merely ENDS WITH the substring but is not a namespace attr -> masks.
+        // Before the v15 tightening this leaked (`ends_with("schemaLocation")` suppressed it).
+        assert_eq!(
+            dets_of(&cfg, &[], r#"dataschemaLocation="https://example.com/x""#, "URL").len(),
+            1,
+            "a URL under `dataschemaLocation` (not a real namespace attr) must MASK, not be suppressed"
+        );
+        // No regression to the real forms: bare + namespaced schemaLocation still suppressed.
+        // The URL sits directly after the key's opening quote so the backward scan lands on the
+        // schemaLocation key itself (a leading namespace token would shift the preceding key).
+        for text in [
+            r#"schemaLocation="https://example.com/x""#,       // bare -> key == "schemaLocation"
+            r#"xsi:schemaLocation="https://example.com/x""#,   // namespaced -> ends_with(":schemaLocation")
+        ] {
+            assert!(
+                dets_of(&cfg, &[], text, "URL").is_empty(),
+                "genuine schemaLocation form must still be suppressed by F8: {text:?}"
+            );
+        }
+    }
+
+    // Also honor the literal acceptance strings (some hosts presidio can't even parse, e.g.
+    // `internal.example`'s invalid TLD — those are suppressed regardless; still assert it).
+    #[test]
+    fn f8_literal_acceptance_cases_suppressed() {
+        let cfg = network_on();
+        for text in [
+            r#"<svg xmlns:custom="https://internal.example/ns">"#,
+            r#"{"$schema":"https://example.com/my/schema.json"}"#,
+        ] {
+            assert!(
+                dets_of(&cfg, &[], text, "URL").is_empty(),
+                "literal acceptance case must be suppressed: {text:?}"
+            );
+        }
+    }
+
+    // UTF-8 falsifier: a multibyte char immediately before the key/value (`é$schema="…"`)
+    // must NOT panic (the backward scan is char-boundary safe) AND the URL is suppressed.
+    #[test]
+    fn f8_utf8_before_key_no_panic_and_suppressed() {
+        let cfg = network_on();
+        let text = "é$schema=\"https://example.com/s.json\"";
+        assert!(
+            dets_of(&cfg, &[], text, "URL").is_empty(),
+            "namespace URL preceded by a multibyte char must be suppressed without panic"
+        );
+    }
+
+    // Direct-unit for the key predicate: exercises the separator-zone trim, the maximal
+    // key-char run, the compound `xmlns:` prefix, and a multibyte prefix — independent of
+    // presidio. `start` is the byte offset of the value (as presidio reports: the opening
+    // quote of a quoted URL).
+    #[test]
+    fn f8_preceding_key_predicate_unit() {
+        // Positives — `start` points just past the trailing `"` (the value's opening quote).
+        for (text, val) in [
+            (r#"{"$schema":"x"#, "$schema"),
+            (r#"{"$id":"x"#, "$id"),
+            (r#"{"$ref":"x"#, "$ref"),
+            (r#"targetNamespace="x"#, "targetNamespace"),
+            (r#"xmlns="x"#, "xmlns"),
+            (r#"xmlns:custom="x"#, "xmlns: compound"),
+            (r#"xsi:schemaLocation="x"#, "namespaced schemaLocation"),
+            (r#"schemaLocation="x"#, "bare schemaLocation"),
+            ("é$schema=\"x", "multibyte-prefixed $schema"),
+        ] {
+            let start = text.rfind('"').expect("value quote") + 1;
+            assert!(
+                preceding_key_is_namespace(text, start),
+                "should be a namespace key ({val}): {text:?}"
+            );
+        }
+        // Negatives — ordinary keys, and a boundary at position 0.
+        // v15: `dataschemaLocation` merely ends with the substring — NOT a real namespace attr.
+        for text in [
+            r#"{"url":"x"#,
+            r#"{"href":"x"#,
+            r#"name="x"#,
+            r#"{"schema_version":"x"#,
+            r#"dataschemaLocation="x"#,
+        ] {
+            let start = text.rfind('"').expect("value quote") + 1;
+            assert!(
+                !preceding_key_is_namespace(text, start),
+                "should NOT be a namespace key: {text:?}"
+            );
+        }
+        assert!(!preceding_key_is_namespace("https://x", 0), "start==0 must not panic or match");
+    }
+
+    // ---- F12: DOMAIN enabled under Network, filename-shaped false positives suppressed ---
+
+    // The detector output identity MUST bump whenever the recognizer set changes: DOMAIN
+    // entered at v16 (F12), and the three structured-secret recognizers (JWK/AWS/.netrc)
+    // entered at v17 (F10). Versions are monotonic, so this exact-equality guard tracks the
+    // latest bump — a future recognizer change that forgets to bump serves stale cache.
+    #[test]
+    fn f10_detector_version_bumped_for_structured_recognizers() {
+        assert_eq!(
+            DETECTOR_VERSION, 17,
+            "JWK/AWS/.netrc recognizers (F10) must bump the detector version"
+        );
+    }
+
+    // FROZEN-set invariants: `la` load-bearing (opts.la gate), `io` (and other popular
+    // real gTLDs) excluded so real domains still mask, and the set stays sorted for the
+    // binary_search membership test.
+    #[test]
+    fn f12_file_extensions_frozen_invariants() {
+        assert!(FILE_EXTENSIONS.binary_search(&"la").is_ok(), "`la` is load-bearing (opts.la gate)");
+        for real_gtld in ["io", "ai", "app", "dev", "co", "com", "net", "org", "me", "tv"] {
+            assert!(
+                FILE_EXTENSIONS.binary_search(&real_gtld).is_err(),
+                "popular real gTLD `{real_gtld}` must NOT be in FILE_EXTENSIONS (real domains must still mask)"
+            );
+        }
+        let mut sorted = FILE_EXTENSIONS.to_vec();
+        sorted.sort_unstable();
+        assert_eq!(FILE_EXTENSIONS, sorted.as_slice(), "FILE_EXTENSIONS must stay sorted for binary_search");
+        // Every acceptance-test filename extension is present.
+        for ext in ["py", "rs", "md", "sh", "cc", "go", "la"] {
+            assert!(FILE_EXTENSIONS.binary_search(&ext).is_ok(), "acceptance ext `{ext}` must be present");
+        }
+    }
+
+    // Direct unit for the predicate: filename-shaped domains (no `/`, no `:`, not `www.`,
+    // rightmost dot-label a known file extension) are true; real hosts, www.-prefixed
+    // hosts, and path/scheme/port forms are false.
+    #[test]
+    fn f12_is_filename_shaped_domain_unit() {
+        for f in ["utils.py", "main.rs", "README.md", "script.sh", "lib.cc", "pkg.go", "opts.la", "Utils.PY"] {
+            assert!(is_filename_shaped_domain(f), "should be filename-shaped: {f:?}");
+        }
+        for d in [
+            "example.com",          // real gTLD
+            "www.example.io",       // www.-prefixed AND io excluded
+            "example.io",           // io is a real gTLD (excluded)
+            "corp.example.com",     // multi-label real domain
+            "path/main.rs",         // has `/`
+            "host:80.rs",           // has `:`
+            "www.foo.rs",           // www.-prefixed guard beats the extension
+        ] {
+            assert!(!is_filename_shaped_domain(d), "should NOT be filename-shaped: {d:?}");
+        }
+    }
+
+    // e2e (Strict / Network-on): each bare filename-shaped domain presidio would mask as a
+    // DOMAIN is suppressed (dropped) at the ingest juncture — no DOMAIN detection survives.
+    #[test]
+    fn f12_filename_shaped_domains_suppressed() {
+        let cfg = network_on();
+        for text in ["utils.py", "main.rs", "README.md", "script.sh", "lib.cc", "pkg.go", "opts.la"] {
+            assert!(
+                dets_of(&cfg, &[], text, "DOMAIN").is_empty(),
+                "filename-shaped domain must be suppressed under Network: {text:?}"
+            );
+        }
+    }
+
+    // e2e differential: a REAL domain is NOT filename-shaped, so it still masks as DOMAIN.
+    // This is the load-bearing negative that proves the suppression is targeted, not blanket.
+    #[test]
+    fn f12_real_domain_still_masks() {
+        let cfg = network_on();
+        assert_eq!(
+            dets_of(&cfg, &[], "reach example.com now", "DOMAIN").len(),
+            1,
+            "a real domain (example.com) must still mask as DOMAIN under Network"
+        );
+        // www.example.io: the www. guard + io exclusion keep it out of the filename set, so it
+        // still masks (as DOMAIN or, via the www. signal, URL) — assert it is not suppressed.
+        let masked = !dets_of(&cfg, &[], "visit www.example.io today", "DOMAIN").is_empty()
+            || !dets_of(&cfg, &[], "visit www.example.io today", "URL").is_empty();
+        assert!(masked, "www.example.io must still mask (www. guard + io excluded)");
+    }
+
+    // WIRING falsifier: a custom rule matching exactly `main.rs` STILL masks. This proves the
+    // F12 check lives at the DOMAIN ingest branch (regex pass) as a plain DROP — NOT an
+    // allow-span (which `finish`'s containment would use to swallow the custom det at the same
+    // coordinates) and NOT the shared `is_suppressed` (which the custom-rule pass also calls).
+    #[test]
+    fn f12_custom_rule_over_filename_domain_still_masks() {
+        let cfg = network_on();
+        let customs = compile_customs(&[CustomReplacement {
+            pattern: r"main\.rs".to_string(),
+            entity_type: "MY_FILE".to_string(),
+            is_regex: true,
+            case_sensitive: true,
+            priority: 0,
+            literal_token: false,
+            token: None,
+            apply_to_surfaces: None,
+        }])
+        .expect("custom rule compiles");
+        let hits = dets_of(&cfg, &customs, "open main.rs please", "MY_FILE");
+        assert_eq!(
+            hits.len(),
+            1,
+            "a custom rule over a filename-shaped domain must still mask (F12 is a plain drop at the DOMAIN ingest branch), got {hits:?}"
+        );
+    }
+
+    // NESTED-DOMAIN-OVERLAP guard: the committed strict_url text has `corp.example.com`
+    // inside a URL span and `example.com` inside an email span. presidio's DomainRecognizer
+    // rejects `://`- and `@`-preceded matches, so NO DOMAIN detection leaks there and the
+    // URL + EMAIL detections stand. (If a future presidio scored a nested DOMAIN that won
+    // overlap resolution, this would go RED — the signal to add resolve_overlaps tiering.)
+    #[test]
+    fn f12_nested_domains_lose_to_url_and_email() {
+        let cfg = network_on();
+        let text = "edit CLAUDE.md and opts.la then open https://corp.example.com/secret and mail bob@example.com";
+        assert!(
+            dets_of(&cfg, &[], text, "DOMAIN").is_empty(),
+            "no nested DOMAIN det may survive inside the URL/email spans"
+        );
+        assert_eq!(dets_of(&cfg, &[], text, "URL").len(), 1, "the real URL must still mask");
+        assert_eq!(dets_of(&cfg, &[], text, "EMAIL_ADDRESS").len(), 1, "the email must still mask");
+    }
+}
+
+#[cfg(test)]
+mod net_precision_containment_tests {
+    use super::*;
+
+    // F6 unit: a Secrets-category entity (URL_CREDENTIAL) arriving as Source::Regex —
+    // NOT Source::Secret — that is fully nested inside an allow span must be KEPT.
+    #[test]
+    fn f6_secrets_category_survives_allow_span_containment() {
+        let out = finish(
+            vec![CachedDetection {
+                start: 20,
+                end: 30,
+                entity_type: "URL_CREDENTIAL".into(),
+                score: 1.0,
+                source: Source::Regex,
+                literal: false,
+                fixed_token: None,
+                secret_op: None,
+            }],
+            vec![(0, 50)],
+        );
+        assert_eq!(out.len(), 1, "URL_CREDENTIAL nested in allow span must be kept");
+    }
+
+    // F6 unit NEGATIVE: a non-Secrets entity (URL) nested in an allow span is still
+    // suppressed — cross-entity containment is preserved for everything but Secrets.
+    #[test]
+    fn f6_non_secrets_entity_still_suppressed_in_allow_span() {
+        let out = finish(
+            vec![CachedDetection {
+                start: 20,
+                end: 30,
+                entity_type: "URL".into(),
+                score: 1.0,
+                source: Source::Regex,
+                literal: false,
+                fixed_token: None,
+                secret_op: None,
+            }],
+            vec![(0, 50)],
+        );
+        assert!(out.is_empty(), "URL nested in allow span must be suppressed");
+    }
+
+    // F6 e2e: a real credential embedded in an allowed standards/vendor URL still masks.
+    #[test]
+    fn f6_embedded_credential_in_allowed_url_still_masks() {
+        let mut cfg = EngineConfig::default();
+        cfg.enabled_categories.insert(crate::config::Category::Network);
+        let e = crate::MaskEngine::new(cfg).expect("engine init");
+        let masked = e
+            .mask(
+                "see https://claude.ai/cb?token=tok3nvalue0000 here",
+                Surface::UserMessage,
+            )
+            .expect("mask")
+            .masked_text;
+        assert!(
+            masked.contains("[URL_CREDENTIAL_"),
+            "expected a URL_CREDENTIAL token, got: {masked:?}"
+        );
+        assert!(
+            !masked.contains("tok3nvalue0000"),
+            "credential must not leak, got: {masked:?}"
+        );
+        assert!(
+            masked.contains("claude.ai"),
+            "allowed host should stay verbatim, got: {masked:?}"
+        );
+    }
+
+    // F7 e2e (wiring falsifier): an allowed standards host stays verbatim while a
+    // look-alike attacker host under the same registrable prefix still masks as a URL.
+    #[test]
+    fn f7_standards_host_allowed_but_lookalike_masks() {
+        let mut cfg = EngineConfig::default();
+        cfg.enabled_categories.insert(crate::config::Category::Network);
+        let e = crate::MaskEngine::new(cfg).expect("engine init");
+        let masked = e
+            .mask(
+                "ns http://www.w3.org/2000/svg vs http://w3.org.attacker.com/ end",
+                Surface::UserMessage,
+            )
+            .expect("mask")
+            .masked_text;
+        assert!(
+            masked.contains("www.w3.org/2000/svg"),
+            "allowed standards host must stay verbatim, got: {masked:?}"
+        );
+        assert!(
+            !masked.contains("http://w3.org.attacker.com/"),
+            "look-alike attacker host must not stay verbatim, got: {masked:?}"
+        );
+        assert!(
+            masked.contains("[URL_"),
+            "attacker URL should mask, got: {masked:?}"
+        );
     }
 }

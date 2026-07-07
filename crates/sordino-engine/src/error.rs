@@ -19,4 +19,9 @@ pub enum EngineError {
     Ml(String),
     #[error("invalid secret rule: {0}")]
     InvalidSecret(String),
+    #[error(
+        "registered secret {0:?} found in a schema/contract subtree that is never \
+         rewritten — refusing rather than forwarding it in plaintext"
+    )]
+    RegisteredSecretInCarveOut(String),
 }

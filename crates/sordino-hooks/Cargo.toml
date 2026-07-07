@@ -17,6 +17,11 @@ sordino-state  = { path = "../sordino-state" }
 # Profile, Category, MlStatus) — no ML backend, no Candle. Opt out of the engine's
 # default features so this binary stays lean (a regex-only engine build).
 sordino-engine = { path = "../sordino-engine", default-features = false }
+# The registration classifier (name/entropy eligibility) — shared by `secrets scan`
+# and `secrets import`. Regex-only, no engine internals, no dep cycle.
+sordino-secrets = { path = "../sordino-secrets" }
+# Native `.env` parsing for the intake funnel (scan/import) — no process spawn.
+dotenvy    = "0.15"
 
 clap       = { workspace = true }
 serde      = { workspace = true }
@@ -30,3 +35,12 @@ reqwest    = { version = "0.12", default-features = false, features = ["blocking
 # Unix-only: process-group signalling for the status-line wrap timeout (kill_group).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+[dev-dependencies]
+# Async runtime for the offline dotenv-resolve + mask-proof acceptance tests.
+tokio = { workspace = true, features = ["macros", "rt"] }
+# The real proxy install path (`resolve_and_install`) for the end-to-end MASK proof.
+# Candle-free (`ml-http`) so the test build stays lean.
+sordino-proxy = { path = "../sordino-proxy", default-features = false, features = ["ml-http"] }
+# Real pty for the interactive per-value opt-in wiring test.
+portable-pty = "0.9"
