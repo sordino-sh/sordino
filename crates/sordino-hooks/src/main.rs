@@ -124,6 +124,10 @@ enum Cmd {
     Secrets {
         #[command(subcommand)]
         action: Option<SecretsAction>,
+        /// Emit a machine-readable JSON posture projection instead of the human view.
+        /// Read-only: reshapes the already-fetched proxy snapshot; never mutates.
+        #[arg(long)]
+        json: bool,
     },
     /// Redact burned plaintext values from a Claude Code transcript JSONL file.
     Scrub {
@@ -234,6 +238,10 @@ enum Cmd {
     Zdr {
         #[command(subcommand)]
         action: Option<ZdrAction>,
+        /// Emit a machine-readable JSON posture projection instead of the human view.
+        /// Read-only: never engages/disengages ZDR — reshapes the status snapshot only.
+        #[arg(long)]
+        json: bool,
     },
     /// Turn Sordino masking OFF (backs `/sordino:disable`). Default: THIS conversation
     /// only (session-scoped, in-memory — lifts on the next Claude Code restart).
@@ -493,8 +501,8 @@ fn main() -> Result<()> {
         Cmd::PreToolUse => pre_tool_use(),
         Cmd::Reveal { token } => reveal(token),
         Cmd::Monitor => monitor_cmd(),
-        Cmd::Secrets { action } => secrets_cmd(action),
-        Cmd::Zdr { action } => zdr_cmd(action),
+        Cmd::Secrets { action, json } => secrets_cmd(action, json),
+        Cmd::Zdr { action, json } => zdr_cmd(action, json),
         Cmd::Disable { project } => disable_cmd(project),
         Cmd::Scrub {
             transcript,
@@ -7646,7 +7654,7 @@ mod prompt_spoof_tests {
 /// Backs `/sordino:zdr`. Targets THIS session's conversation — the SessionStart hook
 /// baked the id into `ANTHROPIC_BASE_URL` as `.../sordino/session/<id>`, which this
 /// process inherits, so the CLI keys the same id the proxy sees on the wire.
-fn zdr_cmd(action: Option<ZdrAction>) -> Result<()> {
+fn zdr_cmd(action: Option<ZdrAction>, json: bool) -> Result<()> {
     let root = canonical(&project_root());
     let (port, key) = live_identity(&root)
         .context("could not reach this project's proxy — is a `claude` session running here?")?;
@@ -7660,6 +7668,20 @@ fn zdr_cmd(action: Option<ZdrAction>) -> Result<()> {
     );
     let client = blocking_client();
     let project = sordino_state::project_key(&root);
+    // Read-only JSON posture projection. Same GET as the Status arm (fail-closed on
+    // unreachable proxy / non-routable session); short-circuits AHEAD of the human path
+    // and the action match, so On/Off's POST/DELETE are unreachable under --json.
+    if json {
+        let snap = json_or_err(
+            client
+                .get(&url)
+                .header("x-sordino-key", &key)
+                .header("x-sordino-project", &project)
+                .send()?,
+        )?;
+        println!("{}", zdr_json_contract(&snap));
+        return Ok(());
+    }
     match action.unwrap_or(ZdrAction::Status) {
         ZdrAction::Status => {
             let snap = json_or_err(
@@ -7711,6 +7733,46 @@ fn zdr_cmd(action: Option<ZdrAction>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Pure reshape of the per-session `zdr_status` snapshot into the frozen v1 posture
+/// contract. Re-derives nothing: `engaged`/`target` come straight off `active`, `default`
+/// is copied raw (nullable), and each configured target is copied through an EXACT
+/// allowlist that DROPS `base_url`; the top-level `conversation` key is dropped entirely.
+/// `trust_basis` stays a bare unordered string (THREAT-MODEL N7/L11 — no ranked/numeric
+/// trust). OFF case (active null): `engaged:false`, `target:null`.
+fn zdr_json_contract(snap: &Value) -> Value {
+    let target = snap
+        .get("active")
+        .cloned()
+        .filter(|v| !v.is_null())
+        .unwrap_or(Value::Null);
+    let engaged = !target.is_null();
+    let default = snap.get("default").cloned().unwrap_or(Value::Null);
+    let empty: Vec<Value> = Vec::new();
+    let configured = snap
+        .get("configured")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+    let targets: Vec<Value> = configured
+        .iter()
+        .map(|t| {
+            let mut o = serde_json::Map::new();
+            for k in ["name", "trust_basis", "user_verified", "has_key"] {
+                if let Some(v) = t.get(k) {
+                    o.insert(k.to_string(), v.clone());
+                }
+            }
+            Value::Object(o)
+        })
+        .collect();
+    json!({
+        "schema_version": 1,
+        "engaged": engaged,
+        "target": target,
+        "default": default,
+        "targets": targets,
+    })
 }
 
 /// Backs `/sordino:disable`. Turns masking OFF — for THIS conversation by default
@@ -7862,6 +7924,201 @@ mod disable_cli_tests {
     }
 }
 
+/// Machine-readable-posture (F13): pure reshape + parse gates for `secrets --json`
+/// and `zdr --json`.
+#[cfg(test)]
+mod mrp_posture_tests {
+    use super::{secrets_json_contract, zdr_json_contract, Cli, Cmd, SecretsAction, ZdrAction};
+    use clap::Parser;
+    use serde_json::{json, Value};
+
+    // The frozen allowlists. Any key outside these in the projection is a leak.
+    const SECRET_KEYS: &[&str] = &["name", "operator", "scheme", "required", "resolved", "error"];
+    const TARGET_KEYS: &[&str] = &["name", "trust_basis", "user_verified", "has_key"];
+
+    // ---- Contract A: secrets ----
+
+    #[test]
+    fn secrets_contract_exact_shape_and_allowlist() {
+        // Raw admin `secrets` block: entries carry a bogus `value` + extra key to prove
+        // the allowlist DROPS them (never a value in the projection).
+        let block = json!({
+            "ready": false,
+            "total": 3,
+            "resolved": 2,
+            "required": 1,
+            "entries": [
+                {"name": "A", "operator": "op1password", "scheme": "env", "required": true,
+                 "resolved": false, "error": "not found", "value": "sk-LEAK", "extra": 1},
+                {"name": "B", "operator": "literal", "scheme": "ref", "required": false,
+                 "resolved": true, "error": null, "value": "sk-LEAK2"},
+                // C omits `error` entirely -> exercises the allowlist's present-keys-only copy.
+                {"name": "C", "operator": "literal", "scheme": "ref", "required": false,
+                 "resolved": true}
+            ]
+        });
+        let got = secrets_json_contract(&block);
+        let want = json!({
+            "schema_version": 1,
+            "ready": false,
+            "registered": 3,
+            "resolved": 2,
+            "required": 1,
+            "unresolved": ["A"],
+            "secrets": [
+                {"name": "A", "operator": "op1password", "scheme": "env", "required": true,
+                 "resolved": false, "error": "not found"},
+                {"name": "B", "operator": "literal", "scheme": "ref", "required": false,
+                 "resolved": true, "error": null},
+                // C omitted `error` in the input -> allowlist copies present keys only,
+                // so `error` is absent here too (proving the copy is faithful, not synthesized).
+                {"name": "C", "operator": "literal", "scheme": "ref", "required": false,
+                 "resolved": true}
+            ]
+        });
+        // Shape-drift gate: any field add/rename/remove fails this equality.
+        assert_eq!(got, want);
+        // schema_version is a flat top-level integer.
+        assert_eq!(got["schema_version"], json!(1));
+        // NEVER-A-VALUE walk: every secrets[*] key set is a subset of the allowlist.
+        for s in got["secrets"].as_array().unwrap() {
+            for k in s.as_object().unwrap().keys() {
+                assert!(
+                    SECRET_KEYS.contains(&k.as_str()),
+                    "leaked key `{k}` in secrets projection"
+                );
+            }
+            assert!(s.get("value").is_none(), "a secret VALUE leaked into projection");
+        }
+    }
+
+    #[test]
+    fn secrets_contract_defaults_when_absent() {
+        // Empty block: ready defaults true, counts 0, arrays empty.
+        let got = secrets_json_contract(&json!({}));
+        assert_eq!(
+            got,
+            json!({
+                "schema_version": 1,
+                "ready": true,
+                "registered": 0,
+                "resolved": 0,
+                "required": 0,
+                "unresolved": [],
+                "secrets": []
+            })
+        );
+    }
+
+    // ---- Contract B: zdr ----
+
+    #[test]
+    fn zdr_contract_engaged_exact_shape_and_allowlist() {
+        // Raw per-session zdr_status: targets carry base_url (must DROP); top-level
+        // `conversation` present (must DROP).
+        let snap = json!({
+            "conversation": "conv-123",
+            "active": "trusted-a",
+            "default": "trusted-a",
+            "configured": [
+                {"name": "trusted-a", "base_url": "https://a.example/v1",
+                 "trust_basis": "self-hosted", "user_verified": true, "has_key": true},
+                {"name": "trusted-b", "base_url": "https://b.example/v1",
+                 "trust_basis": "contractual", "user_verified": false, "has_key": false}
+            ]
+        });
+        let got = zdr_json_contract(&snap);
+        let want = json!({
+            "schema_version": 1,
+            "engaged": true,
+            "target": "trusted-a",
+            "default": "trusted-a",
+            "targets": [
+                {"name": "trusted-a", "trust_basis": "self-hosted",
+                 "user_verified": true, "has_key": true},
+                {"name": "trusted-b", "trust_basis": "contractual",
+                 "user_verified": false, "has_key": false}
+            ]
+        });
+        assert_eq!(got, want);
+        // No top-level conversation key survives.
+        assert!(got.get("conversation").is_none(), "conversation leaked into projection");
+        for t in got["targets"].as_array().unwrap() {
+            for k in t.as_object().unwrap().keys() {
+                assert!(
+                    TARGET_KEYS.contains(&k.as_str()),
+                    "leaked target key `{k}`"
+                );
+            }
+            // base_url must be dropped.
+            assert!(t.get("base_url").is_none(), "base_url survived into projection");
+            // trust_basis stays a bare STRING (never ranked/numeric).
+            assert!(t["trust_basis"].is_string(), "trust_basis must be a JSON string");
+        }
+    }
+
+    #[test]
+    fn zdr_contract_off_case() {
+        // active null => engaged:false, target:null.
+        let snap = json!({
+            "conversation": "conv-x",
+            "active": Value::Null,
+            "default": Value::Null,
+            "configured": []
+        });
+        let got = zdr_json_contract(&snap);
+        assert_eq!(
+            got,
+            json!({
+                "schema_version": 1,
+                "engaged": false,
+                "target": Value::Null,
+                "default": Value::Null,
+                "targets": []
+            })
+        );
+    }
+
+    // ---- Parse: --json is a PARENT-only flag on Secrets/Zdr ----
+
+    #[test]
+    fn secrets_json_parse_matrix() {
+        // [secrets, --json] -> action None, json true.
+        let cli = Cli::try_parse_from(["sordino-hooks", "secrets", "--json"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Secrets { action: None, json: true }));
+        // [secrets] -> json false.
+        let cli = Cli::try_parse_from(["sordino-hooks", "secrets"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Secrets { action: None, json: false }));
+        // [secrets, list, --json] -> err (List declares no --json).
+        assert!(Cli::try_parse_from(["sordino-hooks", "secrets", "list", "--json"]).is_err());
+        // COEXISTENCE: [secrets, scan, --json] -> err (Scan declares no --json; parent-only).
+        assert!(Cli::try_parse_from(["sordino-hooks", "secrets", "scan", "--json"]).is_err());
+        // [secrets, --json, scan] -> Ok(action Some(Scan), json true): short-circuit is
+        // reachable even with a live action.
+        let cli = Cli::try_parse_from(["sordino-hooks", "secrets", "--json", "scan"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Secrets { action: Some(SecretsAction::Scan), json: true }
+        ));
+    }
+
+    #[test]
+    fn zdr_json_parse_matrix() {
+        // [zdr, --json] -> action None, json true.
+        let cli = Cli::try_parse_from(["sordino-hooks", "zdr", "--json"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Zdr { action: None, json: true }));
+        // [zdr, on, --json] -> err (no --json on the mutating action; no-mutation at parse).
+        assert!(Cli::try_parse_from(["sordino-hooks", "zdr", "on", "--json"]).is_err());
+        // [zdr, --json, on] -> Ok(action Some(On), json true): runtime short-circuit
+        // suppresses the POST.
+        let cli = Cli::try_parse_from(["sordino-hooks", "zdr", "--json", "on"]).unwrap();
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Zdr { action: Some(ZdrAction::On { .. }), json: true }
+        ));
+    }
+}
+
 /// PreToolUse broker resolver (T2). Reads the hook payload from stdin, asks the proxy
 /// to resolve allow-listed broker tokens into `tool_input`, and emits `updatedInput`.
 /// Every failure path is silent (emit nothing, exit 0) so the tool runs with the
@@ -7984,8 +8241,17 @@ fn broker_denial_note(denials: &[Value]) -> String {
 /// `/sordino:secrets` — read-only view of the registered-secret gate + status. Pulls
 /// the value-free `secrets` block from the proxy snapshot. (Registration is by
 /// reference in `[[secrets]]`; secret VALUES never transit this command.)
-fn secrets_cmd(action: Option<SecretsAction>) -> Result<()> {
+fn secrets_cmd(action: Option<SecretsAction>, json: bool) -> Result<()> {
     let root = canonical(&project_root());
+    // Read-only JSON posture projection. Action-independent: it inherits Status's
+    // fail-closed proxy precondition (secrets_snapshot) and short-circuits AHEAD of the
+    // match, so Scan/Import (and their disk/import side effects) are never reached.
+    if json {
+        let snap = secrets_snapshot(&root)?;
+        let secrets = snap.get("secrets").cloned().unwrap_or(Value::Null);
+        println!("{}", secrets_json_contract(&secrets));
+        return Ok(());
+    }
     match action.unwrap_or(SecretsAction::Status) {
         // Status/List describe the LIVE registered set — they hard-require the proxy.
         SecretsAction::Status => secrets_status_cmd(&root),
@@ -8050,6 +8316,49 @@ fn secrets_list_cmd(root: &str) -> Result<()> {
         println!("{mark} {name}  [{op}]  {scheme}");
     }
     Ok(())
+}
+
+/// Pure reshape of the admin `secrets` block into the frozen v1 posture contract.
+/// Re-derives nothing: `total` maps to `registered`, counts copy through (0 when absent),
+/// `ready` defaults true, `unresolved` lists the names of `resolved==false` entries in
+/// order, and each entry is copied through an EXACT allowlist — a secret VALUE (or any
+/// other key) can NEVER appear in the projection.
+fn secrets_json_contract(secrets: &Value) -> Value {
+    let ready = secrets.get("ready").and_then(Value::as_bool).unwrap_or(true);
+    let registered = secrets.get("total").and_then(Value::as_u64).unwrap_or(0);
+    let resolved = secrets.get("resolved").and_then(Value::as_u64).unwrap_or(0);
+    let required = secrets.get("required").and_then(Value::as_u64).unwrap_or(0);
+    let empty: Vec<Value> = Vec::new();
+    let entries = secrets
+        .get("entries")
+        .and_then(Value::as_array)
+        .unwrap_or(&empty);
+    let unresolved: Vec<Value> = entries
+        .iter()
+        .filter(|e| !e.get("resolved").and_then(Value::as_bool).unwrap_or(false))
+        .filter_map(|e| e.get("name").cloned())
+        .collect();
+    let secrets_list: Vec<Value> = entries
+        .iter()
+        .map(|e| {
+            let mut o = serde_json::Map::new();
+            for k in ["name", "operator", "scheme", "required", "resolved", "error"] {
+                if let Some(v) = e.get(k) {
+                    o.insert(k.to_string(), v.clone());
+                }
+            }
+            Value::Object(o)
+        })
+        .collect();
+    json!({
+        "schema_version": 1,
+        "ready": ready,
+        "registered": registered,
+        "resolved": resolved,
+        "required": required,
+        "unresolved": unresolved,
+        "secrets": secrets_list,
+    })
 }
 
 // ---------------------------------------------------------------------------
