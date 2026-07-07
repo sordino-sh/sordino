@@ -4263,6 +4263,7 @@ fn doctor(json: bool) -> Result<()> {
         probe_project_proxy(&root),
         probe_windows_excluded_range(),
         probe_no_bare_or_safe_mode_env(),
+        probe_transcript_exposure(&root),
     ];
     let any_fail = probes.iter().any(|p| p.status == ProbeStatus::Fail);
 
@@ -4313,7 +4314,11 @@ fn doctor(json: bool) -> Result<()> {
 /// to surface (masking is on, but this session bypasses it and sends UNMASKED).
 fn verify(json: bool) -> Result<()> {
     let root = canonical(&project_root());
-    let legs = vec![verify_engine_masks(&root), verify_session_routed(&root)];
+    let legs = vec![
+        verify_engine_masks(&root),
+        verify_session_routed(&root),
+        verify_category_coverage(&root),
+    ];
     let any_fail = legs.iter().any(|p| p.status == ProbeStatus::Fail);
     if json {
         let arr: Vec<Value> = legs
@@ -4443,6 +4448,79 @@ fn verify_session_routed(root: &str) -> Probe {
             ProbeStatus::Fail,
             detail,
             Some("restart Claude Code once to apply the route (written but not live this session), or /sordino:enable"),
+        )
+    }
+}
+
+/// Verify disclosure leg F3 (report-only, ALWAYS Info): make it LEGIBLE that a green
+/// `verify` still passes whole categories through untouched. Under the Balanced default
+/// both Network and Personal are OFF, so their entity classes are sent in clear — this
+/// leg names them at preflight. It reads config only (the LIVE snapshot if the proxy is
+/// reachable, else the config FILES — see `effective_categories`), opens no extra
+/// connection, and mutates nothing. It is never a Pass/Fail and it does NOT close the
+/// gap; it only surfaces it.
+fn verify_category_coverage(root: &str) -> Probe {
+    let name = "category coverage (report-only)";
+    let effective = effective_categories(
+        live_identity(root),
+        &sordino_state::project_key(root),
+        root,
+    );
+    probe(
+        name,
+        ProbeStatus::Info,
+        category_coverage_detail(&effective),
+        None,
+    )
+}
+
+/// Pure copy for [`verify_category_coverage`]: given the EFFECTIVE enabled-category
+/// name set (snake_case), name every category that is OFF and what it lets through in
+/// clear. Diffs against `sordino_engine::Category::ALL`; the per-category clause is an
+/// EXHAUSTIVE (compiler-enforced) 6-arm match, so a new category can't silently ship
+/// without a sentence. If every category is on, says so. This describes the
+/// pass-through — it does NOT read as if it closes it.
+fn category_coverage_detail(effective: &[String]) -> String {
+    let on: std::collections::HashSet<&str> = effective.iter().map(String::as_str).collect();
+    let mut clauses: Vec<String> = Vec::new();
+    for c in sordino_engine::Category::ALL {
+        let cat_name = serde_json::to_value(c)
+            .ok()
+            .and_then(|j| j.as_str().map(str::to_string))
+            .unwrap_or_default();
+        if on.contains(cat_name.as_str()) {
+            continue;
+        }
+        // Exhaustive over all 6 variants: a new Category variant fails to compile until
+        // it gets an honest pass-through sentence here.
+        let sentence = match c {
+            sordino_engine::Category::Secrets => {
+                "API keys/tokens/private keys sent in clear"
+            }
+            sordino_engine::Category::Financial => {
+                "card/IBAN/financial numbers sent in clear"
+            }
+            sordino_engine::Category::Identity => {
+                "SSNs and other identity numbers sent in clear"
+            }
+            sordino_engine::Category::Contact => {
+                "emails/phone numbers sent in clear"
+            }
+            sordino_engine::Category::Network => {
+                "bare URLs/IPs/MACs sent in clear (a real secret in a URL is still caught via Secrets/URL_CREDENTIAL)"
+            }
+            sordino_engine::Category::Personal => {
+                "names/locations need the ML model and are not masked"
+            }
+        };
+        clauses.push(format!("{cat_name} OFF — {sentence}"));
+    }
+    if clauses.is_empty() {
+        "all categories on".to_string()
+    } else {
+        format!(
+            "a green verify still passes whole categories through untouched: {}",
+            clauses.join("; ")
         )
     }
 }
@@ -4692,6 +4770,117 @@ fn probe_no_bare_or_safe_mode_env() -> Probe {
                 Some("unset it, or run claude without inheriting it, on any project you rely on Sordino for"),
             )
         }
+    }
+}
+
+/// Doctor disclosure leg F11 (report-only, ALWAYS Info): report the COUNT and
+/// approximate total SIZE of THIS project's local session transcripts — plaintext the
+/// harness persists locally (threat-model L5). Discovery reads a single `cwd` line per
+/// candidate dir via `first_cwd_in_jsonl` to match exactly one dir to `root`; the sizing
+/// path ([`transcript_exposure_detail`]) then uses `read_dir` + `metadata().len()` ONLY
+/// and opens NO `*.jsonl` content. It echoes NO transcript value and writes/rewrites
+/// NO harness file. It makes L5 discoverable; it does NOT close it (transcript retention
+/// is the harness's own lever, outside Sordino's control). Because doctor's human table
+/// prints `remediation` only for Fail|Warn probes, an Info probe's remediation is dropped
+/// from human output — so the scrub pointer lives in the DETAIL to stay discoverable.
+fn probe_transcript_exposure(root: &str) -> Probe {
+    let name = "local session transcripts (report-only)";
+    // Narrow the `discover_session_cwds` walk to THIS project: find the single
+    // projects/<encoded> dir whose first session log's `cwd` canonicalizes to `root`.
+    let project_dir = claude_config_dir()
+        .map(|d| d.join("projects"))
+        .and_then(|projects| {
+            let entries = std::fs::read_dir(&projects).ok()?;
+            for sub in entries.filter_map(|e| e.ok()).map(|e| e.path()) {
+                if !sub.is_dir() {
+                    continue;
+                }
+                let Ok(files) = std::fs::read_dir(&sub) else {
+                    continue;
+                };
+                // One session log with a cwd identifies the dir — every log in it shares one.
+                for f in files.filter_map(|e| e.ok()).map(|e| e.path()) {
+                    if f.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+                        continue;
+                    }
+                    // Only a log that actually yields a `cwd` identifies the dir — a
+                    // leading cwd-less log (e.g. summary-only) must NOT short-circuit
+                    // it, matching the `discover_session_cwds` walk (breaks on Some only).
+                    let Some(cwd) = first_cwd_in_jsonl(&f) else {
+                        continue;
+                    };
+                    if canonical(Path::new(&cwd)) == root {
+                        return Some(sub);
+                    }
+                    break;
+                }
+            }
+            None
+        });
+
+    let (present, count, bytes) = match &project_dir {
+        Some(dir) => transcript_exposure_detail(dir),
+        None => (false, 0, 0),
+    };
+
+    if !present {
+        return probe(
+            name,
+            ProbeStatus::Info,
+            "no transcripts found for this project".to_string(),
+            None,
+        );
+    }
+
+    let detail = format!(
+        "the harness keeps {count} plaintext session transcript(s) for this project on local \
+         disk (~{} total, stored UNMASKED — Sordino masks the API wire, not what the harness \
+         persists here); to burn a leaked value out of one, run `sordino scrub --transcript \
+         <file> --value <burned-value>`; the harness's own transcript-retention settings are the \
+         other lever, outside Sordino's control",
+        approx_size(bytes),
+    );
+    probe(
+        name,
+        ProbeStatus::Info,
+        detail,
+        Some("sordino scrub --transcript <file> --value <burned-value>"),
+    )
+}
+
+/// Pure logic for [`probe_transcript_exposure`]: given a project's Claude Code session-log
+/// DIR, report `(present, count, total_bytes)` for its `*.jsonl` transcripts using
+/// `read_dir` + `metadata().len()` ONLY — it opens NO file content. An absent/unreadable
+/// dir, or one with no `*.jsonl`, yields `(false, 0, 0)`.
+fn transcript_exposure_detail(dir: &Path) -> (bool, usize, u64) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return (false, 0, 0);
+    };
+    let mut count = 0usize;
+    let mut bytes = 0u64;
+    for f in entries.filter_map(|e| e.ok()).map(|e| e.path()) {
+        if f.extension().and_then(|x| x.to_str()) != Some("jsonl") {
+            continue;
+        }
+        // metadata().len() reads the directory entry's size — never the file's content.
+        if let Ok(meta) = std::fs::metadata(&f) {
+            count += 1;
+            bytes += meta.len();
+        }
+    }
+    (count > 0, count, bytes)
+}
+
+/// Coarse human-readable byte size for the report-only transcript-exposure detail.
+fn approx_size(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = 1024 * KIB;
+    if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else if bytes >= KIB {
+        format!("{:.1} KiB", bytes as f64 / KIB as f64)
+    } else {
+        format!("{bytes} B")
     }
 }
 
@@ -9034,6 +9223,191 @@ mod route_gate_tests {
         assert_eq!(first_cwd_in_jsonl(&unterminated), Some("/no-nl".to_string()));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- F3: verify category-coverage disclosure leg ----
+
+    #[test]
+    fn category_coverage_detail_names_off_categories() {
+        // (a) Balanced default: Network + Personal are OFF → detail names BOTH, each with
+        // its honest pass-through sentence.
+        let balanced: Vec<String> = ["secrets", "financial", "identity", "contact"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let d = category_coverage_detail(&balanced);
+        assert!(d.contains("network"), "must name network OFF: {d}");
+        assert!(d.contains("personal"), "must name personal OFF: {d}");
+        assert!(
+            d.contains("bare URLs/IPs/MACs sent in clear"),
+            "network sentence: {d}"
+        );
+        assert!(
+            d.contains("names/locations need the ML model"),
+            "personal sentence: {d}"
+        );
+        assert_ne!(d, "all categories on");
+
+        // (b) all six categories on → the succinct 'all categories on'.
+        let all: Vec<String> =
+            ["secrets", "financial", "identity", "contact", "network", "personal"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        assert_eq!(category_coverage_detail(&all), "all categories on");
+    }
+
+    #[test]
+    fn verify_category_coverage_is_always_info() {
+        // (c) At a temp dir with no live proxy and no TOML, the leg is still report-only
+        // Info — it never participates in any_fail.
+        let dir = std::env::temp_dir().join(format!("sordino-cov-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = canonical(&dir);
+        assert_eq!(verify_category_coverage(&root).status, ProbeStatus::Info);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- F11: doctor transcript-exposure disclosure leg ----
+
+    #[test]
+    fn transcript_exposure_detail_counts_and_sums_via_metadata_only() {
+        let dir = std::env::temp_dir().join(format!("sordino-tx-detail-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Empty dir → absent; a non-existent dir → absent.
+        assert_eq!(transcript_exposure_detail(&dir), (false, 0, 0));
+        assert_eq!(
+            transcript_exposure_detail(&dir.join("does-not-exist")),
+            (false, 0, 0)
+        );
+
+        // Two *.jsonl transcripts (5 + 3 bytes) plus a non-jsonl decoy: counts and sums
+        // ONLY the jsonl files, via metadata (content is never opened).
+        std::fs::write(dir.join("a.jsonl"), "12345").unwrap();
+        std::fs::write(dir.join("b.jsonl"), "678").unwrap();
+        std::fs::write(dir.join("notes.txt"), "ignored").unwrap();
+        assert_eq!(transcript_exposure_detail(&dir), (true, 2, 8));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn probe_transcript_exposure_is_info_present_and_absent() {
+        let base = std::env::temp_dir().join(format!("sordino-tx-probe-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let cfg = base.join("cfg");
+        let projects = cfg.join("projects").join("encoded-root");
+        std::fs::create_dir_all(&projects).unwrap();
+
+        // A real project dir; key the transcript match on its canonical path.
+        let proj = base.join("myproject");
+        std::fs::create_dir_all(&proj).unwrap();
+        let root = canonical(&proj);
+
+        // A session log carrying that cwd + a fake transcript to size.
+        std::fs::write(
+            projects.join("session.jsonl"),
+            format!("{{\"type\":\"user\",\"cwd\":\"{root}\"}}\n"),
+        )
+        .unwrap();
+        std::fs::write(projects.join("t1.jsonl"), "hello").unwrap();
+
+        let prev = std::env::var_os("CLAUDE_CONFIG_DIR");
+        // SAFETY (edition 2024): the probe under test reads CLAUDE_CONFIG_DIR; no other
+        // thread in this test relies on it, and it is restored below.
+        unsafe {
+            std::env::set_var("CLAUDE_CONFIG_DIR", &cfg);
+        }
+
+        // Present: matching project dir with jsonl files → report-only Info.
+        assert_eq!(
+            probe_transcript_exposure(&root).status,
+            ProbeStatus::Info
+        );
+
+        // Absent: a root with no matching session dir → still Info (quiet 'none found').
+        let other = canonical(&base.join("no-such-project"));
+        assert_eq!(
+            probe_transcript_exposure(&other).status,
+            ProbeStatus::Info
+        );
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", v) },
+            None => unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn probe_transcript_exposure_survives_leading_cwdless_log() {
+        // Regression: a cwd-less leading log (e.g. summary-only jsonl) in the matching
+        // project dir must NOT short-circuit discovery into a false 'no transcripts found'.
+        // The narrowing walk breaks only on a log that yields a `cwd` (mismatch = other
+        // project); a `None` continues to the next file, mirroring discover_session_cwds.
+        let base = std::env::temp_dir().join(format!("sordino-tx-lead-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let cfg = base.join("cfg");
+        let projects = cfg.join("projects").join("encoded-root");
+        std::fs::create_dir_all(&projects).unwrap();
+
+        let proj = base.join("myproject");
+        std::fs::create_dir_all(&proj).unwrap();
+        let root = canonical(&proj);
+
+        // Force a cwd-less log to sort BEFORE the one carrying the cwd (aaa_ vs zzz_).
+        std::fs::write(
+            projects.join("aaa_summary.jsonl"),
+            "{\"type\":\"summary\",\"summary\":\"no cwd here\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            projects.join("zzz_session.jsonl"),
+            format!("{{\"type\":\"user\",\"cwd\":\"{root}\"}}\n"),
+        )
+        .unwrap();
+
+        let prev = std::env::var_os("CLAUDE_CONFIG_DIR");
+        // SAFETY (edition 2024): the probe under test reads CLAUDE_CONFIG_DIR; no other
+        // thread in this test relies on it, and it is restored below.
+        unsafe {
+            std::env::set_var("CLAUDE_CONFIG_DIR", &cfg);
+        }
+
+        let p = probe_transcript_exposure(&root);
+        assert_eq!(p.status, ProbeStatus::Info);
+        // The dir WAS discovered despite the leading cwd-less log — not the quiet 'none'.
+        assert!(
+            !p.detail.contains("no transcripts found"),
+            "leading cwd-less log wrongly skipped the matching project dir: {}",
+            p.detail
+        );
+
+        match prev {
+            Some(v) => unsafe { std::env::set_var("CLAUDE_CONFIG_DIR", v) },
+            None => unsafe { std::env::remove_var("CLAUDE_CONFIG_DIR") },
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn any_fail_predicates_stay_fail_only() {
+        // Guardrail: both doctor's and verify's any_fail predicate must remain
+        // Fail-only — an Info leg NEVER flips ok/exit. The needle is assembled from
+        // two fragments so THIS test's own source contains no verbatim occurrence;
+        // the count therefore reflects ONLY the two production sites (asserting a bare
+        // n>=2 against the whole file is vacuous — the literal would appear here twice).
+        let src = include_str!("main.rs");
+        let needle = concat!(".any(|p| p.status == ProbeStatus::", "Fail)");
+        let n = src.matches(needle).count();
+        assert_eq!(
+            n, 2,
+            "exactly the doctor and verify any_fail predicates must stay Fail-only; \
+             found {n} occurrence(s)"
+        );
     }
 
     #[test]
