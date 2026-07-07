@@ -1907,6 +1907,7 @@ fn a8_routed_recently(port: u16, root: &str, raw_session_id: &str) -> Option<boo
         ))
         .timeout(timeout)
         .header("x-sordino-key", &rec.admin_key)
+        .header("x-sordino-project", sordino_state::project_key(root))
         .send()
         .ok()
         .filter(|r| r.status().is_success())?;
@@ -4373,6 +4374,7 @@ fn verify_engine_masks(root: &str) -> Probe {
     let resp = blocking_client()
         .post(format!("http://127.0.0.1:{port}/sordino/diag/mask"))
         .header("x-sordino-key", &key)
+        .header("x-sordino-project", sordino_state::project_key(root))
         .json(&json!({ "text": format!("contact {canary} please") }))
         .send();
     match resp {
@@ -5672,6 +5674,7 @@ fn routed_proxy_status(routed_port: u16, root: &str) -> (MaskState, String) {
         .get(format!("http://127.0.0.1:{routed_port}/sordino/config"))
         .timeout(remaining())
         .header("x-sordino-key", &rec.admin_key)
+        .header("x-sordino-project", sordino_state::project_key(root))
         .send()
     {
         Ok(r) if r.status().is_success() => {
@@ -6336,7 +6339,7 @@ fn render_segment(port: Option<u16>, root: &str, mode: SlMode) -> String {
     let Some((_, key)) = live_identity(root).filter(|(lp, _)| *lp == port) else {
         return unverified(port, mode);
     };
-    match admin_get(port, &key) {
+    match admin_get(port, &key, &sordino_state::project_key(root)) {
         Ok(snap) => match serde_json::from_value::<Snapshot>(snap) {
             Ok(s) if s.enabled => render_on(&s, port, mode),
             Ok(_) => match mode {
@@ -6643,30 +6646,43 @@ fn kill_group(child: &mut std::process::Child) {
 
 fn config_cmd(action: Option<ConfigAction>) -> Result<()> {
     let root = canonical(&project_root());
-    // Best-effort live port. The mutating `--scope project|user|local` actions PERSIST to the
-    // config file even when the proxy is DOWN (the apply_* helpers degrade to "applies on the
-    // next session" — they gate every live admin call on key_for(root)), so they must NOT
-    // hard-require a live proxy. When the proxy is up the real port flows through; when down,
-    // `0` is a sentinel that never reaches a live admin call. Only `Show` and `--scope session`
-    // genuinely need a live proxy, and they surface the resolver's error themselves.
-    let port = resolve_live_port(&root).unwrap_or(0);
+    // Resolve this project's live (port, admin_key) identity EXACTLY ONCE per invocation — a single
+    // nonce-verified `live_identity` round-trip — and thread that one triple (port, key, project)
+    // into every helper below, so no helper ever re-resolves. This closes a TOCTOU: the old chain
+    // re-ran `resolve_live_port` / `key_for` independently across the helpers, so two round-trips
+    // could land on DIFFERENT live instances after a proxy restart / recycled-port race.
+    // `ident == None` means no live, verified proxy: the mutating `--scope project|user|local`
+    // actions STILL persist to the config file ("applies on the next session"); only `Show` and
+    // `--scope session` need a live proxy and surface a hard error themselves. `project` (the
+    // canonical-root identity hash) rides on every control-plane request as `x-sordino-project`,
+    // so a (port,key) resolved against the WRONG instance is rejected once the server binding lands.
+    let ident = live_identity(&root);
+    let project = sordino_state::project_key(&root);
 
     match action.unwrap_or(ConfigAction::Show) {
         ConfigAction::Show => {
-            let port = resolve_live_port(&root)?;
-            let snap = live_snapshot(port, &root)
+            let port = ident.as_ref().map(|(p, _)| *p).unwrap_or(0);
+            let snap = live_snapshot(ident, &project)
                 .context("could not reach this project's proxy (is a `claude` session running?)")?;
             print_status(&snap, port)?;
         }
-        ConfigAction::On { scope } => apply_enabled(port, &root, scope, true)?,
-        ConfigAction::Off { scope } => apply_enabled(port, &root, scope, false)?,
-        ConfigAction::Profile { name, scope } => apply_profile(port, &root, scope, name.into())?,
-        ConfigAction::Category { name, state, scope } => {
-            apply_category(port, &root, scope, &name, matches!(state, OnOff::On))?
+        ConfigAction::On { scope } => apply_enabled(ident, &project, &root, scope, true)?,
+        ConfigAction::Off { scope } => apply_enabled(ident, &project, &root, scope, false)?,
+        ConfigAction::Profile { name, scope } => {
+            apply_profile(ident, &project, &root, scope, name.into())?
         }
-        ConfigAction::Threshold { value, scope } => apply_threshold(port, &root, scope, value)?,
-        ConfigAction::Entity { name, op, scope } => apply_entity(port, &root, scope, &name, &op)?,
-        ConfigAction::Ml { action } => ml_cmd(port, &root, action.unwrap_or(MlAction::Status))?,
+        ConfigAction::Category { name, state, scope } => {
+            apply_category(ident, &project, &root, scope, &name, matches!(state, OnOff::On))?
+        }
+        ConfigAction::Threshold { value, scope } => {
+            apply_threshold(ident, &project, &root, scope, value)?
+        }
+        ConfigAction::Entity { name, op, scope } => {
+            apply_entity(ident, &project, &root, scope, &name, &op)?
+        }
+        ConfigAction::Ml { action } => {
+            ml_cmd(ident, &project, &root, action.unwrap_or(MlAction::Status))?
+        }
     }
     Ok(())
 }
@@ -6675,29 +6691,37 @@ fn config_cmd(action: Option<ConfigAction>) -> Result<()> {
 // config ml (/sordino:privacy model …)
 // ---------------------------------------------------------------------------
 
-fn ml_cmd(port: u16, root: &str, action: MlAction) -> Result<()> {
+fn ml_cmd(ident: Option<(u16, String)>, project: &str, root: &str, action: MlAction) -> Result<()> {
     match action {
         MlAction::Status => {
-            let snap = live_snapshot(port, root)
+            let port = ident.as_ref().map(|(p, _)| *p).unwrap_or(0);
+            let snap = live_snapshot(ident, project)
                 .context("could not reach this project's proxy (is a `claude` session running?)")?;
             print_ml_line(&parse_snapshot(&snap)?, port);
             Ok(())
         }
-        MlAction::On { model, scope } => apply_ml(port, root, scope, true, model),
-        MlAction::Off { scope } => apply_ml(port, root, scope, false, None),
+        MlAction::On { model, scope } => apply_ml(ident, project, root, scope, true, model),
+        MlAction::Off { scope } => apply_ml(ident, project, root, scope, false, None),
     }
 }
 
 /// Turn the ML recognizer on/off. Session scope hits the dedicated control
 /// endpoint (live, not persisted); file scopes persist `[engine.ml]` then apply
 /// live (a `reload` first so a model change is picked up, then the toggle).
-fn apply_ml(port: u16, root: &str, scope: Scope, on: bool, model: Option<String>) -> Result<()> {
+fn apply_ml(
+    ident: Option<(u16, String)>,
+    project: &str,
+    root: &str,
+    scope: Scope,
+    on: bool,
+    model: Option<String>,
+) -> Result<()> {
     let endpoint = if on { "ml/enable" } else { "ml/disable" };
 
     if scope == Scope::Session {
-        let key =
-            key_for(root).context("proxy not running; use --scope project/user to persist")?;
-        let snap = admin_post(port, &key, endpoint)?;
+        let (port, key) =
+            ident.context("proxy not running; use --scope project/user to persist")?;
+        let snap = admin_post(port, &key, endpoint, project)?;
         print_ml_applied(&snap, port, "session", on);
         return Ok(());
     }
@@ -6710,16 +6734,17 @@ fn apply_ml(port: u16, root: &str, scope: Scope, on: bool, model: Option<String>
     })?;
 
     let path = scope_path(scope, root);
-    let applied = match key_for(root) {
-        Ok(key) => {
+    let port = ident.as_ref().map(|(p, _)| *p).unwrap_or(0);
+    let applied = match &ident {
+        Some((p, key)) => {
             // For ON, reload first so a `--model` change in the file is loaded into
             // the live config before we flip the toggle (which starts the load).
             if on {
-                let _ = admin_post(port, &key, "reload");
+                let _ = admin_post(*p, key, "reload", project);
             }
-            admin_post(port, &key, endpoint).ok()
+            admin_post(*p, key, endpoint, project).ok()
         }
-        Err(_) => None,
+        None => None,
     };
     match applied {
         Some(snap) => print_ml_applied(&snap, port, scope_label(scope), on),
@@ -6822,11 +6847,17 @@ fn print_ml_line(s: &Snapshot, port: u16) {
     }
 }
 
-fn apply_enabled(port: u16, root: &str, scope: Scope, on: bool) -> Result<()> {
+fn apply_enabled(
+    ident: Option<(u16, String)>,
+    project: &str,
+    root: &str,
+    scope: Scope,
+    on: bool,
+) -> Result<()> {
     if scope == Scope::Session {
-        let key =
-            key_for(root).context("proxy not running; use --scope project/user to persist")?;
-        let snap = admin_post(port, &key, if on { "enable" } else { "disable" })?;
+        let (port, key) =
+            ident.context("proxy not running; use --scope project/user to persist")?;
+        let snap = admin_post(port, &key, if on { "enable" } else { "disable" }, project)?;
         // "On means on": turning masking back on for this session ALSO clears any
         // per-conversation disable (`/sordino:disable`), so masking is reliably active here
         // regardless of which switch turned it off. Best-effort — the master enable already
@@ -6839,6 +6870,7 @@ fn apply_enabled(port: u16, root: &str, scope: Scope, on: bool) -> Result<()> {
             let _ = blocking_client()
                 .delete(&url)
                 .header("x-sordino-key", &key)
+                .header("x-sordino-project", project)
                 .send();
         }
         print_applied(&snap, port, "session")?;
@@ -6847,27 +6879,33 @@ fn apply_enabled(port: u16, root: &str, scope: Scope, on: bool) -> Result<()> {
     edit_scope_file(scope, root, |doc| {
         doc["engine"]["enabled"] = toml_edit::value(on);
     })?;
-    finish_file_scope(port, scope, root, if on { "enable" } else { "disable" })
+    finish_file_scope(ident, project, scope, root, if on { "enable" } else { "disable" })
 }
 
-fn apply_threshold(port: u16, root: &str, scope: Scope, value: f32) -> Result<()> {
+fn apply_threshold(
+    ident: Option<(u16, String)>,
+    project: &str,
+    root: &str,
+    scope: Scope,
+    value: f32,
+) -> Result<()> {
     anyhow::ensure!(
         (0.0..=1.0).contains(&value),
         "threshold must be in 0.0..=1.0"
     );
     if scope == Scope::Session {
-        let key =
-            key_for(root).context("proxy not running; use --scope project/user to persist")?;
-        let mut cfg = admin_get(port, &key)?;
+        let (port, key) =
+            ident.context("proxy not running; use --scope project/user to persist")?;
+        let mut cfg = admin_get(port, &key, project)?;
         cfg["config"]["score_threshold"] = json!(value);
-        let snap = admin_put(port, &key, &cfg["config"])?;
+        let snap = admin_put(port, &key, &cfg["config"], project)?;
         print_applied(&snap, port, "session")?;
         return Ok(());
     }
     edit_scope_file(scope, root, |doc| {
         doc["engine"]["score_threshold"] = toml_edit::value(f32_to_toml(value));
     })?;
-    finish_file_scope(port, scope, root, "reload")
+    finish_file_scope(ident, project, scope, root, "reload")
 }
 
 /// Widen an `f32` to `f64` via its shortest decimal form, so a value like `0.3`
@@ -6883,17 +6921,23 @@ fn f32_to_toml(v: f32) -> f64 {
 /// does the CLI fall back to writing the scope file itself (so a profile can still
 /// be persisted offline); the field shape it writes matches the proxy's
 /// `persist_profile`, both deriving from `EngineConfig::for_profile`.
-fn apply_profile(port: u16, root: &str, scope: Scope, profile: Profile) -> Result<()> {
+fn apply_profile(
+    ident: Option<(u16, String)>,
+    project: &str,
+    root: &str,
+    scope: Scope,
+    profile: Profile,
+) -> Result<()> {
     let profile_id = serde_json::to_value(profile)?
         .as_str()
         .map(str::to_string)
         .unwrap_or_else(|| "balanced".to_string());
 
     // Proxy up: the endpoint is the single source of truth for apply + persist.
-    if let Ok(key) = key_for(root) {
+    if let Some((port, key)) = ident.as_ref() {
         let path = format!("profile/{profile_id}?scope={}", scope_label(scope));
-        let snap = admin_post(port, &key, &path)?;
-        print_applied(&snap, port, scope_label(scope))?;
+        let snap = admin_post(*port, key, &path, project)?;
+        print_applied(&snap, *port, scope_label(scope))?;
         if scope != Scope::Session {
             println!(
                 "persisted to {} ({} scope).",
@@ -6932,13 +6976,20 @@ fn apply_profile(port: u16, root: &str, scope: Scope, profile: Profile) -> Resul
     Ok(())
 }
 
-fn apply_category(port: u16, root: &str, scope: Scope, name: &str, on: bool) -> Result<()> {
+fn apply_category(
+    ident: Option<(u16, String)>,
+    project: &str,
+    root: &str,
+    scope: Scope,
+    name: &str,
+    on: bool,
+) -> Result<()> {
     let name = name.to_lowercase();
     validate_category(&name)?;
 
     // Base the toggle on the effective set (live proxy, else the config files —
     // never the balanced default, which would clobber a custom persisted set).
-    let mut cats = effective_categories(port, root);
+    let mut cats = effective_categories(ident.clone(), project, root);
     if on {
         if !cats.contains(&name) {
             cats.push(name.clone());
@@ -6950,18 +7001,18 @@ fn apply_category(port: u16, root: &str, scope: Scope, name: &str, on: bool) -> 
     cats.dedup();
 
     if scope == Scope::Session {
-        let key =
-            key_for(root).context("proxy not running; use --scope project/user to persist")?;
-        let mut cfg = admin_get(port, &key)?;
+        let (port, key) =
+            ident.context("proxy not running; use --scope project/user to persist")?;
+        let mut cfg = admin_get(port, &key, project)?;
         cfg["config"]["enabled_categories"] = json!(cats);
-        let snap = admin_put(port, &key, &cfg["config"])?;
+        let snap = admin_put(port, &key, &cfg["config"], project)?;
         print_applied(&snap, port, "session")?;
         return Ok(());
     }
     edit_scope_file(scope, root, |doc| {
         doc["engine"]["enabled_categories"] = toml_edit::value(str_array(&cats));
     })?;
-    finish_file_scope(port, scope, root, "reload")
+    finish_file_scope(ident, project, scope, root, "reload")
 }
 
 /// Per-entity operator override (`config entity <TYPE> <op>`) — the finer-grained
@@ -6969,7 +7020,14 @@ fn apply_category(port: u16, root: &str, scope: Scope, name: &str, on: bool) -> 
 /// type (`entity_enabled` is true for any keyed type) and sets how it masks — so
 /// `on`/`off` work regardless of the type's category (e.g. enable URL masking without
 /// turning the whole Network category on). `clear` removes an override (file scope only).
-fn apply_entity(port: u16, root: &str, scope: Scope, name: &str, op: &str) -> Result<()> {
+fn apply_entity(
+    ident: Option<(u16, String)>,
+    project: &str,
+    root: &str,
+    scope: Scope,
+    name: &str,
+    op: &str,
+) -> Result<()> {
     let (name, builtin) = resolve_entity_type(name);
     if !builtin {
         // Not a typo we can prove here — could be a declared `[[custom_replacements]]`
@@ -6982,7 +7040,7 @@ fn apply_entity(port: u16, root: &str, scope: Scope, name: &str, op: &str) -> Re
     }
 
     if op.eq_ignore_ascii_case("clear") {
-        return clear_entity(port, root, scope, &name);
+        return clear_entity(ident, project, root, scope, &name);
     }
 
     let (op_json, op_toml) = entity_operator_value(op)?;
@@ -7000,27 +7058,33 @@ fn apply_entity(port: u16, root: &str, scope: Scope, name: &str, op: &str) -> Re
     }
 
     if scope == Scope::Session {
-        let key =
-            key_for(root).context("proxy not running; use --scope project/user to persist")?;
+        let (port, key) =
+            ident.context("proxy not running; use --scope project/user to persist")?;
         // Minimal MERGE patch (not the whole fetched config): the control-plane PUT
         // recurses into `entity_operators`, so this overlays exactly the one key —
         // race-safe (a concurrent edit to another key isn't clobbered by stale GET data)
         // and the proxy validates this delta's key (rejecting a typo).
         let patch = json!({ "entity_operators": { name.clone(): op_json } });
-        let snap = admin_put(port, &key, &patch)?;
+        let snap = admin_put(port, &key, &patch, project)?;
         print_applied(&snap, port, "session")?;
         return Ok(());
     }
     edit_scope_file(scope, root, move |doc| {
         doc["engine"]["entity_operators"][name.as_str()] = toml_edit::value(op_toml);
     })?;
-    finish_file_scope(port, scope, root, "reload")
+    finish_file_scope(ident, project, scope, root, "reload")
 }
 
 /// Remove a per-entity override. Only meaningful at a FILE scope: the live session merge
 /// is additive (it cannot delete a key), and a `reload` would reset ALL session state,
 /// so a session-only override is cleared by reload/restart, not surgically here.
-fn clear_entity(port: u16, root: &str, scope: Scope, name: &str) -> Result<()> {
+fn clear_entity(
+    ident: Option<(u16, String)>,
+    project: &str,
+    root: &str,
+    scope: Scope,
+    name: &str,
+) -> Result<()> {
     if scope == Scope::Session {
         bail!(
             "clearing an override needs a file scope (--scope project/user/local); the live session merge cannot remove a key (a session-only override is dropped on the next reload/restart)"
@@ -7032,7 +7096,7 @@ fn clear_entity(port: u16, root: &str, scope: Scope, name: &str) -> Result<()> {
             tbl.remove(&name);
         }
     })?;
-    finish_file_scope(port, scope, root, "reload")
+    finish_file_scope(ident, project, scope, root, "reload")
 }
 
 /// Resolve a user-supplied entity type to its stored form + whether it is a recognized
@@ -7090,14 +7154,23 @@ fn entity_operator_value(op: &str) -> Result<(Value, toml_edit::InlineTable)> {
 /// report where it was persisted. Most edits use `"reload"` (re-read the files);
 /// the master switch uses `"enable"`/`"disable"` because `reload` deliberately
 /// preserves the live switch (so an unrelated edit can't flip masking — review F3).
-fn finish_file_scope(port: u16, scope: Scope, root: &str, action: &str) -> Result<()> {
+fn finish_file_scope(
+    ident: Option<(u16, String)>,
+    project: &str,
+    scope: Scope,
+    root: &str,
+    action: &str,
+) -> Result<()> {
     let path = scope_path(scope, root);
-    let applied = match key_for(root).and_then(|k| admin_post(port, &k, action)) {
-        Ok(snap) => {
-            print_applied(&snap, port, scope_label(scope))?;
-            true
-        }
-        Err(_) => false,
+    let applied = match &ident {
+        Some((port, key)) => match admin_post(*port, key, action, project) {
+            Ok(snap) => {
+                print_applied(&snap, *port, scope_label(scope))?;
+                true
+            }
+            Err(_) => false,
+        },
+        None => false,
     };
     if !applied {
         println!(
@@ -7113,6 +7186,42 @@ fn finish_file_scope(port: u16, scope: Scope, root: &str, action: &str) -> Resul
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod a5_binding_tests {
+    use super::{finish_file_scope, Scope};
+
+    // A5b: the project-identity hash threaded onto every control-plane request is derived from
+    // the canonical root by a PURE hash — no IO, and stable for a fixed root across calls (so the
+    // header the client sends matches the value the server-side binding will compute for the same
+    // instance). Different roots hash to different keys.
+    #[test]
+    fn project_key_is_pure_and_deterministic() {
+        let root = "/home/user/projects/alpha";
+        let a = sordino_state::project_key(root);
+        let b = sordino_state::project_key(root);
+        assert_eq!(a, b, "project_key must be deterministic for a fixed root");
+        assert!(!a.is_empty(), "project_key must produce a non-empty hash");
+        let other = sordino_state::project_key("/home/user/projects/beta");
+        assert_ne!(a, other, "distinct roots must hash to distinct project keys");
+    }
+
+    // A5a degrade-gracefully: with NO live proxy (`ident == None`), a file-scope apply STILL
+    // succeeds — `finish_file_scope` performs no control-plane call, reports "applies on the next
+    // session", and returns Ok(()) rather than erroring. This is the tolerance the config CLI must
+    // preserve after the single-`live_identity`-resolve refactor: a proxy being down never blocks
+    // persisting a project/user/local policy change.
+    #[test]
+    fn file_scope_persist_succeeds_with_no_live_proxy() {
+        for scope in [Scope::Project, Scope::User, Scope::Local] {
+            let out = finish_file_scope(None, "deadbeef", scope, "/tmp/sordino-a5-fixture", "reload");
+            assert!(
+                out.is_ok(),
+                "finish_file_scope must degrade gracefully (Ok) when ident is None for {scope:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7226,6 +7335,7 @@ fn reveal(token: String) -> Result<()> {
     let resp = blocking_client()
         .get(&url)
         .header("x-sordino-key", &key)
+        .header("x-sordino-project", sordino_state::project_key(&root))
         .send()
         .context("calling proxy reveal endpoint")?;
     if resp.status().is_success() {
@@ -7248,7 +7358,8 @@ fn monitor_cmd() -> Result<()> {
     let root = canonical(&project_root());
     let (port, key) = live_identity(&root)
         .context("could not reach this project's proxy — is a `claude` session running here?")?;
-    println!("http://127.0.0.1:{port}/sordino/ui?key={key}");
+    let project = sordino_state::project_key(&root);
+    println!("http://127.0.0.1:{port}/sordino/ui?key={key}&project={project}");
     Ok(())
 }
 
@@ -7347,13 +7458,26 @@ fn zdr_cmd(action: Option<ZdrAction>) -> Result<()> {
         percent_encode(&conv)
     );
     let client = blocking_client();
+    let project = sordino_state::project_key(&root);
     match action.unwrap_or(ZdrAction::Status) {
         ZdrAction::Status => {
-            let snap = json_or_err(client.get(&url).header("x-sordino-key", &key).send()?)?;
+            let snap = json_or_err(
+                client
+                    .get(&url)
+                    .header("x-sordino-key", &key)
+                    .header("x-sordino-project", &project)
+                    .send()?,
+            )?;
             print_zdr_status(&snap);
         }
         ZdrAction::Config => {
-            let snap = json_or_err(client.get(&url).header("x-sordino-key", &key).send()?)?;
+            let snap = json_or_err(
+                client
+                    .get(&url)
+                    .header("x-sordino-key", &key)
+                    .header("x-sordino-project", &project)
+                    .send()?,
+            )?;
             print_zdr_configs(&snap);
         }
         ZdrAction::On { config } => {
@@ -7362,6 +7486,7 @@ fn zdr_cmd(action: Option<ZdrAction>) -> Result<()> {
                 client
                     .post(&url)
                     .header("x-sordino-key", &key)
+                    .header("x-sordino-project", &project)
                     .json(&body)
                     .send()?,
             )
@@ -7372,7 +7497,13 @@ fn zdr_cmd(action: Option<ZdrAction>) -> Result<()> {
             print_zdr_status(&resp);
         }
         ZdrAction::Off => {
-            let resp = json_or_err(client.delete(&url).header("x-sordino-key", &key).send()?)?;
+            let resp = json_or_err(
+                client
+                    .delete(&url)
+                    .header("x-sordino-key", &key)
+                    .header("x-sordino-project", &project)
+                    .send()?,
+            )?;
             println!("ZDR disengaged — this session is back on the masked Anthropic path.");
             println!("(The prompt cache breaks once on the next turn.)\n");
             print_zdr_status(&resp);
@@ -7390,11 +7521,12 @@ fn disable_cmd(project: bool) -> Result<()> {
     let root = canonical(&project_root());
     let (port, key) = live_identity(&root)
         .context("could not reach this project's proxy — is a `claude` session running here?")?;
+    let project_key = sordino_state::project_key(&root);
 
     if project {
         // Project-wide master switch off (session-live — not persisted, so the data policy
         // on disk is unchanged). Same endpoint `config off` uses.
-        let snap = admin_post(port, &key, "disable")
+        let snap = admin_post(port, &key, "disable", &project_key)
             .context("turning the project master switch off")?;
         println!(
             "Sordino masking DISABLED for this PROJECT (master switch off). Every conversation \
@@ -7423,6 +7555,7 @@ fn disable_cmd(project: bool) -> Result<()> {
         blocking_client()
             .post(&url)
             .header("x-sordino-key", &key)
+            .header("x-sordino-project", &project_key)
             .send()?,
     )
     .context("disabling masking for this conversation")?;
@@ -7584,11 +7717,13 @@ fn pre_tool_use() -> Result<()> {
     let Some((port, key)) = live_identity(&root) else {
         return Ok(());
     };
+    let project = sordino_state::project_key(&root);
 
     let req = json!({ "tool_name": tool_name, "tool_input": tool_input });
     let resp = match blocking_client()
         .post(format!("http://127.0.0.1:{port}/sordino/broker/resolve"))
         .header("x-sordino-key", &key)
+        .header("x-sordino-project", &project)
         .json(&req)
         .send()
     {
@@ -7650,8 +7785,8 @@ fn broker_denial_note(denials: &[Value]) -> String {
 /// reference in `[[secrets]]`; secret VALUES never transit this command.)
 fn secrets_cmd(action: Option<SecretsAction>) -> Result<()> {
     let root = canonical(&project_root());
-    let port = resolve_live_port(&root)?;
-    let snap = live_snapshot(port, &root).context("reading secrets status (is the proxy running?)")?;
+    let snap = live_snapshot(live_identity(&root), &sordino_state::project_key(&root))
+        .context("reading secrets status (is the proxy running?)")?;
     let secrets = snap.get("secrets").cloned().unwrap_or(Value::Null);
     let ready = secrets.get("ready").and_then(Value::as_bool).unwrap_or(true);
     let total = secrets.get("total").and_then(Value::as_u64).unwrap_or(0);
@@ -7735,30 +7870,35 @@ fn key_for(root: &str) -> Result<String> {
         .context("could not read this project's proxy key — is a `claude` session running here?")
 }
 
-fn live_snapshot(port: u16, root: &str) -> Result<Value> {
-    admin_get(port, &key_for(root)?)
+fn live_snapshot(ident: Option<(u16, String)>, project: &str) -> Result<Value> {
+    let (port, key) = ident
+        .context("could not read this project's proxy key — is a `claude` session running here?")?;
+    admin_get(port, &key, project)
 }
 
-fn admin_get(port: u16, key: &str) -> Result<Value> {
+fn admin_get(port: u16, key: &str, project: &str) -> Result<Value> {
     let resp = blocking_client()
         .get(format!("http://127.0.0.1:{port}/sordino/config"))
         .header("x-sordino-key", key)
+        .header("x-sordino-project", project)
         .send()?;
     json_or_err(resp)
 }
 
-fn admin_post(port: u16, key: &str, path: &str) -> Result<Value> {
+fn admin_post(port: u16, key: &str, path: &str, project: &str) -> Result<Value> {
     let resp = blocking_client()
         .post(format!("http://127.0.0.1:{port}/sordino/{path}"))
         .header("x-sordino-key", key)
+        .header("x-sordino-project", project)
         .send()?;
     json_or_err(resp)
 }
 
-fn admin_put(port: u16, key: &str, config: &Value) -> Result<Value> {
+fn admin_put(port: u16, key: &str, config: &Value, project: &str) -> Result<Value> {
     let resp = blocking_client()
         .put(format!("http://127.0.0.1:{port}/sordino/config"))
         .header("x-sordino-key", key)
+        .header("x-sordino-project", project)
         .json(config)
         .send()?;
     json_or_err(resp)
@@ -7805,8 +7945,8 @@ fn category_set_to_vec(cats: &std::collections::HashSet<sordino_engine::Category
 /// reachable, else computed from the config FILES (user < project < local) — NOT
 /// the balanced default, which would silently erase a custom persisted set when the
 /// proxy happens to be down (review finding F2/C4).
-fn effective_categories(port: u16, root: &str) -> Vec<String> {
-    if let Ok(snap) = live_snapshot(port, root)
+fn effective_categories(ident: Option<(u16, String)>, project: &str, root: &str) -> Vec<String> {
+    if let Ok(snap) = live_snapshot(ident, project)
         && let Some(arr) = snap
             .pointer("/config/enabled_categories")
             .and_then(Value::as_array)
