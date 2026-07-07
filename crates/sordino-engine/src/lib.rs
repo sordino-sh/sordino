@@ -65,7 +65,10 @@ use detect::{
     CompiledCustom, compile_customs, resolve_operator, resolve_overlaps, run_detection,
     run_detection_batch, today_days,
 };
-use secrets::{CompiledSecret, SecretSet, compile_secrets, detect_secrets, secrets_fingerprint};
+use secrets::{
+    CompiledSecret, SecretSet, compile_secrets, detect_secrets, secret_hit_bytes,
+    secrets_fingerprint,
+};
 use store::SessionStore;
 use token::{hash_value, make_hash_token};
 
@@ -539,6 +542,25 @@ impl MaskEngine {
             .into_iter()
             .next()
             .map(|d| d.entity_type)
+    }
+
+    /// Refuse-only byte-scan tripwire for a request body/path: `true` if any registered
+    /// secret's exact plaintext (Tier-1) OR its base64 needle (Tier-2, encoded-ON)
+    /// appears anywhere in `bytes`. Reads the LIVE secret set unconditionally (like
+    /// [`Self::registered_secret_hit`]) and ignores each secret's `apply_to_surfaces`.
+    /// Tier-2 catches a registered secret embedded inside a larger base64 blob.
+    /// DETECT-ONLY: never rewrites; the proxy (S2) maps a hit to a 409.
+    pub fn registered_secret_in_bytes(&self, bytes: &[u8]) -> bool {
+        let secrets = Arc::clone(&self.secrets.read().expect("secrets rwlock poisoned"));
+        secret_hit_bytes(&secrets, bytes, true)
+    }
+
+    /// Like [`Self::registered_secret_in_bytes`] but Tier-1 EXACT-ONLY (encoded-OFF) —
+    /// for outbound HEADER values, where base64-needle matching over structured header
+    /// tokens would storm. DETECT-ONLY.
+    pub fn registered_secret_in_header_value(&self, bytes: &[u8]) -> bool {
+        let secrets = Arc::clone(&self.secrets.read().expect("secrets rwlock poisoned"));
+        secret_hit_bytes(&secrets, bytes, false)
     }
 
     /// Install (hot-swap) the broker policy (default-deny base + allow rules).
