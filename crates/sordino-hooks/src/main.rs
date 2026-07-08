@@ -5523,17 +5523,19 @@ fn scrub_cmd(
 /// announced up front and points to /sordino:verify; a prompt injection never is.
 ///
 /// Tool-input restore is described to match the A4b whole-value gate (engine `unmask_inner`
-/// `ToolInput` branch + `tool_input_whole_value_mode`): assistant prose and written files restore
-/// as before, but in a TOOL INPUT only a WHOLE-VALUE non-secret placeholder restores — a secret
-/// (API key / URL_CREDENTIAL / broker / Local), an unmapped label, or an EMBEDDED token stays a
-/// verbatim token (fail-closed) that the tool / consumer / broker resolves at use. It also warns
+/// `ToolInput` branch + `tool_input_whole_value_mode`): assistant prose restores as before, but a
+/// file written via a tool is itself a TOOL INPUT — so it follows the same narrower rule as any
+/// tool input: only a WHOLE-VALUE non-secret placeholder restores there; a secret (API key /
+/// URL_CREDENTIAL / broker / Local), an unmapped label, or an EMBEDDED token stays a verbatim
+/// token (fail-closed) that the tool / consumer / broker resolves at use. It also warns
 /// the model NOT to fabricate `[TYPE_hexid]` tokens (Issue 3: a made-up token resolves to nothing
 /// and is not a write-back channel) or to reassemble/split a masked value across fragments.
 const ONBOARDING: &str = "This project is set up to route through Sordino, a LOCAL masking proxy. \
      When masking is active it swaps PII for deterministic mask placeholders like \
-     [EMAIL_ADDRESS_a1b2] or [API_KEY_a1b2c3] in what you receive. In your assistant prose and in \
-     files you write, Sordino restores the real values before they leave the machine. In TOOL \
-     INPUTS the rule is narrower: a placeholder that is the WHOLE value of a non-secret field (a \
+     [EMAIL_ADDRESS_a1b2] or [API_KEY_a1b2c3] in what you receive. In your assistant PROSE, Sordino \
+     restores the real values before they leave the machine. A file you write goes through a TOOL, \
+     so it follows the same TOOL-INPUT rule, which is narrower: a placeholder that is the WHOLE \
+     value of a non-secret field (a \
      URL, domain, or IP) is restored to the real value, but a secret placeholder (an API key or \
      other credential, a URL carrying embedded credentials, a brokered secret) — or a placeholder \
      sitting inside a larger string — stays a verbatim token, which the tool, its consumer, or \
@@ -5541,11 +5543,13 @@ const ONBOARDING: &str = "This project is set up to route through Sordino, a LOC
      - The user always sees their own real values locally; masking hides data from the API \
      provider, NOT from the user. Never tell the user their data is hidden, redacted, or that you \
      can't access it.\n\
-     - Mask placeholders are safe to use verbatim wherever the value belongs — prose, config files \
-     (writing \"api_key\": \"[API_KEY_a1b2c3]\" puts the REAL key in the file), shell commands, and \
-     tool inputs. A placeholder that stays a token in a tool input is STILL correct to pass \
-     verbatim — don't refuse, over-redact, or warn about \"exposing\" PII by using a token; the \
-     tokenization (and the tool or broker that resolves it) is what makes it safe.\n\
+     - Mask placeholders are safe to use verbatim wherever the value belongs — prose, config \
+     files, shell commands, and tool inputs. Writing a placeholder into a file restores the real \
+     value ONLY when the placeholder is the whole non-secret field value; a secret placeholder (or \
+     one embedded in a larger string) stays a verbatim token in the file, which the tool, its \
+     consumer, or Sordino's broker resolves at use. Either way a placeholder is STILL correct to \
+     pass verbatim — don't refuse, over-redact, or warn about \"exposing\" PII by using a token; \
+     the tokenization (and the tool or broker that resolves it) is what makes it safe.\n\
      - Only use placeholders Sordino actually issued to you. NEVER invent or fabricate a \
      [TYPE_hexid] token you were not given — a made-up token maps to nothing, so it will resolve \
      to nothing and pass through as literal text; it is not a write-back or reveal channel. And \
