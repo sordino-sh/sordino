@@ -1206,7 +1206,7 @@ mod diag_mask_tests {
             zdr_targets: Arc::new(HashMap::new()),
             zdr_default: Arc::new(None),
             zdr_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            masking_disabled: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            masking_disabled: Arc::new(std::sync::Mutex::new(crate::state::MaskingDisabled::default())),
         }
     }
 
@@ -1265,7 +1265,7 @@ mod diag_mask_tests {
     #[tokio::test]
     async fn disabled_conversation_passes_canary_unmasked() {
         let st = mk_state();
-        assert!(st.set_masking_disabled("conv-off"), "first disable is new");
+        assert!(st.set_masking_disabled("conv-off", None), "first disable is new");
         let out = run(
             st,
             json!({ "text": format!("contact {CANARY} please"), "conversation": "conv-off" }),
@@ -1285,7 +1285,7 @@ mod diag_mask_tests {
     #[tokio::test]
     async fn disable_is_scoped_to_its_conversation() {
         let st = mk_state();
-        st.set_masking_disabled("conv-off");
+        st.set_masking_disabled("conv-off", None);
         let out = run(
             st,
             json!({ "text": format!("contact {CANARY} please"), "conversation": "conv-other" }),
