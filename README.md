@@ -405,14 +405,14 @@ endpoint = "http://10.0.0.5:3007/detect"
 
 When an un-masked value is restored into the assistant's reply, Sordino wraps it with
 a marker so you can see locally which spans came back from a token. It is **on by
-default** with the printable brackets `⟦`/`⟧`; tune or disable it via
+default** with an ANSI highlight (`ESC[97;44m` … `ESC[0m`); tune or disable it via
 `[engine.reveal_marker]`:
 
 ```toml
 [engine.reveal_marker]
-enabled = true       # on by default; set false to restore silently
-prefix = "⟦"         # the default printable brackets — render in terminal, file, and web UI
-suffix = "⟧"
+enabled = true               # on by default; set false to restore silently
+prefix = "\u001b[97;44m"     # ANSI default: bright-white on blue (out-of-band; value stays copy-clean)
+suffix = "\u001b[0m"         # reset
 ```
 
 - **Assistant prose only.** The decoration is applied **only** to `Surface::AssistantText`
@@ -424,13 +424,17 @@ suffix = "⟧"
   marker literals **before** detection, so upstream receives the bare token —
   byte-identical to a no-marker round-trip, with a stable prompt-cache prefix. The
   marker is purely a local display aid; it never reaches the model.
-- **Printable by default; ANSI optional.** The default `prefix`/`suffix` are the printable
-  brackets `⟦`/`⟧` (U+27E6/U+27E7): they render in every sink (terminal, file, Claude Code
-  web UI) and never occur in ordinary code or prose. Prefer terminal colour? Set them to
-  ANSI escapes (out-of-band, so the model can't emit or override them) — but they show as
-  literal escape bytes anywhere that doesn't interpret them. Whatever you pick, choose
-  markers that don't occur in ordinary prose: the strip removes the **exact** literal from
-  re-sent history (a backtick or `*` would over-strip code/emphasis).
+- **ANSI by default; printable optional.** The default `prefix`/`suffix` are ANSI escapes
+  (`ESC[97;44m` … `ESC[0m`). ANSI is **out-of-band**: the terminal draws the highlight but
+  the escape bytes are not part of the value's glyphs, so an un-masked URL/key stays
+  **copy-clean** — you can select and paste the real value. A printable in-band marker
+  (`⟦`/`⟧`) becomes part of the copied string, so `…?key=⟦SECRET⟧` is a broken URL / wrong
+  key — it corrupts exactly the reveals (keys, tokens, URLs) you most want to grab. ANSI's
+  only cost is that raw escape bytes read as `␛[…m` in a **non-terminal** sink (a stored
+  transcript viewed with `cat`), which is confined to review and is losslessly strippable.
+  Prefer a marker that also renders outside a terminal? Set the printable `⟦`/`⟧` — just
+  choose markers that don't occur in ordinary prose, since the strip removes the **exact**
+  literal from re-sent history (a backtick or `*` would over-strip code/emphasis).
 
 ## Threat model & limitations
 

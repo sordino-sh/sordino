@@ -573,9 +573,9 @@ mod tests {
         ));
         // Categories seeded from the `balanced` profile (snake_case).
         assert!(cfg.engine.enabled_categories.contains(&Category::Secrets));
-        // Reveal marker on by default with the printable bracket (no ANSI junk).
+        // Reveal marker on by default with the ANSI marker (out-of-band; copy-clean value).
         assert!(cfg.engine.reveal_marker.enabled);
-        assert_eq!(cfg.engine.reveal_marker.prefix, "\u{27e6}");
+        assert_eq!(cfg.engine.reveal_marker.prefix, "\u{1b}[97;44m");
         // Allow-list compiled: common-word default + the `^\d{4}$` pattern.
         assert!(cfg.engine.allow_list.is_allowed("Anthropic"));
         assert!(cfg.engine.allow_list.is_allowed("1234"));
@@ -679,10 +679,10 @@ mod tests {
         assert!(cfg.engine.reveal_marker.enabled);
         assert_eq!(cfg.engine.reveal_marker.prefix, "\u{1b}[97;44m");
         assert_eq!(cfg.engine.reveal_marker.suffix, "\u{1b}[0m");
-        // A config without the section defaults cleanly: ON, with the printable `⟦` marker.
+        // A config without the section defaults cleanly: ON, with the ANSI `ESC[97;44m` marker.
         let d = sordino_engine::EngineConfig::default();
         assert!(d.reveal_marker.enabled);
-        assert_eq!(d.reveal_marker.prefix, "\u{27e6}");
+        assert_eq!(d.reveal_marker.prefix, "\u{1b}[97;44m");
 
         unsafe { std::env::remove_var("SORDINO_USER_CONFIG") };
         let _ = std::fs::remove_dir_all(&dir);

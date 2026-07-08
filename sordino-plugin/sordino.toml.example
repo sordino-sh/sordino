@@ -78,15 +78,17 @@ prefer_gpu = false         # GPU backends are not compiled in by default
 # Wrap unmasked values in assistant prose so restored spans are visible locally.
 # Applies only to displayed assistant text, never tool inputs/results. Markers are
 # stripped before that assistant history is sent upstream on the next turn.
-# ON by default with the printable brackets below — they render everywhere (terminal,
-# file, web UI), unlike raw ANSI (which shows as literal escape bytes out of terminal).
+# ON by default with the ANSI marker below — it highlights the span in a terminal
+# WITHOUT altering the value's bytes, so an un-masked URL/key stays copy-clean (a printable
+# in-band marker would corrupt it, e.g. a token spliced into a URL). Raw escape bytes only
+# show as literal junk in a non-terminal sink (a stored transcript viewed with cat).
 # Override prefix/suffix for a different style, or set enabled = false to turn it off.
 enabled = true
-prefix = "⟦"
-suffix = "⟧"
-# Prefer ANSI color in a terminal?
-# prefix = "\u001b[97;44m"   # bright-white on blue
-# suffix = "\u001b[0m"
+prefix = "\u001b[97;44m"   # bright-white on blue
+suffix = "\u001b[0m"       # reset
+# Prefer a printable marker that also renders outside a terminal? (corrupts copied values)
+# prefix = "⟦"
+# suffix = "⟧"
 
 [engine.entity_operators]
 # Per-entity overrides. Presence also opts an entity type into masking even if its

@@ -443,17 +443,26 @@ impl AllowList {
 ///   so upstream receives the bare token — byte-identical to a no-marker
 ///   round-trip, with zero added noise and a stable prompt-cache prefix.
 ///
-/// The default `prefix`/`suffix` are the printable brackets `⟦`/`⟧` (U+27E6/U+27E7):
-/// they render everywhere — terminal, file, and the Claude Code web UI alike — unlike
-/// raw ANSI escapes, which show as literal `␛[…m` bytes anywhere that doesn't interpret
-/// them. Any prefix/suffix pair works; pick markers that do NOT occur in ordinary prose
-/// or code, since the strip removes the exact literals from re-sent assistant history
-/// (the `⟦`/`⟧` brackets are chosen precisely because they don't appear in code/prose;
-/// a backtick would over-strip code spans, and ANSI renders as junk out-of-terminal).
+/// The default `prefix`/`suffix` are ANSI escapes — `ESC[97;44m` (bright-white on a
+/// blue background) and `ESC[0m` (reset). ANSI is *out-of-band*: the terminal renders
+/// the highlight but the escape bytes are not part of the value's glyphs, so the user
+/// still sees — and can copy — the un-masked value verbatim. That is the property that
+/// matters: a printable in-band marker (e.g. `⟦`/`⟧`) becomes part of the string the
+/// user copies, so `…?key=⟦SECRET⟧` yields a broken URL / wrong key — corrupting exactly
+/// the high-value reveals (keys, tokens, URLs) the operator most wants to grab. ANSI's
+/// only cost is that raw escape bytes read as `␛[…m` in a NON-terminal sink (a stored
+/// transcript viewed with `cat`); that noise is confined to the review context and is
+/// losslessly strippable (`sse.rs::strip_terminal_codes`), whereas in-band corruption
+/// happens live and can't be undone after the fact. Essentially every client that routes
+/// through the proxy is a real ANSI-capable terminal (standalone or IDE-integrated), so
+/// the highlight lands for all live traffic. Any prefix/suffix pair works; if you pick a
+/// PRINTABLE marker, choose one that does NOT occur in ordinary prose or code, since the
+/// strip removes the exact literals from re-sent assistant history (a backtick would
+/// over-strip code spans). ANSI has a well-defined strip and no such collision.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct RevealMarker {
-    /// Master switch for the decoration. On by default — the printable `⟦`/`⟧` markers
-    /// (see the type doc) make un-masked spans visible locally with no out-of-band junk.
+    /// Master switch for the decoration. On by default — the ANSI marker (see the type
+    /// doc) highlights un-masked spans in the terminal without altering the value's bytes.
     #[serde(default = "default_true")]
     pub enabled: bool,
     /// Inserted immediately before each un-masked value.
@@ -464,14 +473,14 @@ pub struct RevealMarker {
     pub suffix: String,
 }
 
-/// `⟦` (U+27E6) — a printable left bracket that renders in every sink (terminal, file,
-/// web UI) and never occurs in ordinary code or prose, so the strip can't over-remove.
+/// `ESC[97;44m` — bright-white foreground on a blue background. Out-of-band: highlights
+/// the span in a terminal without adding any byte to the un-masked value's glyphs.
 fn default_marker_prefix() -> String {
-    "\u{27e6}".to_string()
+    "\u{1b}[97;44m".to_string()
 }
-/// `⟧` (U+27E7) — the matching right bracket.
+/// `ESC[0m` — reset all attributes.
 fn default_marker_suffix() -> String {
-    "\u{27e7}".to_string()
+    "\u{1b}[0m".to_string()
 }
 
 impl Default for RevealMarker {
@@ -987,7 +996,7 @@ pub struct EngineConfig {
     pub preserve_current_date: bool,
 
     /// Display-time decoration for un-masked assistant text (see [`RevealMarker`]).
-    /// On by default (printable `⟦`/`⟧` markers); a display/apply-time concern, so it is NOT
+    /// On by default (ANSI `ESC[97;44m`/`ESC[0m` markers); a display/apply-time concern, so it is NOT
     /// part of `detection_fingerprint` (changing it does not invalidate the detection cache).
     #[serde(default)]
     pub reveal_marker: RevealMarker,

@@ -495,7 +495,9 @@ pub(crate) fn clean_capture(engine: &MaskEngine, text: &str) -> String {
 /// `ESC`). The monitor capture holds the CLEAN reply — terminal control bytes are the
 /// client's display concern, never part of the stored reply, and they would stop a
 /// captured reply from matching the un-decorated re-send. Independent of the
-/// configurable reveal marker (default `⟦`/`⟧`; ANSI is a user option this still strips).
+/// configurable reveal marker: with the default ANSI marker this pass also removes it
+/// from the capture (belt-and-suspenders with `strip_reveal_marker`); a printable custom
+/// marker is peeled by `strip_reveal_marker` instead.
 /// Borrow-free when no `ESC`.
 fn strip_terminal_codes(text: &str) -> std::borrow::Cow<'_, str> {
     if !text.contains('\u{1b}') {
