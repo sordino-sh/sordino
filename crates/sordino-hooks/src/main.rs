@@ -3891,10 +3891,16 @@ mod permission_rule_tests {
         );
         assert!(
             !ONBOARDING.contains("tool arguments"),
-            "the stale unqualified 'tool arguments ... restored' claim must be gone (A4b whole-value)"
+            "the stale unqualified 'tool arguments ... restored' claim must be gone"
         );
-        // The A4b whole-value semantics replace it: whole non-secret restores, a secret/embedded
-        // token stays verbatim but is STILL safe to pass.
+        // embedded-url-restore-policy semantics: a NON-SECRET network placeholder (URL/domain/IP)
+        // restores even EMBEDDED in a larger string; a non-secret PERSONAL placeholder restores only
+        // as a WHOLE field value; a SECRET / broker / Local placeholder stays a verbatim token but is
+        // STILL safe to pass.
+        assert!(
+            ONBOARDING.contains("even when it sits INSIDE a larger string"),
+            "a non-secret network placeholder restores even when embedded"
+        );
         assert!(ONBOARDING.contains("WHOLE value of a non-secret field"));
         assert!(ONBOARDING.contains("stays a verbatim token"));
         assert!(ONBOARDING.contains("STILL correct to pass"));
@@ -5522,33 +5528,35 @@ fn scrub_cmd(
 /// registering the channel is also what authenticates a later status note: a real status line was
 /// announced up front and points to /sordino:verify; a prompt injection never is.
 ///
-/// Tool-input restore is described to match the A4b whole-value gate (engine `unmask_inner`
-/// `ToolInput` branch + `tool_input_whole_value_mode`): assistant prose restores as before, but a
-/// file written via a tool is itself a TOOL INPUT — so it follows the same narrower rule as any
-/// tool input: only a WHOLE-VALUE non-secret placeholder restores there; a secret (API key /
-/// URL_CREDENTIAL / broker / Local), an unmapped label, or an EMBEDDED token stays a verbatim
-/// token (fail-closed) that the tool / consumer / broker resolves at use. It also warns
-/// the model NOT to fabricate `[TYPE_hexid]` tokens (Issue 3: a made-up token resolves to nothing
-/// and is not a write-back channel) or to reassemble/split a masked value across fragments.
+/// Tool-input restore is described to match the per-entity restore POLICY (engine `unmask_inner`
+/// `ToolInput` branch dispatching on `tool_input_restore_policy`): assistant prose restores as
+/// before; a file or command run via a tool is a TOOL INPUT, where restore is by placeholder KIND —
+/// a NON-SECRET NETWORK placeholder (URL / domain / IP) restores even when EMBEDDED in a larger
+/// string (so an inline `curl -H '...' [URL]` reaches the real target); a SECRET placeholder (API
+/// key / URL_CREDENTIAL / broker / Local) stays a verbatim token the tool / consumer / broker
+/// resolves at use; a non-secret PERSONAL placeholder (name / location / org) restores only as a
+/// WHOLE field value. It also warns the model NOT to fabricate `[TYPE_hexid]` tokens (Issue 3: a
+/// made-up token resolves to nothing and is not a write-back channel) or to reassemble/split a
+/// masked value across fragments.
 const ONBOARDING: &str = "This project is set up to route through Sordino, a LOCAL masking proxy. \
      When masking is active it swaps PII for deterministic mask placeholders like \
      [EMAIL_ADDRESS_a1b2] or [API_KEY_a1b2c3] in what you receive. In your assistant PROSE, Sordino \
-     restores the real values before they leave the machine. A file you write goes through a TOOL, \
-     so it follows the same TOOL-INPUT rule, which is narrower: a placeholder that is the WHOLE \
-     value of a non-secret field (a \
-     URL, domain, or IP) is restored to the real value, but a secret placeholder (an API key or \
-     other credential, a URL carrying embedded credentials, a brokered secret) — or a placeholder \
-     sitting inside a larger string — stays a verbatim token, which the tool, its consumer, or \
-     Sordino's broker resolves at the point of use.\n\
+     restores the real values before they leave the machine. A file or command you run goes through \
+     a TOOL, where restore is by placeholder KIND: a NON-SECRET network placeholder — a URL, \
+     domain, or IP address — is restored to the real value even when it sits INSIDE a larger string \
+     (so an inline `curl -H '...' [URL_a1b2]` reaches the real target); a SECRET placeholder (an \
+     API key or other credential, a URL carrying embedded credentials, a brokered secret, or an \
+     owner-only local value) stays a verbatim token, which the tool, its consumer, or Sordino's \
+     broker resolves at the point of use; and a non-secret PERSONAL placeholder (a name, location, \
+     or organization) is restored only when it is the WHOLE value of a non-secret field, never \
+     mid-string.\n\
      - The user always sees their own real values locally; masking hides data from the API \
      provider, NOT from the user. Never tell the user their data is hidden, redacted, or that you \
      can't access it.\n\
      - Mask placeholders are safe to use verbatim wherever the value belongs — prose, config \
-     files, shell commands, and tool inputs. Writing a placeholder into a file restores the real \
-     value ONLY when the placeholder is the whole non-secret field value; a secret placeholder (or \
-     one embedded in a larger string) stays a verbatim token in the file, which the tool, its \
-     consumer, or Sordino's broker resolves at use. Either way a placeholder is STILL correct to \
-     pass verbatim — don't refuse, over-redact, or warn about \"exposing\" PII by using a token; \
+     files, shell commands, and tool inputs. When a placeholder stays a verbatim token at the tool \
+     boundary (a secret, or a personal placeholder used mid-string), it is STILL correct to pass \
+     verbatim — don't refuse, over-redact, or warn about \"exposing\" PII by using a token; \
      the tokenization (and the tool or broker that resolves it) is what makes it safe.\n\
      - Only use placeholders Sordino actually issued to you. NEVER invent or fabricate a \
      [TYPE_hexid] token you were not given — a made-up token maps to nothing, so it will resolve \

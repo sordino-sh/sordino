@@ -905,10 +905,13 @@ mod tests {
         }
     }
 
-    // (1b + 2) A token EMBEDDED in a Bash `command` string stays a verbatim token through the
-    // streaming path at every split, and the JSON stays parseable (the L391 corruption fix).
+    // (embedded-url-restore-policy + 2) A NETWORK URL token EMBEDDED in a Bash `command` string now
+    // RESTORES through the STREAMING path at EVERY split — the buffered() path must reassemble a
+    // token that straddles a chunk boundary, then splice + JSON-escape it (RawJsonSource) so the JSON
+    // stays parseable. Verifies the SSE buffered() path handles an embedded (not just whole-value)
+    // Network token; the classifier + broker are the exfil guards now, not the proxy.
     #[test]
-    fn sse_tool_input_embedded_url_stays_verbatim_across_splits() {
+    fn sse_tool_input_embedded_url_restores_across_splits() {
         let e = network_engine();
         let url = "https://www.cisa.gov";
         let m = e.mask(&format!("open {url}"), Surface::UserMessage).unwrap();
@@ -922,9 +925,10 @@ mod tests {
             let v: serde_json::Value = serde_json::from_str(&got)
                 .unwrap_or_else(|err| panic!("unparseable at split {split}: {got:?} ({err})"));
             let cmd = v["command"].as_str().unwrap();
-            assert!(
-                cmd.contains(&tok) && !cmd.contains(url),
-                "split {split}: embedded token must stay verbatim: {cmd}"
+            assert_eq!(
+                cmd,
+                format!("curl {url} | head"),
+                "split {split}: embedded Network token must restore across the streaming split: {cmd}"
             );
         }
     }

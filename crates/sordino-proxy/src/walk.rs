@@ -763,12 +763,13 @@ mod tests {
         );
     }
 
-    // (Fix round) `unmask_str_tool_input`'s only callers are the OpenAI raw-JSON tool-arg strings
-    // (`function.arguments` / function-call `arguments`), where a `"` bracketing a token IS a genuine
-    // JSON delimiter — RAW JSON SOURCE. So it routes through `MaskEngine::unmask_tool_input`
-    // (RawJsonSource): a WHOLE quoted JSON value restores (JsonQuoted); an EMBEDDED (escaped) token
-    // does not. The Anthropic decoded-leaf path (`unmask_value_tool_input`) is untouched and keeps a
-    // quote-wrapped decoded leaf verbatim.
+    // (embedded-url-restore-policy) `unmask_str_tool_input`'s callers are the OpenAI raw-JSON tool-arg
+    // strings (`function.arguments`), RAW JSON SOURCE; `unmask_value_tool_input` is the Anthropic
+    // serde-decoded-leaf path. For the NETWORK class (URL/DOMAIN/IP) a token now restores REGARDLESS
+    // of position — whole OR embedded — the classifier + broker are the exfil guards, not the proxy.
+    // This test pins the SOURCE-dependent ESCAPE discipline: RawJsonSource JSON-escapes the spliced
+    // value (JSON stays parseable); DecodedLeaf splices PLAIN (serde re-serializes downstream, the
+    // 636712a invariant — literal `"` are NEVER treated as JSON delimiters).
     #[test]
     fn str_tool_input_is_raw_json_source_value_gate_is_decoded_leaf() {
         use sordino_engine::Category;
@@ -796,8 +797,7 @@ mod tests {
             .clone();
 
         // (D-analogue) Raw-JSON tool-arg string, token as the WHOLE quoted JSON value → RESTORES,
-        // JSON-escaped so the result still parses. This is the behavior the fix restored for the
-        // OpenAI/Codex tool-egress relaxation (DecodedLeaf had over-masked it).
+        // JSON-escaped so the result still parses.
         let mut args = format!("{{\"url\":\"{tok}\"}}");
         unmask_str_tool_input(&e, &out.manifest, &mut args);
         let v: Value = serde_json::from_str(&args).expect("parseable JSON");
@@ -806,23 +806,25 @@ mod tests {
             "whole quoted JSON value must restore on the raw-JSON tool-arg path: {args}"
         );
 
-        // (C-analogue) Same token EMBEDDED (escaped `\"`) inside a Bash command in the raw-JSON args
-        // → its left quote is escaped, so it is NOT a whole JSON value → stays VERBATIM (no exfil).
+        // (C-analogue) Same Network URL token EMBEDDED (escaped `\"`) inside a Bash command in the
+        // raw-JSON args → now RESTORES (Network class), JSON-escaped so the result still parses.
         let mut embedded = format!("{{\"command\":\"echo \\\"{tok}\\\"\"}}");
         unmask_str_tool_input(&e, &out.manifest, &mut embedded);
-        assert!(
-            embedded.contains(&tok) && !embedded.contains(url),
-            "escaped-embedded token in raw-JSON args must stay verbatim: {embedded}"
+        let ve: Value = serde_json::from_str(&embedded).expect("parseable JSON after embedded restore");
+        assert_eq!(
+            ve["command"], format!("echo \"{url}\""),
+            "embedded Network token in raw-JSON args must restore + stay parseable: {embedded}"
         );
 
-        // (A-analogue) DECODED-leaf path stays protected: a quote-wrapped token in a serde-decoded
-        // `Value::String` (the Anthropic `ToolUse.input` shape) never restores.
+        // (A-analogue) DECODED-leaf path: a quote-wrapped Network token in a serde-decoded
+        // `Value::String` (the Anthropic `ToolUse.input` shape) now RESTORES, spliced PLAIN (the
+        // literal `"` are content, never JSON delimiters — 636712a invariant preserved).
         let mut leaf = Value::String(format!("echo \"{tok}\""));
         unmask_value_tool_input(&e, &out.manifest, &mut leaf);
-        let s = leaf.as_str().unwrap();
-        assert!(
-            s.contains(&tok) && !s.contains(url),
-            "decoded-leaf quote-wrapped token must stay verbatim: {s}"
+        assert_eq!(
+            leaf.as_str().unwrap(),
+            format!("echo \"{url}\""),
+            "decoded-leaf embedded Network token must restore plain: {leaf:?}"
         );
     }
 

