@@ -4654,39 +4654,89 @@ fn verify_engine_masks(root: &str) -> Probe {
         }
     };
     let canary = "verify.canary@example.com";
+    // Resolve THIS session's conversation id (present only when routed through the proxy).
+    // When present, thread it into the diag/mask body so the canary is masked through the
+    // SAME path the wire walk uses for this conversation — catching a per-conversation
+    // disable (the canary comes back unmasked → FAIL). When absent (unrouted), we cannot
+    // attribute the engine's global masking to this conversation, so we return an explicit
+    // indeterminate verdict rather than green-washing.
+    let conv = conversation_from_base_url();
+    let mut body = json!({ "text": format!("contact {canary} please") });
+    if let Some(c) = &conv {
+        body["conversation"] = json!(c);
+    }
     let resp = blocking_client()
         .post(format!("http://127.0.0.1:{port}/sordino/diag/mask"))
         .header("x-sordino-key", &key)
         .header("x-sordino-project", sordino_state::project_key(root))
-        .json(&json!({ "text": format!("contact {canary} please") }))
+        .json(&body)
         .send();
     match resp {
         Ok(r) if r.status().is_success() => {
             let out: Value = r.json().unwrap_or(Value::Null);
             let changed = out.get("changed").and_then(Value::as_bool).unwrap_or(false);
             let masked = out.get("masked").and_then(Value::as_str).unwrap_or("");
-            if changed && !masked.contains(canary) {
-                probe(
-                    name,
-                    ProbeStatus::Pass,
-                    "the proxy tokenized a canary value (masking is ON)".to_string(),
-                    None,
-                )
-            } else {
-                probe(
-                    name,
-                    ProbeStatus::Fail,
-                    "the canary came back UNMASKED — masking is OFF (transparent pass-through)"
-                        .to_string(),
-                    Some("turn masking on: /sordino:privacy on"),
-                )
-            }
+            let masked_ok = changed && !masked.contains(canary);
+            engine_mask_verdict(name, conv.as_deref(), masked_ok)
         }
         _ => probe(
             name,
             ProbeStatus::Fail,
             "the diag/mask canary call failed".to_string(),
             Some("check proxy health with /sordino:doctor"),
+        ),
+    }
+}
+
+/// Pure verdict selection for the engine-mask canary, factored out of
+/// [`verify_engine_masks`] so the `(conv, masked_ok)` → status mapping is
+/// unit-testable without a live proxy.
+///
+/// The load-bearing subtlety (F1c fix): an UNMASKED canary (`masked_ok == false`)
+/// is a verifiable FAIL *regardless* of whether a conversation id resolved — the
+/// engine demonstrably did not mask the value, so a green/WARN verdict would
+/// green-wash a genuinely-unmasked session. A bare-routed session (Leg 2 accepts a
+/// loopback `ANTHROPIC_BASE_URL` with no `/sordino/session/<id>` as routed) yields
+/// `conv == None`, and with masking OFF the canary comes back unmasked; that MUST
+/// FAIL, not WARN. Only a masked-OK result that can't be attributed to THIS
+/// conversation (unrouted / no conv id) is genuinely indeterminate → WARN.
+fn engine_mask_verdict(name: &'static str, conv: Option<&str>, masked_ok: bool) -> Probe {
+    match (conv, masked_ok) {
+        // Unrouted but the canary came back UNMASKED → masking is verifiably OFF → FAIL.
+        (None, false) => probe(
+            name,
+            ProbeStatus::Fail,
+            "the canary came back UNMASKED — masking is OFF (and this session isn't routed \
+             through the proxy, so it can't be tied to a specific conversation)"
+                .to_string(),
+            Some("turn masking on: /sordino:privacy on"),
+        ),
+        // Unrouted + canary masked OK: the engine masks globally, but we can't attribute it to
+        // THIS conversation (a per-conversation disable can't be checked) → indeterminate.
+        (None, true) => probe(
+            name,
+            ProbeStatus::Warn,
+            "cannot determine THIS conversation's masking state — this session isn't \
+             routed through the proxy, so a per-conversation disable can't be checked"
+                .to_string(),
+            Some("route this session (restart Claude Code), then re-run — see /sordino:status"),
+        ),
+        // Routed + this conversation is masking-ON → canary tokenized → PASS.
+        (Some(_), true) => probe(
+            name,
+            ProbeStatus::Pass,
+            "the proxy tokenized a canary value for THIS conversation (masking is ON)"
+                .to_string(),
+            None,
+        ),
+        // Routed but the canary came back UNMASKED → this conversation's masking is OFF.
+        (Some(_), false) => probe(
+            name,
+            ProbeStatus::Fail,
+            "the canary came back UNMASKED for THIS conversation — masking is OFF here \
+             (per-conversation disable or master switch off)"
+                .to_string(),
+            Some("turn masking on: /sordino:privacy on"),
         ),
     }
 }
@@ -11183,6 +11233,41 @@ mod doctor_tests {
         // Status labels are stable (consumed by the JSON output + plugin command).
         assert_eq!(ProbeStatus::Pass.label(), "PASS");
         assert_eq!(ProbeStatus::Fail.label(), "FAIL");
+    }
+
+    // ---- engine-mask canary verdict (F1c: (conv, masked_ok) → status) ----
+
+    #[test]
+    fn engine_mask_verdict_never_greenwashes_an_unmasked_session() {
+        let name = "engine masks (key-gated canary)";
+
+        // Routed + masking ON (canary tokenized) → PASS (the happy path that catches the
+        // regress-everything bug where every healthy session got the floor-only path).
+        assert_eq!(
+            engine_mask_verdict(name, Some("conv-abc"), true).status,
+            ProbeStatus::Pass,
+        );
+
+        // Routed but canary came back UNMASKED → this conversation's masking is OFF → FAIL.
+        assert_eq!(
+            engine_mask_verdict(name, Some("conv-abc"), false).status,
+            ProbeStatus::Fail,
+        );
+
+        // Unrouted (no conv id, e.g. a bare-loopback ANTHROPIC_BASE_URL that Leg 2 accepts as
+        // routed) but the canary came back UNMASKED → masking is verifiably OFF → FAIL, NOT a
+        // green-washing WARN. This is the F1c fix: the None arm must not discard masked_ok.
+        assert_eq!(
+            engine_mask_verdict(name, None, false).status,
+            ProbeStatus::Fail,
+        );
+
+        // Unrouted + canary masked OK: engine masks globally but can't be attributed to THIS
+        // conversation → the ONLY genuinely-indeterminate case → WARN.
+        assert_eq!(
+            engine_mask_verdict(name, None, true).status,
+            ProbeStatus::Warn,
+        );
     }
 
     // ---- dual-instance / chained-masker (pure decision) ----
