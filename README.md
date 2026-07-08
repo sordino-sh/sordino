@@ -261,7 +261,7 @@ proxy. This is the **masking** layer (turn it off quickly with `/sordino:mask of
 /sordino:mask                           # status: health, routing, on/off, profile, categories
 /sordino:mask off                       # off for THIS conversation — bounded, auto-re-arms in ~30 min
 /sordino:mask off --for 2h              # custom bounded window (24h max)
-/sordino:mask off --sticky              # explicit indefinite off (stays off until you re-enable)
+/sordino:mask off --sticky              # longest bounded off: 24h ceiling, then auto-re-arms
 /sordino:mask off --project             # whole-project master switch (shared with a Codex sibling)
 /sordino:mask on                        # re-enable (clears any off at any scope)
 /sordino:mask profile strict            # threshold + categories + default operator preset

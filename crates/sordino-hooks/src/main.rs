@@ -6202,7 +6202,7 @@ fn mask_delta_message(prev: Option<MaskState>, s: &SessionStatus) -> String {
             if s.profile.is_empty() { "on" } else { &s.profile }
         ),
         MaskState::Off => "Sordino: masking is now OFF for this project — the local proxy is \
-             passing text through UNtokenized (a local setting; re-enable with /sordino:privacy). \
+             passing text through UNtokenized (a local setting; re-enable with /sordino:mask on). \
              Treat values you see as real until masking is back on; registered secrets are still \
              masked, so do not reassemble or re-encode a would-be-masked value."
             .to_string(),
@@ -10645,7 +10645,7 @@ mod route_gate_tests {
             port: 0,
             profile: String::new(),
         });
-        assert!(off.contains("/sordino:privacy")); // points at the re-enable lever
+        assert!(off.contains("/sordino:mask on")); // points at the re-enable lever
         // The masking floor still holds while OFF: registered secrets stay masked, so the model must
         // be told not to reassemble/re-encode a would-be-masked value.
         assert!(off.to_ascii_lowercase().contains("registered secrets"));
