@@ -4468,6 +4468,7 @@ fn doctor(json: bool) -> Result<()> {
         probe_ephemeral_bind(),
         probe_state_dir(),
         probe_project_proxy(&root),
+        probe_dual_instance(&root),
         probe_windows_excluded_range(),
         probe_no_bare_or_safe_mode_env(),
         probe_transcript_exposure(&root),
@@ -4910,6 +4911,305 @@ fn probe_project_proxy(root: &str) -> Probe {
             ProbeStatus::Info,
             "no proxy running for this project".into(),
             Some("start a `claude` session here, or run /sordino:enable"),
+        ),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Dual-instance / chained-masker preflight (advisory WARN, read-only)
+// ---------------------------------------------------------------------------
+//
+// Incident this catches: a session served by TWO masking proxies with SEPARATE
+// vaults (e.g. one build plus a second build wired in as an "upstream shim"). A
+// token minted by one instance is unresolvable FOREIGN garbage to the other, which
+// produces non-restoring tokens, "which build served this session" ambiguity, and
+// fabricated-looking handles. Doctor never warned about it before.
+
+/// One observed loopback masking control plane during the dual-instance probe. The
+/// pure decision below is a function ONLY of these observations + the configured
+/// upstream — the I/O (registry walk + `/healthz` verify + config read) is factored
+/// out so the decision is unit-tested with no network or filesystem.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MaskerObservation {
+    /// Loopback port the control plane answered on.
+    port: u16,
+    /// It identified as a Sordino proxy (nonce-verified `/healthz`, via `live_identity`).
+    is_sordino: bool,
+    /// Its canonical project root == THIS project's — i.e. our own instance, not a foreign one.
+    is_this_project: bool,
+}
+
+/// How this session's route (`$ANTHROPIC_BASE_URL`) relates to THIS project's own masking
+/// plane. Fed to the pure decision below; resolved by the thin [`observe_routed_endpoint`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RoutedEndpoint {
+    /// The route is unset, points at the real provider / a non-loopback gateway, or resolves to
+    /// THIS project's own verified proxy — no cross-instance risk.
+    OwnOrDirect,
+    /// The route points at a DIFFERENT local Sordino instance than this project's own plane —
+    /// tokens minted by that instance are unresolvable here.
+    ForeignInstance,
+}
+
+/// PURE dual-instance / chained-masker decision. Given the observed loopback control
+/// planes, this proxy's CONFIGURED upstream target, and how this session is ROUTED, return
+/// the advisory WARN detail (or `None` for a clean single-instance setup). Advisory only — the
+/// message names the RISK and never reveals a token or secret (a loopback `host:port` is
+/// operational config, not a vault value). Three independent signals, any of which fires:
+///   (a) a SECOND distinct Sordino control plane is reachable beyond this project's own —
+///       separate vaults, so a token from one is foreign garbage to the other;
+///   (b) the configured upstream is ITSELF a loopback address (a chained masker) rather
+///       than the real provider — masked traffic is handed to a second vault that can't
+///       resolve the first's tokens;
+///   (c) this session is ROUTED to a DIFFERENT local Sordino instance than this project's own
+///       plane — the client mints/resolves against a foreign vault.
+/// (a) is the endpoint the client is chained-to as upstream; (c) is the endpoint the client is
+/// routed-to. An instance that is NEITHER routed-to (c) NOR chained (b) cannot inject a foreign
+/// token into THIS session, so it is harmless and deliberately not scanned for.
+fn dual_instance_decision(
+    observed: &[MaskerObservation],
+    upstream: &str,
+    routed: RoutedEndpoint,
+) -> Option<String> {
+    let foreign = observed
+        .iter()
+        .filter(|o| o.is_sordino && !o.is_this_project)
+        .count();
+    let chained = upstream_is_loopback(upstream);
+    let foreign_route = routed == RoutedEndpoint::ForeignInstance;
+    if foreign == 0 && !chained && !foreign_route {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if foreign_route {
+        parts.push(
+            "this session's route ($ANTHROPIC_BASE_URL) points at a DIFFERENT local Sordino \
+             instance than this project's own masking plane — a FOREIGN-INSTANCE route. Tokens \
+             minted/resolved against that instance's separate vault are unresolvable here, so this \
+             session can see non-restoring, foreign handles. Route this project's session through \
+             THIS project's proxy only."
+                .to_string(),
+        );
+    }
+    if foreign > 0 {
+        parts.push(format!(
+            "{foreign} other running Sordino masking prox{} found on loopback beyond this \
+             project's own — each masking instance keeps a SEPARATE vault, so a token minted by \
+             one is unresolvable FOREIGN garbage to another (the footgun behind non-restoring \
+             tokens and 'which build served this session' ambiguity). Make sure this project's \
+             session routes through THIS project's proxy only.",
+            if foreign == 1 { "y" } else { "ies" }
+        ));
+    }
+    if chained {
+        parts.push(format!(
+            "this proxy's configured upstream ({upstream}) is itself a loopback address, not the \
+             real provider (api.anthropic.com) — a CHAINED masker. Masked traffic is handed to a \
+             SECOND instance with its own vault, which sees only foreign tokens it cannot resolve. \
+             Point [proxy] upstream_base_url / $SORDINO_UPSTREAM at the real provider."
+        ));
+    }
+    Some(parts.join(" "))
+}
+
+/// PURE: split a URL's authority into `(host, optional port-string)`, tolerant of scheme,
+/// userinfo, path, query, fragment, and bracketed IPv6. The authority ends at the first `/`,
+/// `?`, or `#`; any userinfo before `@` is dropped; the rightmost `:` outside IPv6 brackets
+/// separates the port. Host/port are returned unvalidated — callers decide. Shared by
+/// [`upstream_is_loopback`] and [`loopback_url_port_path_tolerant`] so the authority parse
+/// lives in ONE place.
+fn split_host_port(url: &str) -> (&str, Option<&str>) {
+    let s = url.trim();
+    let rest = s.split_once("://").map(|(_, r)| r).unwrap_or(s);
+    // Authority ends at the first path/query/fragment delimiter.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    // Drop any userinfo before the last `@`.
+    let hostport = authority.rsplit_once('@').map(|(_, h)| h).unwrap_or(authority);
+    if let Some(end) = hostport.strip_prefix('[').and_then(|_| hostport.find(']')) {
+        // Bracketed IPv6: `[::1]:port` → host `::1`, port after the `]`.
+        let host = &hostport[1..end];
+        let port = hostport[end + 1..].strip_prefix(':');
+        (host, port)
+    } else {
+        match hostport.rsplit_once(':') {
+            Some((h, p)) => (h, Some(p)),
+            None => (hostport, None),
+        }
+    }
+}
+
+/// PURE: is `host` a loopback address? `localhost`, `::1`, or anything in `127.0.0.0/8`.
+fn is_loopback_host(host: &str) -> bool {
+    matches!(host, "localhost" | "::1")
+        || host
+            .parse::<std::net::Ipv4Addr>()
+            .map(|ip| ip.is_loopback())
+            .unwrap_or(false)
+}
+
+/// PURE: is `url`'s host a loopback address (regardless of scheme/port/path)? Broader than
+/// [`loopback_url_port`] (which rejects any path) because a chained masker may forward to
+/// `http://127.0.0.1:PORT/v1`. Handles `scheme://user@host:port/path`, bracketed IPv6, and
+/// the whole `127.0.0.0/8` block.
+fn upstream_is_loopback(url: &str) -> bool {
+    is_loopback_host(split_host_port(url).0)
+}
+
+/// PURE: like [`loopback_url_port`] but PATH-TOLERANT — extract the port from a loopback URL
+/// even when it carries a path/query/fragment (notably the SessionStart session route
+/// `http://127.0.0.1:PORT/sordino/session/<id>`). Reuses [`split_host_port`]/[`is_loopback_host`]
+/// with [`upstream_is_loopback`] rather than duplicating the authority parse. Returns the port
+/// ONLY when the host is loopback AND a numeric port is present; `None` for a non-loopback host
+/// or a port-less URL. Used by [`observe_routed_endpoint`] so a path-bearing FOREIGN route is
+/// still probed for its identity instead of resolving quietly to OwnOrDirect.
+fn loopback_url_port_path_tolerant(url: &str) -> Option<u16> {
+    let (host, port) = split_host_port(url);
+    if !is_loopback_host(host) {
+        return None;
+    }
+    port?.parse::<u16>().ok()
+}
+
+/// PURE upstream resolution mirroring the proxy's own layering (`config.rs::merged_value`:
+/// user < project < local, so local wins), with the `$SORDINO_UPSTREAM` launch override on
+/// top. `layers` carries the raw TOML text of each config layer in HIGHEST-precedence-first
+/// order (local, project, user); the first layer that sets a non-empty `[proxy]
+/// upstream_base_url` wins, else the real-provider default. Pure (no fs/net) so the layer
+/// precedence is unit-tested directly, with no env mutation.
+fn resolve_upstream(env_override: Option<&str>, layers: &[Option<&str>]) -> String {
+    if let Some(u) = env_override.map(str::trim).filter(|s| !s.is_empty()) {
+        return u.to_string();
+    }
+    for text in layers.iter().flatten() {
+        let Ok(doc) = text.parse::<toml_edit::DocumentMut>() else {
+            continue;
+        };
+        if let Some(u) = doc
+            .get("proxy")
+            .and_then(toml_edit::Item::as_table_like)
+            .and_then(|t| t.get("upstream_base_url"))
+            .and_then(toml_edit::Item::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            return u.to_string();
+        }
+    }
+    "https://api.anthropic.com".to_string()
+}
+
+/// Read this proxy's EFFECTIVE upstream target — what it forwards masked traffic to — resolved
+/// the SAME way the proxy resolves it (`config.rs::load` -> `merged_value`), so the probe's
+/// notion of "the configured upstream" matches the proxy's actual behaviour across ALL layers:
+/// the `$SORDINO_UPSTREAM` launch override wins, else `[proxy] upstream_base_url` from the
+/// project's config with the proxy's own precedence (`sordino.local.toml` > `sordino.toml` >
+/// the USER layer at [`sordino_state::user_config_path`]), else the real-provider default.
+/// Including the user layer is load-bearing: `merged_value` folds it in, so a user-layer loopback
+/// upstream chains the masker just as a project one does — omitting it was a false negative on the
+/// exact incident shape (and would print an affirmatively-false PASS). Reads config only; opens no
+/// connection. The decision itself lives in the pure [`resolve_upstream`].
+fn configured_upstream(root: &str) -> String {
+    let env_override = std::env::var("SORDINO_UPSTREAM").ok();
+    let local = std::fs::read_to_string(Path::new(root).join("sordino.local.toml")).ok();
+    let project = std::fs::read_to_string(Path::new(root).join("sordino.toml")).ok();
+    let user = std::fs::read_to_string(sordino_state::user_config_path()).ok();
+    resolve_upstream(
+        env_override.as_deref(),
+        &[local.as_deref(), project.as_deref(), user.as_deref()],
+    )
+}
+
+/// Enumerate the LIVE Sordino control planes on loopback — the lightweight, reliable signal
+/// (the plumbed-project registry, NOT a port scan or process walk). This project's own verified
+/// instance is recorded first (it may not be in the registry on a first session); every other
+/// plumbed project is included IFF its recorded proxy is live and nonce-verified (`live_identity`),
+/// so a stale/crashed record never counts as a second instance.
+fn observe_loopback_maskers(root: &str) -> Vec<MaskerObservation> {
+    let mut out: Vec<MaskerObservation> = Vec::new();
+    if let Some((port, _key)) = live_identity(root) {
+        out.push(MaskerObservation {
+            port,
+            is_sordino: true,
+            is_this_project: true,
+        });
+    }
+    for other in sordino_state::registry_plumbed_roots() {
+        let other_c = canonical(Path::new(&other));
+        if other_c == root {
+            continue; // our own instance is already recorded above
+        }
+        if let Some((port, _key)) = live_identity(&other_c) {
+            out.push(MaskerObservation {
+                port,
+                is_sordino: true,
+                is_this_project: false,
+            });
+        }
+    }
+    out
+}
+
+/// Resolve how THIS session is ROUTED (thin I/O for the pure decision). The registry walk in
+/// [`observe_loopback_maskers`] only sees PLUMBED instances; it misses an UNREGISTERED loopback
+/// Sordino that `$ANTHROPIC_BASE_URL` nonetheless points the client at. That routed endpoint is
+/// one of only two instances that can actually inject a foreign token into this session (the
+/// other being whatever THIS proxy chains to as upstream — signal (b)); a Sordino that is neither
+/// routed-to nor chained is harmless to this session, which is why we do NOT port-scan for it
+/// (a blind loopback scan is invasive and false-positive-prone).
+///
+/// `OwnOrDirect` (no warning) when the route is unset, points at the real provider / a
+/// non-loopback gateway, or resolves to this project's OWN verified proxy port. `ForeignInstance`
+/// only when the route is a loopback endpoint (bare OR path-bearing — notably the SessionStart
+/// `.../sordino/session/<id>` route) on a DIFFERENT port that actually identifies as a Sordino
+/// proxy (nonce on `/healthz`) — a foreign local server that is not Sordino cannot mint our
+/// tokens, so it never trips a false positive. (If this project's own proxy is not currently
+/// live, there is no own plane to match, so a loopback Sordino on the route is treated as foreign —
+/// correct: it is not verifiably ours.)
+fn observe_routed_endpoint(root: &str) -> RoutedEndpoint {
+    let abu = std::env::var("ANTHROPIC_BASE_URL").unwrap_or_default();
+    let Some(routed_port) = loopback_url_port_path_tolerant(&abu) else {
+        // Unset, api.anthropic.com, or a non-loopback corporate gateway — not a loopback masking
+        // endpoint to probe. PATH-TOLERANT: a loopback route carrying a path (the SessionStart
+        // session route `.../sordino/session/<id>`) still yields its port here, so we probe THAT
+        // port's identity instead of silently resolving to OwnOrDirect and missing a foreign
+        // instance (the dual-instance incident shape this probe exists to catch).
+        return RoutedEndpoint::OwnOrDirect;
+    };
+    // Routing to our OWN verified plane is the correct single-instance case.
+    if live_identity(root).map(|(p, _)| p) == Some(routed_port) {
+        return RoutedEndpoint::OwnOrDirect;
+    }
+    // A different loopback port: foreign only if it actually identifies as a Sordino proxy.
+    match proxy_identity(routed_port) {
+        Some((_build, nonce)) if !nonce.is_empty() => RoutedEndpoint::ForeignInstance,
+        _ => RoutedEndpoint::OwnOrDirect,
+    }
+}
+
+/// Dual-instance / chained-masker preflight (advisory WARN, read-only). Thin I/O wrapper around
+/// the pure [`dual_instance_decision`]: observe the live control planes, read the configured
+/// upstream, decide. A WARN never fails doctor (only Fail flips exit); never reveals a secret.
+fn probe_dual_instance(root: &str) -> Probe {
+    let name = "single masking instance (no dual-vault / chained masker)";
+    let observed = observe_loopback_maskers(root);
+    let upstream = configured_upstream(root);
+    let routed = observe_routed_endpoint(root);
+    match dual_instance_decision(&observed, &upstream, routed) {
+        Some(detail) => probe(
+            name,
+            ProbeStatus::Warn,
+            detail,
+            Some(
+                "route this project's session through THIS project's proxy only, and set the \
+                 proxy's upstream to the real provider (api.anthropic.com) — never chain one \
+                 masking proxy into another",
+            ),
+        ),
+        None => probe(
+            name,
+            ProbeStatus::Pass,
+            "one masking instance for this project; upstream is the real provider".into(),
+            None,
         ),
     }
 }
@@ -9351,6 +9651,37 @@ mod route_gate_tests {
     }
 
     #[test]
+    fn loopback_url_port_path_tolerant_parses_session_route() {
+        // The whole point: a PATH-BEARING loopback route still yields its port so
+        // `observe_routed_endpoint` can probe THAT port's identity. `loopback_url_port` returns
+        // None here (path-intolerant) — the dual-instance false negative this atomic fixes.
+        // (T1) A foreign SessionStart session route → the FOREIGN port to probe.
+        assert_eq!(
+            loopback_url_port_path_tolerant("http://127.0.0.1:41999/sordino/session/abc123"),
+            Some(41999)
+        );
+        assert_eq!(loopback_url_port("http://127.0.0.1:41999/sordino/session/abc123"), None);
+        // (T2) An OWN-port session route resolves to the same port → later matched to live_identity
+        // → OwnOrDirect (no false positive). Extraction is identity-agnostic; the port is what gates.
+        assert_eq!(
+            loopback_url_port_path_tolerant("http://127.0.0.1:40000/sordino/session/xyz"),
+            Some(40000)
+        );
+        // Other paths / queries / fragments / trailing slash are equally tolerated.
+        assert_eq!(loopback_url_port_path_tolerant("http://127.0.0.1:8080/v1"), Some(8080));
+        assert_eq!(loopback_url_port_path_tolerant("http://localhost:9000/?x=1"), Some(9000));
+        assert_eq!(loopback_url_port_path_tolerant("http://127.0.0.1:8080/"), Some(8080));
+        assert_eq!(loopback_url_port_path_tolerant("http://[::1]:8080/sordino/session/id"), Some(8080));
+        // Bare route (no path) still parses — parity with the intolerant sibling.
+        assert_eq!(loopback_url_port_path_tolerant("http://127.0.0.1:41234"), Some(41234));
+        // Non-loopback host, port-less URL, and non-numeric port → None (no port to probe).
+        assert_eq!(loopback_url_port_path_tolerant("https://api.anthropic.com/v1"), None);
+        assert_eq!(loopback_url_port_path_tolerant("http://192.168.1.5:80/sordino/session/x"), None);
+        assert_eq!(loopback_url_port_path_tolerant("http://127.0.0.1/sordino/session/x"), None);
+        assert_eq!(loopback_url_port_path_tolerant("http://127.0.0.1:notaport/v1"), None);
+    }
+
+    #[test]
     fn stale_route_messages_are_loud_and_actionable() {
         // Every variant says NOT masked + restart, and (model copy) explicitly forbids a
         // masking claim — never a silent false "active".
@@ -10704,6 +11035,217 @@ mod doctor_tests {
         // Status labels are stable (consumed by the JSON output + plugin command).
         assert_eq!(ProbeStatus::Pass.label(), "PASS");
         assert_eq!(ProbeStatus::Fail.label(), "FAIL");
+    }
+
+    // ---- dual-instance / chained-masker (pure decision) ----
+
+    fn ours(port: u16) -> MaskerObservation {
+        MaskerObservation { port, is_sordino: true, is_this_project: true }
+    }
+    fn foreign(port: u16) -> MaskerObservation {
+        MaskerObservation { port, is_sordino: true, is_this_project: false }
+    }
+
+    // Shorthand: the no-warn route (unset / real provider / own plane) for signal-a/b tests.
+    const OWN: RoutedEndpoint = RoutedEndpoint::OwnOrDirect;
+
+    #[test]
+    fn dual_instance_single_normal_setup_is_quiet() {
+        // (a) A lone, this-project instance forwarding to the real provider, routed to its own
+        // plane → NO warning (the false-positive guard). Empty observations are quiet too.
+        assert!(dual_instance_decision(&[ours(40000)], "https://api.anthropic.com", OWN).is_none());
+        assert!(dual_instance_decision(&[], "https://api.anthropic.com", OWN).is_none());
+        // A non-sordino responder observed on loopback (some other app) must NOT trip it.
+        let other_app = MaskerObservation { port: 8080, is_sordino: false, is_this_project: false };
+        assert!(dual_instance_decision(&[ours(40000), other_app], "https://api.anthropic.com", OWN).is_none());
+    }
+
+    #[test]
+    fn dual_instance_second_sordino_warns_foreign_vault() {
+        // (b) Two DISTINCT sordino control planes → warn about the separate-vault risk.
+        let msg = dual_instance_decision(&[ours(40000), foreign(40001)], "https://api.anthropic.com", OWN)
+            .expect("a second sordino instance must warn");
+        assert!(msg.contains("SEPARATE vault"), "names the dual-vault risk: {msg}");
+        assert!(msg.contains("FOREIGN"), "names the foreign-token footgun: {msg}");
+        // Two foreign instances phrase the count in the plural.
+        let msg2 = dual_instance_decision(
+            &[ours(40000), foreign(40001), foreign(40002)],
+            "https://api.anthropic.com",
+            OWN,
+        )
+        .expect("warn");
+        assert!(msg2.contains("2 other"), "counts foreign instances: {msg2}");
+    }
+
+    #[test]
+    fn dual_instance_chained_upstream_warns() {
+        // (c) Upstream target is itself a loopback masker → chained-masker warning, even with a
+        // single observed instance (the "upstream shim" shape from the incident).
+        for up in ["http://127.0.0.1:8080", "http://127.0.0.1:9000/v1", "http://localhost:41234"] {
+            let msg = dual_instance_decision(&[ours(40000)], up, OWN)
+                .unwrap_or_else(|| panic!("chained upstream {up} must warn"));
+            assert!(msg.contains("CHAINED"), "names the chained masker for {up}: {msg}");
+        }
+        // Both signals at once → one message carrying both clauses.
+        let both = dual_instance_decision(&[ours(1), foreign(2)], "http://127.0.0.1:8080", OWN)
+            .expect("warn");
+        assert!(both.contains("SEPARATE vault") && both.contains("CHAINED"), "{both}");
+    }
+
+    #[test]
+    fn dual_instance_foreign_route_warns() {
+        // (F2a) $ANTHROPIC_BASE_URL routes to a foreign Sordino identity → foreign-instance-route
+        // WARN, even with a lone own instance and a real-provider upstream (signals a/b quiet).
+        let msg = dual_instance_decision(
+            &[ours(40000)],
+            "https://api.anthropic.com",
+            RoutedEndpoint::ForeignInstance,
+        )
+        .expect("a foreign-instance route must warn");
+        assert!(msg.contains("FOREIGN-INSTANCE"), "names the foreign-route risk: {msg}");
+        assert!(msg.contains("$ANTHROPIC_BASE_URL"), "names the route source: {msg}");
+        // All three signals at once → one message carrying all three clauses.
+        let all = dual_instance_decision(
+            &[ours(1), foreign(2)],
+            "http://127.0.0.1:8080",
+            RoutedEndpoint::ForeignInstance,
+        )
+        .expect("warn");
+        assert!(
+            all.contains("FOREIGN-INSTANCE") && all.contains("SEPARATE vault") && all.contains("CHAINED"),
+            "{all}"
+        );
+    }
+
+    #[test]
+    fn dual_instance_own_route_is_quiet() {
+        // (F2b) route unset / api.anthropic.com / this project's OWN plane all map to OwnOrDirect →
+        // no foreign-route warning on an otherwise-clean single instance.
+        assert!(
+            dual_instance_decision(&[ours(40000)], "https://api.anthropic.com", RoutedEndpoint::OwnOrDirect)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn upstream_is_loopback_classifies_hosts() {
+        // Loopback in every realistic shape.
+        for u in [
+            "http://127.0.0.1:8080",
+            "http://127.0.0.1:8080/v1",
+            "https://localhost",
+            "http://localhost:9000/",
+            "http://user@127.0.0.1:8080",
+            "http://127.9.9.9:1234",
+            "http://[::1]:8080/v1",
+        ] {
+            assert!(upstream_is_loopback(u), "should be loopback: {u}");
+        }
+        // The real provider and other public hosts are NOT loopback.
+        for u in [
+            "https://api.anthropic.com",
+            "https://bedrock-runtime.us-east-1.amazonaws.com",
+            "http://10.0.0.5:8080",
+            "http://127.example.com:8080",
+        ] {
+            assert!(!upstream_is_loopback(u), "should NOT be loopback: {u}");
+        }
+    }
+
+    #[test]
+    fn resolve_upstream_mirrors_proxy_layer_precedence() {
+        // PURE (no env/fs): layers are passed highest-precedence-first (local, project, user).
+        let api = "[proxy]\nupstream_base_url = \"https://api.anthropic.com\"\n";
+        let local = "[proxy]\nupstream_base_url = \"http://127.0.0.1:9999\"\n";
+        let project = "[proxy]\nupstream_base_url = \"http://127.0.0.1:8080\"\n";
+        let user = "[proxy]\nupstream_base_url = \"http://127.0.0.1:7070\"\n";
+
+        // No layers set it → the real-provider default.
+        assert_eq!(resolve_upstream(None, &[None, None, None]), "https://api.anthropic.com");
+
+        // (F1a) A USER-layer loopback upstream, with NO project/local override, is now resolved
+        // (previously missed) — this is the exact upstream-shim incident shape that must warn.
+        assert_eq!(
+            resolve_upstream(None, &[None, None, Some(user)]),
+            "http://127.0.0.1:7070"
+        );
+        assert!(
+            upstream_is_loopback(&resolve_upstream(None, &[None, None, Some(user)])),
+            "a user-layer loopback upstream must be seen as a chained masker"
+        );
+
+        // (F1b) The real provider at EVERY layer → PASS material (not loopback), no false warning.
+        assert_eq!(
+            resolve_upstream(None, &[Some(api), Some(api), Some(api)]),
+            "https://api.anthropic.com"
+        );
+        assert!(!upstream_is_loopback(&resolve_upstream(None, &[Some(api), Some(api), Some(api)])));
+
+        // Precedence: local > project > user (mirrors config.rs merged_value; local wins).
+        assert_eq!(
+            resolve_upstream(None, &[Some(local), Some(project), Some(user)]),
+            "http://127.0.0.1:9999"
+        );
+        assert_eq!(
+            resolve_upstream(None, &[None, Some(project), Some(user)]),
+            "http://127.0.0.1:8080"
+        );
+        // The $SORDINO_UPSTREAM launch override wins over every file layer.
+        assert_eq!(
+            resolve_upstream(Some("https://gw.corp.example/v1"), &[Some(local), Some(project), Some(user)]),
+            "https://gw.corp.example/v1"
+        );
+        // An empty/whitespace override is ignored (falls through to the file layers).
+        assert_eq!(
+            resolve_upstream(Some("  "), &[Some(project), None, None]),
+            "http://127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn configured_upstream_reads_all_layers_from_disk() {
+        // The $SORDINO_UPSTREAM override wins by design; skip the file-precedence assertion when
+        // it happens to be set in this environment.
+        if std::env::var_os("SORDINO_UPSTREAM").is_some() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("sordino-upstream-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let root = canonical(&dir);
+        // Isolate the USER layer to a controlled, non-existent path so the default assertion is
+        // hermetic (configured_upstream now reads the user layer, matching the proxy). Restored
+        // below. SAFETY (edition 2024): the fn under test reads SORDINO_USER_CONFIG; no other
+        // thread in this test relies on it.
+        let user_cfg = dir.join("user-config.toml");
+        let prev_user = std::env::var_os("SORDINO_USER_CONFIG");
+        unsafe { std::env::set_var("SORDINO_USER_CONFIG", &user_cfg); }
+
+        // No config at any layer → the real-provider default.
+        assert_eq!(configured_upstream(&root), "https://api.anthropic.com");
+        // (F1) A loopback upstream in the USER layer alone is now resolved (the missed-layer bug).
+        std::fs::write(&user_cfg, "[proxy]\nupstream_base_url = \"http://127.0.0.1:7070\"\n").unwrap();
+        assert_eq!(configured_upstream(&root), "http://127.0.0.1:7070");
+        // A loopback upstream in sordino.toml (project) overrides the user layer.
+        std::fs::write(
+            dir.join("sordino.toml"),
+            "[proxy]\nupstream_base_url = \"http://127.0.0.1:8080\"\n",
+        )
+        .unwrap();
+        assert_eq!(configured_upstream(&root), "http://127.0.0.1:8080");
+        // sordino.local.toml overrides the project file.
+        std::fs::write(
+            dir.join("sordino.local.toml"),
+            "[proxy]\nupstream_base_url = \"http://127.0.0.1:9999\"\n",
+        )
+        .unwrap();
+        assert_eq!(configured_upstream(&root), "http://127.0.0.1:9999");
+
+        match prev_user {
+            Some(v) => unsafe { std::env::set_var("SORDINO_USER_CONFIG", v) },
+            None => unsafe { std::env::remove_var("SORDINO_USER_CONFIG") },
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 
