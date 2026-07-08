@@ -9522,6 +9522,23 @@ struct Snapshot {
     /// + value-free target views — never a credential.
     #[serde(default)]
     zdr: ZdrSummary,
+    /// Optional per-conversation masking disable list (absent on older proxies). The
+    /// proxy's admin.rs emits it; hooks merely deserialize it. A conversation in this
+    /// list passes PII through even while the master switch (`enabled`) is ON.
+    #[serde(default)]
+    masking_disabled_conversations: Vec<String>,
+}
+
+/// The single source of truth for "is outbound PII actually being tokenized for
+/// this request?": master switch AND this conversation isn't in the per-conversation
+/// disable list. `conv == None` is safe by construction — a per-conversation disable
+/// cannot exist without a routed conversation id, so `effective == enabled` is correct;
+/// do NOT turn the `None` arm into a lookup that could diverge from the master switch.
+fn effective_masking(snapshot: &Snapshot, conv: Option<&str>) -> bool {
+    snapshot.enabled
+        && conv.map_or(true, |c| {
+            !snapshot.masking_disabled_conversations.iter().any(|d| d == c)
+        })
 }
 
 /// The proxy's `zdr` block. `active` lists the currently ZDR-routed conversations
@@ -9592,15 +9609,17 @@ fn parse_snapshot(snap: &Value) -> Result<Snapshot> {
 }
 
 fn print_status(snap: &Value, port: u16) -> Result<()> {
-    print_snapshot(&parse_snapshot(snap)?, port);
+    let s = parse_snapshot(snap)?;
+    print_snapshot(&s, port);
     // Per-conversation masking switch: if THIS session's conversation is disabled, call it
     // out — the master-switch line above shows ON, so this is the only signal that THIS
-    // conversation is nonetheless passing PII through.
+    // conversation is nonetheless passing PII through. Uses the SAME `effective_masking`
+    // predicate as every other consumer, gated on the master switch being ON so this line
+    // only ever means "master ON, THIS conversation off" (a master-OFF proxy already prints
+    // its own NOTE via print_snapshot).
     if let Some(conv) = conversation_from_base_url()
-        && snap
-            .get("masking_disabled_conversations")
-            .and_then(|v| v.as_array())
-            .is_some_and(|a| a.iter().any(|c| c.as_str() == Some(conv.as_str())))
+        && s.enabled
+        && !effective_masking(&s, Some(&conv))
     {
         println!(
             "  this conversation : masking OFF (per-conversation `/sordino:disable`) — \
@@ -9951,6 +9970,42 @@ mod route_gate_tests {
         assert_eq!(render_on(&snap, 18820, SlMode::ShieldOnly), "\u{1f6e1}");
         // Compact carries port/profile chrome, so it is NOT the bare shield.
         assert_ne!(render_on(&snap, 18820, SlMode::Compact), "\u{1f6e1}");
+    }
+
+    /// F0: `effective_masking` is the single source of truth for whether outbound PII is
+    /// actually tokenized — master switch AND the per-conversation disable list. `conv ==
+    /// None` collapses to the master switch (a per-conversation disable can't exist without
+    /// a routed conversation id, so `effective == enabled`).
+    #[test]
+    fn effective_masking_predicate() {
+        let snap: Snapshot = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "config": {"profile": "balanced", "score_threshold": 0.5, "enabled_categories": ["contact"]},
+            "masking_disabled_conversations": ["A"],
+        }))
+        .unwrap();
+        assert!(!effective_masking(&snap, Some("A")), "disabled conv A -> off");
+        assert!(effective_masking(&snap, Some("B")), "other conv B -> on");
+        assert!(effective_masking(&snap, None), "no conv -> master switch");
+
+        // Master switch OFF dominates regardless of the per-conversation list.
+        let off: Snapshot = serde_json::from_value(serde_json::json!({
+            "enabled": false,
+            "config": {"profile": "balanced", "score_threshold": 0.5, "enabled_categories": ["contact"]},
+            "masking_disabled_conversations": ["A"],
+        }))
+        .unwrap();
+        assert!(!effective_masking(&off, None));
+        assert!(!effective_masking(&off, Some("B")));
+
+        // Absent on older proxies -> `#[serde(default)]` yields an empty list (masking ON).
+        let bare: Snapshot = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "config": {"profile": "balanced", "score_threshold": 0.5, "enabled_categories": ["contact"]},
+        }))
+        .unwrap();
+        assert!(bare.masking_disabled_conversations.is_empty());
+        assert!(effective_masking(&bare, Some("anything")));
     }
 
     /// A1 regression guard: every LIVE ML state carries the literal `ml` text so the indicator
