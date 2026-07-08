@@ -6106,6 +6106,12 @@ enum MaskState {
     /// Routed to our verified proxy but masking toggled OFF (passthrough). Only the key-gated
     /// local admin plane can flip this, so it is always a local/user-authorized change.
     Off,
+    /// Routed to our verified proxy, the master switch is ON, but THIS conversation is in the
+    /// proxy's `masking_disabled_conversations` list (a per-conversation `/sordino:mask off`, F0/F2).
+    /// Raw PII for this conversation now egresses untokenized even though the project shows "on" —
+    /// so the model MUST hear the disabled-this-conversation truth, never the "masking is active"
+    /// line. Registered secrets stay masked (the floor holds), so a re-encode is still forbidden.
+    DisabledThisConversation,
     /// This session is NOT reaching our verified proxy (route not applied, proxy down, or a
     /// stale/foreign port) — so its traffic is not being masked by us right now.
     NotReaching,
@@ -6138,18 +6144,36 @@ struct SessionStatusRecord {
 /// model must hear about once. Transitions between two *other* not-masked states (or a cold open on
 /// a session that was never masking) stay silent — "not noisy, but never let a silent un-masking
 /// slip past."
+///
+/// `DisabledThisConversation` is treated exactly like `UnmaskedBypass`: it is a not-masked state
+/// where raw PII actively egresses, so ANY entry into it announces once (mirrors the `cur ==` clause,
+/// covering both `Masked -> disabled` and a session that OPENS already disabled). Its exit paths are
+/// already covered — `prev == Some(Masked)` handles the drop out of masked, and `cur == Masked`
+/// handles the F2 TTL auto-re-arm (`disabled -> Masked`), so the silent mid-flow re-mask is narrated.
 fn should_narrate(prev: Option<MaskState>, cur: MaskState) -> bool {
     prev != Some(cur)
         && (prev == Some(MaskState::Masked)
             || cur == MaskState::Masked
-            || cur == MaskState::UnmaskedBypass)
+            || cur == MaskState::UnmaskedBypass
+            || cur == MaskState::DisabledThisConversation)
 }
 
 /// The model-facing delta line. Always prefixed `Sordino:` — the status channel SessionStart
 /// pre-registers — and framed factually (no urgency, no "never claim", a verification path), so a
 /// legitimate status note never wears the shape of a prompt injection.
-fn mask_delta_message(s: &SessionStatus) -> String {
+fn mask_delta_message(prev: Option<MaskState>, s: &SessionStatus) -> String {
     match s.state {
+        // F2 TTL auto-re-arm: a conversation that was `DisabledThisConversation` has just crossed
+        // back to `Masked` because its per-conversation window expired. That re-mask happens
+        // mid-flow with no user action, so the model gets a distinct one-shot line (not the plain
+        // "masking is active" baseline) making the silent re-arm explicit.
+        MaskState::Masked if prev == Some(MaskState::DisabledThisConversation) => format!(
+            "Sordino: masking auto-re-armed after your window — output is tokenized again through \
+             the verified local proxy on :{} (profile: {}). Resume using tokens verbatim wherever \
+             the value belongs.",
+            s.port,
+            if s.profile.is_empty() { "on" } else { &s.profile }
+        ),
         MaskState::Masked => format!(
             "Sordino: masking is active for this session — your traffic is tokenized through the \
              verified local proxy on :{} (profile: {}). Keep using tokens verbatim wherever the \
@@ -6159,7 +6183,12 @@ fn mask_delta_message(s: &SessionStatus) -> String {
         ),
         MaskState::Off => "Sordino: masking is now OFF for this project — the local proxy is \
              passing text through UNtokenized (a local setting; re-enable with /sordino:privacy). \
-             Treat values you see as real until masking is back on."
+             Treat values you see as real until masking is back on; registered secrets are still \
+             masked, so do not reassemble or re-encode a would-be-masked value."
+            .to_string(),
+        MaskState::DisabledThisConversation => "Sordino: masking is OFF for THIS conversation via \
+             /sordino:mask off — raw PII now egresses; registered secrets are still masked, so do \
+             not reassemble or re-encode a would-be-masked value; /sordino:mask on to resume."
             .to_string(),
         MaskState::NotReaching => "Sordino: this session is NOT masking right now — its traffic \
              isn't reaching the verified proxy (the route may not have applied this session, or \
@@ -6432,6 +6461,7 @@ fn prune_stale_status(dir: &Path) {
 /// and that read NEVER claims `Masked` unless it positively reads `enabled=true` from our
 /// identity-verified proxy (never a false "you're protected").
 fn session_mask_state(
+    conversation: &str,
     opted_out: bool,
     baked_port: Option<u16>,
     escape_hatch: bool,
@@ -6448,7 +6478,7 @@ fn session_mask_state(
         let state = if escape_hatch { MaskState::UnmaskedBypass } else { MaskState::NotReaching };
         return Some(SessionStatus { state, port: 0, profile: String::new() });
     }
-    let (state, profile) = routed_proxy_status(routed_port, root);
+    let (state, profile) = routed_proxy_status(conversation, routed_port, root);
     Some(SessionStatus { state, port: routed_port, profile })
 }
 
@@ -6503,7 +6533,13 @@ fn intake_identity_ok(port: u16, root: &str) -> bool {
 /// the statusline's `render_segment` verification but returns a typed state. Uses a SHORT timeout
 /// so a wedged proxy can never stall prompt submission; any failure degrades to `NotReaching`
 /// (the honest "can't confirm masking" answer), never an optimistic `Masked`.
-fn routed_proxy_status(routed_port: u16, root: &str) -> (MaskState, String) {
+///
+/// The master switch (`enabled=true`) is NOT sufficient to claim `Masked`: the SAME `/config` JSON
+/// already carries `masking_disabled_conversations` (F0/F2), so when `conversation` is a member we
+/// return `DisabledThisConversation` instead — one extra pointer read off the response we already
+/// have, zero extra round-trip. This is the honesty fix: a per-conversation `/sordino:mask off` must
+/// never be narrated as "masking is active".
+fn routed_proxy_status(conversation: &str, routed_port: u16, root: &str) -> (MaskState, String) {
     let unconfirmed = (MaskState::NotReaching, String::new());
     // ONE client, NO global timeout: the two reads (identity + enabled) share a SINGLE ~600ms
     // deadline via per-request `.timeout()`, so the whole best-effort tail is bounded as a unit
@@ -6540,7 +6576,21 @@ fn routed_proxy_status(routed_port: u16, root: &str) -> (MaskState, String) {
                 .unwrap_or("")
                 .to_string();
             match v.get("enabled").and_then(Value::as_bool) {
-                Some(true) => (MaskState::Masked, profile),
+                // Master ON, but honor the per-conversation disable list from the SAME JSON: if this
+                // conversation opted out (`/sordino:mask off`), it is NOT masked — say so, don't lie.
+                Some(true) => {
+                    let disabled_here = v
+                        .get("masking_disabled_conversations")
+                        .and_then(Value::as_array)
+                        .is_some_and(|list| {
+                            list.iter().any(|d| d.as_str() == Some(conversation))
+                        });
+                    if disabled_here {
+                        (MaskState::DisabledThisConversation, profile)
+                    } else {
+                        (MaskState::Masked, profile)
+                    }
+                }
                 Some(false) => (MaskState::Off, profile),
                 None => unconfirmed,
             }
@@ -6562,9 +6612,9 @@ fn mask_delta_line(
     escape_hatch: bool,
     root: &str,
 ) -> Option<String> {
-    let cur = session_mask_state(opted_out, baked_port, escape_hatch, root)?;
+    let cur = session_mask_state(conversation, opted_out, baked_port, escape_hatch, root)?;
     let prev = read_session_mask_state(conversation);
-    let line = should_narrate(prev, cur.state).then(|| mask_delta_message(&cur));
+    let line = should_narrate(prev, cur.state).then(|| mask_delta_message(prev, &cur));
     // ALWAYS persist, even when unchanged: `should_narrate` already gates the model-facing line, so
     // the rewrite costs no tokens — but it keeps an actively-masked session's record mtime FRESH so
     // `prune_stale_status` can't evict a live baseline. If it did, a later `Masked -> Off` would
@@ -10365,11 +10415,22 @@ mod route_gate_tests {
         assert!(!should_narrate(Some(UnmaskedBypass), UnmaskedBypass));
         assert!(should_narrate(Some(Masked), UnmaskedBypass));
         assert!(should_narrate(Some(UnmaskedBypass), Masked));
+
+        // DisabledThisConversation (per-conversation `/sordino:mask off` = raw PII egress) mirrors
+        // UnmaskedBypass: ANY entry announces once, and it never sits silent behind a "masking is
+        // active" line.
+        assert!(should_narrate(Some(Masked), DisabledThisConversation)); // masked -> disabled
+        assert!(should_narrate(None, DisabledThisConversation)); // opens already disabled
+        assert!(should_narrate(Some(Off), DisabledThisConversation)); // entry from another off state
+        assert!(!should_narrate(Some(DisabledThisConversation), DisabledThisConversation)); // steady
+        // F2 TTL auto-re-arm: the disabled window expires and the next request re-masks — the model
+        // must be told (one shot), so the silent mid-flow re-mask is not silent.
+        assert!(should_narrate(Some(DisabledThisConversation), Masked));
     }
 
     #[test]
     fn delta_messages_are_factual_status_not_injection_shaped() {
-        let masked = mask_delta_message(&SessionStatus {
+        let masked = mask_delta_message(None, &SessionStatus {
             state: MaskState::Masked,
             port: 8787,
             profile: "balanced".to_string(),
@@ -10377,25 +10438,52 @@ mod route_gate_tests {
         assert!(masked.starts_with("Sordino:"));
         assert!(masked.contains(":8787") && masked.contains("balanced"));
 
-        let off = mask_delta_message(&SessionStatus {
+        let off = mask_delta_message(Some(MaskState::Masked), &SessionStatus {
             state: MaskState::Off,
             port: 0,
             profile: String::new(),
         });
         assert!(off.contains("/sordino:privacy")); // points at the re-enable lever
-        let not = mask_delta_message(&SessionStatus {
+        // The masking floor still holds while OFF: registered secrets stay masked, so the model must
+        // be told not to reassemble/re-encode a would-be-masked value.
+        assert!(off.to_ascii_lowercase().contains("registered secrets"));
+        assert!(off.to_ascii_lowercase().contains("re-encode"));
+        let not = mask_delta_message(Some(MaskState::Masked), &SessionStatus {
             state: MaskState::NotReaching,
             port: 0,
             profile: String::new(),
         });
         assert!(not.contains("/sordino:verify")); // offers a verification path
-        let bypass = mask_delta_message(&SessionStatus {
+        let bypass = mask_delta_message(None, &SessionStatus {
             state: MaskState::UnmaskedBypass,
             port: 0,
             profile: String::new(),
         });
         // The one allow-path state where real PII egresses — must say so plainly and name the lever.
         assert!(bypass.contains("UNMASKED") && bypass.contains("SORDINO_NO_INTAKE_GATE"));
+
+        // KILL-CONDITION (a): a disabled conversation must be told OFF-for-this-conversation WITH the
+        // floor caveat — NEVER "masking is active".
+        let disabled = mask_delta_message(Some(MaskState::Masked), &SessionStatus {
+            state: MaskState::DisabledThisConversation,
+            port: 8787,
+            profile: "balanced".into(),
+        });
+        assert!(disabled.contains("THIS conversation"));
+        assert!(disabled.contains("/sordino:mask off") && disabled.contains("/sordino:mask on"));
+        assert!(disabled.to_ascii_lowercase().contains("registered secrets"));
+        assert!(disabled.to_ascii_lowercase().contains("re-encode"));
+        assert!(!disabled.contains("masking is active"));
+
+        // KILL-CONDITION (b): the F2 TTL auto-re-arm (disabled -> Masked) gets a distinct one-shot
+        // line that says it re-armed — NOT the plain steady-state "masking is active" baseline.
+        let rearm = mask_delta_message(
+            Some(MaskState::DisabledThisConversation),
+            &SessionStatus { state: MaskState::Masked, port: 8787, profile: "balanced".into() },
+        );
+        assert!(rearm.contains("auto-re-armed"));
+        assert!(rearm.contains(":8787") && rearm.contains("balanced"));
+        assert!(!rearm.contains("masking is active"));
 
         // Every variant is on the announced channel and free of the alarmist / gag register that
         // made the old stale-port copy read as a prompt injection.
@@ -10405,8 +10493,9 @@ mod route_gate_tests {
             MaskState::NotReaching,
             MaskState::Disabled,
             MaskState::UnmaskedBypass,
+            MaskState::DisabledThisConversation,
         ] {
-            let m = mask_delta_message(&SessionStatus { state, port: 8787, profile: "balanced".into() });
+            let m = mask_delta_message(None, &SessionStatus { state, port: 8787, profile: "balanced".into() });
             assert!(m.starts_with("Sordino:"));
             assert!(!m.contains("Ctrl-C"));
             assert!(!m.to_ascii_lowercase().contains("never claim"));
@@ -10422,6 +10511,15 @@ mod route_gate_tests {
         );
         assert_eq!(serde_json::from_str::<MaskState>("\"masked\"").unwrap(), MaskState::Masked);
         assert_eq!(serde_json::from_str::<MaskState>("\"disabled\"").unwrap(), MaskState::Disabled);
+        // New F1b variant: snake_case wire form round-trips (the session-status record persists it).
+        assert_eq!(
+            serde_json::to_string(&MaskState::DisabledThisConversation).unwrap(),
+            "\"disabled_this_conversation\""
+        );
+        assert_eq!(
+            serde_json::from_str::<MaskState>("\"disabled_this_conversation\"").unwrap(),
+            MaskState::DisabledThisConversation
+        );
     }
 
     #[test]
@@ -10616,7 +10714,7 @@ mod route_gate_tests {
     /// carrying both lines.
     #[test]
     fn session_additional_context_coalesces_into_one_object() {
-        let mask = mask_delta_message(&SessionStatus {
+        let mask = mask_delta_message(None, &SessionStatus {
             state: MaskState::Masked,
             port: 8787,
             profile: "balanced".into(),
