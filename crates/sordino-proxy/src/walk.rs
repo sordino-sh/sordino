@@ -14,7 +14,7 @@ use anthropic_wire::{
     ToolResultBlock, ToolResultContent,
 };
 use serde_json::{Map, Value};
-use sordino_engine::{EngineError, MaskEngine, MaskStats, Surface, UnmaskManifest};
+use sordino_engine::{EngineError, MaskEngine, MaskStats, Surface, UnmaskManifest, token_regex};
 
 use crate::tripwire;
 
@@ -623,20 +623,51 @@ fn unmask_map(engine: &MaskEngine, manifest: &UnmaskManifest, m: &mut Map<String
 // `extra`, and streaming equivalents). Display / compaction / echo paths keep the plain
 // `unmask*` variants above.
 
+/// Fail-loud on a FABRICATED handle (Issue 3): a token-SHAPED string that survives the
+/// tool-input unmask because it resolves to NOTHING (the model invented it — absent from both
+/// manifest and store). A gated real secret is store-KNOWN and never flagged. WARN only —
+/// never deny or drop (a foreign-vault / expired / self-hosted fixture token also store-misses
+/// legitimately); fail-open so a logging hiccup can't break restoration.
+pub(crate) fn warn_fabricated_handles(engine: &MaskEngine, manifest: &UnmaskManifest, text: &str) {
+    if !text.contains('[') {
+        return;
+    }
+    for m in token_regex().find_iter(text) {
+        let handle = m.as_str();
+        if engine.is_unresolvable_handle(handle, manifest) {
+            tracing::warn!(
+                token = %handle,
+                "fabricated/unresolvable token-shaped handle in tool input; passing through verbatim"
+            );
+        }
+    }
+}
+
 /// Unmask a single string in place through the tool-egress gate (no decoration).
+///
+/// The only callers are the OpenAI raw-JSON tool-arg strings (`function.arguments` /
+/// function-call `arguments`), which are a JSON-encoded string whose `"` are GENUINE JSON
+/// delimiters — i.e. RAW JSON SOURCE. So this routes through the raw-JSON-source entrypoint
+/// ([`MaskEngine::unmask_tool_input`]) where a whole quoted JSON value may restore
+/// ([`WholeValueMode::JsonQuoted`]); an embedded token is escaped (`\"`) in that source, so its
+/// left neighbour is `\` not `"` and it never mis-classifies as JsonQuoted. Decoded-leaf callers
+/// (Anthropic `ToolUse.input`, Responses `extra`/`Other`) go through
+/// [`unmask_value_tool_input`], which uses the DecodedLeaf entrypoint instead.
 pub fn unmask_str_tool_input(engine: &MaskEngine, manifest: &UnmaskManifest, text: &mut String) {
     if let Ok(out) = engine.unmask_tool_input(text, manifest) {
         *text = out;
     }
+    warn_fabricated_handles(engine, manifest, text);
 }
 
 /// Recursively unmask every string leaf of `v` through the tool-egress gate.
 pub fn unmask_value_tool_input(engine: &MaskEngine, manifest: &UnmaskManifest, v: &mut Value) {
     match v {
         Value::String(s) => {
-            if let Ok(out) = engine.unmask_tool_input(s, manifest) {
+            if let Ok(out) = engine.unmask_tool_input_decoded_leaf(s, manifest) {
                 *s = out;
             }
+            warn_fabricated_handles(engine, manifest, s);
         }
         Value::Array(a) => a
             .iter_mut()
@@ -729,6 +760,69 @@ mod tests {
         assert_eq!(
             v["content"][1]["input"]["contents"].as_str().unwrap(),
             format!("addr={token}")
+        );
+    }
+
+    // (Fix round) `unmask_str_tool_input`'s only callers are the OpenAI raw-JSON tool-arg strings
+    // (`function.arguments` / function-call `arguments`), where a `"` bracketing a token IS a genuine
+    // JSON delimiter — RAW JSON SOURCE. So it routes through `MaskEngine::unmask_tool_input`
+    // (RawJsonSource): a WHOLE quoted JSON value restores (JsonQuoted); an EMBEDDED (escaped) token
+    // does not. The Anthropic decoded-leaf path (`unmask_value_tool_input`) is untouched and keeps a
+    // quote-wrapped decoded leaf verbatim.
+    #[test]
+    fn str_tool_input_is_raw_json_source_value_gate_is_decoded_leaf() {
+        use sordino_engine::Category;
+        let mut cfg = EngineConfig {
+            reveal_marker: RevealMarker {
+                enabled: false,
+                ..Default::default()
+            },
+            ..EngineConfig::default()
+        };
+        cfg.enabled_categories.insert(Category::Network);
+        let e = MaskEngine::new(cfg).unwrap();
+
+        let url = "https://corp.example.com/secret/path";
+        let out = e
+            .mask(&format!("open {url} now"), Surface::UserMessage)
+            .unwrap();
+        let tok = out
+            .manifest
+            .entries
+            .iter()
+            .find(|x| x.entity_kind == "URL")
+            .expect("a URL token")
+            .token_handle
+            .clone();
+
+        // (D-analogue) Raw-JSON tool-arg string, token as the WHOLE quoted JSON value → RESTORES,
+        // JSON-escaped so the result still parses. This is the behavior the fix restored for the
+        // OpenAI/Codex tool-egress relaxation (DecodedLeaf had over-masked it).
+        let mut args = format!("{{\"url\":\"{tok}\"}}");
+        unmask_str_tool_input(&e, &out.manifest, &mut args);
+        let v: Value = serde_json::from_str(&args).expect("parseable JSON");
+        assert_eq!(
+            v["url"], url,
+            "whole quoted JSON value must restore on the raw-JSON tool-arg path: {args}"
+        );
+
+        // (C-analogue) Same token EMBEDDED (escaped `\"`) inside a Bash command in the raw-JSON args
+        // → its left quote is escaped, so it is NOT a whole JSON value → stays VERBATIM (no exfil).
+        let mut embedded = format!("{{\"command\":\"echo \\\"{tok}\\\"\"}}");
+        unmask_str_tool_input(&e, &out.manifest, &mut embedded);
+        assert!(
+            embedded.contains(&tok) && !embedded.contains(url),
+            "escaped-embedded token in raw-JSON args must stay verbatim: {embedded}"
+        );
+
+        // (A-analogue) DECODED-leaf path stays protected: a quote-wrapped token in a serde-decoded
+        // `Value::String` (the Anthropic `ToolUse.input` shape) never restores.
+        let mut leaf = Value::String(format!("echo \"{tok}\""));
+        unmask_value_tool_input(&e, &out.manifest, &mut leaf);
+        let s = leaf.as_str().unwrap();
+        assert!(
+            s.contains(&tok) && !s.contains(url),
+            "decoded-leaf quote-wrapped token must stay verbatim: {s}"
         );
     }
 

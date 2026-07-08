@@ -18,7 +18,63 @@ use sse_core::{SseClient, SseEvent};
 use sordino_engine::{MAX_TOKEN_LEN, MaskEngine, UnmaskManifest, token_regex};
 
 use crate::monitor::{CapKind, CompletionGuard};
-use crate::walk::unmask_value;
+use crate::walk::{unmask_value, warn_fabricated_handles};
+
+/// True iff `s` is EXACTLY one whole token (a [`token_regex`] match spanning the entire string).
+fn is_exactly_one_token(s: &str) -> bool {
+    token_regex()
+        .find(s)
+        .is_some_and(|m| m.start() == 0 && m.end() == s.len())
+}
+
+/// A `"` at byte index `q` is a real JSON delimiter (not `\"`) iff preceded by an EVEN run of
+/// backslashes.
+fn is_unescaped_quote_at(b: &[u8], q: usize) -> bool {
+    let mut bs = 0usize;
+    let mut k = q;
+    while k > 0 && b[k - 1] == b'\\' {
+        bs += 1;
+        k -= 1;
+    }
+    bs % 2 == 0
+}
+
+/// Byte index of the last UNESCAPED `"` in `s`, if any.
+fn last_unescaped_quote(s: &str) -> Option<usize> {
+    let b = s.as_bytes();
+    (0..s.len())
+        .rev()
+        .find(|&i| b[i] == b'"' && is_unescaped_quote_at(b, i))
+}
+
+/// Count of UNESCAPED `"` in `s`. An ODD count means the tail is INSIDE an open JSON string
+/// (the last unescaped quote OPENED a string not yet closed); EVEN means every string is closed.
+fn unescaped_quote_count(s: &str) -> usize {
+    let b = s.as_bytes();
+    (0..s.len())
+        .filter(|&i| b[i] == b'"' && is_unescaped_quote_at(b, i))
+        .count()
+}
+
+/// True iff `val` (the content of an OPEN JSON string, after its opening `"`) is still a viable
+/// WHOLE-VALUE token candidate: empty (just opened), exactly one complete token, or a viable
+/// partial-token prefix. Anything else (`curl [URL_x`, `[URL_x] more`) is NOT a lone value, so
+/// its opening quote need not be held back.
+fn is_whole_value_candidate(val: &str) -> bool {
+    if val.is_empty() {
+        return true;
+    }
+    if !val.starts_with('[') {
+        return false;
+    }
+    match classify(val) {
+        // A complete token with NOTHING after it → the whole value is this handle.
+        Classify::Complete => is_exactly_one_token(val),
+        // A viable partial token prefix → it may still close as a lone value next delta.
+        Classify::Partial => true,
+        Classify::No => false,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Token-boundary core (pure)
@@ -133,6 +189,9 @@ impl SseUnmasker {
                         _ => engine.unmask(&held, manifest),
                     }
                     .unwrap_or(held);
+                    if kind == HeldKind::InputJson {
+                        warn_fabricated_handles(engine, manifest, &flushed);
+                    }
                     if !flushed.is_empty() {
                         // Flush as the block's TRUE kind, not blindly as text.
                         out.push(StreamEvent::ContentBlockDelta {
@@ -206,18 +265,40 @@ impl SseUnmasker {
             c.push_str(&incoming);
             std::mem::take(c)
         };
-        let (safe, held) = split_safe(&buf);
+        let (mut safe, mut held) = split_safe(&buf);
+        // WHOLE-VALUE hold-extension (tool input only): the engine restores a NON-SECRET token
+        // that is a whole JSON string value (`"[TOK]"`), but the incremental split emits a
+        // token's OPENING quote (and a complete token) before its closing `"` arrives — which
+        // would leave the token verbatim and miss the restore. So when the buffer ends INSIDE an
+        // open JSON string whose value-so-far is a lone whole-value token candidate, hold from
+        // the opening `"` until the next delta brings the closing quote (or non-quote content
+        // proving it embedded). Bounded: one opening quote + at most one token. Non-candidates
+        // (embedded `curl [URL_x`) are left to `split_safe` and stay verbatim.
+        if kind == HeldKind::InputJson
+            // ODD unescaped-quote count ⇒ the tail is INSIDE an open JSON string.
+            && unescaped_quote_count(&buf) % 2 == 1
+            && let Some(j) = last_unescaped_quote(&buf)
+            && is_whole_value_candidate(&buf[j + 1..])
+        {
+            let (s2, h2) = buf.split_at(j);
+            safe = s2;
+            held = h2;
+        }
         // Only the `safe` prefix is unmasked here; `held` is at most one INCOMPLETE token
-        // tail (never a resolvable token), so the reveal marker only ever needs to apply on
-        // this path — the stop/drain flushes below stay plain. Dispatch directly on kind:
-        // assistant prose is revealed (+marker); compaction resolves plain; tool input routes
-        // through the tool-egress gate so a detected-PII token stays a TOKEN (A4b).
+        // tail (never a resolvable token) or one held-open JSON value, so the reveal marker
+        // only ever needs to apply on this path — the stop/drain flushes below stay plain.
+        // Dispatch directly on kind: assistant prose is revealed (+marker); compaction resolves
+        // plain; tool input routes through the tool-egress gate so a detected-PII token stays a
+        // TOKEN (A4b) while a whole-value NON-SECRET handle restores (Issue 1, JSON-escaped).
         let emitted = match kind {
             HeldKind::Text => engine.unmask_assistant(safe, manifest),
             HeldKind::Compaction => engine.unmask(safe, manifest),
             HeldKind::InputJson => engine.unmask_tool_input(safe, manifest),
         }
         .unwrap_or_else(|_| safe.to_string());
+        if kind == HeldKind::InputJson {
+            warn_fabricated_handles(engine, manifest, &emitted);
+        }
         self.carry.insert(index, held.to_string());
         if emitted.is_empty() {
             Vec::new()
@@ -348,6 +429,13 @@ pub fn unmask_sse_body(
                             _ => st.engine.unmask(&held, st.manifest.as_ref()),
                         }
                         .unwrap_or(held);
+                        if kind == HeldKind::InputJson {
+                            warn_fabricated_handles(
+                                st.engine.as_ref(),
+                                st.manifest.as_ref(),
+                                &flushed,
+                            );
+                        }
                         if !flushed.is_empty() {
                             // Re-emit the held tail as its TRUE kind and capture through the
                             // same classifier as the streaming path (compaction → not
@@ -718,5 +806,171 @@ mod tests {
         );
         let out = x.process(StreamEvent::ContentBlockStop { index: 0 }, &e, &m);
         assert_eq!(stop_kind(&out), Some("compaction"), "compaction tail flushes as compaction, not text");
+    }
+
+    // ---- Issue 1 / 2 / 3: streaming whole-value tool-input restore ------------------------------
+
+    fn network_engine() -> MaskEngine {
+        let mut cfg = EngineConfig {
+            reveal_marker: sordino_engine::RevealMarker {
+                enabled: false,
+                ..Default::default()
+            },
+            ..EngineConfig::default()
+        };
+        cfg.enabled_categories.insert(sordino_engine::Category::Network);
+        MaskEngine::new(cfg).unwrap()
+    }
+
+    fn url_token(m: &UnmaskManifest) -> String {
+        m.entries
+            .iter()
+            .find(|x| x.entity_kind == "URL")
+            .expect("a URL token")
+            .token_handle
+            .clone()
+    }
+
+    fn collect_input_json(evs: Vec<StreamEvent>) -> String {
+        let mut s = String::new();
+        for ev in evs {
+            if let StreamEvent::ContentBlockDelta {
+                delta: ContentBlockDelta::InputJsonDelta { partial_json },
+                ..
+            } = ev
+            {
+                s.push_str(&partial_json);
+            }
+        }
+        s
+    }
+
+    /// Drive a full tool-input JSON string through `SseUnmasker` as two `InputJsonDelta` frames
+    /// split at byte `split`, then the terminal `ContentBlockStop`; return the reassembled JSON.
+    fn drive_tool_input_split(e: &MaskEngine, m: &UnmaskManifest, full: &str, split: usize) -> String {
+        let mut x = SseUnmasker::new();
+        x.process(
+            StreamEvent::ContentBlockStart {
+                index: 0,
+                content_block: ApiContentBlock::Text {
+                    text: String::new(),
+                    cache_control: None,
+                },
+            },
+            e,
+            m,
+        );
+        let (a, b) = full.split_at(split);
+        let mut got = String::new();
+        for piece in [a, b] {
+            got.push_str(&collect_input_json(x.process(
+                StreamEvent::ContentBlockDelta {
+                    index: 0,
+                    delta: ContentBlockDelta::InputJsonDelta {
+                        partial_json: piece.to_string(),
+                    },
+                },
+                e,
+                m,
+            )));
+        }
+        got.push_str(&collect_input_json(x.process(
+            StreamEvent::ContentBlockStop { index: 0 },
+            e,
+            m,
+        )));
+        got
+    }
+
+    // (1a + 2) A whole-value Network URL token restores through the streaming tool-input path at
+    // EVERY delta split, and the reassembled JSON stays parseable (no doubled/unescaped quotes —
+    // the L90 corruption). The hold-extension keeps `"[TOK]"` intact across the boundary.
+    #[test]
+    fn sse_tool_input_restores_whole_value_url_across_splits() {
+        let e = network_engine();
+        let url = "https://www.whitehouse.gov/briefing-room/index.html";
+        let m = e.mask(&format!("open {url}"), Surface::UserMessage).unwrap();
+        let tok = url_token(&m.manifest);
+        let full = format!("{{\"url\":\"{tok}\"}}");
+        for split in 0..=full.len() {
+            if !full.is_char_boundary(split) {
+                continue;
+            }
+            let got = drive_tool_input_split(&e, &m.manifest, &full, split);
+            let v: serde_json::Value = serde_json::from_str(&got)
+                .unwrap_or_else(|err| panic!("unparseable at split {split}: {got:?} ({err})"));
+            assert_eq!(v["url"], url, "split {split}: {got}");
+        }
+    }
+
+    // (1b + 2) A token EMBEDDED in a Bash `command` string stays a verbatim token through the
+    // streaming path at every split, and the JSON stays parseable (the L391 corruption fix).
+    #[test]
+    fn sse_tool_input_embedded_url_stays_verbatim_across_splits() {
+        let e = network_engine();
+        let url = "https://www.cisa.gov";
+        let m = e.mask(&format!("open {url}"), Surface::UserMessage).unwrap();
+        let tok = url_token(&m.manifest);
+        let full = format!("{{\"command\":\"curl {tok} | head\"}}");
+        for split in 0..=full.len() {
+            if !full.is_char_boundary(split) {
+                continue;
+            }
+            let got = drive_tool_input_split(&e, &m.manifest, &full, split);
+            let v: serde_json::Value = serde_json::from_str(&got)
+                .unwrap_or_else(|err| panic!("unparseable at split {split}: {got:?} ({err})"));
+            let cmd = v["command"].as_str().unwrap();
+            assert!(
+                cmd.contains(&tok) && !cmd.contains(url),
+                "split {split}: embedded token must stay verbatim: {cmd}"
+            );
+        }
+    }
+
+    // (1c) A whole-value URL_CREDENTIAL (Secrets) stays gated through the streaming path — a
+    // capability secret never restores into a tool input, at any split.
+    #[test]
+    fn sse_tool_input_url_credential_stays_gated_across_splits() {
+        let e = engine(); // Balanced still masks URL_CREDENTIAL
+        let secret = "curl https://api.example.com/v1/users?token=hunter2opaquevalue&id=42";
+        let m = e.mask(secret, Surface::UserMessage).unwrap();
+        let tok = m
+            .manifest
+            .entries
+            .iter()
+            .find(|x| x.token_handle.starts_with("[URL_CREDENTIAL_"))
+            .expect("a URL_CREDENTIAL token")
+            .token_handle
+            .clone();
+        let full = format!("{{\"h\":\"{tok}\"}}");
+        for split in 0..=full.len() {
+            if !full.is_char_boundary(split) {
+                continue;
+            }
+            let got = drive_tool_input_split(&e, &m.manifest, &full, split);
+            assert!(got.contains(&tok), "split {split}: URL_CREDENTIAL must stay gated: {got}");
+        }
+    }
+
+    // (3) A FABRICATED token-shaped handle the model invented (absent from manifest + store) is
+    // passed through VERBATIM on the streaming tool-input path — never denied or dropped — and
+    // the JSON stays parseable, at every split.
+    #[test]
+    fn sse_tool_input_fabricated_handle_passes_through_across_splits() {
+        let e = network_engine();
+        let m = UnmaskManifest::new();
+        let full = "{\"url\":\"[URL_bce6ce4b8f6e]\"}".to_string();
+        for split in 0..=full.len() {
+            if !full.is_char_boundary(split) {
+                continue;
+            }
+            let got = drive_tool_input_split(&e, &m, &full, split);
+            let v: serde_json::Value = serde_json::from_str(&got)
+                .unwrap_or_else(|err| panic!("unparseable at split {split}: {got:?} ({err})"));
+            assert_eq!(
+                v["url"], "[URL_bce6ce4b8f6e]",
+                "split {split}: fabricated handle must pass through verbatim: {got}"
+            );
+        }
     }
 }

