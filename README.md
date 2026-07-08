@@ -27,12 +27,15 @@ the standalone proxy are below.
 The install clones the public repo over HTTPS, but a global git rule on your
 machine — `url."git@github.com:".insteadOf "https://github.com/"` — rewrites
 every GitHub HTTPS URL to SSH, and SSH needs a key GitHub recognizes (even for
-public repos). Fix with **any** of: add an SSH key at
-[github.com/settings/keys](https://github.com/settings/keys); or drop the rule
-with `git config --global --unset url."git@github.com:".insteadOf`; or reverse
-it (`git config --global url."https://github.com/".insteadOf "git@github.com:"`)
-so pulls prefer HTTPS. Common on Windows / Git-for-Windows setups seeded from a
+public repos). Common on Windows / Git-for-Windows setups seeded from a
 dotfiles guide.
+
+Fix with **any** of:
+
+- Add an SSH key at [github.com/settings/keys](https://github.com/settings/keys)
+- Drop the rule: `git config --global --unset url."git@github.com:".insteadOf`
+- Reverse it, so pulls prefer HTTPS:
+  `git config --global url."https://github.com/".insteadOf "git@github.com:"`
 
 </details>
 
