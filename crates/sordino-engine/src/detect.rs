@@ -724,9 +724,37 @@ fn ingest_results(
             allowed_spans.push((r.start, r.end));
             continue;
         }
+        // Quote-trim: presidio's "Quoted URL" / "Quoted Non-schema URL" patterns return
+        // group-0 spans that INCLUDE the surrounding quote chars (a deliberate upstream
+        // Python-parity choice — see the presidio-analyzer url recognizer module doc). We
+        // record the matched slice verbatim as the token's canonical_form (the vault value),
+        // so masking a quoted URL such as "https://www.whitehouse.gov/x" would otherwise mint
+        // a token whose RESTORED value carries the surrounding quotes, corrupting downstream
+        // restoration. Sibling of the F5/F8/F12 precision gates (entity-gated, ingest-juncture
+        // only): when a URL/DOMAIN slice both STARTS and ENDS with the SAME ASCII quote (`"`
+        // or `'`), shrink the RECORDED span by one byte each side so the stored slice /
+        // canonical_form is the BARE URL. We do NOT touch the presidio recognizer or its
+        // regexes — upstream byte-parity is preserved; only the span OUR CachedDetection
+        // records changes. The `>= 3` guard keeps a degenerate 1-2-char slice from underflowing
+        // into an empty/inverted span, and the trimmed quotes are ASCII (1 byte), so start+1 /
+        // end-1 stay on char boundaries. This runs AFTER F5/F8/F12/is_suppressed, so those
+        // gates (and F8's own separator-zone quote-stripping backward scan) still see the
+        // original presidio span and are unaffected.
+        let (mut start, mut end) = (r.start, r.end);
+        if entity_type == "URL" || entity_type == "DOMAIN" {
+            let bytes = slice.as_bytes();
+            let len = bytes.len();
+            if len >= 3 {
+                let quote = bytes[0];
+                if (quote == b'"' || quote == b'\'') && bytes[len - 1] == quote {
+                    start += 1;
+                    end -= 1;
+                }
+            }
+        }
         dets.push(CachedDetection {
-            start: r.start,
-            end: r.end,
+            start,
+            end,
             entity_type,
             score: r.score,
             source,
@@ -1612,6 +1640,101 @@ mod net_precision_ingest_tests {
         assert_eq!(dets_of(&cfg, &[], text, "URL").len(), 1, "the real URL must still mask");
         assert_eq!(dets_of(&cfg, &[], text, "EMAIL_ADDRESS").len(), 1, "the email must still mask");
     }
+
+    // ---- Quote-trim: surrounding quotes stripped from URL/DOMAIN recorded spans --------
+
+    // (a) A quoted URL/DOMAIN — presidio's "Quoted URL" / "Quoted Non-schema URL" patterns
+    // include the surrounding quote chars in the matched span. The RECORDED detection span
+    // (which becomes the token's canonical_form / vault value) must be the BARE URL, with no
+    // surrounding quotes, so downstream restoration is clean. `dets_of` returns the recorded
+    // (start,end); slicing `text[start..end]` reproduces exactly what `intern`/canonical_form
+    // stores.
+    #[test]
+    fn quote_trim_strips_surrounding_quotes_from_url_and_domain_span() {
+        let cfg = network_on();
+        for (text, entity, want_bare) in [
+            (r#""https://example.com/x""#, "URL", "https://example.com/x"),
+            ("'https://example.com/x'", "URL", "https://example.com/x"),
+            (r#""https://www.whitehouse.gov/x""#, "URL", "https://www.whitehouse.gov/x"),
+            (r#""example.com""#, "DOMAIN", "example.com"),
+            ("'example.com'", "DOMAIN", "example.com"),
+        ] {
+            let spans = dets_of(&cfg, &[], text, entity);
+            assert!(!spans.is_empty(), "quoted {entity} must still be detected: {text:?}");
+            for (s, e) in spans {
+                let slice = &text[s..e];
+                assert_eq!(
+                    slice, want_bare,
+                    "recorded {entity} span must be the bare value (no surrounding quotes): {text:?} -> {slice:?}"
+                );
+                assert!(
+                    !slice.starts_with('"') && !slice.starts_with('\''),
+                    "no leading quote in recorded span: {slice:?}"
+                );
+                assert!(
+                    !slice.ends_with('"') && !slice.ends_with('\''),
+                    "no trailing quote in recorded span: {slice:?}"
+                );
+            }
+        }
+    }
+
+    // (b) An UNQUOTED URL's recorded span is UNCHANGED — the trim is entity- AND quote-gated,
+    // so bare URLs (and every non-URL/DOMAIN entity) keep byte-parity with presidio's own span.
+    #[test]
+    fn quote_trim_leaves_unquoted_url_span_unchanged() {
+        let cfg = network_on();
+        let text = "see https://example.com/x end";
+        let spans = dets_of(&cfg, &[], text, "URL");
+        assert!(!spans.is_empty(), "unquoted URL must be detected");
+        for (s, e) in spans {
+            let slice = &text[s..e];
+            assert_eq!(
+                slice, "https://example.com/x",
+                "unquoted URL span must be untouched: {slice:?}"
+            );
+        }
+    }
+
+    // e2e roundtrip: masking a quoted URL then unmasking restores the ORIGINAL bytes exactly.
+    // Because the vault's canonical_form is now the bare URL (no absorbed quotes), the token
+    // sits BETWEEN the untouched surrounding quotes and restoration lands byte-for-byte —
+    // this is the Issue-2 doubled/unescaped-quote corruption the trim fixes.
+    #[test]
+    fn quote_trim_mask_unmask_roundtrip_restores_bare_url() {
+        let mut cfg = EngineConfig::default();
+        cfg.enabled_categories.insert(crate::config::Category::Network);
+        let e = crate::MaskEngine::new(cfg).expect("engine init");
+        let original = r#"link "https://example.com/x" here"#;
+        let outcome = e.mask(original, Surface::UserMessage).expect("mask");
+        assert!(
+            !outcome.masked_text.contains("https://example.com/x"),
+            "URL must be masked, got: {:?}",
+            outcome.masked_text
+        );
+        assert!(
+            outcome.masked_text.contains("[URL_"),
+            "expected a URL token, got: {:?}",
+            outcome.masked_text
+        );
+        // The token's canonical_form (vault value) carries no surrounding quotes.
+        for entry in &outcome.manifest.entries {
+            if entry.entity_kind == "URL" {
+                assert_eq!(
+                    entry.canonical_form, "https://example.com/x",
+                    "canonical_form must be the bare URL: {:?}",
+                    entry.canonical_form
+                );
+            }
+        }
+        let restored = e
+            .unmask(&outcome.masked_text, &outcome.manifest)
+            .expect("unmask");
+        assert_eq!(
+            restored, original,
+            "roundtrip must restore the original bytes exactly (no doubled/absorbed quotes): {restored:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1713,3 +1836,4 @@ mod net_precision_containment_tests {
         );
     }
 }
+
