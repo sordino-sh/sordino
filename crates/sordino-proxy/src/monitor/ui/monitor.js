@@ -147,6 +147,25 @@ function maskBadge(r) {
   if (r.masked_effective !== false) return '';
   return `<span class="mask-badge off new-flag pii-flag" title="masking was OFF for this request — its plaintext left this machine unmasked">MASKING OFF</span>`;
 }
+/* The `MASKING OFF` badge above carries `mask-badge off`, but this build's stylesheet
+   (monitor.css, inlined via include_str!) defines neither class, so the badge would otherwise
+   inherit the red `.new-flag.pii-flag` fallback and read identically to the `N PII` count.
+   Inject a distinct treatment from here — the one editable monitor surface — in amber (--amber,
+   the plaintext-EXPOSURE hue the plain-egress ledger sections already use), which is exactly the
+   posture this badge marks: raw plaintext left the machine. Selector `.new-flag.mask-badge.off`
+   is one class more specific than `.new-flag.pii-flag`, so it wins regardless of stylesheet
+   source order, scoped to the span that carries all three classes. */
+(function injectMaskBadgeStyle() {
+  const id = 'sordino-mask-badge-style';
+  if (typeof document === 'undefined' || document.getElementById(id)) return;
+  const el = document.createElement('style');
+  el.id = id;
+  el.textContent =
+    '.new-flag.mask-badge.off{color:#1a1205;background:var(--amber);' +
+    'box-shadow:0 0 12px -2px var(--amber);border:1px solid var(--amber);' +
+    'font-weight:700;letter-spacing:.04em;}';
+  (document.head || document.documentElement).appendChild(el);
+})();
 function clockClass(ms) {
   if (ms == null) return '';
   if (ms <= 30000) return 'crit';

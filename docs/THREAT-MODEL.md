@@ -332,11 +332,32 @@ failure mode is open, not because they are unimplemented.
 - **The provenance-spoof guard.** PreToolUse denies any tool call that would enqueue a
   `/sordino:` command into a future user turn (`main.rs:7404-7428`) — but only if the
   hook runs.
-- **Per-turn status honesty.** Allowed prompts carry a delta-only masking-status line
-  (Masked / Off / NotReaching / Disabled / UnmaskedBypass) so the model and user are
-  told when protection lapsed (`main.rs:5180-5198`;
-  `delta_messages_are_factual_status_not_injection_shaped`, `main.rs:8325`). This is
-  disclosure, not enforcement.
+- **Per-turn status honesty.** Each surface that answers "masked here, right now?"
+  independently derives the answer from the same per-conversation rule (whether this
+  conversation is in `masking_disabled_conversations`, the predicate `effective_masking`
+  encodes), so a
+  per-conversation `/sordino:mask off` — the everyday, default-scope door, not just the
+  whole-project master switch — surfaces as OFF on ALL FIVE reporting surfaces: the
+  statusline shield (a non-collapsing off segment that can never read as the masked
+  shield — `render_conv_off`, `main.rs:7400`, dispatched via `statusline_render_choice`),
+  the model narration (`MaskState::DisabledThisConversation`; `mask_delta_message`,
+  `main.rs:6188,6213`, gated by `should_narrate`, `main.rs:6177`), the `/sordino:status`
+  text (`print_status`, `main.rs:10041`), `/sordino:verify` (its per-conversation canary
+  leg, `main.rs:4617`), and the monitor badge (value-free
+  `RequestRecord.masked_effective`, `crates/sordino-proxy/src/monitor/model.rs:274`,
+  covered by `masked_effective_records_the_honest_per_request_predicate`). Allowed prompts
+  carry a delta-only status line enumerating the narratable states — Masked / Off /
+  DisabledThisConversation / NotReaching / Disabled / UnmaskedBypass — so the model and
+  user are told when protection lapsed, framed factually rather than injection-shaped
+  (`delta_messages_are_factual_status_not_injection_shaped`, `main.rs:10780`). This is
+  disclosure, not enforcement, and the five-surface claim is machine-backed: a committed
+  golden-fixture guard (`standing_multi_surface_off_guard`, `main.rs:10551`) drives one
+  `{enabled:true, masking_disabled_conversations:["A"]}` snapshot through the four
+  snapshot-consuming hooks surfaces above (predicate, statusline dispatch, status text, and
+  the `routed_proxy_status` narration-state resolution) and fails if any reports masked for
+  the disabled conversation — so a surface regression, or a future 6th surface that
+  re-derives "masked?" from `enabled` alone, trips the test that backs this sentence before
+  the prose can go stale.
 - **Broker injection via PreToolUse** fails closed in the safe direction: any error ⇒
   emit nothing ⇒ the token stays masked in the tool input — a broken hook can deny a
   secret to a tool but can never leak one (`main.rs:7431-7446`).

@@ -17,6 +17,10 @@ locally** at all times — masking only changes what the **model and the API pro
 (deterministic `[TOKEN]` stand-ins). Never tell the user their own data is hidden from them.
 
 - If masking is **on** and this session is **routed**, Sordino is active.
+- If masking is **on for the project** but **this conversation** was turned off (`/sordino:mask
+  off`), the status prints a `this conversation : masking OFF` line **in addition to** the project
+  shield showing ON: THIS conversation is passing text **un-masked** until `/sordino:mask on` or the
+  ~30-minute auto re-arm. Report it as off **for this conversation**, not off for the project.
 - If the proxy is up but masking is **off**, traffic passes through un-masked (transparent).
 - If the proxy is up but this session is **not routed**, routing applies automatically on a
   fresh session; a just-written route takes effect after a one-time restart of Claude Code.

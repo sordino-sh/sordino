@@ -3339,9 +3339,13 @@ const AUTOMODE_ENV_NOTE: &str = "Sordino is a local PII-masking proxy the user i
 /// (broker's job to contain a capability URL, not the classifier's); (3) Masking Circumvention still
 /// bites on splitting/spacing/re-encoding or reassembling a would-be-masked value, provenance-gated.
 /// Wording is preserved VERBATIM from GUIDANCE-DRAFT-automode.md `## The wording` (v5) — the paired
-/// audit diffs it. Bullet 4 defers to [`AUTOMODE_SOFT_DENY_MASKING`] ("Masking Circumvention") by
-/// name, which MUST stay co-present.
-const AUTOMODE_ENV_MASKING_NOTE: &str = "**Masking proxy (Sordino)**: this project's traffic — including your own classification request — is routed through Sordino, which replaces real secrets and personal data with **mask placeholders** shaped `[TYPE_hexid]` (`[API_KEY_…]`, `[EMAIL_ADDRESS_…]`, `[URL_…]`); you see only these, not the raw value. A placeholder is not a test or example credential — at execution on the user's machine Sordino restores it to the real value. So **treat a placeholder as the live Sensitive data it will become and apply the existing rules to that value**: Data Exfiltration, Credential Leakage/Materialization, and PII handling already decide the tier by where the value lands — let them, judging each placeholder on its own.";
+/// audit diffs it — EXCEPT for the closing F4 authoritative-narration clause: the v5 note is
+/// switch-blind ("you see only placeholders"), false in a `/sordino:mask off` conversation where
+/// raw values egress, so the note now defers to the per-turn `Sordino:` MaskState narration as the
+/// authoritative live-state signal. The clause only adds a caveat; it does NOT relax the tiering or
+/// the Masking-Circumvention posture (which it restates as still-binding). Bullet 4 defers to
+/// [`AUTOMODE_SOFT_DENY_MASKING`] ("Masking Circumvention") by name, which MUST stay co-present.
+const AUTOMODE_ENV_MASKING_NOTE: &str = "**Masking proxy (Sordino)**: this project's traffic — including your own classification request — is routed through Sordino, which replaces real secrets and personal data with **mask placeholders** shaped `[TYPE_hexid]` (`[API_KEY_…]`, `[EMAIL_ADDRESS_…]`, `[URL_…]`); you see only these, not the raw value. A placeholder is not a test or example credential — at execution on the user's machine Sordino restores it to the real value. So **treat a placeholder as the live Sensitive data it will become and apply the existing rules to that value**: Data Exfiltration, Credential Leakage/Materialization, and PII handling already decide the tier by where the value lands — let them, judging each placeholder on its own. This note describes the DEFAULT (masking on); the per-turn `Sordino:` status line is AUTHORITATIVE over it: if that line reports masking is OFF for this conversation, this session's outbound text is NOT placeholder-only — you may be seeing (and sending) raw values directly. Either way, Masking Circumvention below still binds on the live value.";
 const AUTOMODE_ENV_MASKING_RELAXATION: &str = "**One relaxation those rules lack**: a value that comes back WHOLE in a tool's own OUTPUT is re-masked before it returns to the provider, so a tool materializing it for its own use — an auth header to that value's provider, piping a secret into the command that consumes it — is Standard Credentials/Materialization (ALLOW), not a leak. This covers ONLY the tool-output-return channel: a value placed into an outbound request to a host OTHER than its own provider/consumer, or written to a file, is NOT re-masked and is judged on the live value.";
 const AUTOMODE_ENV_MASKING_URLS: &str = "**URLs**: you see only `[URL_hexid]` and cannot tell a citation link from a secret capability URL — do not judge a URL by its type; deterministic containment of a capability URL is the broker's job, not yours.";
 const AUTOMODE_ENV_MASKING_CIRCUMVENTION: &str = "**Circumvention**: a whole placeholder passed intact — concatenated or scheme-prepended (`\"https://\" + [URL_x]`) — is not itself circumvention. But the live value stays subject to Masking Circumvention: splitting, spacing, or re-encoding a value so it no longer reads as its placeholder — or reassembling from raw fragments a host, URL, or key **Sordino would have masked** — defeats the mask and lets the raw value reach the provider in the clear, so it is judged as that value. The gate is provenance, not appearance: inspect the pieces in the command — a mid-token split of a would-be-masked host counts even if the fragments look public, while concatenating a host Sordino never masked (an ordinary public or agent-authored host) does not.";
@@ -6595,27 +6599,48 @@ fn routed_proxy_status(conversation: &str, routed_port: u16, root: &str) -> (Mas
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            match v.get("enabled").and_then(Value::as_bool) {
-                // Master ON, but honor the per-conversation disable list from the SAME JSON: if this
-                // conversation opted out (`/sordino:mask off`), it is NOT masked — say so, don't lie.
-                Some(true) => {
-                    let disabled_here = v
-                        .get("masking_disabled_conversations")
-                        .and_then(Value::as_array)
-                        .is_some_and(|list| {
-                            list.iter().any(|d| d.as_str() == Some(conversation))
-                        });
-                    if disabled_here {
-                        (MaskState::DisabledThisConversation, profile)
-                    } else {
-                        (MaskState::Masked, profile)
-                    }
-                }
-                Some(false) => (MaskState::Off, profile),
-                None => unconfirmed,
+            // Master ON, but honor the per-conversation disable list from the SAME JSON: if this
+            // conversation opted out (`/sordino:mask off`), it is NOT masked — say so, don't lie.
+            // The per-conversation resolution is factored into `resolve_routed_mask_state` so the
+            // standing F-TEST guard exercises it without a live proxy.
+            let disabled: Vec<String> = v
+                .get("masking_disabled_conversations")
+                .and_then(Value::as_array)
+                .map(|list| list.iter().filter_map(|d| d.as_str().map(str::to_string)).collect())
+                .unwrap_or_default();
+            match resolve_routed_mask_state(
+                v.get("enabled").and_then(Value::as_bool),
+                &disabled,
+                conversation,
+            ) {
+                // `enabled` absent/unparseable ⇒ can't confirm ⇒ the value-free unconfirmed pair.
+                MaskState::NotReaching => unconfirmed,
+                state => (state, profile),
             }
         }
         _ => unconfirmed,
+    }
+}
+
+/// Resolve the per-turn `MaskState` from a proxy `/config` reply's `enabled` flag and its
+/// `masking_disabled_conversations` list for THIS `conversation`. Factored out of
+/// `routed_proxy_status` so the standing F-TEST guard exercises the REAL per-conversation
+/// resolution without a live proxy: a surface that drops the disable-list check and keys on
+/// `enabled` alone returns `Masked` here and trips the guard. The `Some(true)` arm mirrors
+/// `effective_masking`'s per-conversation predicate; `None` (field absent/unparseable) is the
+/// honest "can't confirm masking" degrade, never an optimistic `Masked`.
+fn resolve_routed_mask_state(
+    enabled: Option<bool>,
+    disabled_conversations: &[String],
+    conversation: &str,
+) -> MaskState {
+    match enabled {
+        Some(true) if disabled_conversations.iter().any(|d| d == conversation) => {
+            MaskState::DisabledThisConversation
+        }
+        Some(true) => MaskState::Masked,
+        Some(false) => MaskState::Off,
+        None => MaskState::NotReaching,
     }
 }
 
@@ -7266,29 +7291,51 @@ fn render_segment(port: Option<u16>, root: &str, mode: SlMode) -> String {
     };
     match admin_get(port, &key, &sordino_state::project_key(root)) {
         Ok(snap) => match serde_json::from_value::<Snapshot>(snap) {
-            // Master ON *and* THIS conversation is actually masked (not in the
-            // per-conversation disable list) — the confirmed shield. Gating on
-            // `effective_masking` (F0's single predicate) closes the J1 defect where the
-            // dispatch keyed on `s.enabled` alone and rendered a full ON shield for a
-            // conversation that was passing PII through.
-            Ok(s) if s.enabled && effective_masking(&s, conversation_from_base_url().as_deref()) => {
-                render_on(&s, port, mode)
-            }
-            // Master ON but THIS conversation is in `masking_disabled_conversations`:
-            // PII egresses UNMASKED here despite the master switch. Render an honest,
-            // non-collapsing OFF segment that can never read as the ON shield.
-            Ok(s) if s.enabled => render_conv_off(&s, port, mode),
-            // Master switch OFF: nothing is masked for this project. ShieldOnly carries the
-            // same non-collapsing ⚠ marker as Min (filling the former empty-ShieldOnly gap)
-            // so an OFF project is never silently indistinguishable from a masked one.
-            Ok(_) => match mode {
-                SlMode::ShieldOnly => "\u{26a0}".to_string(),
-                SlMode::Min => "\u{26a0}".to_string(),
-                _ => format!("\u{26a0} Sordino OFF :{port}"),
+            Ok(s) => match statusline_render_choice(&s, conversation_from_base_url().as_deref()) {
+                // Master ON *and* THIS conversation is actually masked (not in the
+                // per-conversation disable list) — the confirmed shield. Gating on
+                // `effective_masking` (F0's single predicate) closes the J1 defect where the
+                // dispatch keyed on `s.enabled` alone and rendered a full ON shield for a
+                // conversation that was passing PII through.
+                StatuslineRender::On => render_on(&s, port, mode),
+                // Master ON but THIS conversation is in `masking_disabled_conversations`:
+                // PII egresses UNMASKED here despite the master switch. Render an honest,
+                // non-collapsing OFF segment that can never read as the ON shield.
+                StatuslineRender::ConvOff => render_conv_off(&s, port, mode),
+                // Master switch OFF: nothing is masked for this project. ShieldOnly carries the
+                // same non-collapsing ⚠ marker as Min (filling the former empty-ShieldOnly gap)
+                // so an OFF project is never silently indistinguishable from a masked one.
+                StatuslineRender::MasterOff => match mode {
+                    SlMode::ShieldOnly => "\u{26a0}".to_string(),
+                    SlMode::Min => "\u{26a0}".to_string(),
+                    _ => format!("\u{26a0} Sordino OFF :{port}"),
+                },
             },
             Err(_) => unverified(port, mode),
         },
         Err(_) => unverified(port, mode),
+    }
+}
+
+/// Which statusline segment the enabled dispatch selects, factored out of `render_segment`
+/// so the standing F-TEST honesty guard can assert the branch selection (conv A → `ConvOff`,
+/// NOT `On`) without a live proxy. `On` keys on the SAME `effective_masking` predicate the
+/// other reporting surfaces use; a revert to `enabled`-alone here would return `On` for a
+/// masking-off conversation and trip the guard.
+#[derive(Debug, PartialEq, Eq)]
+enum StatuslineRender {
+    On,
+    ConvOff,
+    MasterOff,
+}
+
+fn statusline_render_choice(s: &Snapshot, conv: Option<&str>) -> StatuslineRender {
+    if !s.enabled {
+        StatuslineRender::MasterOff
+    } else if effective_masking(s, conv) {
+        StatuslineRender::On
+    } else {
+        StatuslineRender::ConvOff
     }
 }
 
@@ -9994,22 +10041,29 @@ fn parse_snapshot(snap: &Value) -> Result<Snapshot> {
 fn print_status(snap: &Value, port: u16) -> Result<()> {
     let s = parse_snapshot(snap)?;
     print_snapshot(&s, port);
-    // Per-conversation masking switch: if THIS session's conversation is disabled, call it
-    // out — the master-switch line above shows ON, so this is the only signal that THIS
-    // conversation is nonetheless passing PII through. Uses the SAME `effective_masking`
-    // predicate as every other consumer, gated on the master switch being ON so this line
-    // only ever means "master ON, THIS conversation off" (a master-OFF proxy already prints
-    // its own NOTE via print_snapshot).
-    if let Some(conv) = conversation_from_base_url()
-        && s.enabled
-        && !effective_masking(&s, Some(&conv))
-    {
-        println!(
-            "  this conversation : masking OFF (per-conversation `/sordino:mask off`) — \
-             `/sordino:mask on` to resume"
-        );
+    // Per-conversation masking switch: if THIS session's conversation is disabled, call it out
+    // (the master-switch line above shows ON, so this line is the only signal that THIS
+    // conversation is nonetheless passing PII through). The decision is factored into
+    // `conversation_off_status_line` so the standing F-TEST guard can assert it fires for a
+    // disabled conversation without capturing stdout.
+    if let Some(line) = conversation_off_status_line(&s, conversation_from_base_url().as_deref()) {
+        println!("{line}");
     }
     Ok(())
+}
+
+/// The per-conversation OFF line `print_status` appends when the master switch is ON but THIS
+/// conversation opted out (`/sordino:mask off`). `None` when the line must NOT show — master OFF
+/// (its own NOTE is printed by `print_snapshot`) or this conversation is still masked (including
+/// `conv == None`). Keyed on the SAME `effective_masking` predicate as every other reporting
+/// surface, gated on the master switch being ON so it only ever means "master ON, THIS
+/// conversation off"; a revert to `enabled`-alone stops emitting it and trips the F-TEST guard.
+fn conversation_off_status_line(s: &Snapshot, conv: Option<&str>) -> Option<String> {
+    (s.enabled && !effective_masking(s, conv)).then(|| {
+        "  this conversation : masking OFF (per-conversation `/sordino:mask off`) — \
+         `/sordino:mask on` to resume"
+            .to_string()
+    })
 }
 
 fn print_applied(snap: &Value, port: u16, scope: &str) -> Result<()> {
@@ -10481,6 +10535,98 @@ mod route_gate_tests {
                 "🔒ZDR suffix present alongside the off marker: {seg:?}"
             );
         }
+    }
+
+    /// F-TEST — the standing multi-surface honesty guard (backs the THREAT-MODEL "all five
+    /// surfaces" per-turn-status-honesty claim; see `threat_model_five_surface_honesty_guard`).
+    /// ONE fixture `Snapshot { enabled: true, masking_disabled_conversations: ["A"] }` is driven
+    /// through EVERY snapshot-consuming reporting surface and each MUST report OFF for conversation
+    /// A. The surfaces route through the SAME `effective_masking` predicate via a thin, proxy-free
+    /// seam per surface, so a future surface (a hypothetical 6th) that re-derives "masked?" from
+    /// `enabled` alone — or a regression that reverts one of these to `enabled`-alone — flips the
+    /// relevant assertion below and trips this test BEFORE the threat-model prose can go stale.
+    /// The masked control conversation "B" pins the other direction: the guard is bidirectional,
+    /// so a surface that always reports OFF is caught too.
+    #[test]
+    fn standing_multi_surface_off_guard() {
+        let snap: Snapshot = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "config": {"profile": "balanced", "score_threshold": 0.5, "enabled_categories": ["contact"]},
+            "masking_disabled_conversations": ["A"],
+        }))
+        .unwrap();
+
+        // Surface 1 — the shared predicate itself (F0): conv A OFF, masked conv B ON.
+        assert!(!effective_masking(&snap, Some("A")), "predicate: A is OFF");
+        assert!(effective_masking(&snap, Some("B")), "predicate: B stays masked");
+
+        // Surface 2 — statusline render dispatch: conv A routes to `render_conv_off`, NOT
+        // `render_on` (a revert to `enabled`-alone would pick `On` here). Masked B → `On`.
+        assert_eq!(
+            statusline_render_choice(&snap, Some("A")),
+            StatuslineRender::ConvOff,
+            "statusline dispatch: A must route to render_conv_off, not render_on"
+        );
+        assert_eq!(
+            statusline_render_choice(&snap, Some("B")),
+            StatuslineRender::On,
+            "statusline dispatch: masked B must route to render_on"
+        );
+        // And the two renderers are observably distinct in every mode (the segment the dispatch
+        // actually emits for A can never read as the masked-ON shield).
+        for mode in [SlMode::ShieldOnly, SlMode::Min, SlMode::Compact, SlMode::Verbose] {
+            assert_ne!(
+                render_conv_off(&snap, 18820, mode),
+                render_on(&snap, 18820, mode),
+                "{mode:?}: conv-off segment must not equal the ON segment"
+            );
+        }
+
+        // Surface 3 — `/sordino:status` text: `print_status` appends the per-conversation OFF
+        // line for A, and NOTHING for masked B (or for a conv-less session).
+        let line_a = conversation_off_status_line(&snap, Some("A"))
+            .expect("status text: A must emit the per-conversation OFF line");
+        assert!(
+            line_a.contains("masking OFF") && line_a.contains("/sordino:mask on"),
+            "status OFF line names the state and the re-arm verb: {line_a:?}"
+        );
+        assert_eq!(
+            conversation_off_status_line(&snap, Some("B")),
+            None,
+            "status text: masked B must emit no per-conversation OFF line"
+        );
+        assert_eq!(
+            conversation_off_status_line(&snap, None),
+            None,
+            "status text: a conv-less session emits no per-conversation OFF line"
+        );
+
+        // Surface 4 — model narration / `routed_proxy_status`: the proxy `/config` state
+        // resolution for A is `DisabledThisConversation` (NOT `Masked`), and masked B is `Masked`.
+        assert_eq!(
+            resolve_routed_mask_state(Some(true), &snap.masking_disabled_conversations, "A"),
+            MaskState::DisabledThisConversation,
+            "narration: A must resolve to DisabledThisConversation"
+        );
+        assert_eq!(
+            resolve_routed_mask_state(Some(true), &snap.masking_disabled_conversations, "B"),
+            MaskState::Masked,
+            "narration: masked B must resolve to Masked"
+        );
+        // The narration surface then carries a conversation-scoped OFF line for that state, so a
+        // model reading it is told THIS conversation is off (F1b), not "masking is active".
+        let narration = mask_delta_message(
+            Some(MaskState::Masked),
+            &SessionStatus {
+                state: MaskState::DisabledThisConversation,
+                port: 18820,
+                profile: "balanced".into(),
+            },
+        );
+        assert!(
+            narration.contains("OFF for THIS conversation"),
+            "narration line reports this-conversation OFF: {narration:?}"
+        );
     }
 
     /// A1 regression guard: every LIVE ML state carries the literal `ml` text so the indicator

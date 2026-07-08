@@ -43,6 +43,11 @@ corresponds to a real value they can see, and `reveal` just decodes one for conv
 - **`reveal <token>`**: present the decoded plaintext, or relay the error verbatim.
 - **`scrub --transcript <jsonl> (--value <text> | --values-file <file>)`**: report the redaction
   count, removed thinking records, relinked parent pointers, and backup path.
+- **Reading a status output**: if the project shows masking **ON** but the output ALSO carries a
+  `this conversation : masking OFF` line, THIS conversation was turned off via `/sordino:mask off`
+  — it passes text **un-masked** until `/sordino:mask on` or the ~30-minute auto re-arm, even
+  though the project master switch reads on. Report it as off **for this conversation**, not off
+  for the project.
 
 Do not run any other commands. If the script exited non-zero, surface its error message verbatim.
 Never print or echo the session/control key.
