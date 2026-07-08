@@ -8,7 +8,7 @@
                        response_preview, response_spans, response_status,
                        tokens[], tags[], rejection_reason, turn_index,
                        request_surfaces[], response_surfaces[], delta,
-                       human_turn_index, upstream? }
+                       human_turn_index, upstream?, masked_effective? }
      Surface         { label, role?, kind, runs[], block_hash }
      Run             { text, token? }      // token ABSENT => plain run
      TokenRef        { token, value, entity_kind, surface }
@@ -137,6 +137,15 @@ function destBadge(r) {
     return `<span class="dest-badge zdr" title="routed to verified ZDR target '${attr(name)}' (zero-data-retention)">ZDR &middot; ${esc(name)}</span>`;
   }
   return `<span class="dest-badge normal" title="routed to the default Anthropic upstream (Normal — not ZDR)">${esc(u)}</span>`;
+}
+/* Per-request masking-posture badge (F1d). Reads the value-free RequestRecord.masked_effective
+   (the HONEST effective predicate captured at record time). STRICTLY `=== false` renders the
+   'MASKING OFF' badge: this request's plaintext egressed unmasked. `true` (normal, masked) and
+   `null`/absent (legacy record — UNKNOWN, no claim) render NOTHING. The `=== false` check is
+   deliberate so a missing/legacy field never false-alarms history. */
+function maskBadge(r) {
+  if (r.masked_effective !== false) return '';
+  return `<span class="mask-badge off new-flag pii-flag" title="masking was OFF for this request — its plaintext left this machine unmasked">MASKING OFF</span>`;
 }
 function clockClass(ms) {
   if (ms == null) return '';
@@ -542,6 +551,7 @@ function renderReview() {
   const head = `<div class="review-head">`
     + `<div><div class="rh-id">TURN ${turnLabel}`
     +   `<small title="${esc(r.id)}">${esc(r.method)} ${esc(r.endpoint)} &middot; ${esc(r.id)}${egressNote}</small></div>${rollHead}</div>`
+    + maskBadge(r)
     + `<div class="rh-spacer"></div>`
     + `<div class="rh-controls">`
     +   `<label class="reveal-toggle" title="show masked values inline in this browser — local only, never sent"><input type="checkbox" id="revealToggle" ${revealValues ? 'checked' : ''}> peek values</label>`
@@ -841,6 +851,7 @@ function renderTraffic(flashId) {
       +   turnPip
       +   `<span class="rec-endpoint">${esc(r.endpoint)}</span>`
       +   destBadge(r)
+      +   maskBadge(r)
       +   (pending ? `<span class="rec-clock ${clockClass(rem)}" data-countdown="${esc(r.id)}">&#9201; ${fmtClock(rem)}</span>` : '')
       +   (inflight ? `<span class="rec-clock live" data-elapsed="${esc(r.id)}">&#9201; ${fmtClock(ela)} streaming</span>` : '')
       +   (r.delta && r.delta.is_first ? `<span class="new-flag">FIRST</span>`
