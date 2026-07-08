@@ -21,16 +21,20 @@ auto-routes each project the first time it sees it. After the one-time restart,
 masking is live — run `/sordino:status` to confirm. Details, scoping options, and
 the standalone proxy are below.
 
-> **`Permission denied (publickey)` on install?** The install clones the public
-> repo over HTTPS, but a global git rule on your machine —
-> `url."git@github.com:".insteadOf "https://github.com/"` — rewrites every GitHub
-> HTTPS URL to SSH, and SSH needs a key GitHub recognizes (even for public repos).
-> Fix with **any** of: add an SSH key at
-> [github.com/settings/keys](https://github.com/settings/keys); or drop the rule with
-> `git config --global --unset url."git@github.com:".insteadOf`; or reverse it
-> (`git config --global url."https://github.com/".insteadOf "git@github.com:"`) so
-> pulls prefer HTTPS. Common on Windows / Git-for-Windows setups seeded from a
-> dotfiles guide.
+<details>
+<summary><code>Permission denied (publickey)</code> on install?</summary>
+
+The install clones the public repo over HTTPS, but a global git rule on your
+machine — `url."git@github.com:".insteadOf "https://github.com/"` — rewrites
+every GitHub HTTPS URL to SSH, and SSH needs a key GitHub recognizes (even for
+public repos). Fix with **any** of: add an SSH key at
+[github.com/settings/keys](https://github.com/settings/keys); or drop the rule
+with `git config --global --unset url."git@github.com:".insteadOf`; or reverse
+it (`git config --global url."https://github.com/".insteadOf "git@github.com:"`)
+so pulls prefer HTTPS. Common on Windows / Git-for-Windows setups seeded from a
+dotfiles guide.
+
+</details>
 
 Detection is done by [`presidio-rs`](../jcc/presidio-rs) (offline regex
 recognizers — email, phone, credit card, IP, API keys, IBAN, SSN, …). The
