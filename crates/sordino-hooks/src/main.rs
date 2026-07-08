@@ -7196,9 +7196,23 @@ fn render_segment(port: Option<u16>, root: &str, mode: SlMode) -> String {
     };
     match admin_get(port, &key, &sordino_state::project_key(root)) {
         Ok(snap) => match serde_json::from_value::<Snapshot>(snap) {
-            Ok(s) if s.enabled => render_on(&s, port, mode),
+            // Master ON *and* THIS conversation is actually masked (not in the
+            // per-conversation disable list) — the confirmed shield. Gating on
+            // `effective_masking` (F0's single predicate) closes the J1 defect where the
+            // dispatch keyed on `s.enabled` alone and rendered a full ON shield for a
+            // conversation that was passing PII through.
+            Ok(s) if s.enabled && effective_masking(&s, conversation_from_base_url().as_deref()) => {
+                render_on(&s, port, mode)
+            }
+            // Master ON but THIS conversation is in `masking_disabled_conversations`:
+            // PII egresses UNMASKED here despite the master switch. Render an honest,
+            // non-collapsing OFF segment that can never read as the ON shield.
+            Ok(s) if s.enabled => render_conv_off(&s, port, mode),
+            // Master switch OFF: nothing is masked for this project. ShieldOnly carries the
+            // same non-collapsing ⚠ marker as Min (filling the former empty-ShieldOnly gap)
+            // so an OFF project is never silently indistinguishable from a masked one.
             Ok(_) => match mode {
-                SlMode::ShieldOnly => String::new(),
+                SlMode::ShieldOnly => "\u{26a0}".to_string(),
                 SlMode::Min => "\u{26a0}".to_string(),
                 _ => format!("\u{26a0} Sordino OFF :{port}"),
             },
@@ -7238,6 +7252,52 @@ fn render_on(s: &Snapshot, port: u16, mode: SlMode) -> String {
         ),
         SlMode::Verbose => format!(
             "\u{1f6e1} ON :{port} {} t={:.2}{} {} PII [{}]{}{}",
+            s.config.profile,
+            s.config.score_threshold,
+            ml,
+            s.token_count,
+            s.config.enabled_categories.join(","),
+            key_suffix(s.secrets.as_ref()),
+            zdr,
+        ),
+    }
+}
+
+/// Master switch ON, but THIS conversation is in `masking_disabled_conversations`
+/// (`/sordino:disable`) — outbound PII passes through UNMASKED here even though the
+/// project's master switch reads ON. Reached only when `effective_masking` is false, so
+/// this segment MUST never render byte-identical to `render_on`:
+///
+/// - Text-bearing modes (Compact/Verbose): a struck shield `🛡̸` (U+1F6E1 + combining long
+///   solidus U+0338) PLUS an UNCONDITIONAL literal `off` token. The word is the load-bearing
+///   signal and is NOT gated on tofu detection: the failure mode is collision, not
+///   invisibility — a terminal that drops the combining overlay draws exactly `🛡` (the
+///   masked-ON glyph), so `off` is what keeps a stripped overlay from reading as a false
+///   masked shield.
+/// - Glyph-only modes (ShieldOnly/Min): no text can disambiguate a collapsed overlay, so use
+///   a base glyph that needs NO overlay — `⚠` — which can never collapse to `🛡`.
+///
+/// Mirrors `render_on`'s per-conversation `zdr_suffix` threading (V5 precedence: masking-off
+/// does NOT suppress the ZDR signal — a conversation that is masking-off AND ZDR-routed still
+/// shows its `🔒ZDR` glyph; both states are live in the same segment).
+fn render_conv_off(s: &Snapshot, port: u16, mode: SlMode) -> String {
+    let ml = ml_indicator(s.ml.as_ref());
+    let zdr = zdr_suffix(&s.zdr, conversation_from_base_url().as_deref());
+    match mode {
+        SlMode::Off => String::new(),
+        // Non-collapsing marker: ⚠ carries no combining overlay, so it can NEVER render as 🛡.
+        SlMode::ShieldOnly => "\u{26a0}".to_string(),
+        SlMode::Min => "\u{26a0}".to_string(),
+        SlMode::Compact => format!(
+            "\u{1f6e1}\u{0338} off :{port} {}{}{}{}{}",
+            s.config.profile,
+            ml,
+            pii_suffix(s.token_count),
+            key_suffix(s.secrets.as_ref()),
+            zdr,
+        ),
+        SlMode::Verbose => format!(
+            "\u{1f6e1}\u{0338} off :{port} {} t={:.2}{} {} PII [{}]{}{}",
             s.config.profile,
             s.config.score_threshold,
             ml,
@@ -10077,6 +10137,98 @@ mod route_gate_tests {
         .unwrap();
         assert!(bare.masking_disabled_conversations.is_empty());
         assert!(effective_masking(&bare, Some("anything")));
+    }
+
+    /// F1a gate (a)+(b): the enabled dispatch splits on `effective_masking`, so a master-ON
+    /// project with THIS conversation disabled renders `render_conv_off` — which must NEVER
+    /// collide with the masked-ON render in ANY mode (the kill-condition of this atomic).
+    #[test]
+    fn render_conv_off_never_collides_with_on() {
+        let snap: Snapshot = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "config": {"profile": "balanced", "score_threshold": 0.5, "enabled_categories": ["contact"]},
+            "masking_disabled_conversations": ["CONV1"],
+        }))
+        .unwrap();
+
+        // (a) Text-bearing modes carry the UNCONDITIONAL literal `off` token and are never
+        // byte-equal to the ON render (which leads with a bare 🛡 and no `off`). The `off`
+        // is what survives a terminal dropping the combining U+0338 (collision, not
+        // invisibility): even collapsed to a plain 🛡, the word still reads OFF.
+        for mode in [SlMode::Compact, SlMode::Verbose] {
+            let off = render_conv_off(&snap, 18820, mode);
+            let on = render_on(&snap, 18820, mode);
+            assert!(
+                off.contains("off"),
+                "{mode:?}: conv-off must contain literal `off`: {off:?}"
+            );
+            assert_ne!(off, on, "{mode:?}: conv-off must not be byte-equal to ON");
+        }
+
+        // (b) Glyph-only modes use ⚠ — a base glyph with NO combining overlay — so there is
+        // nothing to strip and it can never collapse to the bare 🛡 that ON renders.
+        for mode in [SlMode::ShieldOnly, SlMode::Min] {
+            let off = render_conv_off(&snap, 18820, mode);
+            assert_eq!(off, "\u{26a0}", "{mode:?}: conv-off glyph must be ⚠");
+            assert_ne!(
+                off,
+                render_on(&snap, 18820, mode),
+                "{mode:?}: conv-off must not equal the ON glyph"
+            );
+            assert_ne!(off, "\u{1f6e1}", "{mode:?}: conv-off must not be the ON shield");
+        }
+        // Even a struck-shield source, with its overlay stripped, degrades to the plain ON
+        // shield — proving WHY glyph-only modes must not use it (⚠ has no such failure mode).
+        assert_ne!("\u{26a0}", "\u{1f6e1}\u{0338}");
+        assert_eq!(
+            "\u{1f6e1}\u{0338}".chars().next(),
+            Some('\u{1f6e1}'),
+            "a stripped struck shield IS the ON shield — the collision this avoids"
+        );
+    }
+
+    /// F1a gate (c) + V5 precedence: a conversation that is masking-OFF *and* ZDR-routed
+    /// renders BOTH the off marker and the 🔒ZDR glyph in one segment (masking-off does not
+    /// suppress ZDR). Exercises the real `conversation_from_base_url` env threading that
+    /// `render_on` also uses, so it drives ANTHROPIC_BASE_URL and restores it.
+    #[test]
+    fn render_conv_off_keeps_zdr_suffix() {
+        let snap: Snapshot = serde_json::from_value(serde_json::json!({
+            "enabled": true,
+            "config": {"profile": "balanced", "score_threshold": 0.5, "enabled_categories": ["contact"]},
+            "masking_disabled_conversations": ["CONV1"],
+            "zdr": {"active": [{"conversation": "CONV1", "config": "strict"}]},
+        }))
+        .unwrap();
+        // The shared predicate agrees this conversation is masking-off (dispatch → conv_off).
+        assert!(!effective_masking(&snap, Some("CONV1")));
+
+        let prev = std::env::var("ANTHROPIC_BASE_URL").ok();
+        // SAFETY: test-only env toggle, restored immediately below; mirrors the crate's
+        // proxy-side tests that drive env under `unsafe`.
+        unsafe {
+            std::env::set_var(
+                "ANTHROPIC_BASE_URL",
+                "http://127.0.0.1:9/sordino/session/CONV1/",
+            );
+        }
+        let compact = render_conv_off(&snap, 18820, SlMode::Compact);
+        let verbose = render_conv_off(&snap, 18820, SlMode::Verbose);
+        // Restore before asserting so a failed assert can't leak the override.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("ANTHROPIC_BASE_URL", v),
+                None => std::env::remove_var("ANTHROPIC_BASE_URL"),
+            }
+        }
+
+        for seg in [&compact, &verbose] {
+            assert!(seg.contains("off"), "off marker present: {seg:?}");
+            assert!(
+                seg.contains("\u{1f512}ZDR\u{b7}strict"),
+                "🔒ZDR suffix present alongside the off marker: {seg:?}"
+            );
+        }
     }
 
     /// A1 regression guard: every LIVE ML state carries the literal `ml` text so the indicator
