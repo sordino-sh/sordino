@@ -5843,7 +5843,23 @@ fn session_start(port_arg: Option<u16>, config: Option<PathBuf>, proxy_bin: Stri
         return Ok(());
     }
 
-    // port == routed_port: this session's traffic flows through our live proxy. Announce.
+    // port == routed_port: this session's traffic flows through our live proxy.
+    //
+    // F2 bounded-lifecycle GC: fire a key-gated EXPIRED-ONLY sweep of the per-conversation
+    // masking-off map. This is a pure TTL garbage-collect — it evicts ONLY entries whose bounded
+    // window has elapsed, never a live SIBLING window's deliberate off (so restarting one window
+    // can't strand another's off). Best-effort: a failure never blocks the announce, and the
+    // per-request lazy expiry in the proxy is the real enforcement gate regardless.
+    if let Ok(key) = key_for(&root) {
+        let project_key = sordino_state::project_key(&root);
+        let _ = blocking_client()
+            .post(format!("http://127.0.0.1:{port}/sordino/masking/sweep"))
+            .header("x-sordino-key", &key)
+            .header("x-sordino-project", &project_key)
+            .send();
+    }
+
+    // Announce.
     let base_url = format!("http://127.0.0.1:{port}");
     // SessionStart hook output. The static `env` written into settings.local.json (by
     // auto-plumb or `/sordino:enable`) is the load-bearing path for ANTHROPIC_BASE_URL;
@@ -7693,25 +7709,30 @@ fn apply_enabled(
     scope: Scope,
     on: bool,
 ) -> Result<()> {
+    // "On means on" (kills J3): turning masking back ON ALWAYS clears any per-conversation
+    // disable (`/sordino:disable`), at ANY scope — a `--project`/`--user`/`--local` re-enable
+    // must not leave a conversation-scoped off standing (the server clear is unconditional, so a
+    // `--project off` + conversation override then `mask on` ends up masked). UNCONDITIONAL and
+    // best-effort: it only needs a reachable proxy (`ident`) and a session-routed conversation id;
+    // a failure (e.g. not session-routed) just leaves the override, never blocking the master flip.
+    if on
+        && let Some((port, key)) = ident.clone()
+        && let Some(conv) = conversation_from_base_url()
+    {
+        let url = format!(
+            "http://127.0.0.1:{port}/sordino/session/{}/masking",
+            percent_encode(&conv)
+        );
+        let _ = blocking_client()
+            .delete(&url)
+            .header("x-sordino-key", &key)
+            .header("x-sordino-project", project)
+            .send();
+    }
     if scope == Scope::Session {
         let (port, key) =
             ident.context("proxy not running; use --scope project/user to persist")?;
         let snap = admin_post(port, &key, if on { "enable" } else { "disable" }, project)?;
-        // "On means on": turning masking back on for this session ALSO clears any
-        // per-conversation disable (`/sordino:disable`), so masking is reliably active here
-        // regardless of which switch turned it off. Best-effort — the master enable already
-        // succeeded; a failed clear (e.g. not session-routed) just leaves the override.
-        if on && let Some(conv) = conversation_from_base_url() {
-            let url = format!(
-                "http://127.0.0.1:{port}/sordino/session/{}/masking",
-                percent_encode(&conv)
-            );
-            let _ = blocking_client()
-                .delete(&url)
-                .header("x-sordino-key", &key)
-                .header("x-sordino-project", project)
-                .send();
-        }
         print_applied(&snap, port, "session")?;
         return Ok(());
     }

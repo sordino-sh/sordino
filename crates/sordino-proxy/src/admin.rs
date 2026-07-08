@@ -14,6 +14,7 @@
 //! only; concurrent sessions in other projects are untouched.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
@@ -870,24 +871,61 @@ pub async fn masking_disable(
     State(st): State<AppState>,
     hdrs: HeaderMap,
     Path(conversation): Path<String>,
+    body: Bytes,
 ) -> Response {
     if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
-    let newly = st.set_masking_disabled(&conversation);
+    #[derive(Deserialize, Default)]
+    struct Req {
+        /// Bounded off-window in seconds. Absent (incl. the legacy no-body `disable` alias) ⇒
+        /// the SERVER-SIDE default, so an off is NEVER unbounded.
+        #[serde(default)]
+        ttl_secs: Option<u64>,
+    }
+    let req: Req = if body.is_empty() {
+        Req::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(r) => r,
+            Err(e) => {
+                return text(StatusCode::BAD_REQUEST, &format!("invalid masking body: {e}"));
+            }
+        }
+    };
+    // Resolve the TTL SERVER-SIDE (default when absent) so the message can state the real
+    // deadline AND the stored deadline is always bounded, regardless of what the client sent.
+    let ttl = req
+        .ttl_secs
+        .map(Duration::from_secs)
+        .unwrap_or(crate::state::DEFAULT_MASKING_OFF_TTL);
+    let newly = st.set_masking_disabled(&conversation, Some(ttl));
+    let mins = ttl.as_secs().div_ceil(60);
     let mut snap = masking_status(&st, &conversation);
     if let Some(obj) = snap.as_object_mut() {
         obj.insert("changed".into(), json!(newly));
+        obj.insert("ttl_secs".into(), json!(ttl.as_secs()));
         obj.insert(
             "warning".into(),
-            json!(
+            json!(format!(
                 "Masking is OFF for this conversation — its PII now egresses UNMASKED (registered \
-                 secrets are still masked). Session-scoped and NOT persisted: it lifts on the next \
-                 Claude Code restart, or turn it back on with `/sordino:privacy on`."
-            ),
+                 secrets are still masked). This is a BOUNDED window: masking AUTO-REVERTS to ON \
+                 in ~{mins} minute(s), or turn it back on now with `/sordino:privacy on`."
+            )),
         );
     }
     json_ok(&snap)
+}
+
+/// `POST /sordino/masking/sweep` (x-sordino-key) — expired-only GC of the per-conversation off
+/// map. Called at SessionStart. Evicts ONLY entries whose bounded TTL has elapsed; a still-live
+/// SIBLING window's deliberate off is untouched (no strand-siblings). Returns the swept count.
+pub async fn masking_sweep(State(st): State<AppState>, hdrs: HeaderMap) -> Response {
+    if !st.authed_for_project(&hdrs) {
+        return forbidden();
+    }
+    let swept = st.sweep_expired_masking_disabled();
+    json_ok(&json!({ "swept": swept }))
 }
 
 /// `DELETE /sordino/session/{conversation}/masking` (x-sordino-key) — turn masking back

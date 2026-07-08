@@ -113,7 +113,9 @@ mod tests {
             zdr_targets: Arc::new(std::collections::HashMap::new()),
             zdr_default: Arc::new(None),
             zdr_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-            masking_disabled: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            masking_disabled: Arc::new(std::sync::Mutex::new(
+                crate::state::MaskingDisabled::default(),
+            )),
         }
     }
 

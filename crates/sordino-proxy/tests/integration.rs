@@ -74,7 +74,9 @@ fn mk_state(engine: MaskEngine, upstream_base: String, admin_key: &str) -> AppSt
         zdr_targets: Arc::new(std::collections::HashMap::new()),
         zdr_default: Arc::new(None),
         zdr_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        masking_disabled: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        masking_disabled: Arc::new(std::sync::Mutex::new(
+            sordino_proxy::state::MaskingDisabled::default(),
+        )),
     }
 }
 
@@ -1610,7 +1612,9 @@ fn mk_state_in(
         zdr_targets: Arc::new(std::collections::HashMap::new()),
         zdr_default: Arc::new(None),
         zdr_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
-        masking_disabled: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        masking_disabled: Arc::new(std::sync::Mutex::new(
+            sordino_proxy::state::MaskingDisabled::default(),
+        )),
     }
 }
 
