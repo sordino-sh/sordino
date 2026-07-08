@@ -898,7 +898,11 @@ pub async fn masking_disable(
     let ttl = req
         .ttl_secs
         .map(Duration::from_secs)
-        .unwrap_or(crate::state::DEFAULT_MASKING_OFF_TTL);
+        .unwrap_or(crate::state::DEFAULT_MASKING_OFF_TTL)
+        // Clamp to the same 24h ceiling `set_masking_disabled` enforces, so the deadline this
+        // message quotes MATCHES the deadline actually stored (a `--for 9999h` reports ~24h, not
+        // a wild figure).
+        .min(crate::state::MAX_MASKING_OFF_TTL);
     let newly = st.set_masking_disabled(&conversation, Some(ttl));
     let mins = ttl.as_secs().div_ceil(60);
     let mut snap = masking_status(&st, &conversation);
@@ -909,8 +913,9 @@ pub async fn masking_disable(
             "warning".into(),
             json!(format!(
                 "Masking is OFF for this conversation — its PII now egresses UNMASKED (registered \
-                 secrets are still masked). This is a BOUNDED window: masking AUTO-REVERTS to ON \
-                 in ~{mins} minute(s), or turn it back on now with `/sordino:privacy on`."
+                 secrets stay masked while traffic transits the proxy). This is a BOUNDED window: \
+                 masking AUTO-REVERTS to ON in ~{mins} minute(s) (restarting Claude Code does NOT \
+                 change that) — or turn it back on now with `/sordino:mask on`."
             )),
         );
     }

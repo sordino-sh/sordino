@@ -121,6 +121,12 @@ struct GlobalRevert {
 /// Short-and-bounded is the safe surprise direction (fails toward masking-ON).
 pub const DEFAULT_MASKING_OFF_TTL: Duration = Duration::from_secs(30 * 60);
 
+/// Hard ceiling on ANY off-window (F3 `--for <dur>` / `--sticky`). A caller-supplied ttl is
+/// CLAMPED to this before the deadline is computed, so (a) a huge `--for 9999h` (or `--sticky`,
+/// which requests this ceiling explicitly) can never overflow the monotonic `Instant + ttl` add,
+/// and (b) "indefinite" is really "up to 24h, then auto-re-arm" — there is no unbounded off.
+pub const MAX_MASKING_OFF_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
 /// Cap on the recently-auto-reverted ring. Write-mostly here (feeds later re-arm narration);
 /// bounded so a long-lived proxy that churns many offs never grows it without limit.
 const RECENTLY_REVERTED_CAP: usize = 16;
@@ -356,11 +362,19 @@ impl AppState {
     /// was a NEW disable, `false` if it re-armed an existing one (mirroring the old set-insert
     /// contract `admin.rs` consumes). In-memory only — no fail-closed rollback path.
     pub fn set_masking_disabled(&self, conversation: &str, ttl: Option<Duration>) -> bool {
-        let ttl = ttl.unwrap_or(DEFAULT_MASKING_OFF_TTL);
+        // Clamp to the 24h ceiling FIRST: a huge caller ttl (`--for 9999h`, or `--sticky` which
+        // asks for the ceiling) is bounded before it ever reaches the `Instant`/`SystemTime` add,
+        // so it can neither overflow nor produce a truly unbounded off.
+        let ttl = ttl.unwrap_or(DEFAULT_MASKING_OFF_TTL).min(MAX_MASKING_OFF_TTL);
         let now = self.clock_now();
+        // Belt-and-suspenders even after the clamp: `checked_add` can't panic, and a (practically
+        // impossible, post-clamp) overflow falls back to `now` — an already-elapsed deadline, i.e.
+        // fail-toward-masking-ON.
         let deadline = Deadline {
-            enforce: now + ttl,
-            display: SystemTime::now() + ttl,
+            enforce: now.checked_add(ttl).unwrap_or(now),
+            display: SystemTime::now()
+                .checked_add(ttl)
+                .unwrap_or_else(SystemTime::now),
             reason: format!("ttl={}s", ttl.as_secs()),
         };
         self.masking_disabled

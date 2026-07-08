@@ -52,15 +52,15 @@ Installing the plugin is, in the common case, all you do — **installed = route
    — handy to re-enable after `/sordino:uninstall`, or to also seed a starter
    `sordino.toml` — but you rarely need it. The full annotated config reference is
    shipped as `sordino.toml.example`.)
-3. **Run `/sordino:privacy`** anytime to confirm routing + masking, or to flip
-   masking on/off live.
+3. **Run `/sordino:mask on`/`off`** anytime to flip masking live; the read-only
+   routing + masking status is `/sordino:status`.
 
 Set `env.SORDINO_STATUSLINE=off` to hide the `🛡` segment (your own status line still
 shows), `shield` to show the `🛡` ONLY when masking is confirmed (nothing in any other
 state), or `min`/`verbose` to change how much it shows.
 
-To quickly turn masking **off** without removing anything: `/sordino:disable` (this
-conversation) or `/sordino:disable --project` (the whole project). To remove routing:
+To quickly turn masking **off** without removing anything: `/sordino:mask off` (this
+conversation) or `/sordino:mask off --project` (the whole project). To remove routing:
 `/sordino:uninstall` (this project; stops routing reliably after a one-time restart, and opts
 the project out of auto-routing). **Before uninstalling the plugin, run `/sordino:uninstall --all`** to sweep
 every project the plugin plumbed, so none is left pointing at a proxy that's about to
@@ -131,14 +131,16 @@ at all) is plumbing: auto-set once into `settings.local.json` on the first sessi
 effectively permanent — `/sordino:enable` sets it explicitly and `/sordino:uninstall`
 removes it (each takes effect reliably after a one-time restart of Claude Code). **Masking**
 (what the running proxy does to your text) is policy: the everyday on/off, controlled live by
-`/sordino:privacy` (change what's masked) and `/sordino:disable` (quickly turn masking off for
-this conversation or `--project`). Masking sits *on top of* routing, so turning it off is
-transparent pass-through and never strands a session.
+`/sordino:mask on` / `/sordino:mask off` (the unified verb — `off` is bounded and scoped to this
+conversation by default, `off --project` flips the whole-project master switch, and the same
+command also carries `profile` / `category` / `threshold` / `model` / `reveal` / `scrub`). Masking
+sits *on top of* routing, so turning it off is transparent pass-through and never strands a session.
+The older `/sordino:privacy` and `/sordino:disable` are deprecated aliases that forward here.
 
 **Who can run what.** The model can drive only the read-and-tighten commands —
 `/sordino:status`, `/sordino:secrets`, `/sordino:doctor`, `/sordino:enable` — through its
 SlashCommand tool. The commands that can *loosen* masking or open a browser
-(`/sordino:privacy`, `/sordino:disable`, `/sordino:uninstall`, `/sordino:monitor`) are **user-only**: the model
+(`/sordino:mask`, `/sordino:privacy`, `/sordino:disable`, `/sordino:uninstall`, `/sordino:monitor`) are **user-only**: the model
 surfaces the exact command and you run it. This is enforced by `disable-model-invocation` on
 those commands plus the `permissions.deny`/`ask` rules the plugin writes into
 `.claude/settings.local.json` (deny the model's Bash on the `sordino-*` CLIs; force an `ask`
@@ -155,11 +157,11 @@ prompt on its edits of `sordino.toml` / `sordino.local.toml`).
 | Command | What it does |
 |---|---|
 | `/sordino:enable` | Explicit per-project routing setup (usually automatic — the `SessionStart` hook does this on first sight). Writes this project's gitignored `.claude/settings.local.json` to set `ANTHROPIC_BASE_URL` (and `SORDINO_PORT`) at the proxy's per-project OS-assigned ephemeral port, takes over the status-line slot (wrapping any existing line as `🛡 … │ {your line}`, original saved for restore), and seeds a practical starter `sordino.toml`. **Masking activates after a one-time restart of Claude Code** (Sordino blocks the first unrouted message until then, so nothing sends unmasked). |
-| `/sordino:disable [--project]` | **User-only.** Quickly turn **masking** off without changing your data policy or removing anything. Default: **this conversation only** (session-scoped, in-memory — lifts on restart). `--project`: the whole project's master switch (session-live, not persisted). Registered secrets stay masked in both modes. Re-enable with `/sordino:privacy on`. |
+| `/sordino:mask [on\|off]` | **User-only** (for `off`). The unified masking verb. `on` re-enables masking, clearing any off at any scope. `off` turns **masking** off for **this conversation** without changing your data policy: a **bounded** window that **auto-re-arms to ON in ~30 min** unless extended, and stays off until then or `/sordino:mask on` — a Claude Code restart does not change that (the proxy daemon outlives it). `off --for <dur>` sets a custom window (24h max), `off --sticky` is the explicit indefinite off, and `off --project` flips the whole-project master switch (**shared with any Codex sibling** here). Registered secrets stay masked while traffic transits the proxy in every mode. Also carries `profile` / `category` / `threshold` / `model` / `reveal` / `scrub`. |
+| `/sordino:disable [--project]` | **User-only.** *Deprecated — renamed to `/sordino:mask off`.* Forwards to the unified verb; same behavior. |
 | `/sordino:uninstall [--all]` | **User-only.** Revert the **routing** change for this project and restore your original status line (saved at enable time; if you had none, the sordino line is just removed) so traffic goes straight to Anthropic again — effective after a one-time restart, and it opts the project out of auto-routing. Your `sordino.toml` policy is left in place. **`/sordino:uninstall --all`** sweeps every plumbed project (found via its registry and a scan of Claude Code's session logs); run it **before deleting the plugin** so no project strands on a dead proxy. |
-| `/sordino:status` | **Read-only** (model-invocable): proxy health, whether this session is routed, and the masking state (on/off, profile, categories, ML model). Changes nothing — the model uses this to report status; to *change* anything it surfaces the `/sordino:privacy` command for you to run. |
-| `/sordino:privacy [args]` | **User-only.** Unified masking control. With no args (or `status`): show proxy health, whether this session is routed, and the masking state. Also: `on` / `off`, `profile <name>`, `category <name> on\|off`, `threshold <0-1>` (each takes `--scope session\|project\|user\|local`), and `reveal <token>` to decode one masked token (e.g. `[EMAIL_ADDRESS_a47n1d8s9c0f]`) via the key-gated proxy. |
-| `/sordino:privacy model …` | The optional `openai/privacy-filter` ML recognizer (CPU) for free-text PII (names, locations). `model download [<repo>]` caches the weights (large/slow first run); `model on`/`off` toggles it (on **loads in the background** — text is not filtered through the model until `model status` shows `ready`, so masking stays regex-only meanwhile); `model status` reports `disabled\|loading\|ready\|failed`. Pair with `category personal on`. |
+| `/sordino:status` | **Read-only** (model-invocable): proxy health, whether this session is routed, and the masking state (on/off, profile, categories, ML model). Changes nothing — the model uses this to report status; to *change* anything it surfaces the `/sordino:mask` command for you to run. |
+| `/sordino:privacy [args]` | **User-only.** *Deprecated — renamed to `/sordino:mask`.* Forwards to the unified verb; same `on` / `off` / `profile` / `category` / `threshold` / `model` / `reveal` / `scrub` surface (each taking `--scope session\|project\|user\|local`). |
 | `/sordino:verify` | **Read-only** (model-invocable): proves THIS session is fully active in two distinct legs — the engine **masks** (a key-gated canary comes back tokenized) AND this session is **routed** (`ANTHROPIC_BASE_URL` points at the proxy). A green engine with an unrouted session reads ✗ — the case to catch (masking is on, but this session bypasses it and sends unmasked). |
 | `/sordino:doctor` | **Read-only** (model-invocable): preflight self-check for the loopback / firewall / port footguns that would make masking requests hang. |
 

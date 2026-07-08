@@ -243,16 +243,31 @@ enum Cmd {
         #[arg(long)]
         json: bool,
     },
-    /// Turn Sordino masking OFF (backs `/sordino:disable`). Default: THIS conversation
-    /// only (session-scoped, in-memory — lifts on the next Claude Code restart).
-    /// `--project`: the whole project's master switch. Registered secrets stay masked
-    /// either way, and the data policy (categories/profile/threshold) is untouched.
-    /// Re-enable with `/sordino:privacy on`.
+    /// Turn Sordino masking OFF (backs `/sordino:mask off`). Default: THIS conversation
+    /// only. It stays off until you turn it back on with `/sordino:mask on` or it
+    /// auto-re-arms in ~30 min; restarting Claude Code does NOT change that (the proxy is a
+    /// daemon that outlives a Claude Code restart). `--project`: the whole project's master
+    /// switch (shared with any Codex sibling in this project). Registered secrets stay masked
+    /// while traffic transits the proxy either way, and the data policy
+    /// (categories/profile/threshold) is untouched. Re-enable with `/sordino:mask on`.
     Disable {
         /// Turn masking off for the WHOLE project (the master switch) instead of just
-        /// this one conversation.
+        /// this one conversation. NOTE: the master switch is SHARED with any Codex sibling
+        /// running in this project.
         #[arg(long)]
         project: bool,
+        /// Bounded timed off: keep masking off for this long, then auto-re-arm. Accepts
+        /// `90s`, `10m`, `2h`, or a compound like `1h30m`. Clamped to a 24h maximum. Omit for
+        /// the default ~30 min window. Conflicts with `--project` (the master switch has no
+        /// per-conversation timer).
+        #[arg(long = "for", value_name = "DUR", conflicts_with = "project")]
+        for_dur: Option<String>,
+        /// Explicit indefinite off: stay off until you re-enable with `/sordino:mask on` (up
+        /// to a 24h ceiling, then it auto-re-arms — nothing is ever unbounded). Deliberately
+        /// NOT `--until-restart`: a Claude Code restart does NOT re-mask. Conflicts with
+        /// `--for` and `--project`.
+        #[arg(long, conflicts_with_all = ["for_dur", "project"])]
+        sticky: bool,
     },
 }
 
@@ -445,7 +460,8 @@ enum MlAction {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Scope {
-    /// Live on this project's running proxy only; not persisted (lost on restart).
+    /// Live on this project's running proxy only; not written to any config file (applies
+    /// until the proxy process itself exits).
     Session,
     /// Persist to `./sordino.toml` (committed) and apply now if the proxy is up.
     Project,
@@ -503,7 +519,11 @@ fn main() -> Result<()> {
         Cmd::Monitor => monitor_cmd(),
         Cmd::Secrets { action, json } => secrets_cmd(action, json),
         Cmd::Zdr { action, json } => zdr_cmd(action, json),
-        Cmd::Disable { project } => disable_cmd(project),
+        Cmd::Disable {
+            project,
+            for_dur,
+            sticky,
+        } => disable_cmd(project, for_dur, sticky),
         Cmd::Scrub {
             transcript,
             values,
@@ -4709,7 +4729,7 @@ fn engine_mask_verdict(name: &'static str, conv: Option<&str>, masked_ok: bool) 
             "the canary came back UNMASKED — masking is OFF (and this session isn't routed \
              through the proxy, so it can't be tied to a specific conversation)"
                 .to_string(),
-            Some("turn masking on: /sordino:privacy on"),
+            Some("turn masking on: /sordino:mask on"),
         ),
         // Unrouted + canary masked OK: the engine masks globally, but we can't attribute it to
         // THIS conversation (a per-conversation disable can't be checked) → indeterminate.
@@ -4736,7 +4756,7 @@ fn engine_mask_verdict(name: &'static str, conv: Option<&str>, masked_ok: bool) 
             "the canary came back UNMASKED for THIS conversation — masking is OFF here \
              (per-conversation disable or master switch off)"
                 .to_string(),
-            Some("turn masking on: /sordino:privacy on"),
+            Some("turn masking on: /sordino:mask on"),
         ),
     }
 }
@@ -8461,29 +8481,56 @@ fn zdr_json_contract(snap: &Value) -> Value {
     })
 }
 
-/// Backs `/sordino:disable`. Turns masking OFF — for THIS conversation by default
-/// (in-memory, session-scoped, lifts on the next restart), or for the whole PROJECT
-/// with `--project` (the master switch, session-live). Registered secrets are still
-/// masked in both modes, and the data policy (categories/profile/threshold) is never
-/// touched. Re-enable with `/sordino:privacy on`.
-fn disable_cmd(project: bool) -> Result<()> {
+/// Backs `/sordino:mask off`. Turns masking OFF — for THIS conversation by default, or for
+/// the whole PROJECT master switch with `--project` (shared with any Codex sibling here). The
+/// off STAYS OFF until you turn it back on with `/sordino:mask on` or it auto-re-arms (~30 min
+/// default; `--for <dur>` for a custom bounded window; `--sticky` for the 24h ceiling);
+/// restarting Claude Code does NOT change that. Registered secrets stay masked while traffic
+/// transits the proxy in both modes, and the data policy (categories/profile/threshold) is
+/// never touched. Re-enable with `/sordino:mask on`.
+fn disable_cmd(project: bool, for_dur: Option<String>, sticky: bool) -> Result<()> {
     let root = canonical(&project_root());
-    let (port, key) = live_identity(&root)
-        .context("could not reach this project's proxy — is a `claude` session running here?")?;
+    // Resolve the bounded off-window (seconds) threaded into the masking POST body:
+    //  - `--for <dur>`: the parsed duration (server clamps to 24h),
+    //  - `--sticky`:    the 24h ceiling explicitly (the honest "indefinite" — still bounded),
+    //  - neither:       `None`, so the SERVER applies its ~30 min default (never unbounded).
+    let ttl_secs: Option<u64> = if sticky {
+        Some(state_max_off_ttl_secs())
+    } else if let Some(spec) = for_dur.as_deref() {
+        Some(parse_off_duration(spec)?)
+    } else {
+        None
+    };
+
+    let Some((port, key)) = live_identity(&root) else {
+        // No live proxy. If the project IS routed on disk, routing simply hasn't taken effect in
+        // THIS (pre-restart) session yet — the honest next step is a one-time restart, NOT
+        // `--project` (which needs this same live proxy and would fail here too).
+        if route_configured(&root) {
+            bail!(
+                "routing isn't active for this session yet — restart Claude Code once to activate, \
+                 then `/sordino:mask off` works here."
+            );
+        }
+        bail!("could not reach this project's proxy — is a `claude` session running here?");
+    };
     let project_key = sordino_state::project_key(&root);
 
     if project {
-        // Project-wide master switch off (session-live — not persisted, so the data policy
-        // on disk is unchanged). Same endpoint `config off` uses.
+        // Project-wide master switch off (session-live — cleared only when the proxy process
+        // exits or you turn masking back on; the data policy on disk is unchanged). Same endpoint
+        // `config off` uses. `--for`/`--sticky` are rejected by clap here (the master switch has
+        // no per-conversation timer).
         let snap = admin_post(port, &key, "disable", &project_key)
             .context("turning the project master switch off")?;
         println!(
-            "Sordino masking DISABLED for this PROJECT (master switch off). Every conversation \
-             here now egresses UNMASKED — registered secrets are still masked."
+            "Sordino masking DISABLED for this PROJECT (master switch off, SHARED with any Codex \
+             sibling in this project). Every conversation here now egresses UNMASKED — registered \
+             secrets stay masked while traffic transits the proxy."
         );
         println!(
-            "Your data policy (categories/profile/threshold) is unchanged; this is session-live \
-             and NOT persisted. Turn it back on with `/sordino:privacy on`.\n"
+            "Your data policy (categories/profile/threshold) is unchanged. It stays off until you \
+             turn it back on with `/sordino:mask on`; restarting Claude Code does NOT change that.\n"
         );
         print_applied(&snap, port, "session")?;
         return Ok(());
@@ -8491,31 +8538,116 @@ fn disable_cmd(project: bool) -> Result<()> {
 
     // Conversation-scoped (default): needs a session-routed conversation id, exactly like
     // ZDR — the id is read from the inherited ANTHROPIC_BASE_URL, never threaded in.
-    let conv = conversation_from_base_url().context(
-        "this session is not session-routed: ANTHROPIC_BASE_URL has no /sordino/session/<id> \
-         segment, so masking can't be scoped to just this conversation. Run /sordino:enable and \
-         restart Claude Code, or disable the whole project with `/sordino:disable --project`.",
-    )?;
+    let Some(conv) = conversation_from_base_url() else {
+        // The proxy is up but THIS session isn't routed through it (no /sordino/session/<id> in
+        // ANTHROPIC_BASE_URL) — a just-written route only takes effect at startup. Point at the
+        // real fix (restart), NOT `--project`: silently widening a per-conversation off to the
+        // whole project is exactly the surprise we refuse.
+        bail!(
+            "routing isn't active for this session yet — restart Claude Code once to activate, \
+             then `/sordino:mask off` works here. (Turning masking off is scoped to THIS \
+             conversation, which needs this session routed through the proxy.)"
+        );
+    };
     let url = format!(
         "http://127.0.0.1:{port}/sordino/session/{}/masking",
         percent_encode(&conv)
     );
-    let resp = json_or_err(
-        blocking_client()
-            .post(&url)
-            .header("x-sordino-key", &key)
-            .header("x-sordino-project", &project_key)
-            .send()?,
-    )
-    .context("disabling masking for this conversation")?;
+    let mut req = blocking_client()
+        .post(&url)
+        .header("x-sordino-key", &key)
+        .header("x-sordino-project", &project_key);
+    // Thread the bounded window when one was requested; omit the body entirely otherwise so the
+    // server applies its own default (the legacy no-body contract stays intact).
+    if let Some(secs) = ttl_secs {
+        req = req.json(&json!({ "ttl_secs": secs }));
+    }
+    let resp =
+        json_or_err(req.send()?).context("disabling masking for this conversation")?;
     if let Some(w) = resp.get("warning").and_then(|v| v.as_str()) {
         println!("{w}\n");
     }
     println!(
         "Masking is now OFF for THIS conversation only — other conversations in this project are \
-         unaffected. Re-enable with `/sordino:privacy on`."
+         unaffected. It stays off until you turn it back on with `/sordino:mask on` or it \
+         auto-re-arms; restarting Claude Code does NOT change that."
     );
     Ok(())
+}
+
+/// The 24h off-window ceiling (seconds), mirrored from the proxy so `--sticky` requests exactly
+/// the server's `MAX_MASKING_OFF_TTL` (the honest "indefinite": bounded, then auto-re-arm).
+fn state_max_off_ttl_secs() -> u64 {
+    24 * 60 * 60
+}
+
+/// True when this project has a Sordino route written to disk (`ANTHROPIC_BASE_URL` in
+/// `.claude/settings.local.json`, else `settings.json`) — i.e. routing is CONFIGURED even if it
+/// hasn't taken effect in this (pre-restart) session yet. Mirrors `print_route_url`'s local-first
+/// precedence. Lets `disable_cmd` tell "configured-but-pre-restart" (⇒ restart) apart from
+/// "never set up" (⇒ start a session / `/sordino:enable`).
+fn route_configured(root: &str) -> bool {
+    let base = std::path::Path::new(root);
+    for name in [".claude/settings.local.json", ".claude/settings.json"] {
+        if let Ok(text) = std::fs::read_to_string(base.join(name))
+            && let Ok(v) = serde_json::from_str::<Value>(strip_bom(&text))
+            && v.pointer("/env/ANTHROPIC_BASE_URL")
+                .and_then(Value::as_str)
+                .is_some_and(|u| !u.is_empty())
+        {
+            return true;
+        }
+    }
+    false
+}
+
+/// Parse a `--for` off-window spec into seconds: a bare integer is seconds, and unit-suffixed
+/// components (`s`/`m`/`h`, optionally compounded like `1h30m`) sum. Rejects empty / zero /
+/// unparseable specs so a typo can't silently become "off forever" or "off for 0s". The proxy
+/// still clamps the result to its 24h ceiling; this only turns human input into `ttl_secs`.
+fn parse_off_duration(spec: &str) -> Result<u64> {
+    let s = spec.trim();
+    if s.is_empty() {
+        bail!("empty --for duration; try e.g. `--for 10m`, `--for 2h`, or `--for 90s`");
+    }
+    // Bare integer ⇒ seconds.
+    if let Ok(n) = s.parse::<u64>() {
+        if n == 0 {
+            bail!("--for 0 is not a valid off-window; omit --for for the default, or give a positive duration");
+        }
+        return Ok(n);
+    }
+    let mut total: u64 = 0;
+    let mut num = String::new();
+    let mut saw_unit = false;
+    for ch in s.chars() {
+        if ch.is_ascii_digit() {
+            num.push(ch);
+            continue;
+        }
+        let unit = ch.to_ascii_lowercase();
+        let mult = match unit {
+            's' => 1u64,
+            'm' => 60,
+            'h' => 3600,
+            _ => bail!("unrecognized duration '{spec}'; use s/m/h units, e.g. `10m`, `2h`, `1h30m`"),
+        };
+        let val: u64 = num
+            .parse()
+            .map_err(|_| anyhow::anyhow!("malformed duration '{spec}' near '{ch}'"))?;
+        total = total
+            .checked_add(val.saturating_mul(mult))
+            .ok_or_else(|| anyhow::anyhow!("duration '{spec}' is too large"))?;
+        num.clear();
+        saw_unit = true;
+    }
+    if !num.is_empty() {
+        bail!("duration '{spec}' has a trailing number with no unit; e.g. `10m`, not `10m30`");
+    }
+    if !saw_unit || total == 0 {
+        bail!("could not parse --for '{spec}'; try e.g. `--for 10m`, `--for 2h`, or `--for 90s`");
+    }
+    Ok(total)
 }
 
 /// Print the per-session ZDR status from a `{active, default, configured}` payload.
@@ -8594,19 +8726,89 @@ fn conversation_from_url(url: &str) -> Option<String> {
 
 #[cfg(test)]
 mod disable_cli_tests {
-    use super::{Cli, Cmd};
+    use super::{parse_off_duration, Cli, Cmd};
     use clap::Parser;
 
     #[test]
     fn disable_defaults_to_conversation_scope() {
         let cli = Cli::try_parse_from(["sordino-hooks", "disable"]).unwrap();
-        assert!(matches!(cli.cmd, Cmd::Disable { project: false }));
+        assert!(matches!(
+            cli.cmd,
+            Cmd::Disable {
+                project: false,
+                for_dur: None,
+                sticky: false
+            }
+        ));
     }
 
     #[test]
     fn disable_project_flag_selects_project_scope() {
         let cli = Cli::try_parse_from(["sordino-hooks", "disable", "--project"]).unwrap();
-        assert!(matches!(cli.cmd, Cmd::Disable { project: true }));
+        assert!(matches!(cli.cmd, Cmd::Disable { project: true, .. }));
+    }
+
+    #[test]
+    fn disable_for_carries_duration() {
+        let cli = Cli::try_parse_from(["sordino-hooks", "disable", "--for", "10m"]).unwrap();
+        match cli.cmd {
+            Cmd::Disable {
+                for_dur: Some(d),
+                sticky: false,
+                project: false,
+            } => assert_eq!(d, "10m"),
+            _ => panic!("expected Cmd::Disable with --for 10m"),
+        }
+    }
+
+    #[test]
+    fn disable_sticky_is_the_indefinite_flag() {
+        let cli = Cli::try_parse_from(["sordino-hooks", "disable", "--sticky"]).unwrap();
+        assert!(matches!(cli.cmd, Cmd::Disable { sticky: true, .. }));
+    }
+
+    #[test]
+    fn no_until_restart_flag_exists() {
+        // The dishonest `--until-restart` name must never be a real flag (a CC restart does NOT
+        // re-mask on a daemon that outlives it). `--sticky` is the honest indefinite hatch.
+        assert!(Cli::try_parse_from(["sordino-hooks", "disable", "--until-restart"]).is_err());
+    }
+
+    #[test]
+    fn for_conflicts_with_project() {
+        // `--for` is a per-conversation timer; the master switch has none, so the combination
+        // must be rejected rather than silently ignored.
+        assert!(
+            Cli::try_parse_from(["sordino-hooks", "disable", "--project", "--for", "5m"]).is_err()
+        );
+    }
+
+    #[test]
+    fn sticky_conflicts_with_for_and_project() {
+        assert!(
+            Cli::try_parse_from(["sordino-hooks", "disable", "--sticky", "--for", "5m"]).is_err()
+        );
+        assert!(
+            Cli::try_parse_from(["sordino-hooks", "disable", "--sticky", "--project"]).is_err()
+        );
+    }
+
+    #[test]
+    fn parse_off_duration_units_and_compounds() {
+        assert_eq!(parse_off_duration("90s").unwrap(), 90);
+        assert_eq!(parse_off_duration("10m").unwrap(), 600);
+        assert_eq!(parse_off_duration("2h").unwrap(), 7200);
+        assert_eq!(parse_off_duration("1h30m").unwrap(), 5400);
+        assert_eq!(parse_off_duration("45").unwrap(), 45); // bare int ⇒ seconds
+    }
+
+    #[test]
+    fn parse_off_duration_rejects_garbage_and_zero() {
+        assert!(parse_off_duration("").is_err());
+        assert!(parse_off_duration("0").is_err());
+        assert!(parse_off_duration("10x").is_err());
+        assert!(parse_off_duration("abc").is_err());
+        assert!(parse_off_duration("10m30").is_err()); // trailing number, no unit
     }
 }
 
@@ -9803,8 +10005,8 @@ fn print_status(snap: &Value, port: u16) -> Result<()> {
         && !effective_masking(&s, Some(&conv))
     {
         println!(
-            "  this conversation : masking OFF (per-conversation `/sordino:disable`) — \
-             `/sordino:privacy on` to resume"
+            "  this conversation : masking OFF (per-conversation `/sordino:mask off`) — \
+             `/sordino:mask on` to resume"
         );
     }
     Ok(())

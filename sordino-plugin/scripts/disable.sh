@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
-# Backs /sordino:disable — turns Sordino MASKING off (NOT routing; routing teardown is
-# /sordino:uninstall). Default: THIS conversation only (session-scoped, in-memory — it
-# lifts on the next Claude Code restart). `--project`: the whole project's master switch.
-# Registered secrets stay masked in both modes, and the data policy (categories / profile
-# / threshold) is never touched. Re-enable with /sordino:privacy on.
+# Legacy backing for /sordino:disable, now superseded by /sordino:mask off (which routes through
+# scripts/mask.sh -> `sordino-hooks disable`). Turns Sordino MASKING off (NOT routing; routing
+# teardown is /sordino:uninstall). Default: THIS conversation only — a BOUNDED off that auto-re-arms
+# to ON in ~30 min unless extended, and stays off until then or until you re-enable; a Claude Code
+# restart does not change that (the proxy daemon outlives it). `--project`: the whole project's
+# master switch (shared with any Codex sibling). Registered secrets stay masked while traffic
+# transits the proxy in both modes, and the data policy (categories / profile / threshold) is never
+# touched. Re-enable with /sordino:mask on.
 #
 # Observer-style: never aborts hard (needs a *running* proxy), resolves binaries with
 # --no-build (the SessionStart hook builds/launches the proxy; a control verb can't
