@@ -777,6 +777,39 @@ mod tests {
         assert_eq!(restored, "the admin is reachable at bob@example.com");
     }
 
+    // Regression: `/v1/messages/count_tokens` bodies carry NO `max_tokens` by Anthropic spec.
+    // Before `max_tokens` was modeled `Option<u32>`, they failed the typed parse ("missing field
+    // max_tokens") and dropped to the structure-agnostic value-walk — masking still applied, but
+    // with a broad surface and ~1600 WARN lines/session (the reporter's proxy-log finding). They
+    // must now parse into the precise typed schema AND re-serialize byte-faithfully (no injected
+    // `max_tokens`, which would risk a 400 / mangle the count).
+    #[test]
+    fn count_tokens_body_without_max_tokens_parses_typed_and_is_byte_faithful() {
+        let count_tokens = serde_json::json!({
+            "model": "claude-opus-4-8",
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        })
+        .to_string();
+        let req: anthropic_wire::ApiRequest = serde_json::from_slice(count_tokens.as_bytes())
+            .expect("count_tokens body (no max_tokens) must parse typed, not fall back");
+        assert_eq!(req.max_tokens, None);
+        assert!(
+            !serde_json::to_string(&req).unwrap().contains("max_tokens"),
+            "count_tokens re-serialization must NOT inject a max_tokens"
+        );
+
+        // A normal /v1/messages body still carries and round-trips its max_tokens.
+        let messages = serde_json::json!({
+            "model": "m", "max_tokens": 4096,
+            "messages": [{"role": "user", "content": [{"type": "text", "text": "hi"}]}]
+        })
+        .to_string();
+        let msg: anthropic_wire::ApiRequest =
+            serde_json::from_slice(messages.as_bytes()).unwrap();
+        assert_eq!(msg.max_tokens, Some(4096));
+        assert!(serde_json::to_string(&msg).unwrap().contains("\"max_tokens\":4096"));
+    }
+
     #[test]
     fn context_management_protocol_tags_are_not_masked() {
         let e = engine();

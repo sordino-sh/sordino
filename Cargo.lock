@@ -119,7 +119,7 @@ dependencies = [
 [[package]]
 name = "anthropic-wire"
 version = "0.1.0"
-source = "git+https://github.com/FailSpy/llm-wires.git?branch=main#9290f0e223211c2b734cec5e08edcdb6ea0dc502"
+source = "git+https://github.com/FailSpy/llm-wires.git?branch=main#3460e2b7b2f6db791cd80967650281236e6d745c"
 dependencies = [
  "bon",
  "http",
@@ -326,7 +326,7 @@ version = "3.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "519bd3116aeeb42d5372c29d982d16d0170d3d4a5ed85fc7dd91642ffff3c67c"
 dependencies = [
- "darling 0.23.0",
+ "darling",
  "ident_case",
  "prettyplease",
  "proc-macro2",
@@ -788,18 +788,8 @@ version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc7f46116c46ff9ab3eb1597a45688b6715c6e628b5c133e288e709a29bcb4ee"
 dependencies = [
- "darling_core 0.20.11",
- "darling_macro 0.20.11",
-]
-
-[[package]]
-name = "darling"
-version = "0.23.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25ae13da2f202d56bd7f91c25fba009e7717a1e4a1cc98a76d844b65ae912e9d"
-dependencies = [
- "darling_core 0.23.0",
- "darling_macro 0.23.0",
+ "darling_core",
+ "darling_macro",
 ]
 
 [[package]]
@@ -817,36 +807,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "darling_core"
-version = "0.23.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9865a50f7c335f53564bb694ef660825eb8610e0a53d3e11bf1b0d3df31e03b0"
-dependencies = [
- "ident_case",
- "proc-macro2",
- "quote",
- "strsim",
- "syn",
-]
-
-[[package]]
 name = "darling_macro"
 version = "0.20.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "fc34b93ccb385b40dc71c6fceac4b2ad23662c7eeb248cf10d529b7e055b6ead"
 dependencies = [
- "darling_core 0.20.11",
- "quote",
- "syn",
-]
-
-[[package]]
-name = "darling_macro"
-version = "0.23.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac3984ec7bd6cfa798e62b4a642426a5be0e68f9401cfc2a01e3fa9ea2fcdb8d"
-dependencies = [
- "darling_core 0.23.0",
+ "darling_core",
  "quote",
  "syn",
 ]
@@ -875,7 +841,7 @@ version = "0.20.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2d5bcf7b024d6835cfb3d473887cd966994907effbe9227e8c8219824d06c4e8"
 dependencies = [
- "darling 0.20.11",
+ "darling",
  "proc-macro2",
  "quote",
  "syn",
@@ -2179,7 +2145,7 @@ dependencies = [
 [[package]]
 name = "model-heuristics"
 version = "0.1.0"
-source = "git+https://github.com/FailSpy/model-heuristics.git?branch=main#ea177f94546d86ec71e3837a06e4d051a189c276"
+source = "git+https://github.com/FailSpy/model-heuristics.git?branch=main#7f1b413ad44d559664bdc663d89402c1beb1573f"
 dependencies = [
  "serde",
  "serde_json",
@@ -2440,7 +2406,7 @@ checksum = "c08d65885ee38876c4f86fa503fb49d7b507c2b62552df7c70b2fce627e06381"
 [[package]]
 name = "openai-wire"
 version = "0.1.0"
-source = "git+https://github.com/FailSpy/llm-wires.git?branch=main#9290f0e223211c2b734cec5e08edcdb6ea0dc502"
+source = "git+https://github.com/FailSpy/llm-wires.git?branch=main#3460e2b7b2f6db791cd80967650281236e6d745c"
 dependencies = [
  "bon",
  "http",
@@ -3464,7 +3430,7 @@ dependencies = [
 [[package]]
 name = "sse-core"
 version = "0.1.0"
-source = "git+https://github.com/FailSpy/llm-wires.git?branch=main#9290f0e223211c2b734cec5e08edcdb6ea0dc502"
+source = "git+https://github.com/FailSpy/llm-wires.git?branch=main#3460e2b7b2f6db791cd80967650281236e6d745c"
 dependencies = [
  "bytes",
  "futures-core",
