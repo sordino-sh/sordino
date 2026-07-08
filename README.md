@@ -249,31 +249,35 @@ Rebuild after editing engine/proxy/hooks code; restart the session (or re-run
 
 ## Configuration
 
-### The `/sordino:privacy` command
+### The `/sordino:mask` command
 
 Inside a `claude` session, change masking settings live with the slash command
 (or `sordino-hooks config …` from a shell). It affects **only this project's**
-proxy. This is the **masking** layer (turn it off quickly with `/sordino:disable`);
+proxy. This is the **masking** layer (turn it off quickly with `/sordino:mask off`);
 `/sordino:enable` / `/sordino:uninstall` are the separate **routing** layer.
+(`/sordino:privacy` and `/sordino:disable` are deprecated aliases that forward here.)
 
 ```
-/sordino:privacy                        # status: health, routing, on/off, profile, categories
-/sordino:privacy off                    # transparent passthrough (this session, live)
-/sordino:privacy on
-/sordino:privacy profile strict         # threshold + categories + default operator preset
-/sordino:privacy category contact off   # toggle one category
-/sordino:privacy threshold 0.3
-/sordino:privacy model download         # fetch the openai/privacy-filter model (once)
-/sordino:privacy model on               # turn the ML recognizer on (loads in background)
-/sordino:privacy model status           # disabled | loading | ready | failed
-/sordino:privacy reveal '[EMAIL_ADDRESS_a47n1d8s9c0f]'   # decode one token (local debug/audit)
+/sordino:mask                           # status: health, routing, on/off, profile, categories
+/sordino:mask off                       # off for THIS conversation — bounded, auto-re-arms in ~30 min
+/sordino:mask off --for 2h              # custom bounded window (24h max)
+/sordino:mask off --sticky              # longest bounded off: 24h ceiling, then auto-re-arms
+/sordino:mask off --project             # whole-project master switch (shared with a Codex sibling)
+/sordino:mask on                        # re-enable (clears any off at any scope)
+/sordino:mask profile strict            # threshold + categories + default operator preset
+/sordino:mask category contact off      # toggle one category
+/sordino:mask threshold 0.3
+/sordino:mask model download            # fetch the openai/privacy-filter model (once)
+/sordino:mask model on                  # turn the ML recognizer on (loads in background)
+/sordino:mask model status              # disabled | loading | ready | failed
+/sordino:mask reveal '[EMAIL_ADDRESS_a47n1d8s9c0f]'      # decode one token (local debug/audit)
 ```
 
 Each change takes a `--scope` (default `session`):
 
 | scope | persists to | applies |
 |---|---|---|
-| `session` | nothing (live only) | this project's running proxy; lost on restart |
+| `session` | nothing (live only) | this project's running proxy; applies until the proxy process exits |
 | `project` | `./sordino.toml` (committed) | now (reload) + every future session |
 | `local` | `./sordino.local.toml` (gitignored) | now + future sessions, just for you |
 | `user` | `~/.config/sordino/config.toml` | now + every project you own |
@@ -296,7 +300,7 @@ project has its own proxy, a live change here is isolated — it never affects a
 annotated reference that enumerates optional and advanced fields, see
 [`sordino.toml.example`](./sordino.toml.example). Highlights:
 
-- `enabled` — master switch (`/sordino:privacy on`/`off`).
+- `enabled` — master switch (`/sordino:mask on`/`off`).
 - `profile` / `score_threshold` / `enabled_categories` — what to detect. The
   presets are `strict` (0.4, all 5 categories), `balanced` (0.5, secrets +
   financial + identity + contact — the default), `minimal` (0.6, secrets +

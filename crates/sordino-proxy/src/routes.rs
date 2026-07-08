@@ -77,6 +77,10 @@ pub fn router(state: AppState) -> Router {
                 .post(admin::masking_disable)
                 .delete(admin::masking_enable),
         )
+        // Expired-only GC sweep of the per-conversation masking-off map (F2). Key-gated; called
+        // at SessionStart. Conversation-agnostic (a top-level path, so it never collides with the
+        // `{conversation}` capture above) because it sweeps ONLY TTL-expired entries.
+        .route("/sordino/masking/sweep", post(admin::masking_sweep))
         .route(
             "/sordino/session/{conversation}/v1/messages",
             post(messages_session),

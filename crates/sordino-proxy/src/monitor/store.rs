@@ -465,6 +465,12 @@ impl Monitor {
             delta,
             human_turn_index,
             upstream,
+            // Persist the HONEST effective predicate already threaded in as
+            // `masking_enabled` (= engine.is_enabled() && !force_disabled, uniform
+            // across all call sites), so a disabled request's record carries
+            // `Some(false)` and the monitor can badge it 'MASKING OFF'. Display-only
+            // — `should_hold` above is unchanged.
+            masked_effective: Some(masking_enabled),
         };
         push_record(&mut inner.records, record.clone());
         drop(inner);
@@ -1337,6 +1343,94 @@ mod tests {
             matches!(decision_of(&m, &on_id), RequestDecision::Pending),
             "HOLD ALL LLM with masking enabled must hold: {:?}",
             decision_of(&m, &on_id)
+        );
+    }
+
+    // F1d: the honest effective predicate threaded in as `masking_enabled` is PERSISTED on
+    // the record as `masked_effective`, so the monitor can badge a disabled request 'MASKING
+    // OFF'. A disabled request carries Some(false); an enabled one Some(true). Legacy records
+    // (field absent) deserialize to None — no claim, never badged. Display-only: this does not
+    // change should_hold (covered by disabled_filter_never_holds_even_in_hold_all_llm).
+    #[test]
+    fn masked_effective_records_the_honest_per_request_predicate() {
+        let m = Monitor::new();
+        let manifest = UnmaskManifest::new();
+
+        let off_id = m
+            .record_llm_request(
+                "/v1/messages",
+                "POST",
+                None,
+                &body(&[("user", json!("disabled convo"))]),
+                &manifest,
+                &PinnedMode::Normal,
+                false,
+            )
+            .id()
+            .to_string();
+        let on_id = m
+            .record_llm_request(
+                "/v1/messages",
+                "POST",
+                None,
+                &body(&[("user", json!("masked convo"))]),
+                &manifest,
+                &PinnedMode::Normal,
+                true,
+            )
+            .id()
+            .to_string();
+
+        let snap = m.snapshot();
+        let masked_of = |id: &str| {
+            snap.records
+                .iter()
+                .find(|r| r.id == id)
+                .unwrap()
+                .masked_effective
+        };
+        assert_eq!(
+            masked_of(&off_id),
+            Some(false),
+            "a masking-disabled request must record masked_effective:false (badge fires)"
+        );
+        assert_eq!(
+            masked_of(&on_id),
+            Some(true),
+            "a masking-enabled request must record masked_effective:true (no badge)"
+        );
+    }
+
+    // A legacy snapshot record predating the field MUST deserialize to None (unknown, no
+    // claim) — NOT false (would false-alarm every historical masked request) and NOT true
+    // (would assert masked on an unknown request). #[serde(default)] guarantees this.
+    #[test]
+    fn masked_effective_absent_field_deserializes_to_none() {
+        let legacy = json!({
+            "id": "req-1",
+            "conversation_id": "cc-x",
+            "endpoint": "/v1/messages",
+            "method": "POST",
+            "started_ms": 0,
+            "updated_ms": 0,
+            "decision": "auto_accepted",
+            "request_preview": "",
+            "request_spans": [],
+            "response_preview": null,
+            "response_spans": [],
+            "response_status": null,
+            "tokens": [],
+            "tags": [],
+            "rejection_reason": null,
+            "turn_index": 1,
+            "request_surfaces": [],
+            "response_surfaces": [],
+            "delta": { "prev_turn": null, "is_first": true, "added_surface_hashes": [] }
+        });
+        let rec: RequestRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            rec.masked_effective, None,
+            "a legacy record without the field must be None (no claim), never badged"
         );
     }
 

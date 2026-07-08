@@ -261,6 +261,17 @@ pub struct RequestRecord {
     /// Additive; deserializes to `None` on old snapshots.
     #[serde(default)]
     pub upstream: Option<String>,
+    /// The HONEST effective masking predicate for THIS request, captured at record
+    /// time (`st.engine.is_enabled() && !force_disabled`, the same value that gates
+    /// `should_hold`). `Some(false)` = masking was OFF for this request (its
+    /// plaintext egressed unmasked → the UI badges it 'MASKING OFF'); `Some(true)` =
+    /// masking was ON (normal, no badge). `None` = a legacy record predating this
+    /// field: UNKNOWN, make no claim — never badge it (a bool default-false would
+    /// false-alarm every historical masked request; default-true would assert masked
+    /// on an unknown request, the dangerous direction). Display-only: this NEVER
+    /// influences `should_hold`. Additive; deserializes to `None` on old snapshots.
+    #[serde(default)]
+    pub masked_effective: Option<bool>,
 }
 
 /// Provenance class of a masked value, carried on every [`TokenLedgerEntry`].

@@ -1,11 +1,11 @@
 //! Shared proxy state.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sordino_engine::MaskEngine;
@@ -115,6 +115,113 @@ struct GlobalRevert {
     reason: String,
 }
 
+/// Default bounded off-window: an absent-ttl `mask off` self-reverts after this. Enforced
+/// **server-side** (in [`AppState::set_masking_disabled`]), NOT client-side — so the legacy
+/// `disable` alias, which POSTs no body, can never produce an UNBOUNDED off (the J2 backstop).
+/// Short-and-bounded is the safe surprise direction (fails toward masking-ON).
+pub const DEFAULT_MASKING_OFF_TTL: Duration = Duration::from_secs(30 * 60);
+
+/// Hard ceiling on ANY off-window (F3 `--for <dur>` / `--sticky`). A caller-supplied ttl is
+/// CLAMPED to this before the deadline is computed, so (a) a huge `--for 9999h` (or `--sticky`,
+/// which requests this ceiling explicitly) can never overflow the monotonic `Instant + ttl` add,
+/// and (b) "indefinite" is really "up to 24h, then auto-re-arm" — there is no unbounded off.
+pub const MAX_MASKING_OFF_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Cap on the recently-auto-reverted ring. Write-mostly here (feeds later re-arm narration);
+/// bounded so a long-lived proxy that churns many offs never grows it without limit.
+const RECENTLY_REVERTED_CAP: usize = 16;
+
+/// Why a per-conversation masking-off was cleared (recorded on the [`MaskingDisabled`] ring).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RevertReason {
+    /// The bounded off-window's TTL elapsed; enforcement lazily re-masked the conversation.
+    Expired,
+}
+
+/// A per-conversation masking-off window's bounded deadline.
+#[derive(Clone, Debug)]
+pub struct Deadline {
+    /// **Monotonic** instant at/after which enforcement re-masks. Compared against the injected
+    /// [`Clock`], NEVER wall-clock — so setting `SystemTime` backward can't extend the window.
+    pub enforce: Instant,
+    /// Wall-clock deadline for DISPLAY only (statusline "until HH:MM"); never drives enforcement.
+    pub display: SystemTime,
+    /// How the off was set (informational — currently the ttl basis).
+    pub reason: String,
+}
+
+/// Injectable monotonic clock behind the off-window TTL. Production uses [`Clock::system`];
+/// a unit test uses [`Clock::manual`] and ADVANCES it — a hardcoded `Instant::now()` cannot be
+/// moved forward, which would make the load-bearing TTL gate un-runnable.
+#[derive(Clone)]
+pub enum Clock {
+    /// Real monotonic time.
+    System,
+    /// Test clock: a shared, advanceable `Instant` (cloneable — an `Arc` handle can advance it).
+    Manual(Arc<std::sync::Mutex<Instant>>),
+}
+
+impl Clock {
+    /// The production clock (real monotonic time).
+    pub fn system() -> Self {
+        Clock::System
+    }
+
+    /// A test clock starting at `base`; advance it with [`Clock::advance`].
+    pub fn manual(base: Instant) -> Self {
+        Clock::Manual(Arc::new(std::sync::Mutex::new(base)))
+    }
+
+    /// Now, on the monotonic timeline this clock represents.
+    pub fn now(&self) -> Instant {
+        match self {
+            Clock::System => Instant::now(),
+            Clock::Manual(t) => *t.lock().expect("manual clock mutex poisoned"),
+        }
+    }
+
+    /// Advance a manual clock by `by` (a no-op on the system clock — test affordance only).
+    pub fn advance(&self, by: Duration) {
+        if let Clock::Manual(t) = self {
+            let mut g = t.lock().expect("manual clock mutex poisoned");
+            *g += by;
+        }
+    }
+}
+
+/// The per-conversation masking-off state, held behind a single mutex: the bounded off-windows,
+/// the [`Clock`] their TTL is enforced against, and a small ring of recently auto-reverted
+/// windows. Colocating the three under ONE lock lets [`AppState::is_masking_disabled`] read the
+/// clock, evict an expired entry, and record the revert atomically — WITHOUT adding a clock/ring
+/// parameter to that method (its `(&self, &str) -> bool` signature is pinned by egress callers).
+pub struct MaskingDisabled {
+    /// conv id -> its bounded off-window. Presence (after lazy expiry) = masking OFF for that
+    /// conversation. This is the `HashMap<String, Deadline>` the F2 spec names.
+    pub entries: HashMap<String, Deadline>,
+    /// The clock the `enforce` deadlines are compared against.
+    pub clock: Clock,
+    /// Ring of recently TTL-expired offs (newest at the back), bounded by [`RECENTLY_REVERTED_CAP`].
+    pub recently_reverted: VecDeque<(String, SystemTime, RevertReason)>,
+}
+
+impl MaskingDisabled {
+    /// Empty state driven by `clock`.
+    pub fn new(clock: Clock) -> Self {
+        Self {
+            entries: HashMap::new(),
+            clock,
+            recently_reverted: VecDeque::new(),
+        }
+    }
+}
+
+impl Default for MaskingDisabled {
+    /// Empty state on the production (system) clock — the default for every non-test init site.
+    fn default() -> Self {
+        Self::new(Clock::system())
+    }
+}
+
 #[derive(Clone)]
 pub struct AppState {
     pub engine: Arc<MaskEngine>,
@@ -185,7 +292,13 @@ pub struct AppState {
     /// never silently keep a conversation unmasked across restarts. A registered secret is
     /// still masked for a disabled conversation (the engine's A9 carve-out via
     /// [`MaskEngine::mask_when_disabled`]).
-    pub masking_disabled: Arc<std::sync::Mutex<HashSet<String>>>,
+    ///
+    /// **Bounded lifecycle (F2):** each off is a `HashMap<String, Deadline>` entry, not a bare
+    /// set member — it self-reverts once its TTL elapses (default [`DEFAULT_MASKING_OFF_TTL`]),
+    /// enforced on a monotonic [`Clock`] via lazy expiry in [`Self::is_masking_disabled`] plus a
+    /// key-gated expired-only GC sweep at SessionStart. The recycle-fails-ON guarantee still
+    /// holds; the TTL adds a backstop for a forgotten off within a single proxy life.
+    pub masking_disabled: Arc<std::sync::Mutex<MaskingDisabled>>,
 }
 
 impl AppState {
@@ -209,46 +322,133 @@ impl AppState {
         self.zdr_targets.get(name).cloned()
     }
 
-    /// Whether masking is currently turned OFF for this conversation. A cheap set
-    /// membership read; the guard is dropped before the caller does any `.await`.
+    /// Whether masking is currently turned OFF for this conversation — with **lazy expiry**:
+    /// if the entry's bounded TTL has elapsed on the injected [`Clock`], it is evicted, recorded
+    /// on the recently-reverted ring, and this returns `false` (masked). Because every egress
+    /// chokepoint (`routes.rs`, `openai_chat.rs`, `openai_responses.rs`) funnels through this one
+    /// method, the whole request path inherits auto-revert from here. The guard is dropped before
+    /// the caller does any `.await`.
     pub fn is_masking_disabled(&self, conversation: &str) -> bool {
+        // Read the clock BEFORE taking the lock so no lock is held across the (trivial) clock read.
+        let now = self.clock_now();
+        let mut md = self
+            .masking_disabled
+            .lock()
+            .expect("masking_disabled mutex poisoned");
+        match md.entries.get(conversation) {
+            Some(d) if now >= d.enforce => {
+                // TTL elapsed on the MONOTONIC timeline: evict and record the auto-revert. Record
+                // the scheduled wall-clock deadline (`display`) as the revert `when` (display-only).
+                let display = d.display;
+                md.entries.remove(conversation);
+                md.recently_reverted.push_back((
+                    conversation.to_string(),
+                    display,
+                    RevertReason::Expired,
+                ));
+                while md.recently_reverted.len() > RECENTLY_REVERTED_CAP {
+                    md.recently_reverted.pop_front();
+                }
+                false
+            }
+            Some(_) => true,
+            None => false,
+        }
+    }
+
+    /// Turn masking OFF for this conversation for a bounded window. `ttl` `None` applies the
+    /// SERVER-SIDE default [`DEFAULT_MASKING_OFF_TTL`] — so an absent-ttl caller (the legacy
+    /// `disable` alias POSTs no body) can never produce an unbounded off. Returns `true` if this
+    /// was a NEW disable, `false` if it re-armed an existing one (mirroring the old set-insert
+    /// contract `admin.rs` consumes). In-memory only — no fail-closed rollback path.
+    pub fn set_masking_disabled(&self, conversation: &str, ttl: Option<Duration>) -> bool {
+        // Clamp to the 24h ceiling FIRST: a huge caller ttl (`--for 9999h`, or `--sticky` which
+        // asks for the ceiling) is bounded before it ever reaches the `Instant`/`SystemTime` add,
+        // so it can neither overflow nor produce a truly unbounded off.
+        let ttl = ttl.unwrap_or(DEFAULT_MASKING_OFF_TTL).min(MAX_MASKING_OFF_TTL);
+        let now = self.clock_now();
+        // Belt-and-suspenders even after the clamp: `checked_add` can't panic, and a (practically
+        // impossible, post-clamp) overflow falls back to `now` — an already-elapsed deadline, i.e.
+        // fail-toward-masking-ON.
+        let deadline = Deadline {
+            enforce: now.checked_add(ttl).unwrap_or(now),
+            display: SystemTime::now()
+                .checked_add(ttl)
+                .unwrap_or_else(SystemTime::now),
+            reason: format!("ttl={}s", ttl.as_secs()),
+        };
         self.masking_disabled
             .lock()
             .expect("masking_disabled mutex poisoned")
-            .contains(conversation)
+            .entries
+            .insert(conversation.to_string(), deadline)
+            .is_none()
     }
 
-    /// Turn masking OFF for this conversation (idempotent). Returns `true` if this was a
-    /// new disable, `false` if it was already off. In-memory only — nothing to persist,
-    /// so there is no fail-closed rollback path (contrast [`Self::set_zdr_selection`]).
-    pub fn set_masking_disabled(&self, conversation: &str) -> bool {
-        self.masking_disabled
-            .lock()
-            .expect("masking_disabled mutex poisoned")
-            .insert(conversation.to_string())
-    }
-
-    /// Turn masking back ON for this conversation (clear the override). Returns whether
-    /// the conversation was disabled (so the caller can report a no-op honestly).
+    /// Turn masking back ON for this conversation — **unconditionally** (removes the override at
+    /// any scope; kills J3). Returns whether the conversation was disabled, so the caller can
+    /// report a no-op honestly.
     pub fn clear_masking_disabled(&self, conversation: &str) -> bool {
         self.masking_disabled
             .lock()
             .expect("masking_disabled mutex poisoned")
+            .entries
             .remove(conversation)
+            .is_some()
     }
 
-    /// The conversations currently masking-disabled, for the admin snapshot / statusline.
-    /// Sorted so the snapshot is stable across reads.
+    /// The conversations currently masking-disabled, for the admin snapshot / statusline (feeds
+    /// the F0 snapshot array). Sorted so the snapshot is stable across reads.
     pub fn masking_disabled_active(&self) -> Vec<String> {
         let mut v: Vec<String> = self
             .masking_disabled
             .lock()
             .expect("masking_disabled mutex poisoned")
-            .iter()
+            .entries
+            .keys()
             .cloned()
             .collect();
         v.sort();
         v
+    }
+
+    /// Now, on the [`Clock`] behind the masking-off TTL. Reads the clock out from under the
+    /// `masking_disabled` lock (system clock in production; a manual, advanceable one in tests).
+    fn clock_now(&self) -> Instant {
+        self.masking_disabled
+            .lock()
+            .expect("masking_disabled mutex poisoned")
+            .clock
+            .now()
+    }
+
+    /// Expired-only GC sweep of the per-conversation off map: evict EVERY entry whose TTL has
+    /// elapsed on the injected [`Clock`], recording each on the recently-reverted ring, and
+    /// return how many were swept. Called (key-gated) at SessionStart. It sweeps ONLY expired
+    /// entries — never a still-live SIBLING window's deliberate off — so a restart of one window
+    /// can't strand another's off (the TTL alone covers forgotten offs).
+    pub fn sweep_expired_masking_disabled(&self) -> usize {
+        let mut md = self
+            .masking_disabled
+            .lock()
+            .expect("masking_disabled mutex poisoned");
+        let now = md.clock.now();
+        let expired: Vec<String> = md
+            .entries
+            .iter()
+            .filter(|(_, d)| now >= d.enforce)
+            .map(|(c, _)| c.clone())
+            .collect();
+        for conv in &expired {
+            if let Some(d) = md.entries.remove(conv) {
+                md.recently_reverted
+                    .push_back((conv.clone(), d.display, RevertReason::Expired));
+                while md.recently_reverted.len() > RECENTLY_REVERTED_CAP {
+                    md.recently_reverted.pop_front();
+                }
+            }
+        }
+        expired.len()
     }
 
     /// The ZDR posture a conversation is pinned to, if any. Clones out from under the
@@ -968,7 +1168,7 @@ mod project_binding_tests {
             zdr_targets: Arc::new(HashMap::new()),
             zdr_default: Arc::new(None),
             zdr_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            masking_disabled: Arc::new(std::sync::Mutex::new(HashSet::new())),
+            masking_disabled: Arc::new(std::sync::Mutex::new(MaskingDisabled::default())),
         }
     }
 
@@ -1008,5 +1208,178 @@ mod project_binding_tests {
         assert!(!st.authed_for_project(&hdrs(Some(KEY), None)));
         // wrong key + correct project -> false (bearer key still required)
         assert!(!st.authed_for_project(&hdrs(Some("wrong-key"), Some(correct.as_str()))));
+    }
+}
+
+#[cfg(test)]
+mod masking_ttl_tests {
+    //! F2 bounded per-conversation masking lifecycle — the load-bearing gate, run against an
+    //! INJECTED, advanceable [`Clock`] (a hardcoded `Instant::now()` could not be moved forward,
+    //! making the TTL un-testable). Covers the atomic's five kill-conditions at the state layer,
+    //! which is where enforcement (`is_masking_disabled`) and the sweep actually live.
+    use super::*;
+    use sordino_engine::{EngineConfig, MaskEngine};
+    use std::sync::atomic::AtomicBool;
+
+    /// Minimal `AppState` whose masking-off map is driven by the supplied (manual) clock, so the
+    /// test can advance time past a deadline.
+    fn mk_state_with_clock(clock: Clock) -> AppState {
+        AppState {
+            engine: Arc::new(MaskEngine::new(EngineConfig::default()).unwrap()),
+            http: reqwest::Client::new(),
+            upstream_base: Arc::new("http://127.0.0.1:1".into()),
+            admin_key: Arc::new("k".into()),
+            layers: Arc::new(ConfigLayers {
+                user: PathBuf::from("/nonexistent/sordino/config.toml"),
+                project: None,
+                local: None,
+            }),
+            project_root: Arc::new("/tmp/sordino-ttl-test".into()),
+            port: 0,
+            monitor: Monitor::new(),
+            ledger: None,
+            ml_control: Arc::new(std::sync::Mutex::new(())),
+            config_control: Arc::new(std::sync::Mutex::new(())),
+            secrets_ready: Arc::new(AtomicBool::new(true)),
+            secrets_status: Arc::new(std::sync::RwLock::new(SecretsStatus::default())),
+            zdr_targets: Arc::new(HashMap::new()),
+            zdr_default: Arc::new(None),
+            zdr_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            masking_disabled: Arc::new(std::sync::Mutex::new(MaskingDisabled::new(clock))),
+        }
+    }
+
+    /// Kill-conditions (1) + (5): an absent-ttl off is BOUNDED (server-side 30m default, not
+    /// `None`), and once the injected clock passes that deadline the next check is MASKED and the
+    /// entry is evicted (recorded on the revert ring).
+    #[test]
+    fn absent_ttl_off_is_bounded_and_auto_reverts() {
+        let base = Instant::now();
+        let clock = Clock::manual(base);
+        let st = mk_state_with_clock(clock.clone());
+
+        // `mask off` with NO ttl → the SERVER-SIDE default window, so it is bounded (not None).
+        assert!(st.set_masking_disabled("A", None));
+        assert!(st.is_masking_disabled("A"));
+        {
+            let md = st.masking_disabled.lock().unwrap();
+            let d = md.entries.get("A").expect("entry present");
+            assert_eq!(
+                d.enforce,
+                base + DEFAULT_MASKING_OFF_TTL,
+                "absent ttl ⇒ the 30m default deadline, never an unbounded off"
+            );
+        }
+
+        // Just before the deadline → still off.
+        clock.advance(DEFAULT_MASKING_OFF_TTL - Duration::from_secs(1));
+        assert!(st.is_masking_disabled("A"));
+
+        // Past the deadline → the next request is MASKED and the entry is evicted.
+        clock.advance(Duration::from_secs(2));
+        assert!(!st.is_masking_disabled("A"));
+        let md = st.masking_disabled.lock().unwrap();
+        assert!(md.entries.is_empty(), "expired entry evicted");
+        assert_eq!(
+            md.recently_reverted
+                .back()
+                .map(|(c, _, r)| (c.as_str(), *r)),
+            Some(("A", RevertReason::Expired)),
+            "the auto-revert is recorded on the ring"
+        );
+    }
+
+    /// Kill-condition (2): enforcement is on the MONOTONIC `Instant`, never the display
+    /// `SystemTime`. An entry whose display wall-clock is far in the past stays off until its
+    /// monotonic deadline — a backward wall clock can neither revert it early nor extend it.
+    #[test]
+    fn enforcement_uses_monotonic_instant_not_wall_clock() {
+        let base = Instant::now();
+        let clock = Clock::manual(base);
+        let st = mk_state_with_clock(clock.clone());
+
+        {
+            let mut md = st.masking_disabled.lock().unwrap();
+            md.entries.insert(
+                "A".into(),
+                Deadline {
+                    enforce: base + Duration::from_secs(600),
+                    // Wall-clock deadline already an hour in the PAST — must not drive enforcement.
+                    display: SystemTime::now() - Duration::from_secs(3600),
+                    reason: "test".into(),
+                },
+            );
+        }
+        // Display is in the past, but the monotonic deadline has not passed → still OFF.
+        assert!(st.is_masking_disabled("A"));
+        // Only advancing the MONOTONIC clock past `enforce` reverts it.
+        clock.advance(Duration::from_secs(601));
+        assert!(!st.is_masking_disabled("A"));
+    }
+
+    /// Kill-condition (3): `mask on` clears the per-conversation off UNCONDITIONALLY (the server
+    /// clear is a scope-free map removal), and reports a no-op honestly when nothing was off.
+    #[test]
+    fn clear_is_unconditional() {
+        let st = mk_state_with_clock(Clock::manual(Instant::now()));
+        assert!(st.set_masking_disabled("A", None));
+        assert!(st.is_masking_disabled("A"));
+        assert!(st.clear_masking_disabled("A"), "was disabled");
+        assert!(!st.is_masking_disabled("A"));
+        assert!(!st.clear_masking_disabled("A"), "second clear is a no-op");
+    }
+
+    /// Kill-condition (4): the SessionStart sweep is EXPIRED-ONLY — it evicts a lapsed window but
+    /// never a still-live SIBLING window's deliberate off, so restarting one window can't strand
+    /// another's off.
+    #[test]
+    fn sweep_evicts_only_expired_not_live_siblings() {
+        let base = Instant::now();
+        let clock = Clock::manual(base);
+        let st = mk_state_with_clock(clock.clone());
+
+        st.set_masking_disabled("A", Some(Duration::from_secs(60)));
+        st.set_masking_disabled("B", Some(Duration::from_secs(36_000)));
+        // Advance past A's deadline but well within B's.
+        clock.advance(Duration::from_secs(120));
+
+        let swept = st.sweep_expired_masking_disabled();
+        assert_eq!(swept, 1, "only the expired sibling is swept");
+        assert!(!st.is_masking_disabled("A"));
+        assert!(
+            st.is_masking_disabled("B"),
+            "a live sibling's off SURVIVES another window's SessionStart sweep"
+        );
+    }
+
+    /// The snapshot array (feeds the F0 predicate) is the sorted set of off conversation keys.
+    #[test]
+    fn active_lists_sorted_keys() {
+        let st = mk_state_with_clock(Clock::manual(Instant::now()));
+        st.set_masking_disabled("beta", None);
+        st.set_masking_disabled("alpha", None);
+        assert_eq!(
+            st.masking_disabled_active(),
+            vec!["alpha".to_string(), "beta".to_string()]
+        );
+    }
+
+    /// Re-disabling an already-off conversation re-arms the deadline and reports `false` (not a
+    /// NEW disable), preserving the old set-insert bool contract `admin.rs` consumes.
+    #[test]
+    fn redisable_rearms_and_reports_not_new() {
+        let base = Instant::now();
+        let clock = Clock::manual(base);
+        let st = mk_state_with_clock(clock.clone());
+        assert!(st.set_masking_disabled("A", Some(Duration::from_secs(60))));
+        clock.advance(Duration::from_secs(30));
+        // Re-arm with a fresh window → reports `false` (already off) but the deadline moves out.
+        assert!(!st.set_masking_disabled("A", Some(Duration::from_secs(600))));
+        let md = st.masking_disabled.lock().unwrap();
+        assert_eq!(
+            md.entries.get("A").unwrap().enforce,
+            base + Duration::from_secs(30) + Duration::from_secs(600),
+            "re-arm resets the deadline off the current clock"
+        );
     }
 }

@@ -14,6 +14,7 @@
 //! only; concurrent sessions in other projects are untouched.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State};
@@ -622,10 +623,19 @@ fn deny_reason_label(reason: &sordino_engine::DenyReason) -> &'static str {
 }
 
 /// `POST /sordino/diag/mask` (key-gated): a masking canary for `/sordino:verify` Leg 1. Masks a
-/// caller-supplied `{"text": ...}` through THIS project's live engine + merged config and
-/// reports whether anything changed — proving the engine actually masks, a verdict distinct
-/// from "this session is routed". Never forwards upstream. Key-gated so the model can't use it
-/// as a masking oracle.
+/// caller-supplied `{"text": ..., "conversation": ...?}` through THIS project's live engine +
+/// merged config and reports whether anything changed — proving the engine actually masks, a
+/// verdict distinct from "this session is routed". Never forwards upstream. Key-gated so the
+/// model can't use it as a masking oracle.
+///
+/// The optional `conversation` makes the canary conversation-AWARE, mirroring the wire walk's
+/// masker pick in [`crate::routes`] (`mask_body`): a conversation whose masking is turned OFF
+/// routes the canary through the floor-only [`MaskEngine::mask_when_disabled`] path (registered
+/// secrets still masked, PII passes), so its canary returns UNMASKED and `/sordino:verify`
+/// reports FAIL. Every other case — no `conversation` supplied, or one that is masking-ON —
+/// takes the normal [`MaskEngine::mask`] path, so a healthy routed session's canary is tokenized
+/// and verify PASSes. Selecting on `conversation` PRESENCE alone (rather than disabled-STATE)
+/// would wrongly floor-only every healthy session and fail every masking-ON verify.
 pub async fn diag_mask(State(st): State<AppState>, hdrs: HeaderMap, body: Bytes) -> Response {
     if !st.authed_for_project(&hdrs) {
         return forbidden();
@@ -633,12 +643,24 @@ pub async fn diag_mask(State(st): State<AppState>, hdrs: HeaderMap, body: Bytes)
     #[derive(Deserialize)]
     struct Req {
         text: String,
+        #[serde(default)]
+        conversation: Option<String>,
     }
     let req: Req = match serde_json::from_slice(&body) {
         Ok(r) => r,
         Err(e) => return text(StatusCode::BAD_REQUEST, &format!("invalid diag/mask body: {e}")),
     };
-    match st.engine.mask(&req.text, sordino_engine::Surface::UserMessage) {
+    let outcome = match req.conversation.as_deref() {
+        // This conversation's masking is OFF → mirror the wire walk's disabled path.
+        Some(conv) if st.is_masking_disabled(conv) => st
+            .engine
+            .mask_when_disabled(&req.text, sordino_engine::Surface::UserMessage),
+        // No conversation, or a masking-ON conversation → the normal mask path.
+        _ => st
+            .engine
+            .mask(&req.text, sordino_engine::Surface::UserMessage),
+    };
+    match outcome {
         Ok(m) => {
             let changed = m.masked_text != req.text;
             json_ok(&json!({ "masked": m.masked_text, "changed": changed }))
@@ -849,24 +871,66 @@ pub async fn masking_disable(
     State(st): State<AppState>,
     hdrs: HeaderMap,
     Path(conversation): Path<String>,
+    body: Bytes,
 ) -> Response {
     if !st.authed_for_project(&hdrs) {
         return forbidden();
     }
-    let newly = st.set_masking_disabled(&conversation);
+    #[derive(Deserialize, Default)]
+    struct Req {
+        /// Bounded off-window in seconds. Absent (incl. the legacy no-body `disable` alias) ⇒
+        /// the SERVER-SIDE default, so an off is NEVER unbounded.
+        #[serde(default)]
+        ttl_secs: Option<u64>,
+    }
+    let req: Req = if body.is_empty() {
+        Req::default()
+    } else {
+        match serde_json::from_slice(&body) {
+            Ok(r) => r,
+            Err(e) => {
+                return text(StatusCode::BAD_REQUEST, &format!("invalid masking body: {e}"));
+            }
+        }
+    };
+    // Resolve the TTL SERVER-SIDE (default when absent) so the message can state the real
+    // deadline AND the stored deadline is always bounded, regardless of what the client sent.
+    let ttl = req
+        .ttl_secs
+        .map(Duration::from_secs)
+        .unwrap_or(crate::state::DEFAULT_MASKING_OFF_TTL)
+        // Clamp to the same 24h ceiling `set_masking_disabled` enforces, so the deadline this
+        // message quotes MATCHES the deadline actually stored (a `--for 9999h` reports ~24h, not
+        // a wild figure).
+        .min(crate::state::MAX_MASKING_OFF_TTL);
+    let newly = st.set_masking_disabled(&conversation, Some(ttl));
+    let mins = ttl.as_secs().div_ceil(60);
     let mut snap = masking_status(&st, &conversation);
     if let Some(obj) = snap.as_object_mut() {
         obj.insert("changed".into(), json!(newly));
+        obj.insert("ttl_secs".into(), json!(ttl.as_secs()));
         obj.insert(
             "warning".into(),
-            json!(
+            json!(format!(
                 "Masking is OFF for this conversation — its PII now egresses UNMASKED (registered \
-                 secrets are still masked). Session-scoped and NOT persisted: it lifts on the next \
-                 Claude Code restart, or turn it back on with `/sordino:privacy on`."
-            ),
+                 secrets stay masked while traffic transits the proxy). This is a BOUNDED window: \
+                 masking AUTO-REVERTS to ON in ~{mins} minute(s) (restarting Claude Code does NOT \
+                 change that) — or turn it back on now with `/sordino:mask on`."
+            )),
         );
     }
     json_ok(&snap)
+}
+
+/// `POST /sordino/masking/sweep` (x-sordino-key) — expired-only GC of the per-conversation off
+/// map. Called at SessionStart. Evicts ONLY entries whose bounded TTL has elapsed; a still-live
+/// SIBLING window's deliberate off is untouched (no strand-siblings). Returns the swept count.
+pub async fn masking_sweep(State(st): State<AppState>, hdrs: HeaderMap) -> Response {
+    if !st.authed_for_project(&hdrs) {
+        return forbidden();
+    }
+    let swept = st.sweep_expired_masking_disabled();
+    json_ok(&json!({ "swept": swept }))
 }
 
 /// `DELETE /sordino/session/{conversation}/masking` (x-sordino-key) — turn masking back
@@ -1098,5 +1162,144 @@ mod tests {
             .entity_operators
             .insert("DOMAIN".into(), Operator::Redact);
         assert!(new_unknown_entity_keys(&current, &merged).is_empty());
+    }
+}
+
+/// F1c — the conversation-aware `diag/mask` canary that `/sordino:verify` Leg 1 drives.
+/// Proves the mask-path SELECTION: a masking-ON conversation (and the no-conversation case)
+/// takes the normal `mask` path so the PII canary is tokenized (verify PASSes), while a
+/// masking-OFF conversation takes the floor-only `mask_when_disabled` path so the canary
+/// passes UNMASKED (verify FAILs). Gating on conversation PRESENCE alone would floor-only every
+/// healthy session and fail every masking-ON verify — the regress-everything bug this pins.
+#[cfg(test)]
+mod diag_mask_tests {
+    use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+
+    use axum::body::to_bytes;
+    use sordino_engine::MaskEngine;
+
+    use crate::config::ConfigLayers;
+    use crate::monitor::Monitor;
+
+    const CANARY: &str = "verify.canary@example.com";
+
+    /// Minimal `AppState` with a default (masking-ON) engine; only the fields diag_mask
+    /// touches (engine, admin_key, project_root, masking_disabled) carry real values.
+    fn mk_state() -> AppState {
+        AppState {
+            engine: Arc::new(MaskEngine::new(EngineConfig::default()).unwrap()),
+            http: reqwest::Client::new(),
+            upstream_base: Arc::new("http://127.0.0.1:0".into()),
+            admin_key: Arc::new("unit-admin-key".into()),
+            layers: Arc::new(ConfigLayers {
+                user: std::path::PathBuf::from("/nonexistent/sordino/config.toml"),
+                project: None,
+                local: None,
+            }),
+            project_root: Arc::new("/tmp/sordino-diag-mask-test".into()),
+            port: 0,
+            monitor: Monitor::new(),
+            ledger: None,
+            ml_control: Arc::new(std::sync::Mutex::new(())),
+            config_control: Arc::new(std::sync::Mutex::new(())),
+            secrets_ready: Arc::new(AtomicBool::new(true)),
+            secrets_status: Arc::new(std::sync::RwLock::new(
+                crate::secrets::SecretsStatus::default(),
+            )),
+            zdr_targets: Arc::new(HashMap::new()),
+            zdr_default: Arc::new(None),
+            zdr_sessions: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            masking_disabled: Arc::new(std::sync::Mutex::new(crate::state::MaskingDisabled::default())),
+        }
+    }
+
+    /// Authed headers for `st` (correct admin key + this project's binding hash).
+    fn authed_hdrs(st: &AppState) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        h.insert("x-sordino-key", "unit-admin-key".parse().unwrap());
+        h.insert("x-sordino-project", st.project_key().parse().unwrap());
+        h
+    }
+
+    /// Drive `diag_mask` with the given body and return the parsed JSON `{masked, changed}`.
+    async fn run(st: AppState, body: serde_json::Value) -> serde_json::Value {
+        let hdrs = authed_hdrs(&st);
+        let resp = diag_mask(
+            State(st),
+            hdrs,
+            Bytes::from(serde_json::to_vec(&body).unwrap()),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK, "diag_mask should 200 for authed request");
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    // Gate (a): the happy path verify's original gate omitted — routed + masking ON. No
+    // conversation supplied AND a masking-ON conversation must BOTH tokenize the PII canary,
+    // so verify PASSes. This is the row that would catch a floor-only-everything regression.
+    #[tokio::test]
+    async fn masking_on_tokenizes_canary_with_and_without_conversation() {
+        // No `conversation` field → normal mask path → canary tokenized.
+        let out = run(mk_state(), json!({ "text": format!("contact {CANARY} please") })).await;
+        assert_eq!(out["changed"], json!(true), "no-conv: canary must be masked");
+        let masked = out["masked"].as_str().unwrap();
+        assert!(!masked.contains(CANARY), "no-conv: raw canary must not egress: {masked}");
+        assert!(masked.contains("[EMAIL_ADDRESS_"), "no-conv: canary must be tokenized: {masked}");
+
+        // A conversation that is NOT disabled → still the normal mask path (selection keys on
+        // disabled-STATE, not presence) → canary tokenized. THIS is the anti-regression pin.
+        let out = run(
+            mk_state(),
+            json!({ "text": format!("contact {CANARY} please"), "conversation": "conv-healthy" }),
+        )
+        .await;
+        assert_eq!(out["changed"], json!(true), "masking-ON conv: canary must be masked");
+        let masked = out["masked"].as_str().unwrap();
+        assert!(
+            !masked.contains(CANARY) && masked.contains("[EMAIL_ADDRESS_"),
+            "masking-ON conv must tokenize the canary (verify PASS), got: {masked}"
+        );
+    }
+
+    // Gate (b): a DISABLED conversation routes the canary through the floor-only
+    // `mask_when_disabled` path → PII passes UNMASKED → verify FAILs. Selecting the disabled
+    // path here is exactly what makes verify catch a per-conversation disable.
+    #[tokio::test]
+    async fn disabled_conversation_passes_canary_unmasked() {
+        let st = mk_state();
+        assert!(st.set_masking_disabled("conv-off", None), "first disable is new");
+        let out = run(
+            st,
+            json!({ "text": format!("contact {CANARY} please"), "conversation": "conv-off" }),
+        )
+        .await;
+        assert_eq!(out["changed"], json!(false), "disabled conv: nothing should change");
+        let masked = out["masked"].as_str().unwrap();
+        assert!(
+            masked.contains(CANARY) && !masked.contains("[EMAIL_ADDRESS_"),
+            "disabled conv must pass the PII canary through unmasked (verify FAIL), got: {masked}"
+        );
+    }
+
+    // A masking-OFF conversation must NOT bleed into a DIFFERENT conversation's canary: the
+    // other conversation is still masking-ON, so its canary is tokenized. Pins that the
+    // selection is per-conversation, not a global flip.
+    #[tokio::test]
+    async fn disable_is_scoped_to_its_conversation() {
+        let st = mk_state();
+        st.set_masking_disabled("conv-off", None);
+        let out = run(
+            st,
+            json!({ "text": format!("contact {CANARY} please"), "conversation": "conv-other" }),
+        )
+        .await;
+        let masked = out["masked"].as_str().unwrap();
+        assert!(
+            masked.contains("[EMAIL_ADDRESS_"),
+            "a sibling conversation stays masking-ON, canary tokenized: {masked}"
+        );
     }
 }

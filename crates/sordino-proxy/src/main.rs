@@ -202,8 +202,11 @@ async fn main() -> anyhow::Result<()> {
         // global revert) before we ever serve a request.
         zdr_sessions: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         // Per-conversation masking-off overrides. In-memory only (never persisted) — a
-        // recycle intentionally clears them, so masking fails back ON.
-        masking_disabled: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        // recycle intentionally clears them, so masking fails back ON. Each off is bounded by a
+        // self-reverting TTL (F2) via the system clock.
+        masking_disabled: Arc::new(std::sync::Mutex::new(
+            sordino_proxy::state::MaskingDisabled::default(),
+        )),
     };
 
     // Reload + re-validate the per-conversation ZDR selections that survived the last

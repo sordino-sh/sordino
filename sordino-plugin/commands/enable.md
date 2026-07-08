@@ -33,19 +33,32 @@ after the first is masked automatically.
 
 This command controls **routing** (whether traffic goes through the proxy at all, set once
 and then effectively permanent). The everyday control is **masking** — on/off, profile,
-categories — which is live and managed with `/sordino:privacy`; flipping masking off leaves
-routing in place (transparent pass-through) and can never strand the session. Confirm both
-with `/sordino:privacy` (or `/sordino:privacy status`). Before UNINSTALLING the plugin, the
+categories — which is live and flipped with `/sordino:mask on|off`; flipping masking off leaves
+routing in place and can never strand the session. Confirm both
+with `/sordino:status`. Before UNINSTALLING the plugin, the
 user should run `/sordino:uninstall --all` so no project is left pointing at a proxy that's gone.
 
 After reporting the result, give the user a **brief onboarding** (a few lines, not a wall of
 text) so they know what just happened and how to use it. Cover, in your own words:
+- **Two axes, kept separate.** **Routing** is whether traffic goes through the proxy at all
+  (set once by `/sordino:enable`, effectively permanent; removed by `/sordino:uninstall`).
+  **Masking** is whether that routed traffic gets tokenized — live, flipped with
+  `/sordino:mask on|off`. Routing-off is not the same as masking-off, and masking-off leaves
+  routing in place (transparent pass-through), so it can never strand the session.
+- **One honest "am I masked?" read.** `/sordino:status` is the single read-only answer — it
+  reports the project master switch **and** whether THIS conversation is off. Trust it over any
+  assumption that "the proxy is up, so I'm masked."
+- **`/sordino:mask off` is per-conversation and bounded.** Its default scope is **THIS
+  conversation only** (not the whole project), and it **auto-re-arms to ON in ~30 minutes**
+  unless extended; `/sordino:mask on` resumes immediately. `off --project` instead flips the
+  whole-project master switch (shared with any Codex sibling here) and stays off until re-enabled.
 - **It's project-scoped** — masking is enabled for THIS project only; other projects are
   untouched until they run `/sordino:enable` there.
-- **Watch it live** — `/sordino:monitor` opens a local web view of what's being masked for
-  this project.
-- **The everyday controls** — `/sordino:privacy` to change what's masked, `/sordino:disable`
-  to quickly turn masking off (this conversation, or `--project`), `/sordino:verify` to
-  confirm the live state, `/sordino:uninstall` to remove routing entirely.
+- **Watch it live** — `/sordino:monitor` opens a local web view of what's being masked.
+- **The one bypass door.** Setting `SORDINO_NO_INTAKE_GATE=1` removes the intake floor — the
+  block that stops an unrouted session from sending — so outbound text can egress **un-masked**.
+  Leave it unset unless you specifically intend that. Only two paths send text un-masked: an
+  announced `/sordino:mask off` (routing stays, PII passes un-tokenized) and this env var (which
+  removes the proxy floor entirely) — nothing else drops the floor.
 - **Restart once** to activate (per the activation note above).
 Keep it short and practical — an orientation, not documentation.

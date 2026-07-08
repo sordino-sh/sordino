@@ -8,7 +8,7 @@
                        response_preview, response_spans, response_status,
                        tokens[], tags[], rejection_reason, turn_index,
                        request_surfaces[], response_surfaces[], delta,
-                       human_turn_index, upstream? }
+                       human_turn_index, upstream?, masked_effective? }
      Surface         { label, role?, kind, runs[], block_hash }
      Run             { text, token? }      // token ABSENT => plain run
      TokenRef        { token, value, entity_kind, surface }
@@ -138,6 +138,34 @@ function destBadge(r) {
   }
   return `<span class="dest-badge normal" title="routed to the default Anthropic upstream (Normal — not ZDR)">${esc(u)}</span>`;
 }
+/* Per-request masking-posture badge (F1d). Reads the value-free RequestRecord.masked_effective
+   (the HONEST effective predicate captured at record time). STRICTLY `=== false` renders the
+   'MASKING OFF' badge: this request's plaintext egressed unmasked. `true` (normal, masked) and
+   `null`/absent (legacy record — UNKNOWN, no claim) render NOTHING. The `=== false` check is
+   deliberate so a missing/legacy field never false-alarms history. */
+function maskBadge(r) {
+  if (r.masked_effective !== false) return '';
+  return `<span class="mask-badge off new-flag pii-flag" title="masking was OFF for this request — its plaintext left this machine unmasked">MASKING OFF</span>`;
+}
+/* The `MASKING OFF` badge above carries `mask-badge off`, but this build's stylesheet
+   (monitor.css, inlined via include_str!) defines neither class, so the badge would otherwise
+   inherit the red `.new-flag.pii-flag` fallback and read identically to the `N PII` count.
+   Inject a distinct treatment from here — the one editable monitor surface — in amber (--amber,
+   the plaintext-EXPOSURE hue the plain-egress ledger sections already use), which is exactly the
+   posture this badge marks: raw plaintext left the machine. Selector `.new-flag.mask-badge.off`
+   is one class more specific than `.new-flag.pii-flag`, so it wins regardless of stylesheet
+   source order, scoped to the span that carries all three classes. */
+(function injectMaskBadgeStyle() {
+  const id = 'sordino-mask-badge-style';
+  if (typeof document === 'undefined' || document.getElementById(id)) return;
+  const el = document.createElement('style');
+  el.id = id;
+  el.textContent =
+    '.new-flag.mask-badge.off{color:#1a1205;background:var(--amber);' +
+    'box-shadow:0 0 12px -2px var(--amber);border:1px solid var(--amber);' +
+    'font-weight:700;letter-spacing:.04em;}';
+  (document.head || document.documentElement).appendChild(el);
+})();
 function clockClass(ms) {
   if (ms == null) return '';
   if (ms <= 30000) return 'crit';
@@ -542,6 +570,7 @@ function renderReview() {
   const head = `<div class="review-head">`
     + `<div><div class="rh-id">TURN ${turnLabel}`
     +   `<small title="${esc(r.id)}">${esc(r.method)} ${esc(r.endpoint)} &middot; ${esc(r.id)}${egressNote}</small></div>${rollHead}</div>`
+    + maskBadge(r)
     + `<div class="rh-spacer"></div>`
     + `<div class="rh-controls">`
     +   `<label class="reveal-toggle" title="show masked values inline in this browser — local only, never sent"><input type="checkbox" id="revealToggle" ${revealValues ? 'checked' : ''}> peek values</label>`
@@ -841,6 +870,7 @@ function renderTraffic(flashId) {
       +   turnPip
       +   `<span class="rec-endpoint">${esc(r.endpoint)}</span>`
       +   destBadge(r)
+      +   maskBadge(r)
       +   (pending ? `<span class="rec-clock ${clockClass(rem)}" data-countdown="${esc(r.id)}">&#9201; ${fmtClock(rem)}</span>` : '')
       +   (inflight ? `<span class="rec-clock live" data-elapsed="${esc(r.id)}">&#9201; ${fmtClock(ela)} streaming</span>` : '')
       +   (r.delta && r.delta.is_first ? `<span class="new-flag">FIRST</span>`
