@@ -200,13 +200,20 @@ async fn mask_body(
         // A2b: a registered secret's exact value in a never-masked schema/contract subtree
         // → 409 CONFLICT (mirrors the ZDR/broker refusal idiom), naming the secret but
         // NEVER its value. MUST precede the generic Engine → 500 arm below.
-        Err(MaskError::Engine(EngineError::RegisteredSecretInCarveOut(name))) => Err(routes::err(
-            StatusCode::CONFLICT,
-            &format!(
-                "registered secret {name:?} found in a never-masked schema/contract subtree — \
-                 refusing rather than forwarding it in plaintext"
-            ),
-        )),
+        Err(MaskError::Engine(EngineError::RegisteredSecretInCarveOut(name))) => {
+            // Ledger receipt: the carve-out knows the secret's NAME (a config label, never
+            // its value). The 409 below is the enforcement; this line never gates it.
+            if let Some(l) = &st.ledger {
+                l.record_refusal(&name, "carve_out");
+            }
+            Err(routes::err(
+                StatusCode::CONFLICT,
+                &format!(
+                    "registered secret {name:?} found in a never-masked schema/contract subtree — \
+                     refusing rather than forwarding it in plaintext"
+                ),
+            ))
+        }
         Err(MaskError::Engine(e)) => Err(routes::err(
             StatusCode::INTERNAL_SERVER_ERROR,
             &format!("masking error, request refused: {e}"),

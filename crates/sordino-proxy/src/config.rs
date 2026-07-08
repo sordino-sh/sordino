@@ -42,6 +42,10 @@ pub struct LoadedConfig {
     /// rejects it pre-parse); the env var named by `from_env` is read in
     /// [`crate::zdr::resolve_targets`].
     pub zdr: ZdrSection,
+    /// Opt-in append-only policy-event ledger switch (`[proxy] ledger`). Default false.
+    pub ledger: bool,
+    /// Explicit ledger path (`[proxy] ledger_path`); `None` ⇒ the `<state_dir>` default.
+    pub ledger_path: Option<String>,
     pub layers: ConfigLayers,
 }
 
@@ -171,6 +175,15 @@ struct ProxySection {
     bind: String,
     #[serde(default = "default_upstream")]
     upstream_base_url: String,
+    /// Opt-in append-only JSONL policy-event ledger (`[proxy] ledger`). OFF by default:
+    /// on a privacy-first local tool, recording policy events must be a deliberate
+    /// operator choice, never a silent default.
+    #[serde(default)]
+    ledger: bool,
+    /// Explicit ledger path (`[proxy] ledger_path`). Unset ⇒ the default
+    /// `<state_dir>/ledger/<project_key>.jsonl` (resolved in `main.rs` when enabled).
+    #[serde(default)]
+    ledger_path: Option<String>,
 }
 
 impl Default for ProxySection {
@@ -179,6 +192,8 @@ impl Default for ProxySection {
             port: None,
             bind: default_bind(),
             upstream_base_url: default_upstream(),
+            ledger: false,
+            ledger_path: None,
         }
     }
 }
@@ -229,6 +244,8 @@ pub fn load(project: Option<&Path>) -> anyhow::Result<LoadedConfig> {
         secrets: file.secrets,
         broker_allows: file.broker.allow,
         zdr: file.zdr,
+        ledger: file.proxy.ledger,
+        ledger_path: file.proxy.ledger_path,
         layers,
     })
 }

@@ -17,7 +17,11 @@ use anyhow::Context;
 use clap::Parser;
 use sordino_engine::{EngineConfig, MaskEngine, MlConfig};
 use sordino_proxy::{
-    bind, config, ml, monitor::Monitor, routes, secrets as proxy_secrets, state::AppState, zdr,
+    bind, config, ml,
+    monitor::{Ledger, Monitor},
+    routes, secrets as proxy_secrets,
+    state::AppState,
+    zdr,
 };
 
 #[derive(Parser, Debug)]
@@ -144,6 +148,37 @@ async fn main() -> anyhow::Result<()> {
         .build()
         .context("building HTTP client")?;
 
+    // Opt-in policy-event ledger (`[proxy] ledger`). Built only when the operator enabled
+    // it; `None` on the default privacy-first path (zero cost). Default path when enabled
+    // but unset: `<state_dir>/ledger/<project_key>.jsonl`. An open failure is NON-fatal —
+    // warn loudly and serve WITHOUT the ledger, since event recording is best-effort
+    // telemetry, never an enforcement gate that should block startup.
+    let ledger = if cfg.ledger {
+        let project_key = sordino_state::project_key(&project_root);
+        let path = match &cfg.ledger_path {
+            Some(p) => PathBuf::from(p),
+            None => sordino_state::state_dir()
+                .context("resolving the sordino state dir for the policy-event ledger")?
+                .join("ledger")
+                .join(format!("{project_key}.jsonl")),
+        };
+        match Ledger::open(&path, project_key) {
+            Ok(l) => {
+                tracing::info!("sordino ledger: policy events -> {}", path.display());
+                Some(Arc::new(l))
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "sordino ledger: could not open {} ({e}); policy-event recording DISABLED",
+                    path.display()
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let state = AppState {
         engine: Arc::new(engine),
         http,
@@ -153,6 +188,7 @@ async fn main() -> anyhow::Result<()> {
         project_root: Arc::new(project_root.clone()),
         port,
         monitor: Monitor::new(),
+        ledger,
         ml_control: Arc::new(std::sync::Mutex::new(())),
         config_control: Arc::new(std::sync::Mutex::new(())),
         // Open immediately when nothing is `required` (zero overhead for no-secret

@@ -490,9 +490,19 @@ pub(crate) async fn relay_verbatim(st: &AppState, req: Request) -> Response {
     // bytes upstream — BEFORE any adapter.build/.send below. `path_q` is a superset of
     // every downstream relay path (session-stripped inner path or the bare path), so
     // this single scan gates BOTH build sites. Empty secret set short-circuits to false.
-    if st.engine.registered_secret_in_bytes(&body_bytes)
-        || st.engine.registered_secret_in_bytes(path_q.as_bytes())
-    {
+    let body_hit = st.engine.registered_secret_in_bytes(&body_bytes);
+    // Preserve the original `||` short-circuit: scan the path/query superset only when the
+    // body was clean, so a body hit still skips the path scan exactly as before.
+    let path_hit = !body_hit && st.engine.registered_secret_in_bytes(path_q.as_bytes());
+    if body_hit || path_hit {
+        // Ledger receipt (opt-in, class-only) BEFORE the refusal is returned. The 409 is
+        // the enforcement; this line never gates it.
+        if let Some(l) = &st.ledger {
+            l.record_refusal(
+                "registered_secret",
+                if body_hit { "body" } else { "path_query" },
+            );
+        }
         return err(
             StatusCode::CONFLICT,
             "a registered secret value appears in this verbatim relay body/path/query — \
@@ -597,6 +607,9 @@ async fn relay_built(
             continue;
         }
         if st.engine.registered_secret_in_header_value(value.as_bytes()) {
+            if let Some(l) = &st.ledger {
+                l.record_refusal("registered_secret", "header");
+            }
             return err(
                 StatusCode::CONFLICT,
                 "a registered secret value appears in an outbound request header — refusing \
@@ -718,13 +731,20 @@ async fn mask_body(
         // subtree (tool.input_schema, a contract-key subtree, or an `extra` flatten sink).
         // Refuse 409 CONFLICT (mirroring the ZDR/broker refusal idiom), naming the secret but
         // NEVER its value. MUST precede the generic Engine → 500 arm below (order matters).
-        Err(walk::MaskError::Engine(EngineError::RegisteredSecretInCarveOut(name))) => Err(err(
-            StatusCode::CONFLICT,
-            &format!(
-                "registered secret {name:?} found in a never-masked schema/contract subtree — \
-                 refusing rather than forwarding it in plaintext"
-            ),
-        )),
+        Err(walk::MaskError::Engine(EngineError::RegisteredSecretInCarveOut(name))) => {
+            // Ledger receipt: the carve-out DOES know the offending secret's NAME (a
+            // config label, never its value), so record it as the entity class.
+            if let Some(l) = &st.ledger {
+                l.record_refusal(&name, "carve_out");
+            }
+            Err(err(
+                StatusCode::CONFLICT,
+                &format!(
+                    "registered secret {name:?} found in a never-masked schema/contract subtree — \
+                     refusing rather than forwarding it in plaintext"
+                ),
+            ))
+        }
         // The engine refused to mask (detection error, or an encryption failure).
         // Either way we do NOT forward — refusing is the safe outcome.
         Err(walk::MaskError::Engine(e)) => Err(err(
@@ -758,6 +778,9 @@ pub(crate) async fn send_upstream(
             continue;
         }
         if st.engine.registered_secret_in_header_value(value.as_bytes()) {
+            if let Some(l) = &st.ledger {
+                l.record_refusal("registered_secret", "header");
+            }
             return Err(err(
                 StatusCode::CONFLICT,
                 "a registered secret value appears in an outbound request header — refusing \

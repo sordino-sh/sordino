@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use sordino_engine::MaskEngine;
 
 use crate::config::ConfigLayers;
-use crate::monitor::Monitor;
+use crate::monitor::{Ledger, Monitor};
 use crate::secrets::SecretsStatus;
 use crate::zdr::{ZdrSelection, ZdrTarget};
 
@@ -133,6 +133,12 @@ pub struct AppState {
     pub port: u16,
     /// In-memory local request monitor and optional approval gate.
     pub monitor: Monitor,
+    /// Opt-in append-only policy-event ledger. `None` on the default (privacy-first)
+    /// path — a registered-secret wire-refusal appends one class-only JSONL line only
+    /// when the operator sets `[proxy] ledger = true`. Best-effort: a ledger write error
+    /// never alters the 409 refusal (the refusal is the enforcement; the ledger is the
+    /// receipt). Its own `Mutex` lives inside [`Ledger`], never the monitor store's lock.
+    pub ledger: Option<Arc<Ledger>>,
     /// Serializes ML state transitions (`/sordino/ml/{enable,disable}`, and the ML
     /// reconcile in `put`/`reload`). Without it, two concurrent `model on`/`off`
     /// requests can interleave their config-write and runtime-toggle so a stale
@@ -954,6 +960,7 @@ mod project_binding_tests {
             project_root: Arc::new(ROOT.into()),
             port: 0,
             monitor: Monitor::new(),
+            ledger: None,
             ml_control: Arc::new(std::sync::Mutex::new(())),
             config_control: Arc::new(std::sync::Mutex::new(())),
             secrets_ready: Arc::new(AtomicBool::new(true)),

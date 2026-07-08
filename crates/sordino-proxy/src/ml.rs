@@ -103,6 +103,7 @@ mod tests {
             project_root: Arc::new("/tmp/sordino-test-project".into()),
             port: 0,
             monitor: Monitor::new(),
+            ledger: None,
             ml_control: Arc::new(std::sync::Mutex::new(())),
             config_control: Arc::new(std::sync::Mutex::new(())),
             secrets_ready: Arc::new(AtomicBool::new(true)),

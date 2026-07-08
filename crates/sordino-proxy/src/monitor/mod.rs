@@ -16,6 +16,7 @@
 mod capture;
 mod delta;
 mod http;
+mod ledger;
 mod model;
 mod persist;
 mod spans;
@@ -26,6 +27,7 @@ mod ui;
 // --- preserved public API surface ---
 
 pub use capture::CapKind;
+pub use ledger::{Ledger, LedgerEvent};
 pub use http::{
     approve, custom_mask, custom_masks_list, custom_masks_remove, events, maybe_approve,
     reject, remask_keyphrase, reveal_keyphrase, set_mode, snapshot, tags,
