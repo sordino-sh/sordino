@@ -1555,12 +1555,18 @@ impl MaskEngine {
     }
 
     /// Tool-egress unmask for a serde-DECODED string leaf (the non-streaming walk path). Identical
-    /// to [`Self::unmask_tool_input`] EXCEPT that `text` is treated as a decoded leaf, not raw JSON
-    /// source: a `"` in it is literal content, so a quote-wrapped token is EMBEDDED and stays
-    /// MASKED. A decoded leaf restores as a whole value IFF the ENTIRE leaf (modulo surrounding
-    /// ASCII whitespace) is exactly the token ([`WholeValueMode::Bare`]); [`WholeValueMode::JsonQuoted`]
-    /// is never returned. This preserves the A4b exfil-safety invariant (an embedded masked URL
-    /// must never restore into a command bound for a different host).
+    /// to [`Self::unmask_tool_input`] EXCEPT that `text` is a decoded leaf, not raw JSON source: a
+    /// `"` in it is literal content, NOT a JSON delimiter, so [`WholeValueMode::JsonQuoted`] is
+    /// never used here (a quote-wrapped token is not a whole JSON string value) — the
+    /// `WholeValueOnly` policy restores only via [`WholeValueMode::Bare`] (the ENTIRE leaf, modulo
+    /// surrounding ASCII whitespace, is exactly the token). WHICH tokens restore is decided per
+    /// entity by [`tool_input_restore_policy`], not by position: an `Embedded`-policy token
+    /// (Network class — URL/DOMAIN/IP) restores even when embedded (the auto-mode classifier +
+    /// broker are the exfil/secret guards, not this gate); a `Gated` token (secrets /
+    /// URL_CREDENTIAL / broker / Local) NEVER restores in a tool input; a `WholeValueOnly` token
+    /// restores only as a Bare whole value. A restored value is spliced plain (serde re-serializes
+    /// the surrounding Value, so JSON escaping is automatic); the DecodedLeaf-never-JsonQuoted rule
+    /// still guarantees a literal content `"` can't be mistaken for a JSON string terminator.
     pub fn unmask_tool_input_decoded_leaf(
         &self,
         text: &str,

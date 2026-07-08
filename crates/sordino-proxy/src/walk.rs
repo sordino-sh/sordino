@@ -648,11 +648,13 @@ pub(crate) fn warn_fabricated_handles(engine: &MaskEngine, manifest: &UnmaskMani
 /// The only callers are the OpenAI raw-JSON tool-arg strings (`function.arguments` /
 /// function-call `arguments`), which are a JSON-encoded string whose `"` are GENUINE JSON
 /// delimiters — i.e. RAW JSON SOURCE. So this routes through the raw-JSON-source entrypoint
-/// ([`MaskEngine::unmask_tool_input`]) where a whole quoted JSON value may restore
-/// ([`WholeValueMode::JsonQuoted`]); an embedded token is escaped (`\"`) in that source, so its
-/// left neighbour is `\` not `"` and it never mis-classifies as JsonQuoted. Decoded-leaf callers
-/// (Anthropic `ToolUse.input`, Responses `extra`/`Other`) go through
-/// [`unmask_value_tool_input`], which uses the DecodedLeaf entrypoint instead.
+/// ([`MaskEngine::unmask_tool_input`]). Which tokens restore is decided per entity by the engine's
+/// `tool_input_restore_policy` (a whole quoted value via [`WholeValueMode::JsonQuoted`]; a
+/// Network token even when embedded; a Gated secret/credential never) — a restored value is
+/// JSON-escaped so it can't corrupt the surrounding source. An embedded MASKED token is `\"`-
+/// escaped in that source, so its left neighbour is `\` not `"` and it never mis-classifies as
+/// JsonQuoted. Decoded-leaf callers (Anthropic `ToolUse.input`, Responses `extra`/`Other`) go
+/// through [`unmask_value_tool_input`], which uses the DecodedLeaf entrypoint instead.
 pub fn unmask_str_tool_input(engine: &MaskEngine, manifest: &UnmaskManifest, text: &mut String) {
     if let Ok(out) = engine.unmask_tool_input(text, manifest) {
         *text = out;

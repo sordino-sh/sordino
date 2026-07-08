@@ -272,8 +272,10 @@ impl SseUnmasker {
         // would leave the token verbatim and miss the restore. So when the buffer ends INSIDE an
         // open JSON string whose value-so-far is a lone whole-value token candidate, hold from
         // the opening `"` until the next delta brings the closing quote (or non-quote content
-        // proving it embedded). Bounded: one opening quote + at most one token. Non-candidates
-        // (embedded `curl [URL_x`) are left to `split_safe` and stay verbatim.
+        // proving it embedded). Bounded: one opening quote + at most one token. An embedded token
+        // (e.g. `curl [URL_x`) doesn't need this: `split_safe` holds its incomplete tail until it
+        // completes, then it restores or not per `tool_input_restore_policy` — a Network token
+        // restores even embedded; the hold-extension only adds the whole-`"[TOK]"` JsonQuoted case.
         if kind == HeldKind::InputJson
             // ODD unescaped-quote count ⇒ the tail is INSIDE an open JSON string.
             && unescaped_quote_count(&buf) % 2 == 1
@@ -288,8 +290,9 @@ impl SseUnmasker {
         // tail (never a resolvable token) or one held-open JSON value, so the reveal marker
         // only ever needs to apply on this path — the stop/drain flushes below stay plain.
         // Dispatch directly on kind: assistant prose is revealed (+marker); compaction resolves
-        // plain; tool input routes through the tool-egress gate so a detected-PII token stays a
-        // TOKEN (A4b) while a whole-value NON-SECRET handle restores (Issue 1, JSON-escaped).
+        // plain; tool input routes through the tool-egress gate so a Gated token (secret/PII per
+        // `tool_input_restore_policy`) stays a TOKEN (A4b) while a restorable NON-SECRET handle
+        // restores — a Network token even when embedded (Issue 1), JSON-escaped.
         let emitted = match kind {
             HeldKind::Text => engine.unmask_assistant(safe, manifest),
             HeldKind::Compaction => engine.unmask(safe, manifest),
