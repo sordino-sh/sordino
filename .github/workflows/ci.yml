@@ -47,9 +47,9 @@ jobs:
           set -euo pipefail
           test "$(jq -r .name codex-sordino-plugin/.codex-plugin/plugin.json)" = "sordino-openai"
           jq -e '.version | test("^[0-9]+\\.[0-9]+\\.[0-9]+$")' codex-sordino-plugin/.codex-plugin/plugin.json >/dev/null
-          jq -e '.hooks.SessionStart[0].hooks[0].command == "./scripts/session-start.sh"' codex-sordino-plugin/hooks/hooks.json >/dev/null
+          jq -e '.hooks.SessionStart[0].hooks[0].command == "${CLAUDE_PLUGIN_ROOT}/scripts/codex-session-start.sh"' codex-sordino-plugin/hooks/hooks.json >/dev/null
           bash -n codex-sordino-plugin/scripts/_resolve-bins.sh
-          bash -n codex-sordino-plugin/scripts/session-start.sh
+          bash -n codex-sordino-plugin/scripts/codex-session-start.sh
           test -f codex-sordino-plugin/sordino.toml
           test -f codex-sordino-plugin/skills/sordino-openai/SKILL.md
 
