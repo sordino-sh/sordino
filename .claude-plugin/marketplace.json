@@ -10,7 +10,7 @@
       "name": "sordino",
       "source": {
         "source": "github",
-        "repo": "FailSpy/sordino",
+        "repo": "sordino-sh/sordino",
         "ref": "plugin-dist"
       },
       "displayName": "Sordino",
@@ -20,7 +20,7 @@
         "name": "FailSpy",
         "email": "failspy@exonull.com"
       },
-      "homepage": "https://github.com/FailSpy/sordino",
+      "homepage": "https://github.com/sordino-sh/sordino",
       "license": "BUSL-1.1",
       "category": "security",
       "keywords": [

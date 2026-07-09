@@ -6,8 +6,8 @@
     "name": "failspy",
     "email": "failspy@exonull.com"
   },
-  "homepage": "https://github.com/FailSpy/sordino",
-  "repository": "https://github.com/FailSpy/sordino",
+  "homepage": "https://github.com/sordino-sh/sordino",
+  "repository": "https://github.com/sordino-sh/sordino",
   "license": "BUSL-1.1",
   "keywords": [
     "privacy",
@@ -27,7 +27,7 @@
       "Read",
       "Write"
     ],
-    "websiteURL": "https://github.com/FailSpy/sordino",
+    "websiteURL": "https://github.com/sordino-sh/sordino",
     "brandColor": "#2563EB",
     "defaultPrompt": [
       "Check whether this Codex project is routed through Sordino"
