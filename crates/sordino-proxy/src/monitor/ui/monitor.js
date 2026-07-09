@@ -1,5 +1,5 @@
 /* ============================================================
-   ZLAUDER INTERCEPT STATION  -  frontend controller
+   SORDINO INTERCEPT STATION  -  frontend controller
    Binds to the exact serde contract emitted by monitor/model.rs:
      MonitorSnapshot { mode, pending_count, max_pending_approvals,
                        approval_timeout_secs, records[], conversations[] }
@@ -21,18 +21,18 @@
    instead of only on the next full snapshot.
    ============================================================ */
 
-/* ---------- key handling (x-zlauder-key + EventSource ?key=) ---------- */
+/* ---------- key handling (x-sordino-key + EventSource ?key=) ---------- */
 let key = new URLSearchParams(location.search).get('key')
-       || localStorage.getItem('zlauderKey') || '';
+       || localStorage.getItem('sordinoKey') || '';
 // This proxy instance's project identity, required (alongside the key) on every
 // control-plane call. EventSource cannot set headers, so it also rides the query.
 let project = new URLSearchParams(location.search).get('project')
        || localStorage.getItem('sordinoProject') || '';
 if (project) { localStorage.setItem('sordinoProject', project); }
-if (key) { localStorage.setItem('zlauderKey', key); history.replaceState(null, '', location.pathname); }
-if (!key) { key = (prompt('x-zlauder-key') || '').trim(); if (key) localStorage.setItem('zlauderKey', key); }
+if (key) { localStorage.setItem('sordinoKey', key); history.replaceState(null, '', location.pathname); }
+if (!key) { key = (prompt('x-sordino-key') || '').trim(); if (key) localStorage.setItem('sordinoKey', key); }
 
-const hdr = { 'x-zlauder-key': key, 'x-sordino-project': project, 'content-type': 'application/json' };
+const hdr = { 'x-sordino-key': key, 'x-sordino-project': project, 'content-type': 'application/json' };
 function api(path, opts = {}) { opts.headers = { ...(opts.headers || {}), ...hdr }; return fetch(path, opts); }
 
 /* ---------- state ---------- */
@@ -51,8 +51,8 @@ let approvalTimeoutMs = 300000;   // overwritten by snapshot.approval_timeout_se
 /* ---------- ledger view state ---------- */
 let view = 'ledger';                 // 'ledger' (default, always) | 'inspector'
 let sessionTokens = [];              // snapshot.session_tokens (durable, session-scoped)
-let ledgerAllow = { exact: [], exact_ci: [] };  // GET /zlauder/config .config.allow_list
-let ledgerCustomRules = [];          // GET /zlauder/monitor/custom-mask
+let ledgerAllow = { exact: [], exact_ci: [] };  // GET /sordino/config .config.allow_list
+let ledgerCustomRules = [];          // GET /sordino/monitor/custom-mask
 const peeked = new Set();            // row keys currently peeked (local plaintext, anti shoulder-surf)
 let peekAll = false;                  // PEEK ALL master: force every peekable row open (local only, default off)
 let denoise = localStorage.getItem('zlDenoise') === '1';  // DE-NOISE: group ledger by lane + fold scaffolding (default OFF — the complete view is the baseline)
@@ -1179,9 +1179,9 @@ function renderLedger() {
 /* ---- ledger sources: allow-list + custom rules (fetched once + after edits) ---- */
 function applyLedgerConfig(wire) { if (wire && wire.allow_list) ledgerAllow = wire.allow_list; }
 function refreshLedgerSources() {
-  const a = api('/zlauder/config').then(r => r.ok ? r.json() : null)
+  const a = api('/sordino/config').then(r => r.ok ? r.json() : null)
     .then(s => { if (s && s.config && s.config.allow_list) ledgerAllow = s.config.allow_list; }).catch(() => {});
-  const b = api('/zlauder/monitor/custom-mask').then(r => r.ok ? r.json() : null)
+  const b = api('/sordino/monitor/custom-mask').then(r => r.ok ? r.json() : null)
     .then(d => { if (d) ledgerCustomRules = d.custom_replacements || []; }).catch(() => {});
   return Promise.all([a, b]).then(renderLedger);
 }
@@ -1207,14 +1207,14 @@ function revealToModel(value, pattern, entity) {
   const ok = window.confirm(
     head
     + `This STOPS MASKING this exact value: it is sent to the model UNMASKED from now on AND `
-    + `detection is turned OFF for it (it will not be re-flagged), persisted to zlauder.local.toml. `
+    + `detection is turned OFF for it (it will not be re-flagged), persisted to sordino.local.toml. `
     + `It does not touch values masked by a config regex pattern, nor masking-exempt control/schema `
     + `keys. You can RE-MASK any time from PASSING PLAINTEXT.`
   );
   if (!ok) return;
   const body = { value };
   if (pattern) { body.pattern = pattern; body.entity_type = entity || 'CUSTOM_KEYWORD'; }
-  api('/zlauder/monitor/reveal', { method: 'POST', body: JSON.stringify(body) })
+  api('/sordino/monitor/reveal', { method: 'POST', body: JSON.stringify(body) })
     .then(async r => {
       if (!r.ok) { toast('reveal failed', 'bad'); return; }
       let res = {}; try { res = await r.json(); } catch {}
@@ -1228,7 +1228,7 @@ function revealToModel(value, pattern, entity) {
 }
 function remaskValue(value) {
   if (!value) return;
-  api('/zlauder/monitor/reveal', { method: 'DELETE', body: JSON.stringify({ value }) })
+  api('/sordino/monitor/reveal', { method: 'DELETE', body: JSON.stringify({ value }) })
     .then(async r => {
       if (!r.ok) { toast('re-mask failed', 'bad'); return; }
       let res = {}; try { res = await r.json(); } catch {}
@@ -1239,7 +1239,7 @@ function remaskValue(value) {
     .catch(() => toast('re-mask failed', 'bad'));
 }
 function removeCustomRule(pattern, entity_type) {
-  api('/zlauder/monitor/custom-mask', { method: 'DELETE', body: JSON.stringify({ pattern, entity_type }) })
+  api('/sordino/monitor/custom-mask', { method: 'DELETE', body: JSON.stringify({ pattern, entity_type }) })
     .then(r => r.ok ? r.json() : Promise.reject(new Error('remove failed')))
     .then(res => {
       toast(`removed mask <b>${esc(pattern)}</b>${res.removed_persisted ? ' (live + persisted)' : ' (live only)'}`, 'good');
@@ -1253,7 +1253,7 @@ function ledgerAdd() {
   if (!pat) return;
   const entity = ($('ledgerAddEntity').value || '').trim() || 'CUSTOM_KEYWORD';
   const caseSensitive = $('ledgerAddCase').checked;
-  api('/zlauder/monitor/custom-mask', { method: 'POST', body: JSON.stringify({ pattern: pat, entity_type: entity, case_sensitive: caseSensitive }) })
+  api('/sordino/monitor/custom-mask', { method: 'POST', body: JSON.stringify({ pattern: pat, entity_type: entity, case_sensitive: caseSensitive }) })
     .then(async r => {
       if (!r.ok) { toast('keyphrase rejected', 'bad'); return; }
       let res = {}; try { res = await r.json(); } catch {}
@@ -1330,13 +1330,13 @@ function autoSelect() {
    ACTIONS
    ============================================================ */
 function approve(id) {
-  api(`/zlauder/monitor/requests/${id}/approve`, { method: 'POST' })
+  api(`/sordino/monitor/requests/${id}/approve`, { method: 'POST' })
     .then(r => r.ok ? toast('APPROVED &mdash; released upstream', 'good') : toast('approve failed', 'bad'))
     .then(load);
 }
 function reject(id, reasonOverride) {
   const reason = (reasonOverride || $('rejectReason')?.value || '').trim() || 'rejected in monitor';
-  api(`/zlauder/monitor/requests/${id}/reject`, { method: 'POST', body: JSON.stringify({ reason }) })
+  api(`/sordino/monitor/requests/${id}/reject`, { method: 'POST', body: JSON.stringify({ reason }) })
     .then(r => r.ok ? toast('REJECTED &mdash; blocked', 'bad') : toast('reject failed', 'bad'))
     .then(load);
 }
@@ -1345,12 +1345,12 @@ function tagReq(id) {
   if (!v) return;
   const existing = records.find(x => x.id === id)?.tags || [];
   if (existing.includes(v)) { toast('tag already present', 'bad'); return; }
-  api(`/zlauder/monitor/requests/${id}/tags`, { method: 'POST', body: JSON.stringify({ tags: [...existing, v] }) })
+  api(`/sordino/monitor/requests/${id}/tags`, { method: 'POST', body: JSON.stringify({ tags: [...existing, v] }) })
     .then(() => toast('tag added', 'good')).then(load);
 }
 function untag(id, tag) {
   const existing = records.find(x => x.id === id)?.tags || [];
-  api(`/zlauder/monitor/requests/${id}/tags`,
+  api(`/sordino/monitor/requests/${id}/tags`,
     { method: 'POST', body: JSON.stringify({ tags: existing.filter(t => t !== tag) }) })
     .then(() => toast('tag removed', 'good')).then(load);
 }
@@ -1415,7 +1415,7 @@ function saveMode() {
   // secrets still mask (engine A9 carve-out). `apiWrite` tags the write so this tab's own
   // resulting `policy` SSE echo is recognised and doesn't raise a spurious "policy changed".
   if (val === 'disabled') {
-    apiWrite('/zlauder/disable', { method: 'POST' })
+    apiWrite('/sordino/disable', { method: 'POST' })
       .then(r => r.ok ? toast('filter DISABLED &middot; masking OFF — data policy unchanged', 'bad')
                       : toast('disable failed', 'bad'))
       .then(load);
@@ -1428,10 +1428,10 @@ function saveMode() {
   const cap = parseInt($('queueCap').value, 10);
   if (Number.isFinite(cap) && cap >= 0) body.max_pending_approvals = cap;
   const ensureOn = (committedPolicy && committedPolicy.enabled === false)
-    ? apiWrite('/zlauder/enable', { method: 'POST' })
+    ? apiWrite('/sordino/enable', { method: 'POST' })
     : Promise.resolve({ ok: true });
   ensureOn
-    .then(() => api('/zlauder/monitor/mode', { method: 'POST', body: JSON.stringify(body) }))
+    .then(() => api('/sordino/monitor/mode', { method: 'POST', body: JSON.stringify(body) }))
     .then(r => r.ok ? toast('posture set: ' + body.mode + (body.max_pending_approvals != null ? ` &middot; cap ${body.max_pending_approvals}` : ''), 'good')
                     : toast('mode change failed', 'bad'))
     .then(load);
@@ -1502,7 +1502,7 @@ $('maskGo').addEventListener('click', () => {
   const sel = records.find(x => x.id === selectedId);
   const wasPending = sel && sel.decision === 'pending';
   const pat = pendingMask;
-  api('/zlauder/monitor/custom-mask', {
+  api('/sordino/monitor/custom-mask', {
     method: 'POST',
     body: JSON.stringify({ pattern: pat, entity_type: entity, case_sensitive: caseSensitive }),
   }).then(async r => {
@@ -1548,7 +1548,7 @@ function applySnapshot(s) {
   renderHeader(s);
 }
 function load() {
-  return api('/zlauder/monitor/snapshot')
+  return api('/sordino/monitor/snapshot')
     .then(r => r.json())
     .then(s => { applySnapshot(s); autoSelect(); render(); })
     .catch(() => toast('snapshot fetch failed', 'bad'));
@@ -1565,7 +1565,7 @@ load().then(refreshLedgerSources);
 // controls AND raises its confirming toast, instead of being silently absorbed as a seed.
 loadPolicy();
 
-const es = new EventSource(`/zlauder/monitor/events?key=${encodeURIComponent(key)}&project=${encodeURIComponent(project)}`);
+const es = new EventSource(`/sordino/monitor/events?key=${encodeURIComponent(key)}&project=${encodeURIComponent(project)}`);
 es.onopen = () => setLink(true);
 es.onerror = () => setLink(false);
 es.onmessage = e => {
@@ -1643,7 +1643,7 @@ es.onmessage = e => {
       }
     }
   } else if (ev.event === 'policy') {
-    // The live masking policy moved (this panel, the /zlauder:privacy CLI, or another
+    // The live masking policy moved (this panel, the /sordino:privacy CLI, or another
     // window). Re-sync the controls so the panel never drifts from the real policy.
     onPolicyEvent(ev.data);
   }
@@ -1678,12 +1678,12 @@ setInterval(() => {
 
 /* ============================================================
    POLICY DRAWER  —  the human masking-policy surface.
-   Reads GET /zlauder/config (the live snapshot) and drives:
-     - profile      via POST /zlauder/profile/{name}?scope=…
-     - threshold    via merge PUT /zlauder/config {score_threshold}
-     - categories   via merge PUT /zlauder/config {enabled_categories}
-     - ML toggle    via POST /zlauder/ml/{enable,disable}
-     - custom masks via GET/DELETE /zlauder/monitor/custom-mask
+   Reads GET /sordino/config (the live snapshot) and drives:
+     - profile      via POST /sordino/profile/{name}?scope=…
+     - threshold    via merge PUT /sordino/config {score_threshold}
+     - categories   via merge PUT /sordino/config {enabled_categories}
+     - ML toggle    via POST /sordino/ml/{enable,disable}
+     - custom masks via GET/DELETE /sordino/monitor/custom-mask
    Reuses the authed api() wrapper. This panel owns POLICY (what is
    masked); the header POSTURE owns the review HOLD (separate surface).
    ============================================================ */
@@ -1729,7 +1729,7 @@ $('policyScrim').addEventListener('click', closePolicy);
 
 /* The drawer has NO Set/Apply buttons: changing any control applies IMMEDIATELY, and
    the panel always mirrors the LIVE policy (a server `policy` SSE frame re-syncs it the
-   instant /zlauder:privacy or another window moves the policy — see onPolicyEvent).
+   instant /sordino:privacy or another window moves the policy — see onPolicyEvent).
    `committedPolicy` is the last server-confirmed snapshot: the source of truth a focused
    field reverts to on Esc, and the baseline that separates our own writes from external
    ones (so an external change toasts but our own echo does not double-toast). */
@@ -1753,7 +1753,7 @@ function policyWrite(doFetch) {
   return policyWriteChain;
 }
 
-/* Per-write correlation id. Each write tags its request with a unique `x-zlauder-write-id`;
+/* Per-write correlation id. Each write tags its request with a unique `x-sordino-write-id`;
    the server echoes it on the resulting `policy` SSE frame. THIS tab recognizes its own
    echo (id in `pendingWids`) and suppresses the redundant external-change toast — while a
    genuinely concurrent change from the CLI or ANOTHER tab (no matching id) still toasts,
@@ -1766,7 +1766,7 @@ function apiWrite(path, opts = {}) {
   const wid = 'w' + (++widSeq) + '.' + Math.floor(Math.random() * 1e9).toString(36);
   pendingWids.add(wid);
   setTimeout(() => pendingWids.delete(wid), 30000);
-  opts.headers = { ...(opts.headers || {}), 'x-zlauder-write-id': wid };
+  opts.headers = { ...(opts.headers || {}), 'x-sordino-write-id': wid };
   return api(path, opts);
 }
 
@@ -1927,7 +1927,7 @@ function refreshPersonalTier() {
 }
 
 function loadPolicy() {
-  api('/zlauder/config')
+  api('/sordino/config')
     .then(r => r.ok ? r.json() : Promise.reject(new Error('config fetch failed')))
     .then(applyPolicyConfig)
     .catch(() => toast('policy fetch failed', 'bad'));
@@ -1967,7 +1967,7 @@ function refreshDivergence() {
 }
 
 /* ---- live policy sync. A server `policy` SSE frame (from ANY control-plane writer —
-   this panel, the /zlauder:privacy CLI, custom-mask / reveal endpoints, or another browser
+   this panel, the /sordino:privacy CLI, custom-mask / reveal endpoints, or another browser
    window) re-renders the panel so it is ALWAYS an accurate mirror of the live policy.
    - The dropdown/threshold/category/ML CONTROLS moving externally raises one confirming
      toast — UNLESS the frame is the echo of OUR OWN write (matched precisely by write-id,
@@ -2052,7 +2052,7 @@ $('polProfile').addEventListener('change', () => {
   const name = $('polProfile').value;
   const scope = $('polScope').value;
   policyWrite(() =>
-    apiWrite(`/zlauder/profile/${encodeURIComponent(name)}?scope=${encodeURIComponent(scope)}`, { method: 'POST' })
+    apiWrite(`/sordino/profile/${encodeURIComponent(name)}?scope=${encodeURIComponent(scope)}`, { method: 'POST' })
       .then(r => r.ok ? r.json() : Promise.reject(new Error('profile rejected')))
       .then(snap => {
         applyPolicyConfig(snap);
@@ -2096,7 +2096,7 @@ function revertPanelToCommitted() {
 /* shared merge-PUT helper. On success the server's authoritative snapshot re-renders the
    controls; on failure roll the controls back to the committed policy and surface why. */
 function putConfigMerge(body, label) {
-  return apiWrite('/zlauder/config', { method: 'PUT', body: JSON.stringify(body) })
+  return apiWrite('/sordino/config', { method: 'PUT', body: JSON.stringify(body) })
     .then(r => r.ok ? r.json() : r.text().then(t => Promise.reject(new Error(t))))
     .then(snap => { applyPolicyConfig(snap); policyToast(label, 'good'); })
     .catch(err => { revertPanelToCommitted(); toast(`set failed: ${esc(err.message || 'rejected')}`, 'bad'); });
@@ -2106,7 +2106,7 @@ function putConfigMerge(body, label) {
 $('polMlToggle').addEventListener('change', e => {
   const on = e.target.checked;
   policyWrite(() =>
-    apiWrite(`/zlauder/ml/${on ? 'enable' : 'disable'}`, { method: 'POST' })
+    apiWrite(`/sordino/ml/${on ? 'enable' : 'disable'}`, { method: 'POST' })
       .then(r => r.ok ? r.json() : Promise.reject(new Error('ml toggle failed')))
       .then(snap => {
         applyPolicyConfig(snap);
@@ -2118,7 +2118,7 @@ $('polMlToggle').addEventListener('change', e => {
 
 /* ---- custom masks: list + remove ---- */
 function loadCustomMasks() {
-  api('/zlauder/monitor/custom-mask')
+  api('/sordino/monitor/custom-mask')
     .then(r => r.ok ? r.json() : Promise.reject(new Error('mask list failed')))
     .then(renderCustomMasks)
     .catch(() => { $('polMasks').innerHTML = `<div class="pol-masks-empty">could not load custom masks</div>`; });
@@ -2146,7 +2146,7 @@ $('polMasks').addEventListener('click', e => {
   if (!btn) return;
   const pattern = btn.dataset.maskPat;
   const entity_type = btn.dataset.maskKind;
-  api('/zlauder/monitor/custom-mask', { method: 'DELETE', body: JSON.stringify({ pattern, entity_type }) })
+  api('/sordino/monitor/custom-mask', { method: 'DELETE', body: JSON.stringify({ pattern, entity_type }) })
     .then(r => r.ok ? r.json() : Promise.reject(new Error('remove failed')))
     .then(res => {
       toast(`removed mask <b>${esc(pattern)}</b>${res.removed_persisted ? ' (live + persisted)' : ' (live only)'}`, 'good');
