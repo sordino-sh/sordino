@@ -11,7 +11,7 @@ Run these **inside a `claude` session** — they are Claude Code slash commands,
 shell commands:
 
 ```
-/plugin marketplace add FailSpy/sordino
+/plugin marketplace add sordino-sh/sordino
 /plugin install sordino
 [restart Claude Code]
 ```
@@ -212,7 +212,7 @@ can iterate locally while end users keep the zero-build GitHub flow:
 
 | | end users | local dev |
 |---|---|---|
-| marketplace | `/plugin marketplace add FailSpy/sordino` → the plugin's `source` is the orphan **`plugin-dist`** branch | not used (see below) |
+| marketplace | `/plugin marketplace add sordino-sh/sordino` → the plugin's `source` is the orphan **`plugin-dist`** branch | not used (see below) |
 | plugin files | shipped on `plugin-dist` | this repo's [`sordino-plugin/`](./sordino-plugin/), live |
 | binaries | prebuilt `bin/<triple>/`, picked by host triple — **no compile, no download** | your `cargo build --release --workspace` output |
 

@@ -76,7 +76,7 @@ commands), then reload so the freshly installed plugin activates without
 restarting Claude Code:
 
 ```
-/plugin marketplace add FailSpy/sordino
+/plugin marketplace add sordino-sh/sordino
 /plugin install sordino
 /reload-plugins
 ```
@@ -252,7 +252,7 @@ native PowerShell/cmd wrappers are not shipped.
 On any other platform there is no shipped binary, so the hook falls through to the
 source build (which needs the cargo workspace + toolchain). In that case, put the
 binaries on your `PATH` — e.g. grab an archive from the
-[GitHub Release](https://github.com/FailSpy/sordino/releases) and drop them in
+[GitHub Release](https://github.com/sordino-sh/sordino/releases) and drop them in
 `~/.local/bin` — or set `$SORDINO_WORKSPACE` to a checkout.
 
 ## Security and limitations

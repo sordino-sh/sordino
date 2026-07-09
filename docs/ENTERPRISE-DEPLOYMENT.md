@@ -184,7 +184,7 @@ before enforcing.
 |---|---|
 | `allowManagedPermissionRulesOnly: true` | Only permission rules from managed settings apply; user/project rules are ignored |
 | `disableBypassPermissionsMode: "disable"` | Users cannot enter bypass-permissions mode |
-| `strictKnownMarketplaces` | Allow-list plugin marketplace sources — include the Sordino marketplace source (`FailSpy/sordino`; its plugin `source` is the `plugin-dist` branch) |
+| `strictKnownMarketplaces` | Allow-list plugin marketplace sources — include the Sordino marketplace source (`sordino-sh/sordino`; its plugin `source` is the `plugin-dist` branch) |
 | `disableSideloadFlags` (v2.1.193+) | Disables plugin/agent side-loading CLI flags |
 | `strictPluginOnlyCustomization` | Restricts customization to plugins |
 | `allowManagedHooksOnly` | Only hooks delivered via managed settings run |
