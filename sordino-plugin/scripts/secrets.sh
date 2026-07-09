@@ -15,4 +15,4 @@ PORT_ARGS=()
 
 # $1 is the (possibly empty) action: status | list. Empty defaults to status.
 ACTION="${1:-}"
-exec "$SORDINO_HOOKS_BIN" "${PORT_ARGS[@]}" secrets ${ACTION:+$ACTION}
+exec "$SORDINO_HOOKS_BIN" ${PORT_ARGS[@]+"${PORT_ARGS[@]}"} secrets ${ACTION:+$ACTION}

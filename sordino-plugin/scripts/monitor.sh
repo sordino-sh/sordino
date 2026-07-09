@@ -17,7 +17,7 @@ PORT_ARGS=()
 # MODEL's context (slash-command !bash is not shown directly to the user), so the
 # model relays it — the admin key is a `Local` token that the proxy reveals on the
 # display path, so the relayed URL works.
-URL="$("$SORDINO_HOOKS_BIN" "${PORT_ARGS[@]}" monitor)"
+URL="$("$SORDINO_HOOKS_BIN" ${PORT_ARGS[@]+"${PORT_ARGS[@]}"} monitor)"
 printf '%s\n' "$URL"
 
 # Belt-and-suspenders: also open the monitor in the user's browser directly, so they

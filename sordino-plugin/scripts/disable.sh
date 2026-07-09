@@ -35,4 +35,4 @@ set -- ${1:-}
 PORT_ARGS=()
 [ -n "${SORDINO_PORT:-}" ] && PORT_ARGS=(--port "$SORDINO_PORT")
 
-exec "$SORDINO_HOOKS_BIN" "${PORT_ARGS[@]}" disable "$@"
+exec "$SORDINO_HOOKS_BIN" ${PORT_ARGS[@]+"${PORT_ARGS[@]}"} disable "$@"

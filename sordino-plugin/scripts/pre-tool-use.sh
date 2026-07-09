@@ -22,4 +22,4 @@ PORT_ARGS=()
 
 # sordino-hooks reads the PreToolUse payload from stdin and prints the hook JSON (or
 # nothing). Never fail the tool: swallow any non-zero exit.
-"$SORDINO_HOOKS_BIN" "${PORT_ARGS[@]}" pre-tool-use || true
+"$SORDINO_HOOKS_BIN" ${PORT_ARGS[@]+"${PORT_ARGS[@]}"} pre-tool-use || true

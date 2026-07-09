@@ -121,9 +121,9 @@ CFG="$(config_path)"
 # until the restart, so nothing sends unmasked.) Single source of truth, no shell guard.
 set +e
 if [ -n "$CFG" ]; then
-  "$SORDINO_HOOKS_BIN" "${PORT_ARGS[@]}" session-start --config "$CFG"
+  "$SORDINO_HOOKS_BIN" ${PORT_ARGS[@]+"${PORT_ARGS[@]}"} session-start --config "$CFG"
 else
-  "$SORDINO_HOOKS_BIN" "${PORT_ARGS[@]}" session-start
+  "$SORDINO_HOOKS_BIN" ${PORT_ARGS[@]+"${PORT_ARGS[@]}"} session-start
 fi
 rc=$?
 set -e

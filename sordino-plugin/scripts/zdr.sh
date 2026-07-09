@@ -25,6 +25,6 @@ PORT_ARGS=()
 [ -n "${SORDINO_PORT:-}" ] && PORT_ARGS=(--port "$SORDINO_PORT")
 
 if [ "$#" -eq 0 ]; then
-  exec "$SORDINO_HOOKS_BIN" "${PORT_ARGS[@]}" zdr status
+  exec "$SORDINO_HOOKS_BIN" ${PORT_ARGS[@]+"${PORT_ARGS[@]}"} zdr status
 fi
-exec "$SORDINO_HOOKS_BIN" "${PORT_ARGS[@]}" zdr "$@"
+exec "$SORDINO_HOOKS_BIN" ${PORT_ARGS[@]+"${PORT_ARGS[@]}"} zdr "$@"

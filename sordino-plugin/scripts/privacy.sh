@@ -40,27 +40,27 @@ case "$sub" in
       echo "usage: /sordino:privacy reveal <TOKEN>   (e.g. [EMAIL_ADDRESS_xxxx])" >&2
       exit 2
     fi
-    exec "$SORDINO_HOOKS_BIN" "${PORT_ARGS[@]}" reveal "$tok"
+    exec "$SORDINO_HOOKS_BIN" ${PORT_ARGS[@]+"${PORT_ARGS[@]}"} reveal "$tok"
     ;;
   status | "")
     # One unified "where do I stand": proxy health, then routing, then masking config.
     echo "Proxy health:"
-    "$SORDINO_HOOKS_BIN" "${PORT_ARGS[@]}" statusline || true
+    "$SORDINO_HOOKS_BIN" ${PORT_ARGS[@]+"${PORT_ARGS[@]}"} statusline || true
     echo
     echo "Routing (ANTHROPIC_BASE_URL in this project's .claude/settings.local.json):"
     # sordino-hooks reads settings.local.json first (then legacy settings.json) — no jq needed.
     "$SORDINO_HOOKS_BIN" settings route-url || echo "(unset)"
     echo
     echo "Masking:"
-    "$SORDINO_HOOKS_BIN" "${PORT_ARGS[@]}" config || true
+    "$SORDINO_HOOKS_BIN" ${PORT_ARGS[@]+"${PORT_ARGS[@]}"} config || true
     ;;
   on | off | profile | category | threshold | entity)
     # Masking verbs (and any --scope flag) pass straight through to the CLI.
-    exec "$SORDINO_HOOKS_BIN" "${PORT_ARGS[@]}" config "$@"
+    exec "$SORDINO_HOOKS_BIN" ${PORT_ARGS[@]+"${PORT_ARGS[@]}"} config "$@"
     ;;
   scrub)
     shift || true
-    exec "$SORDINO_HOOKS_BIN" "${PORT_ARGS[@]}" scrub "$@"
+    exec "$SORDINO_HOOKS_BIN" ${PORT_ARGS[@]+"${PORT_ARGS[@]}"} scrub "$@"
     ;;
   model)
     # ML recognizer (openai/privacy-filter, CPU): download | status | on | off.
@@ -84,11 +84,11 @@ case "$sub" in
         [ -f "$proj_cfg" ] && CFG_ARGS=(--config "$proj_cfg")
         MODEL_ARGS=()
         [ -n "${1:-}" ] && MODEL_ARGS=(--model "$1")
-        exec "$SORDINO_PROXY_BIN" "${CFG_ARGS[@]}" --download-model "${MODEL_ARGS[@]}"
+        exec "$SORDINO_PROXY_BIN" ${CFG_ARGS[@]+"${CFG_ARGS[@]}"} --download-model ${MODEL_ARGS[@]+"${MODEL_ARGS[@]}"}
         ;;
       on | off | status | "")
         # status / on / off go through the lean control CLI (no ml deps needed).
-        exec "$SORDINO_HOOKS_BIN" "${PORT_ARGS[@]}" config ml "$@"
+        exec "$SORDINO_HOOKS_BIN" ${PORT_ARGS[@]+"${PORT_ARGS[@]}"} config ml "$@"
         ;;
       *)
         echo "usage: /sordino:privacy model [status | download [<repo>] | on | off] [--scope session|project|user|local]" >&2

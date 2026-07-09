@@ -53,6 +53,25 @@ jobs:
           test -f codex-sordino-plugin/sordino.toml
           test -f codex-sordino-plugin/skills/sordino-openai/SKILL.md
 
+      # Guard the plugin shell scripts against the bash-3.2 array-expansion crash
+      # (GH #2): macOS's /bin/bash is 3.2, where a bare `"${ARR[@]}"` on an empty
+      # array under `set -u` is a fatal unbound-variable error — it took down every
+      # hook/command in an unrouted first session. The failure is 3.2-specific and
+      # can't be reproduced on the Linux runner's bash 5, so we guard it statically:
+      # `bash -n` on every script (syntax) plus a lint that rejects any bare
+      # `"${name[@]}"` in a shipped script (the guarded `${name[@]+"${name[@]}"}`
+      # form is required). Static, deterministic, and free of macOS minutes.
+      - name: Guard plugin shell scripts (bash 3.2 safety, GH #2)
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in sordino-plugin/scripts/*.sh \
+                   codex-sordino-plugin/scripts/*.sh \
+                   codex-sordino-plugin/skills/sordino-openai/scripts/*.sh; do
+            bash -n "$f"
+          done
+          bash sordino-plugin/scripts/no-bare-array-expansion.test.sh
+
   # The macOS-ARM Metal code path (presidio-classifier `metal` feature ->
   # candle-core/metal -> candle-metal-kernels -> objc2) is compiled on NO other
   # target, so the Linux job above can't catch a break in it. This leg compiles

@@ -48,7 +48,7 @@ case "$sub" in
     # Re-enable: `config on` is the unconditional path — it clears any per-conversation off at any
     # scope AND turns the master switch back on. Extra args (e.g. --scope project) pass through.
     shift || true
-    exec "$SORDINO_HOOKS_BIN" "${PORT_ARGS[@]}" config on "$@"
+    exec "$SORDINO_HOOKS_BIN" ${PORT_ARGS[@]+"${PORT_ARGS[@]}"} config on "$@"
     ;;
   off)
     # Turn off: the per-conversation `disable` path (bounded, server-side ~30m TTL by default).
@@ -61,9 +61,9 @@ case "$sub" in
       case "$a" in --scope | --scope=*) route_config_off=1 ;; esac
     done
     if [ "$route_config_off" -eq 1 ]; then
-      exec "$SORDINO_HOOKS_BIN" "${PORT_ARGS[@]}" config off "$@"
+      exec "$SORDINO_HOOKS_BIN" ${PORT_ARGS[@]+"${PORT_ARGS[@]}"} config off "$@"
     else
-      exec "$SORDINO_HOOKS_BIN" "${PORT_ARGS[@]}" disable "$@"
+      exec "$SORDINO_HOOKS_BIN" ${PORT_ARGS[@]+"${PORT_ARGS[@]}"} disable "$@"
     fi
     ;;
   *)
