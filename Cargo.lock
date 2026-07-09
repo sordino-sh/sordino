@@ -3301,7 +3301,7 @@ dependencies = [
 
 [[package]]
 name = "sordino-engine"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "aes-gcm",
  "aho-corasick",
@@ -3329,7 +3329,7 @@ dependencies = [
 
 [[package]]
 name = "sordino-hooks"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "blake3",
@@ -3351,7 +3351,7 @@ dependencies = [
 
 [[package]]
 name = "sordino-proxy"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anthropic-wire",
  "anyhow",
@@ -3383,7 +3383,7 @@ dependencies = [
 
 [[package]]
 name = "sordino-secrets"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "async-trait",
  "dotenvy",
@@ -3397,7 +3397,7 @@ dependencies = [
 
 [[package]]
 name = "sordino-state"
-version = "0.14.0"
+version = "0.15.0"
 dependencies = [
  "anyhow",
  "blake3",

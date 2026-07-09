@@ -1,6 +1,6 @@
 {
   "name": "sordino-openai",
-  "version": "0.14.0",
+  "version": "0.15.0",
   "description": "Launch a per-project Sordino proxy for Codex's OpenAI provider.",
   "author": {
     "name": "failspy",
