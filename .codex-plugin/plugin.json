@@ -1,0 +1,36 @@
+{
+  "name": "sordino-openai",
+  "version": "0.15.2",
+  "description": "Launch a per-project Sordino proxy for Codex's OpenAI provider.",
+  "author": {
+    "name": "failspy",
+    "email": "failspy@exonull.com"
+  },
+  "homepage": "https://github.com/sordino-sh/sordino",
+  "repository": "https://github.com/sordino-sh/sordino",
+  "license": "BUSL-1.1",
+  "keywords": [
+    "privacy",
+    "pii",
+    "openai",
+    "proxy",
+    "codex"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Sordino OpenAI",
+    "shortDescription": "PII masking proxy for Codex OpenAI traffic",
+    "longDescription": "Starts or reuses a per-project Sordino proxy configured for api.openai.com so Codex can route its built-in OpenAI provider through local PII masking.",
+    "developerName": "failspy",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Read",
+      "Write"
+    ],
+    "websiteURL": "https://github.com/sordino-sh/sordino",
+    "brandColor": "#2563EB",
+    "defaultPrompt": [
+      "Check whether this Codex project is routed through Sordino"
+    ]
+  }
+}
