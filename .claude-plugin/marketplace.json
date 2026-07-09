@@ -15,7 +15,7 @@
       },
       "displayName": "Sordino",
       "description": "PII mask/unmask proxy control plane for Claude Code: launches the local masking reverse-proxy, wires routing, and adds /sordino:enable, :disable, and :privacy.",
-      "version": "0.15.1",
+      "version": "0.15.2",
       "author": {
         "name": "FailSpy",
         "email": "failspy@exonull.com"
