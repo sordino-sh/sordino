@@ -1,0 +1,129 @@
+# Sordino exhaustive configuration example.
+#
+# The seeded sordino.toml is intentionally concise. This file documents the full
+# config surface, including optional and advanced fields. Copy selected keys into
+# sordino.toml, sordino.local.toml, or ~/.config/sordino/config.toml.
+#
+# Config layers merge in this order:
+#   user (~/.config/sordino/config.toml) < project (./sordino.toml) < local (./sordino.local.toml)
+# Tables merge recursively; arrays replace wholesale.
+
+[proxy]
+# Omit `port` (the default) to bind an OS-assigned ephemeral port, published to a
+# per-project rendezvous file so two projects never collide. Uncomment to PIN a static
+# port instead — bound exactly; a conflict is a hard error, never silently moved.
+# port = 8787
+bind = "127.0.0.1"
+upstream_base_url = "https://api.anthropic.com"
+
+[engine]
+# Master on/off switch. When false, outbound requests pass through unmasked, but
+# response unmasking still runs so existing transcript tokens can decode.
+enabled = true
+
+# Presets: "strict", "balanced", "minimal", "secrets_only".
+#   strict       threshold 0.4, all 6 categories, Token operator
+#   balanced     threshold 0.5, secrets+financial+identity+contact (default)
+#   minimal      threshold 0.6, secrets+financial
+#   secrets_only threshold 0.6, secrets only   (was "development_safe"; alias kept)
+# The profile SEEDS score_threshold / enabled_categories / default_operator: if you
+# set `profile` but OMIT those fields, they take the profile's values. Any field you
+# DO set explicitly below overrides the profile's seed.
+profile = "balanced"
+
+# Detection score floor, 0.0..1.0. Lower is more aggressive.
+score_threshold = 0.5
+language = "en"
+
+# Categories:
+#   secrets   API_KEY, AWS_ACCESS_KEY, AWS_SECRET_KEY, AZURE_KEY, GCP_API_KEY,
+#             PRIVATE_KEY, JWT, URL_CREDENTIAL
+#   financial CREDIT_CARD, IBAN_CODE, CRYPTO, US_BANK_NUMBER, ABA_ROUTING_NUMBER
+#   identity  SSN/ITIN, national IDs, passports, driver's licenses, medical IDs
+#   contact   EMAIL_ADDRESS, PHONE_NUMBER
+#   network   IP_ADDRESS, URL, MAC_ADDRESS  (off in balanced; on in strict)
+#   personal  PERSON, LOCATION, ORGANIZATION; requires [engine.ml] to be ready
+enabled_categories = ["secrets", "financial", "identity", "contact"]
+
+# Default operator for enabled entity types:
+#   { kind = "token" }                         reversible deterministic token
+#   { kind = "redact" }                        irreversible [REDACTED]
+#   { kind = "mask", char = "*", from_end = 4 } irreversible partial mask
+#   { kind = "hash" }                          irreversible [ENTITY:hash]
+#   { kind = "keep" }                          detect but leave plaintext
+default_operator = { kind = "token" }
+
+# Disable masking/unmasking on selected traffic surfaces. Usually leave empty.
+# Values: "user_message", "system_prompt", "tool_result", "assistant_text",
+# "tool_use_input".
+disabled_surfaces = []
+
+# In-memory detection cache. 0 disables and clears it live.
+detection_cache_cap = 50000
+
+[engine.ml]
+# Optional openai/privacy-filter recognizer for free-text PII such as names,
+# locations, and organizations. Download once with:
+#   /sordino:privacy model download
+# Then enable with:
+#   /sordino:privacy model on
+#   /sordino:privacy category personal on
+enabled = false
+model = "openai/privacy-filter"
+# revision = "main"        # branch, tag, or commit
+# min_score = 0.5          # ML recognizer score floor
+prefer_gpu = false         # GPU backends are not compiled in by default
+
+[engine.reveal_marker]
+# Wrap unmasked values in assistant prose so restored spans are visible locally.
+# Applies only to displayed assistant text, never tool inputs/results. Markers are
+# stripped before that assistant history is sent upstream on the next turn.
+# ON by default with the ANSI marker below — it highlights the span in a terminal
+# WITHOUT altering the value's bytes, so an un-masked URL/key stays copy-clean (a printable
+# in-band marker would corrupt it, e.g. a token spliced into a URL). Raw escape bytes only
+# show as literal junk in a non-terminal sink (a stored transcript viewed with cat).
+# Override prefix/suffix for a different style, or set enabled = false to turn it off.
+enabled = true
+prefix = "\u001b[97;44m"   # bright-white on blue
+suffix = "\u001b[0m"       # reset
+# Prefer a printable marker that also renders outside a terminal? (corrupts copied values)
+# prefix = "⟦"
+# suffix = "⟧"
+
+[engine.entity_operators]
+# Per-entity overrides. Presence also opts an entity type into masking even if its
+# category is not listed in enabled_categories.
+# CREDIT_CARD masks the last 4 irreversibly by DEFAULT (compiled built-in, like CVV);
+# list it here only to OVERRIDE that (e.g. a reversible token round-trips the full PAN):
+# CREDIT_CARD = { kind = "token" }
+# EMAIL_ADDRESS = { kind = "token" }
+# PASSWORD = { kind = "redact" }
+# DATE_TIME = { kind = "keep" }
+# DOMAIN = { kind = "token" }
+
+[engine.allow_list]
+# Values that must never be tokenized. Common defaults are seeded internally too,
+# but listing them here makes project policy explicit.
+exact = ["Anthropic", "Claude", "127.0.0.1"]
+exact_ci = ["localhost"]
+patterns = ['^\d{4}$']
+
+# Custom rules. Lower priority wins on overlap. is_regex=false means literal.
+# case_sensitive defaults true. literal_token=true emits the fixed token verbatim
+# and remains reversible in the local session store.
+#
+# [[engine.custom_replacements]]
+# pattern = "ACME-INTERNAL-CODENAME"
+# entity_type = "CODENAME"
+# is_regex = false
+# case_sensitive = true
+# priority = 0
+# literal_token = true
+# token = "[CODENAME_acme]"
+#
+# [[engine.custom_replacements]]
+# pattern = '\bEMP-\d{6}\b'
+# entity_type = "EMPLOYEE_ID"
+# is_regex = true
+# priority = 10
+# apply_to_surfaces = ["user_message", "tool_result"]
